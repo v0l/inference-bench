@@ -1,1 +1,1 @@
-{"layer": 3, "rows": 34, "prompt": 30, "width": 19, "greedy": [187, 396, 65, 449, 127]}
+{"layer": 3, "rows": 34, "prompt": 30, "width": 19, "greedy": [187, 396, 65, 449, 127], "attn_from": 19, "attn_scale": 6.007626491277354e-05}

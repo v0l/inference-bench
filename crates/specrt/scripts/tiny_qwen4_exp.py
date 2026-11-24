@@ -273,8 +273,162 @@ def indexer_reference(model, head):
     hidden = torch.cat(inputs)
     gated = torch.cat(outputs)
     assert hidden.shape[0] == PROMPT + DECODE and gated.shape[0] == PROMPT + DECODE and selected.shape[0] == PROMPT + DECODE
-    save(out, f"{NAME}.indexer", {"input": hidden, "selected": selected, "attn": gated}, {"layer": layer, "rows": PROMPT + DECODE, "prompt": PROMPT, "width": width, "greedy": greedy})
-    print(NAME, "indexer layer", layer, "rows", PROMPT + DECODE, "width", width)
+    save(out, f"{NAME}.indexer", {"input": hidden, "selected": selected}, {"layer": layer, "rows": PROMPT + DECODE, "prompt": PROMPT, "width": width, "greedy": greedy})
+    sparse = next(p for p, r in enumerate(rows) if sum(t >= 0 for t in r) < p + 1)
+    kept = gated[sparse:]
+    scale = float(kept.abs().max()) / 32767
+    np.round(kept.numpy() / scale).astype(np.int16).tofile(out / f"{NAME}.indexer.attn.i16")
+    meta = json.loads((out / f"{NAME}.indexer.json").read_text())
+    (out / f"{NAME}.indexer.json").write_text(json.dumps({**meta, "attn_from": sparse, "attn_scale": scale}) + "\n")
+    print(NAME, "indexer layer", layer, "rows", PROMPT + DECODE, "width", width, "attn rows from", sparse, "scale", scale)
+
+
+MASK64 = (1 << 64) - 1
+REAL_CONFIG = ROOT / "tests/fixtures/popular/Qwen__Qwen3.8-Flash-Next/config.json"
+
+
+def np_splitmix64(value):
+    value = (value + 0x9E3779B97F4A7C15) & MASK64
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & MASK64
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & MASK64
+    return (value ^ (value >> 31)) & MASK64
+
+
+def np_multipliers(vocab, ngram, ple_index, seed):
+    half = max(1, ((1 << 63) - 1) // max(vocab, 1) // 2)
+    base = seed + 10007 * ple_index
+    return [2 * (np_splitmix64((base + 0x9E3779B97F4A7C15 * (k + 1)) & MASK64) % half) + 1 for k in range(ngram)]
+
+
+def np_prime_after(start, count):
+    p = start
+    for _ in range(count):
+        p += 1
+        while p < 2 or any(p % d == 0 for d in range(2, int(p ** 0.5) + 1)):
+            p += 1
+    return p
+
+
+def np_heads(hp, ple_index):
+    heads = (hp["ngram_size"] - 1) * hp["heads_per_ngram"]
+    sizes = [np_prime_after(hp["ngram_vocab_size_base"] - 1, ple_index * heads + h + 1) for h in range(heads)]
+    offsets = [sum(sizes[:h]) for h in range(heads)]
+    return sizes, offsets
+
+
+def np_ngram_ids(tokens, hp, ple_index):
+    n, hpn, eos = hp["ngram_size"], hp["heads_per_ngram"], hp["eos_token_id"]
+    mult = np_multipliers(hp["vocab_size"], n, ple_index, hp["seed"])
+    sizes, offsets = np_heads(hp, ple_index)
+    hist = [eos] * (n - 1) + list(tokens)
+    out = []
+    for t in range(n - 1, len(hist)):
+        shifted, live = [hist[t]], True
+        for k in range(1, n):
+            h = hist[t - k]
+            shifted.append(h if live else eos)
+            if h == eos:
+                live = False
+        row = []
+        for g in range(2, n + 1):
+            acc = (shifted[0] * mult[0]) & MASK64
+            for k in range(1, g):
+                acc ^= (shifted[k] * mult[k]) & MASK64
+            signed = acc - (1 << 64) if acc >> 63 else acc
+            for j in range(hpn):
+                h = (g - 2) * hpn + j
+                row.append(signed % sizes[h] + offsets[h])
+        out.append(row)
+    return np.array(out, dtype=np.int64)
+
+
+class IdsOut(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, ids):
+        return ids.unsqueeze(-1)
+
+
+def torch_ngram_ids(tokens, hp, ple_index):
+    from types import SimpleNamespace
+
+    from transformers.models.qwen4_exp import modeling_qwen4_exp as m
+
+    cfg = SimpleNamespace(**hp, make_ngram_vocab_size_divisible_by=128)
+    with torch.device("meta"):
+        emb = m.Qwen4ExpTextNGramEmbedding(cfg, (hp["ngram_size"] - 1) * hp["heads_per_ngram"], 0, ple_index)
+    emb.layer_multipliers = m._build_layer_multipliers(hp["vocab_size"], hp["ngram_size"], ple_index, hp["seed"])
+    emb.ngram_heads_vocab_sizes = torch.tensor(emb.head_vocab_sizes, dtype=torch.long)
+    emb.ngram_heads_offsets = torch.tensor(emb.head_offsets, dtype=torch.long)
+    emb.ngram_embedding = IdsOut()
+    return emb(torch.tensor([tokens], dtype=torch.long), None)[0].long().numpy()
+
+
+def hash_params(text):
+    keys = ("vocab_size", "ngram_size", "heads_per_ngram", "ngram_vocab_size_base", "seed", "eos_token_id")
+    defaults = {"seed": 1234, "heads_per_ngram": 8, "ngram_size": 3, "ngram_vocab_size_base": 20_000_000}
+    return {k: text.get(k, defaults.get(k)) if text.get(k) is not None else defaults[k] for k in keys}
+
+
+def hash_cases():
+    real = hash_params(json.loads(REAL_CONFIG.read_text())["text_config"])
+    tiny = hash_params(TEXT)
+    rng = np.random.default_rng(1279)
+    cases = []
+
+    def history(hp, length, eos_rate, high):
+        toks = rng.integers(0, high, length)
+        toks[rng.random(length) < eos_rate] = hp["eos_token_id"]
+        toks[5:7] = hp["eos_token_id"]
+        return [int(t) for t in toks]
+
+    for name, hp, ple_index, high in [
+        ("tiny", tiny, 0, tiny["vocab_size"]),
+        ("tiny_second_ple", tiny, 1, tiny["vocab_size"]),
+        ("real", real, 0, real["vocab_size"]),
+        ("real_second_ple", real, 1, real["vocab_size"]),
+        ("real_wraparound", real, 0, (1 << 31) - 1),
+    ]:
+        tokens = history(hp, 48, 0.12, high)
+        want = np_ngram_ids(tokens, hp, ple_index)
+        got = torch_ngram_ids(tokens, hp, ple_index)
+        assert (want == got).all(), name
+        mult = np_multipliers(hp["vocab_size"], hp["ngram_size"], ple_index, hp["seed"])
+        wraps = any(t * m >= 1 << 63 for t in tokens for m in mult)
+        assert wraps == name.endswith("wraparound"), name
+        sizes, offsets = np_heads(hp, ple_index)
+        cases.append({"name": name, "params": hp, "ple_index": ple_index, "multipliers": mult, "sizes": sizes, "offsets": offsets, "tokens": tokens, "ids": want.tolist()})
+    return cases
+
+
+def ple_reference(model, head):
+    out = FIXTURE / "reference"
+    cfg = model.config
+    ids = prompt_tokens(cfg.vocab_size)
+    layer = cfg.ple_layer_ids[0] - 1
+    calls = []
+    hook = model.layers[layer].ple.register_forward_hook(lambda _m, a, o: calls.append((a[0][0].detach().clone(), a[1][0].detach().clone(), o[0].detach().clone())))
+    with torch.inference_mode():
+        prefill, state = logits_of(model, head, ids, use_cache=True)
+        past = state.past_key_values
+        greedy = [int(prefill[-1].argmax())]
+        for _ in range(DECODE):
+            row, state = logits_of(model, head, torch.tensor([greedy[-1]]), past_key_values=past, use_cache=True)
+            past = state.past_key_values
+            greedy.append(int(row[-1].argmax()))
+    hook.remove()
+    stored = json.loads((out / f"{NAME}.ref.json").read_text())
+    assert greedy == stored["greedy"], (greedy, stored["greedy"])
+    streams = torch.cat([c[0] for c in calls])
+    tokens = torch.cat([c[1] for c in calls])
+    ple = torch.cat([c[2] for c in calls])
+    hp = hash_params(TEXT)
+    ngram = np_ngram_ids(tokens.tolist(), hp, cfg.ple_layer_ids.index(layer + 1))
+    save(out, f"{NAME}.ple", {"streams": streams, "out": ple}, {"layer": layer, "tokens": tokens.tolist(), "prefill": PROMPT, "decode_steps": DECODE, "ngram_ids": ngram.tolist(), "shape": list(ple.shape)})
+    (out / f"{NAME}.ngram.json").write_text(json.dumps(hash_cases()) + "\n")
+    print(NAME, "ple layer", layer, "rows", tuple(ple.shape), "calls", len(calls))
 
 
 def fixture_bytes():
@@ -292,6 +446,8 @@ def main():
         references(model, head)
     if command in ("all", "reference", "indexer"):
         indexer_reference(model, head)
+    if command in ("all", "reference", "ple"):
+        ple_reference(model, head)
     size = fixture_bytes()
     print(NAME, size, "bytes")
     assert size < MAX_BYTES, size

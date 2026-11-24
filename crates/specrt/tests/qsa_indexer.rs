@@ -125,6 +125,13 @@ impl Attention {
     }
 }
 
+fn reference_attn() -> (usize, Vec<f32>) {
+    let m = meta();
+    let scale = m["attn_scale"].as_f64().unwrap() as f32;
+    let bytes = std::fs::read(fixture().join("reference").join(format!("{NAME}.indexer.attn.i16"))).unwrap();
+    (m["attn_from"].as_u64().unwrap() as usize, bytes.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b) as f32 * scale).collect())
+}
+
 fn reference_rows() -> Vec<Vec<i32>> {
     let width = meta()["width"].as_u64().unwrap() as usize;
     floats(&format!("{NAME}.indexer.selected.bin")).chunks(width).map(|r| r.iter().map(|v| *v as i32).collect()).collect()
@@ -231,10 +238,10 @@ fn attention_over_the_selected_tokens_reproduces_the_fixture_output_on_cpu() {
     };
     let rows: Vec<&[f32]> = qkv.chunks(row).collect();
     let keys: Vec<Vec<Vec<f32>>> = rows.iter().enumerate().map(|(p, r)| (0..a.kv_heads).map(|k| head(r, qd + k * hd, &attn.k_norm, p)).collect()).collect();
-    let want = floats(&format!("{NAME}.indexer.attn.bin"));
+    let (from, want) = reference_attn();
     let selected = reference_rows();
     let mut worst = 0f32;
-    for (p, r) in rows.iter().enumerate() {
+    for (p, r) in rows.iter().enumerate().skip(from) {
         let chosen: Vec<usize> = selected[p].iter().filter(|t| **t >= 0).map(|t| *t as usize).collect();
         for h in 0..a.heads {
             let kv = h / (a.heads / a.kv_heads);
@@ -246,7 +253,7 @@ fn attention_over_the_selected_tokens_reproduces_the_fixture_output_on_cpu() {
             for d in 0..hd {
                 let v: f32 = chosen.iter().zip(&e).map(|(&t, w)| w * rows[t][qd + kvd + kv * hd + d]).sum::<f32>() / total;
                 let gate = 1.0 / (1.0 + (-r[qd + 2 * kvd + h * hd + d]).exp());
-                worst = worst.max((v * gate - want[p * qd + h * hd + d]).abs());
+                worst = worst.max((v * gate - want[(p - from) * qd + h * hd + d]).abs());
             }
         }
     }
@@ -392,7 +399,8 @@ fn the_indexed_layer_matches_the_fixture_at_prefill_and_across_decode_group_boun
     let row = spec.qkv_rows();
     let prompt = meta()["prompt"].as_u64().unwrap() as usize;
     let total = qkv.len() / row;
-    let want_attn = floats(&format!("{NAME}.indexer.attn.bin"));
+    let (from, want_attn) = reference_attn();
+    assert!(from < prompt, "the attention reference starts at the first sparse prompt row");
     let want = reference_rows();
     let cpu = cpu_selection(&spec);
     let qd = spec.q_dim();
@@ -407,7 +415,10 @@ fn the_indexed_layer_matches_the_fixture_at_prefill_and_across_decode_group_boun
             assert_eq!(sorted(got), sorted(&want[p]), "row {p} selected tokens");
             assert_eq!(groups(got, p, ix.ratio), groups(&want[p], p, ix.ratio), "row {p} group ids");
             assert_eq!(sorted(got), sorted(&cpu[p]), "row {p} matches the CPU reference");
-            let diff = step.attn[r * qd..(r + 1) * qd].iter().zip(&want_attn[p * qd..(p + 1) * qd]).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            if p < from {
+                continue;
+            }
+            let diff = step.attn[r * qd..(r + 1) * qd].iter().zip(&want_attn[(p - from) * qd..(p - from + 1) * qd]).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
             worst = worst.max(diff);
             assert!(diff <= TOLERANCE, "row {p} attention output differs by {diff}");
         }

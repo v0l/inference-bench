@@ -12,7 +12,7 @@ pub const KIND: &str = "kir-kernel";
 
 pub const ROW_FAMILIES: [&str; 14] = ["span_rope", "state_write", "head_matvec", "index_topk", "layernorm_segment", "head_rms", "block_pool", "hyper_pre", "hyper_post", "hyper_expand", "hyper_mean", "pool_topk", "group_pool", "group_topk"];
 
-pub const SEQ_FAMILIES: [&str; 3] = ["recurrence", "seq_conv", "group_norm"];
+pub const SEQ_FAMILIES: [&str; 5] = ["recurrence", "seq_conv", "group_norm", "token_hash", "group_map"];
 
 pub const BUILTIN: [(&str, &str); 10] = [
     ("rmsnorm", include_str!("../kernels/rmsnorm.toml")),
@@ -79,6 +79,17 @@ pub struct Description {
     pub recurrence: Option<BTreeMap<String, Value>>,
     #[serde(default)]
     pub input: Vec<BTreeMap<String, Value>>,
+    #[serde(default)]
+    pub int: Vec<IntDesc>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntDesc {
+    pub name: String,
+    pub expr: String,
+    #[serde(default)]
+    pub per: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
@@ -695,6 +706,93 @@ impl Description {
         Expr::parse(&self.text(words, &text)).map_err(|e| format!("{}: {key}: {e}", self.name))
     }
 
+    pub fn token_hash(&self, shape: &Shape) -> Result<crate::hash::TokenHash, String> {
+        use crate::int::IntExpr;
+        let n = self.sizes_except(shape, &self.args, &["context", "heads", "out_row", "layers", "blank"], &["index"], "[args]")?;
+        let parse = |text: &str, what: &str| IntExpr::parse(text).map_err(|e| format!("{}: {what}: {e}", self.name));
+        let symbol = |name: &str| -> Option<u64> {
+            match shape.get(name)? {
+                Value::Integer(i) if *i >= 0 => Some(*i as u64),
+                Value::Float(f) if *f >= 0.0 && f.fract() == 0.0 && *f < 9.007_199_254_740_992e15 => Some(*f as u64),
+                _ => None,
+            }
+        };
+        let mut consts: Vec<(String, u64)> = Vec::new();
+        let mut per_head: Vec<(String, Vec<u64>)> = Vec::new();
+        let mut lets: Vec<(String, IntExpr)> = Vec::new();
+        let heads = n["heads"] as u64;
+        for d in &self.int {
+            let taken = consts.iter().any(|(c, _)| *c == d.name) || per_head.iter().any(|(c, _)| *c == d.name) || lets.iter().any(|(c, _)| *c == d.name);
+            if taken || d.name == "head" || !d.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return Err(format!("{}: [[int]] name {:?} is not usable", self.name, d.name));
+            }
+            let e = parse(&d.expr, &d.name)?.subst(&|m| consts.iter().find(|(c, _)| c == m).map(|(_, v)| IntExpr::Lit(*v)));
+            let at = |what: String| format!("{}: [[int]] {}: {what}", self.name, d.name);
+            match d.per.as_deref() {
+                None | Some("const") => {
+                    let v = e.eval(&|m| symbol(m)).map_err(at)?;
+                    consts.push((d.name.clone(), v));
+                }
+                Some("head") => {
+                    let mut table = Vec::new();
+                    for h in 0..heads {
+                        let env = |m: &str| if m == "head" { Some(h) } else { per_head.iter().find(|(c, _)| c == m).map(|(_, t)| t[h as usize]).or_else(|| symbol(m)) };
+                        table.push(e.eval(&env).map_err(at)?);
+                    }
+                    per_head.push((d.name.clone(), table));
+                }
+                Some("row") => {
+                    let local = |m: &str| m == "head" || (m.starts_with('t') && m[1..].parse::<u32>().is_ok()) || per_head.iter().any(|(c, _)| c == m) || lets.iter().any(|(c, _)| c == m);
+                    let e = e.subst(&|m| if local(m) { None } else { symbol(m).map(IntExpr::Lit) });
+                    lets.push((d.name.clone(), e.fold().map_err(at)?));
+                }
+                Some(o) => return Err(format!("{}: [[int]] {} per {o:?} is not const, head or row", self.name, d.name)),
+            }
+        }
+        let index = match self.args.get("index") {
+            Some(Value::String(s)) => parse(s, "index")?.subst(&|m| consts.iter().find(|(c, _)| c == m).map(|(_, v)| IntExpr::Lit(*v))),
+            _ => return Err(format!("{}: token_hash needs an index expression", self.name)),
+        };
+        Ok(crate::hash::TokenHash { context: n["context"], heads: n["heads"], out_row: n["out_row"], layers: n["layers"], blank: n["blank"] as u64, per_head, lets, index: index.fold().map_err(|e| format!("{}: index: {e}", self.name))? })
+    }
+
+    fn group_map(&self, shape: &Shape, words: &[(String, String)]) -> Result<crate::group::GroupMap, String> {
+        use crate::group::GroupStage;
+        let n = self.sizes(shape, &self.args, &["width"], "[args]")?;
+        let mut consts = Vec::new();
+        for c in &self.consts {
+            consts.push(Const { name: c.name.clone(), value: self.constant(shape, c)?, wgsl_const: false, fold: c.fold });
+        }
+        let need = |v: &Option<String>, what: &str, op: &str| v.clone().ok_or_else(|| format!("{}: stage {op} needs {what}", self.name));
+        let size = |v: &Option<Value>, key: &str| -> Result<u32, String> { v.as_ref().map_or(Ok(0), |v| self.size(shape, v, key)) };
+        let parse = |text: String| Expr::parse(&self.text(words, &text)).map_err(|e| format!("{}: {e}", self.name));
+        let mut stages = Vec::new();
+        for s in &self.stage {
+            let e = || parse(need(&s.expr, "expr", &s.op)?);
+            let dst = || need(&s.name, "name", &s.op);
+            let at = || -> Result<(u32, u32, u32), String> { Ok((size(&s.row, "row")?, size(&s.head, "head")?, size(&s.offset, "offset")?)) };
+            stages.push(match s.op.as_str() {
+                "load" => {
+                    let (row, group, offset) = at()?;
+                    GroupStage::Load { dst: dst()?, src: need(&s.src, "src", &s.op)?, row, group, offset, index: None }
+                }
+                "gather" => {
+                    let (row, group, offset) = at()?;
+                    GroupStage::Load { dst: dst()?, src: need(&s.src, "src", &s.op)?, row, group, offset, index: Some(need(&s.index, "index", &s.op)?) }
+                }
+                "value" => GroupStage::Value { dst: dst()?, expr: e()? },
+                "sum" => GroupStage::Sum { dst: dst()?, expr: e()? },
+                "scalar" => GroupStage::Scalar { dst: dst()?, expr: e()? },
+                "store" => {
+                    let (row, group, offset) = at()?;
+                    GroupStage::Store { dst: need(&s.dst, "dst", &s.op)?, value: parse(need(&s.value, "value", &s.op)?)?, row, group, offset }
+                }
+                o => return Err(format!("{}: group_map stage op {o:?} is not load, gather, value, sum, scalar or store", self.name)),
+            });
+        }
+        Ok(crate::group::GroupMap { width: n["width"], consts, stages })
+    }
+
     fn seq_kernel(&self, t: &Target, shape: &Shape) -> Result<Kernel, String> {
         use crate::recur::{Input, Recurrence, SeqBody, Space, Stage as RStage};
         let params = self.params()?;
@@ -702,9 +800,19 @@ impl Description {
         let fail = |e: String| if e.starts_with(&format!("{}:", self.name)) { e } else { format!("{}: {e}", self.name) };
         match self.family.as_str() {
             "seq_conv" => {
-                let n = self.sizes(shape, &self.args, &["x_row", "x_offset", "channels", "taps", "y_row", "y_offset", "layers"], "[args]")?;
+                let mut table = self.args.clone();
+                table.entry("dilation".into()).or_insert(Value::Integer(1));
+                let n = self.sizes(shape, &table, &["x_row", "x_offset", "channels", "taps", "dilation", "y_row", "y_offset", "layers"], "[args]")?;
                 let expr = self.expr_arg(&words, &self.args, "act", "v")?;
-                let body = SeqBody::Conv { x_row: n["x_row"], x_offset: n["x_offset"], channels: n["channels"], taps: n["taps"], y_row: n["y_row"], y_offset: n["y_offset"], layers: n["layers"], expr };
+                let body = SeqBody::Conv { x_row: n["x_row"], x_offset: n["x_offset"], channels: n["channels"], taps: n["taps"], dilation: n["dilation"], y_row: n["y_row"], y_offset: n["y_offset"], layers: n["layers"], expr };
+                Kernel::seq(t, intern(&self.name), self.threads(shape)?, params, body).map_err(fail)
+            }
+            "token_hash" => {
+                let body = SeqBody::TokenHash(self.token_hash(shape)?);
+                Kernel::seq(t, intern(&self.name), self.threads(shape)?, params, body).map_err(fail)
+            }
+            "group_map" => {
+                let body = SeqBody::GroupMap(self.group_map(shape, &words)?);
                 Kernel::seq(t, intern(&self.name), self.threads(shape)?, params, body).map_err(fail)
             }
             "group_norm" => {
@@ -991,6 +1099,9 @@ impl Description {
         }
         if self.family != "recurrence" && (self.recurrence.is_some() || !self.input.is_empty()) {
             return Err(format!("{}: only family recurrence takes [recurrence] and [[input]]", self.name));
+        }
+        if self.family != "token_hash" && !self.int.is_empty() {
+            return Err(format!("{}: only family token_hash takes [[int]]", self.name));
         }
         match self.family.as_str() {
             "compose" => self.compose(t, shape),

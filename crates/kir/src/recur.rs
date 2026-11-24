@@ -58,8 +58,10 @@ pub struct Recurrence {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SeqBody {
-    Conv { x_row: u32, x_offset: u32, channels: u32, taps: u32, y_row: u32, y_offset: u32, layers: u32, expr: Expr },
+    Conv { x_row: u32, x_offset: u32, channels: u32, taps: u32, dilation: u32, y_row: u32, y_offset: u32, layers: u32, expr: Expr },
     GroupNorm { x_row: u32, x_offset: u32, g_row: u32, g_offset: u32, width: u32, w_group: u32, out_row: u32, eps: f32, input: Expr, output: Expr },
+    TokenHash(crate::hash::TokenHash),
+    GroupMap(crate::group::GroupMap),
 }
 
 fn ident(n: &str) -> bool {
@@ -159,6 +161,8 @@ impl SeqBody {
         match self {
             SeqBody::Conv { .. } => "seq_conv",
             SeqBody::GroupNorm { .. } => "group_norm",
+            SeqBody::TokenHash(_) => "token_hash",
+            SeqBody::GroupMap(_) => "group_map",
         }
     }
 
@@ -179,13 +183,24 @@ impl SeqBody {
             }
             SeqBody::GroupNorm { .. } if Self::planes(params) => vec!["x", "g", "w", "out_hi", "out_lo"],
             SeqBody::GroupNorm { .. } => vec!["x", "g", "w", "y"],
+            SeqBody::TokenHash(_) => crate::hash::TokenHash::allowed(),
+            SeqBody::GroupMap(_) => params.iter().map(|p| p.name).collect(),
         }
     }
 
-    pub fn check(&self, t: &Target, params: &[Param]) -> Result<(), String> {
+    pub fn has_sum(&self) -> bool {
+        matches!(self, SeqBody::GroupMap(g) if g.has_sum())
+    }
+
+    pub fn check(&self, t: &Target, threads: u32, params: &[Param]) -> Result<(), String> {
         let family = self.family();
         if t.language != Language::Cuda {
             return Err(format!("a {family} body has only a CUDA lowering"));
+        }
+        match self {
+            SeqBody::TokenHash(h) => return h.check(t, threads, params),
+            SeqBody::GroupMap(g) => return g.check(t, params),
+            _ => {}
         }
         let allowed = self.allowed(params);
         if let Some(p) = params.iter().find(|p| !allowed.contains(&p.name) && p.role != Role::Value) {
@@ -198,7 +213,7 @@ impl SeqBody {
         }
         let f = |n: &str, role: Role, access: Access| want(params, n, Scalar::F32, role, access, family);
         match self {
-            SeqBody::Conv { channels, taps, layers, expr, .. } => {
+            SeqBody::Conv { channels, taps, dilation, layers, expr, .. } => {
                 f("x", Role::Activation, Access::Read)?;
                 f("w", Role::Weight, Access::Read)?;
                 f("y", Role::Activation, Access::Write)?;
@@ -209,8 +224,8 @@ impl SeqBody {
                 for &(name, ty, role, access) in &SEQUENCE {
                     want(params, name, ty, role, access, family)?;
                 }
-                if *channels == 0 || *layers == 0 || !(2..=8).contains(taps) {
-                    return Err("seq_conv needs positive channels and layers and 2 to 8 taps".into());
+                if *channels == 0 || *layers == 0 || !(2..=8).contains(taps) || !(1..=8).contains(dilation) {
+                    return Err("seq_conv needs positive channels and layers, 2 to 8 taps and a dilation of 1 to 8".into());
                 }
                 lower_with(expr, &[("v", "v".into())], params)?;
             }
@@ -230,6 +245,7 @@ impl SeqBody {
                 lower_with(input, &[("x", "xv[i]".into()), ("g", "gv[i]".into())], params)?;
                 lower_with(output, &[("n", "nv".into()), ("w", "wv[i]".into()), ("g", "gv[i]".into()), ("x", "xv[i]".into())], params)?;
             }
+            SeqBody::TokenHash(_) | SeqBody::GroupMap(_) => {}
         }
         Ok(())
     }
@@ -237,7 +253,40 @@ impl SeqBody {
     pub fn emit_cuda(&self, k: &Kernel) -> Result<String, String> {
         let head = format!("extern \"C\" __global__ void __launch_bounds__({}) {}({}) {{\n", k.threads, k.name, sig(&k.params));
         let body = match self {
-            SeqBody::Conv { x_row, x_offset, channels, taps, y_row, y_offset, layers, expr } => {
+            SeqBody::TokenHash(h) => return h.emit(k, &head),
+            SeqBody::GroupMap(g) => return g.emit(k, &head),
+            SeqBody::Conv { x_row, x_offset, channels, taps, dilation, y_row, y_offset, layers, expr } if *dilation > 1 => {
+                let act = lower_with(expr, &[("v", "v".into())], &k.params)?;
+                let bias = if find(&k.params, "bias").is_some() { "bias[c]" } else { "0.0f" };
+                format!(
+                    "    constexpr int CH = {channels};
+    constexpr int TAPS = {taps};
+    constexpr int DIL = {dilation};
+    constexpr int SPAN = (TAPS - 1) * DIL;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= CH) return;
+    const int seq = blockIdx.y;
+    const int slot = slot_step ? slots[seq] : slot_base;
+    float* st = state + ((size_t)slot * {layers} + layer) * ((size_t)CH * SPAN) + (size_t)c * SPAN;
+    float win[SPAN + 1];
+#pragma unroll
+    for (int j = 0; j < SPAN; j++) win[j] = st[j];
+    for (int t = 0; t < rows_per_seq; t++) {{
+        const int row = seq * rows_per_seq + t;
+        win[SPAN] = x[(size_t)row * {x_row} + {x_offset} + c];
+        float v = {bias};
+#pragma unroll
+        for (int j = 0; j < TAPS; j++) v += w[c * TAPS + j] * win[j * DIL];
+        y[(size_t)row * {y_row} + {y_offset} + c] = {act};
+#pragma unroll
+        for (int j = 0; j < SPAN; j++) win[j] = win[j + 1];
+    }}
+#pragma unroll
+    for (int j = 0; j < SPAN; j++) st[j] = win[j];
+"
+                )
+            }
+            SeqBody::Conv { x_row, x_offset, channels, taps, y_row, y_offset, layers, expr, .. } => {
                 let act = lower_with(expr, &[("v", "v".into())], &k.params)?;
                 let bias = if find(&k.params, "bias").is_some() { "bias[c]" } else { "0.0f" };
                 format!(

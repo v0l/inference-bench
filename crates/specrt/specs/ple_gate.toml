@@ -1,0 +1,167 @@
+kind = "kir-kernel"
+family = "group_map"
+name = "ple_gate"
+threads = 128
+
+[args]
+width = "hidden"
+
+[[const]]
+name = "eps"
+value = "norm_eps"
+
+[[const]]
+name = "scale"
+value = "ple_gate_scale"
+
+[[param]]
+name = "key"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "value"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "norm_key"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "norm_query"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "norm_conv"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "gated"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "normed"
+role = "activation"
+access = "write"
+
+[[stage]]
+op = "load"
+name = "k"
+src = "key"
+row = "streams * hidden"
+head = "hidden"
+
+[[stage]]
+op = "load"
+name = "kw"
+src = "norm_key"
+head = "hidden"
+
+[[stage]]
+op = "sum"
+name = "kss"
+expr = "k * k"
+
+[[stage]]
+op = "scalar"
+name = "kinv"
+expr = "rsqrt(kss / width + eps)"
+
+[[stage]]
+op = "value"
+name = "kn"
+expr = "k * kinv * (1.0 + kw)"
+
+[[stage]]
+op = "load"
+name = "q"
+src = "x"
+row = "streams * hidden"
+head = "hidden"
+
+[[stage]]
+op = "load"
+name = "qw"
+src = "norm_query"
+head = "hidden"
+
+[[stage]]
+op = "sum"
+name = "qss"
+expr = "q * q"
+
+[[stage]]
+op = "scalar"
+name = "qinv"
+expr = "rsqrt(qss / width + eps)"
+
+[[stage]]
+op = "sum"
+name = "dot"
+expr = "kn * (q * qinv * (1.0 + qw))"
+
+[[stage]]
+op = "scalar"
+name = "g"
+expr = "dot * scale"
+
+[[stage]]
+op = "scalar"
+name = "mag"
+expr = "sqrt(max(abs(g), 0.000001))"
+
+[[stage]]
+op = "scalar"
+name = "s"
+expr = "sigmoid(select(g > 0.0, mag, select(g < 0.0, -mag, 0.0)))"
+
+[[stage]]
+op = "load"
+name = "v"
+src = "value"
+row = "hidden"
+
+[[stage]]
+op = "value"
+name = "gv"
+expr = "s * v"
+
+[[stage]]
+op = "load"
+name = "cw"
+src = "norm_conv"
+head = "hidden"
+
+[[stage]]
+op = "sum"
+name = "gss"
+expr = "gv * gv"
+
+[[stage]]
+op = "scalar"
+name = "ginv"
+expr = "rsqrt(gss / width + eps)"
+
+[[stage]]
+op = "store"
+dst = "gated"
+value = "gv"
+row = "streams * hidden"
+head = "hidden"
+
+[[stage]]
+op = "store"
+dst = "normed"
+value = "gv * ginv * (1.0 + cw)"
+row = "streams * hidden"
+head = "hidden"

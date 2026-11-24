@@ -1,0 +1,72 @@
+kind = "kir-kernel"
+family = "group_map"
+name = "ple_add"
+threads = 128
+
+[args]
+width = "hidden"
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "gated"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "conv"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "ple"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "out"
+role = "activation"
+access = "write"
+
+[[stage]]
+op = "load"
+name = "a"
+src = "x"
+row = "streams * hidden"
+head = "hidden"
+
+[[stage]]
+op = "load"
+name = "g"
+src = "gated"
+row = "streams * hidden"
+head = "hidden"
+
+[[stage]]
+op = "load"
+name = "c"
+src = "conv"
+row = "streams * hidden"
+head = "hidden"
+
+[[stage]]
+op = "value"
+name = "p"
+expr = "g + c"
+
+[[stage]]
+op = "store"
+dst = "ple"
+value = "p"
+row = "streams * hidden"
+head = "hidden"
+
+[[stage]]
+op = "store"
+dst = "out"
+value = "a + p"
+row = "streams * hidden"
+head = "hidden"
