@@ -164,14 +164,15 @@ fn class_of(body: &kir::Body) -> Class {
         kir::Body::Rows(r) => match r {
             RowBody::HeadRms { .. } | RowBody::LayerNorm { .. } => Class::RowReduce,
             RowBody::SpanRope { .. } => Class::Elementwise,
-            RowBody::StateWrite { .. } | RowBody::BlockPool { .. } | RowBody::IndexTopk { .. } | RowBody::PoolTopk { .. } => Class::Gather,
+            RowBody::StateWrite { .. } | RowBody::BlockPool { .. } | RowBody::IndexTopk { .. } | RowBody::PoolTopk { .. } | RowBody::GroupPool { .. } | RowBody::GroupTopk { .. } => Class::Gather,
             RowBody::HeadMatvec { .. } => Class::Gemm,
             RowBody::HyperPre { .. } => Class::RowReduce,
             RowBody::HyperPost { .. } | RowBody::HyperExpand { .. } | RowBody::HyperMean { .. } => Class::Elementwise,
         },
         kir::Body::Recurrence(_) => Class::Scan,
         kir::Body::Seq(kir::recur::SeqBody::Conv { .. }) => Class::Scan,
-        kir::Body::Seq(kir::recur::SeqBody::GroupNorm { .. }) => Class::RowReduce,
+        kir::Body::Seq(kir::recur::SeqBody::GroupNorm { .. } | kir::recur::SeqBody::GroupMap(_)) => Class::RowReduce,
+        kir::Body::Seq(kir::recur::SeqBody::TokenHash(_)) => Class::Gather,
     }
 }
 

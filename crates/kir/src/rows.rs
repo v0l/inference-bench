@@ -11,6 +11,8 @@ pub enum RowBody {
     SpanRope { row: u32, head: u32, offset: u32, rot: u32, style: RopeStyle, invert: bool, theta: Option<f32>, angles: Option<u32> },
     HeadRms { row: u32, head: u32, offset: u32, width: u32, eps: f32 },
     BlockPool { dim: u32, rot: u32, layers: u32, raw_width: u32, gate_offset: u32, eps: f32 },
+    GroupPool { dim: u32, rot: u32, layers: u32, ratio: u32, eps: f32, unit: bool },
+    GroupTopk { heads: u32, dim: u32, rot: u32, topk: u32, ratio: u32, max_groups: u32, q_row: u32, q_offset: u32, layers: u32, eps: f32, unit: bool },
     StateWrite { src_row: u32, src_offset: u32, layers: u32, rows: u32, width: u32, stride: u32 },
     IndexTopk { heads: u32, dim: u32, topk: u32, max_keys: u32, q_row: u32, q_offset: u32, w_row: u32, w_offset: u32, out_row: u32, layers: u32 },
     LayerNorm { width: u32, row: u32, head: u32, offset: u32, eps: f32 },
@@ -52,6 +54,8 @@ impl RowBody {
             RowBody::HyperExpand { .. } => "hyper_expand",
             RowBody::HyperMean { .. } => "hyper_mean",
             RowBody::PoolTopk { .. } => "pool_topk",
+            RowBody::GroupPool { .. } => "group_pool",
+            RowBody::GroupTopk { .. } => "group_topk",
         }
     }
 
@@ -104,6 +108,22 @@ impl RowBody {
                 out.extend(PAGED);
                 out.push(("ratio", Scalar::I32, Role::Value, Access::Read));
                 out.push(("overlap", Scalar::I32, Role::Value, Access::Read));
+            }
+            RowBody::GroupPool { .. } => {
+                out.push(("raw", Scalar::Bf16, Role::Activation, Access::Read));
+                out.push(("norm", Scalar::F32, Role::Weight, Access::Read));
+                out.push(("dst", Scalar::Bf16, Role::Activation, Access::Write));
+                out.extend(POSITION);
+                out.extend(PAGED);
+            }
+            RowBody::GroupTopk { .. } => {
+                out.push(("q", Scalar::F32, Role::Activation, Access::Read));
+                out.push(("norm", Scalar::F32, Role::Weight, Access::Read));
+                out.push(("keys", Scalar::Bf16, Role::Activation, Access::Read));
+                out.push(("idx", Scalar::I32, Role::Activation, Access::Write));
+                out.extend(POSITION);
+                out.extend(PAGED);
+                out.push(("scale", Scalar::F32, Role::Value, Access::Read));
             }
             RowBody::LayerNorm { .. } => {
                 out.push(("x", Scalar::F32, Role::Activation, Access::Write));
@@ -184,6 +204,15 @@ impl RowBody {
                 Err("block_pool needs a positive dim and layers, an even rot no wider than dim and a finite eps".into())
             }
             RowBody::BlockPool { dim, .. } if *dim > 1024 => Err("block_pool rows live in shared memory, at most 1024 wide".into()),
+            RowBody::GroupPool { dim, rot, layers, ratio, eps, .. } | RowBody::GroupTopk { dim, rot, layers, ratio, eps, .. }
+                if *dim == 0 || *layers == 0 || *ratio == 0 || *rot == 0 || !rot.is_multiple_of(2) || rot > dim || !eps.is_finite() || *eps < 0.0 =>
+            {
+                Err(format!("{} needs a positive dim, layers and ratio, an even rot no wider than dim and a finite eps", self.family()))
+            }
+            RowBody::GroupPool { dim, .. } if *dim > 1024 => Err("group_pool rows live in shared memory, at most 1024 wide".into()),
+            RowBody::GroupTopk { heads, topk, max_groups, .. } if *heads == 0 || *topk == 0 || *max_groups == 0 => Err("group_topk needs positive heads, topk and max_groups".into()),
+            RowBody::GroupTopk { topk, max_groups, .. } if topk > max_groups => Err("group_topk cannot select more groups than it scores".into()),
+            RowBody::GroupTopk { heads, dim, max_groups, .. } if heads * dim + max_groups > 12288 => Err("group_topk keeps the query and the group scores in shared memory, at most 12288 values".into()),
             RowBody::IndexTopk { heads, dim, topk, max_keys, .. } if *heads == 0 || *dim == 0 || *topk == 0 || *max_keys == 0 => Err("index_topk needs positive heads, dim, topk and max_keys".into()),
             RowBody::IndexTopk { topk, max_keys, .. } if topk > max_keys => Err("index_topk cannot select more keys than it scores".into()),
             RowBody::IndexTopk { max_keys, .. } if *max_keys > 12288 => Err("index_topk scores live in shared memory, at most 12288 keys".into()),
@@ -644,6 +673,149 @@ impl RowBody {
         out[PICK * POOL + k] = TAIL && k < POOL - 1 && tok < seen ? tok : -1;
     }}
 "
+            ),
+            RowBody::GroupPool { dim, rot, layers, ratio, eps, unit } => format!(
+                "    constexpr int DIM = {dim};
+    constexpr int ROT = {rot};
+    constexpr int RATIO = {ratio};
+    __shared__ float pooled[DIM];
+    __shared__ float part[32];
+    const int row = blockIdx.y;
+    const int p = pos[row * pos_step] + row * row_step;
+    if ((p + 1) % RATIO != 0) return;
+    const int start = p + 1 - RATIO;
+    const int* table = seq_table(block_table, slots, row, pages);
+    float ss = 0.0f;
+    for (int d = threadIdx.x; d < DIM; d += blockDim.x) {{
+        float acc = 0.0f;
+        for (int k = 0; k < RATIO; k++) {{
+            const int s = start + k;
+            const bf16_t* rr = raw + (((size_t)table[s / PAGE] * {layers} + layer) * PAGE + s % PAGE) * DIM * KV_PLANES;
+            acc += attn_float(rr[d]) + (KV_PLANES == 2 ? attn_float(rr[DIM + d]) : 0.0f);
+        }}
+        float v = acc / (float)RATIO;
+        pooled[d] = v;
+        ss += v * v;
+    }}
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, o);
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    float total = 0.0f;
+    for (int w = 0; w < ((int)blockDim.x + 31) / 32; w++) total += part[w];
+    const float inv = rsqrtf(total / (float)DIM + {eps}f);
+    for (int d = threadIdx.x; d < DIM; d += blockDim.x) pooled[d] = {weight} * (pooled[d] * inv);
+    __syncthreads();
+    bf16_t* out = dst + (((size_t)table[p / PAGE] * {layers} + layer) * PAGE + p % PAGE) * DIM * KV_PLANES;
+    for (int d = ROT + threadIdx.x; d < DIM; d += blockDim.x) {{
+        unsigned hi, lo;
+        attn_split(pooled[d], hi, lo);
+        out[d] = (bf16_t)hi;
+        if (KV_PLANES == 2) out[DIM + d] = (bf16_t)lo;
+    }}
+    for (int i = threadIdx.x; i < ROT / 2; i += blockDim.x) {{
+        float angle = (float)start * rope_inv_freq(i, layer);
+        float c = cosf(angle) * ROPE_MSCALE;
+        float s = sinf(angle) * ROPE_MSCALE;
+        float a = pooled[i];
+        float b = pooled[i + ROT / 2];
+        unsigned hi, lo;
+        attn_split(a * c - b * s, hi, lo);
+        out[i] = (bf16_t)hi;
+        if (KV_PLANES == 2) out[DIM + i] = (bf16_t)lo;
+        attn_split(b * c + a * s, hi, lo);
+        out[i + ROT / 2] = (bf16_t)hi;
+        if (KV_PLANES == 2) out[DIM + i + ROT / 2] = (bf16_t)lo;
+    }}
+",
+                eps = crate::lit(*eps),
+                weight = if *unit { "(1.0f + norm[d])" } else { "norm[d]" },
+            ),
+            RowBody::GroupTopk { heads, dim, rot, topk, ratio, max_groups, q_row, q_offset, layers, eps, unit } => format!(
+                "    constexpr int HEADS = {heads};
+    constexpr int DIM = {dim};
+    constexpr int ROT = {rot};
+    constexpr int TOPK = {topk};
+    constexpr int RATIO = {ratio};
+    constexpr int MAX_GROUPS = {max_groups};
+    constexpr int OUT = TOPK * RATIO + RATIO - 1;
+    __shared__ float qs[HEADS * DIM];
+    __shared__ float score[MAX_GROUPS];
+    __shared__ float best_v[32];
+    __shared__ int best_i[32];
+    const int row = blockIdx.y;
+    const int p = pos[row * pos_step] + row * row_step;
+    const int n = min((p + 1) / RATIO, MAX_GROUPS);
+    const int cnt = min(TOPK, n);
+    const float* qr = q + (size_t)row * {q_row} + {q_offset};
+    const int* table = seq_table(block_table, slots, row, pages);
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = (blockDim.x + 31) >> 5;
+    for (int h = warp; h < HEADS; h += warps) {{
+        float ss = 0.0f;
+        for (int d = lane; d < DIM; d += 32) ss += qr[h * DIM + d] * qr[h * DIM + d];
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, o);
+        const float inv = rsqrtf(ss / (float)DIM + {eps}f);
+        for (int d = lane; d < DIM; d += 32) qs[h * DIM + d] = {weight} * (qr[h * DIM + d] * inv);
+        __syncwarp();
+        for (int j = lane; j < ROT / 2; j += 32) {{
+            float angle = (float)p * rope_inv_freq(j, layer);
+            float c = cosf(angle) * ROPE_MSCALE;
+            float s = sinf(angle) * ROPE_MSCALE;
+            float a = qs[h * DIM + j];
+            float b = qs[h * DIM + j + ROT / 2];
+            qs[h * DIM + j] = a * c - b * s;
+            qs[h * DIM + j + ROT / 2] = b * c + a * s;
+        }}
+    }}
+    __syncthreads();
+    for (int g = threadIdx.x; g < MAX_GROUPS; g += blockDim.x) {{
+        if (g < n) {{
+            const int tp = g * RATIO + RATIO - 1;
+            const bf16_t* kr = keys + (((size_t)table[tp / PAGE] * {layers} + layer) * PAGE + tp % PAGE) * DIM * KV_PLANES;
+            float s = 0.0f;
+            for (int h = 0; h < HEADS; h++) {{
+                float d = 0.0f;
+                for (int j = 0; j < DIM; j++) d += qs[h * DIM + j] * (attn_float(kr[j]) + (KV_PLANES == 2 ? attn_float(kr[DIM + j]) : 0.0f));
+                s += fmaxf(d, 0.0f);
+            }}
+            score[g] = s * scale;
+        }} else {{
+            score[g] = -3.0e30f;
+        }}
+    }}
+    __syncthreads();
+    for (int r = 0; r < cnt; r++) {{
+        float bv = -3.0e30f;
+        int bi = MAX_GROUPS;
+        for (int g = threadIdx.x; g < n; g += blockDim.x) {{
+            if (score[g] > bv) {{ bv = score[g]; bi = g; }}
+        }}
+        for (int o = 16; o > 0; o >>= 1) {{
+            float ov = __shfl_xor_sync(0xffffffff, bv, o);
+            int oi = __shfl_xor_sync(0xffffffff, bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) {{ bv = ov; bi = oi; }}
+        }}
+        if (lane == 0) {{ best_v[warp] = bv; best_i[warp] = bi; }}
+        __syncthreads();
+        if (threadIdx.x == 0) {{
+            float v = best_v[0];
+            int at = best_i[0];
+            for (int i = 1; i < warps; i++) {{
+                if (best_v[i] > v || (best_v[i] == v && best_i[i] < at)) {{ v = best_v[i]; at = best_i[i]; }}
+            }}
+            for (int k = 0; k < RATIO; k++) idx[(size_t)row * OUT + r * RATIO + k] = at * RATIO + k;
+            score[at] = -3.0e30f;
+        }}
+        __syncthreads();
+    }}
+    for (int j = cnt * RATIO + threadIdx.x; j < OUT; j += blockDim.x) {{
+        const int t = n * RATIO + (j - cnt * RATIO);
+        idx[(size_t)row * OUT + j] = t <= p ? t : -1;
+    }}
+",
+                eps = crate::lit(*eps),
+                weight = if *unit { "(1.0f + norm[d])" } else { "norm[d]" },
             ),
             RowBody::HeadMatvec { x_row, x_head, x_offset, inner, w_head, w_inner, w_out, w_offset, out, y_row, y_head, y_offset } => {
                 let store = if Self::planes(&k.params) {

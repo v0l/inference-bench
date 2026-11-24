@@ -1,0 +1,78 @@
+[attention.params]
+index_heads = 4
+index_head_dim = 64
+index_ratio = 4
+index_groups = 4
+index_out = 19
+index_scale = 0.125
+
+[attention.int_scratch]
+index_sel = "index_out"
+
+[[attention.projection]]
+tensor = "indexer.index_qk_proj"
+rows = "(index_heads + 1) * index_head_dim"
+append = true
+
+[[state]]
+name = "index_raw"
+per = "token"
+layers = "attention"
+shape = ["1", "index_head_dim"]
+dtype = "bf16"
+rollback = "positional"
+
+[[state]]
+name = "index_pool"
+per = "token"
+layers = "attention"
+shape = ["1", "index_head_dim"]
+dtype = "bf16"
+rollback = "positional"
+
+[[attention.node]]
+op = "qk_rope"
+phase = "prefill"
+
+[[attention.node]]
+op = "decode_rope"
+phase = "rows"
+
+[[attention.node]]
+op = "kernel"
+kernel = "qsa_index_raw_write"
+grid = ["1", "rows"]
+
+[attention.node.bind]
+src = { buffer = "qkv" }
+dst = { state = "index_raw" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "qsa_index_pool"
+grid = ["1", "rows"]
+
+[attention.node.bind]
+raw = { state = "index_raw" }
+norm = { weight = "indexer.k_layernorm.weight", len = "index_head_dim" }
+dst = { state = "index_pool" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "qsa_index_select"
+grid = ["1", "rows"]
+
+[attention.node.bind]
+q = { buffer = "qkv" }
+norm = { weight = "indexer.q_layernorm.weight", len = "index_head_dim" }
+keys = { state = "index_pool" }
+idx = { buffer = "index_sel" }
+scale = "index_scale"
+
+[[attention.node]]
+op = "kernel"
+kernel = "qsa_attention"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+idx = { buffer = "index_sel" }

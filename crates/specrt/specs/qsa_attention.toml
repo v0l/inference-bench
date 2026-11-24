@@ -1,0 +1,96 @@
+kind = "kir-kernel"
+family = "scan_attention"
+name = "qsa_attention"
+threads = 128
+
+[[param]]
+name = "qkv"
+type = "f32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "k_cache"
+type = "bf16"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "v_cache"
+type = "bf16"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "block_table"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "pos"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "slots"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "out_hi"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "out_lo"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "layer"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "pages"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "pos_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "row_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "idx"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[stage]]
+op = "select_from"
+index = "idx"
+row = "index_out"
+
+[[stage]]
+op = "epilogue"
+name = "score"
+expr = "s * scale"
+
+[[stage]]
+op = "online_softmax"
+value = "score"

@@ -890,6 +890,8 @@ pub struct Projection {
     pub slot: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub append: bool,
 }
 
 impl Projection {
@@ -2258,6 +2260,10 @@ impl Spec {
 
     fn validate_attention_nodes(&self) -> Result<()> {
         let nodes = &self.attention.node;
+        let appended = self.attention.projection.iter().filter(|p| p.append).count();
+        ensure!(appended == 0 || appended == self.attention.projection.len(), "[[attention.projection]] mixes appended projections with ones that replace q, k and v");
+        ensure!(appended == 0 || !self.attention.fused_qkv, "[[attention.projection]] append needs separate q, k and v projections");
+        ensure!(appended == 0 || !self.attention.qkv_bias, "[[attention.projection]] append does not cover a qkv bias");
         for p in &self.attention.projection {
             let rows = crate::state::dim(self, &p.rows).with_context(|| format!("[[attention.projection]] {}", p.tensor))?;
             for k in &p.layers {
@@ -2469,9 +2475,18 @@ impl Spec {
     }
 
     pub fn qkv_rows(&self) -> usize {
-        if !self.attention.projection.is_empty() {
+        if self.attention.projection.iter().any(|p| !p.append) {
             return self.projection_groups().iter().map(|g| g.1).sum();
         }
+        let gate = if self.attention.output_gate { self.q_dim() } else { 0 };
+        self.q_dim() + 2 * self.kv_dim() + gate + self.appended_rows()
+    }
+
+    pub fn appended_rows(&self) -> usize {
+        self.projection_groups().iter().filter(|g| g.0[0].append).map(|g| g.1).sum()
+    }
+
+    pub fn appended_offset(&self) -> usize {
         let gate = if self.attention.output_gate { self.q_dim() } else { 0 };
         self.q_dim() + 2 * self.kv_dim() + gate
     }

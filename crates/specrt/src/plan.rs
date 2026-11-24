@@ -129,13 +129,14 @@ impl Weight {
     pub fn tensors(self, spec: &Spec) -> Vec<String> {
         let w = |m: &str| format!("{m}.weight");
         match self {
-            Weight::Qkv if !spec.attention.projection.is_empty() => spec.attention.projection.iter().map(|p| format!("self_attn.{}.weight", p.tensor)).collect(),
+            Weight::Qkv if spec.attention.projection.iter().any(|p| !p.append) => spec.attention.projection.iter().map(|p| format!("self_attn.{}.weight", p.tensor)).collect(),
             Weight::Qkv => {
                 let names: &[&str] = if spec.attention.fused_qkv { &["self_attn.qkv_proj"] } else { &["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"] };
                 let mut t: Vec<String> = names.iter().map(|m| w(m)).collect();
                 if spec.attention.qkv_bias {
                     t.extend(["self_attn.q_proj.bias", "self_attn.k_proj.bias", "self_attn.v_proj.bias"].map(String::from));
                 }
+                t.extend(spec.attention.projection.iter().map(|p| format!("self_attn.{}.weight", p.tensor)));
                 t
             }
             Weight::O => {

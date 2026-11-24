@@ -1,0 +1,107 @@
+kind = "kir-kernel"
+family = "token_hash"
+name = "ple_ngram_hash"
+threads = 256
+
+[args]
+context = "ngram_size - 1"
+heads = "ngram_heads"
+out_row = "ngram_heads"
+layers = "ple_layers"
+blank = "ngram_eos"
+index = "rem(select(ge(head, hpn), mixed3, mixed2), size) + offset"
+
+[[int]]
+name = "ngram_is_three"
+expr = "1 / (ge(ngram_size, 3) & ge(3, ngram_size))"
+
+[[int]]
+name = "hpn"
+expr = "ngram_heads / (ngram_size - 1)"
+
+[[int]]
+name = "half"
+expr = "max(1, 9223372036854775807 / max(vocab, 1) / 2)"
+
+[[int]]
+name = "base"
+expr = "ngram_seed + 10007 * ple_index"
+
+[[int]]
+name = "m0"
+expr = "2 * (splitmix64(base + 0x9E3779B97F4A7C15 * 1) % half) + 1"
+
+[[int]]
+name = "m1"
+expr = "2 * (splitmix64(base + 0x9E3779B97F4A7C15 * 2) % half) + 1"
+
+[[int]]
+name = "m2"
+expr = "2 * (splitmix64(base + 0x9E3779B97F4A7C15 * 3) % half) + 1"
+
+[[int]]
+name = "size"
+per = "head"
+expr = "prime_after(ngram_base - 1, ple_index * ngram_heads + head + 1)"
+
+[[int]]
+name = "offset"
+per = "head"
+expr = "prime_sum(ngram_base - 1, ple_index * ngram_heads + 1, head)"
+
+[[int]]
+name = "mixed2"
+per = "row"
+expr = "(t0 * m0) ^ (t1 * m1)"
+
+[[int]]
+name = "mixed3"
+per = "row"
+expr = "mixed2 ^ (t2 * m2)"
+
+[[param]]
+name = "tokens"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "idx"
+type = "i32"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "state"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "slots"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "layer"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "slot_base"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "slot_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "rows_per_seq"
+type = "i32"
+role = "value"
+access = "read"

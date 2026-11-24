@@ -12,7 +12,8 @@ cargo test -p inference-bench-specrt
 ```
 
 - Use a per-issue target dir. The default one is shared and parallel sessions overwrite each other's binaries.
-- Run cargo under `systemd-run --user --wait --collect -P -q -p MemoryMax=10G`. Anything that loads weights uses `MemoryMax=16G -p MemorySwapMax=0`.
+- Run cargo under `systemd-run --user --wait --collect -P -q -p MemoryMax=10G -E CARGO_TARGET_DIR=/mnt/data/cargo-target/inference-bench-<issue> -E CARGO_BUILD_JOBS=3 --working-directory=$PWD nice -n 19 cargo ...`. The `-E` flags are required: systemd-run does not pass the shell's exported variables, so without them the build lands in the shared target dir. Anything that loads weights uses `MemoryMax=16G -p MemorySwapMax=0`.
+- A GPU check named in your brief is not optional because the user's app is serving. If GPU1 shows at least 2000 MiB free, run it as `~/.agents/bin/gpu-run 1 --min-free 2000 -- <cmd>` (compile with `--no-run` first, lock only around the binary). Skip it only when GPU1 has less free than that, and then report the free figure you read.
 - Put every GPU run under the per-GPU lock: `~/.agents/bin/gpu-run 1 -- <cmd>` (see the GPUs section). The old `flock /tmp/gpu27.lock` is not used any more.
 - Everything configurable lives in the model spec TOML or the server config. Env vars are deprecated dev overrides.
 - No code comments. Commit subjects are short, no trailers.
