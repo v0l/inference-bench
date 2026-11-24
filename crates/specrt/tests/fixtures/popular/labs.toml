@@ -1,5 +1,5 @@
 [machine]
-nvme_path = "~"
+nvme_paths = ["~", "/mnt/data"]
 host_share = 0.75
 host_bandwidth_gbs = 50.0
 cards = 2

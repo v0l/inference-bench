@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import sys
 import time
@@ -428,6 +429,33 @@ def lab_listing(cutoff):
     return found
 
 
+def machine_inputs():
+    cfg = LABS["machine"]
+    meminfo = {}
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        k, _, v = line.partition(":")
+        meminfo[k] = int(v.split()[0]) * 1024
+    free = {}
+    seen = set()
+    for p in cfg["nvme_paths"]:
+        path = os.path.expanduser(p)
+        dev = os.stat(path).st_dev
+        if dev in seen:
+            continue
+        seen.add(dev)
+        free[p] = shutil.disk_usage(path).free
+    return {
+        "ram_total_gb": round(meminfo["MemTotal"] / 1e9, 1),
+        "ram_available_gb": round(meminfo["MemAvailable"] / 1e9, 1),
+        "host_share": cfg["host_share"],
+        "host_bandwidth_gbs": cfg["host_bandwidth_gbs"],
+        "nvme_free_gb": round(sum(free.values()) / 1e9, 1),
+        "nvme_paths": sorted(free),
+        "cards": cfg["cards"],
+        "card_gib": cfg["card_gib"],
+    }
+
+
 def main():
     today = datetime.date.today().isoformat()
     previous = OUT / "manifest.json"
@@ -547,7 +575,7 @@ def main():
             m = meta(repo)
             entry = row(repo, role, root, chosen[root] if role == "base" else ({"disk"} if role == "disk" else set()), m)
             entry["group_downloads"] = g["downloads"] if role == "base" else 0
-            lab_key = lab_repos.get(root) or lab_repos.get(repo)
+            lab_key = lab_repos.get(repo) or lab_repos.get(root)
             if lab_key:
                 entry["lab"] = lab_key
             local = local_snapshot(repo)
@@ -586,6 +614,7 @@ def main():
         "card_gb": CARD_GB,
         "commit_limit_bytes": COMMIT_LIMIT,
         "labs_since": cutoff,
+        "machine": machine_inputs(),
         "selection": f"every model of the labs in labs.toml released since {cutoff} or still shipped by its lab, then top {TEXT_TOP} text groups by summed downloads, the top {TRENDING_TOP} trending text groups not already in, the top {VISION_TOP} vision groups not already in, and every text model in the local hub cache; a group is every repo whose base_model chain ends at the same root; repos whose names look like test fixtures are skipped",
         "models": rows,
     }
