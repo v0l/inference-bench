@@ -22,10 +22,10 @@ Selection: top 100 text groups by summed downloads, the top 20 trending text gro
 | class | base models | all rows |
 |---|---|---|
 | LOADS | 70 | 181 |
-| LOADS-TEXT-ONLY | 0 | 0 |
+| LOADS-TEXT-ONLY | 2 | 3 |
 | TOO-BIG | 12 | 17 |
-| UNKNOWN-QUANT | 1 | 167 |
-| REFUSED | 76 | 297 |
+| UNKNOWN-QUANT | 1 | 174 |
+| REFUSED | 74 | 287 |
 | UNCHECKED | 2 | 10 |
 | total | 161 | 672 |
 
@@ -35,107 +35,109 @@ Each gap is one missing piece, ranked by the summed downloads of the rows it blo
 
 | # | kind | gap | blocked downloads | rows | models | issue |
 |---|---|---|---|---|---|---|
-| 1 | new family spec | model_type gemma4 | 57.92 M | 25 | unsloth/gemma-4-12b-it-GGUF, google/gemma-4-26B-A4B-it, nvidia/Gemma-4-26B-A4B-NVFP4, RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic and 21 more | #1194 |
-| 2 | new family spec | model_type gpt2 | 35.99 M | 9 | distilbert/distilgpt2, mradermacher/distilgpt2-i1-GGUF, openai-community/gpt2, liodon-ai/gpt2-FP8 and 5 more | #1195 |
-| 3 | new family spec | model_type qwen4_exp | 32.17 M | 5 | Qwen/Qwen3.8-Flash-Next, RadixArk/Qwen3.8-Flash-Next-NVFP4, Qwen/Qwen3.8-Flash-Next-FP8, tcclaviger/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ and 1 more | #1196 |
-| 4 | new family spec | model_type florence2 | 22.83 M | 1 | microsoft/Florence-2-base | #1198 |
-| 5 | new family spec | model_type qwen3_vl | 14.82 M | 18 | Qwen/Qwen3-VL-2B-Instruct, kaitchup/Qwen3-VL-2B-Instruct-NVFP4, Qwen/Qwen3-VL-2B-Instruct-FP8, cyankiwi/Qwen3-VL-2B-Instruct-AWQ-4bit and 14 more | #1197 |
-| 6 | new family spec | model_type qwen2_5_vl | 11.10 M | 13 | Qwen/Qwen2.5-VL-32B-Instruct, BCCard/Qwen2.5-VL-32B-Instruct-FP8-Dynamic, Qwen/Qwen2.5-VL-32B-Instruct-AWQ, Qwen/Qwen2.5-VL-3B-Instruct and 9 more | #1197 |
-| 7 | new family spec | model_type deepseek_v32 | 11.00 M | 4 | XingChen-AGI/Xing4.1-Preview, deepseek-ai/DeepSeek-V3.2, RedHatAI/DeepSeek-V3.2-NVFP4-FP8-BLOCK, QuantTrio/DeepSeek-V3.2-AWQ | #1199 |
-| 8 | quant format | awq 4bit weights | 7.79 M | 27 | fbaldassarri/HuggingFaceTB_SmolLM2-135M-auto_awq-int4-gs64-sym, fbaldassarri/HuggingFaceTB_SmolLM2-360M-auto_awq-int4-gs64-sym, Qwen/Qwen2.5-0.5B-Instruct-AWQ, Qwen/Qwen2.5-1.5B-Instruct-AWQ and 23 more | #1200 |
-| 9 | new family spec | model_type glm5_next | 7.46 M | 4 | zai-org/GLM-5.3-Flash, tattrongvu/GLM-5.3-Flash-NVFP4, wtdcode/GLM-5.3-Flash-AWQ-W4A16, Piecrust/GLM-5.3-Flash-FP4-Abliterated | #1179 |
-| 10 | new family spec | model_type gemma4_unified | 7.44 M | 5 | google/gemma-4-12B-it, AEON-7/Gemma-4-12B-it-AEON-Abliterated-K4-NVFP4-FP8, AEON-7/Gemma-4-12B-it-AEON-Abliterated-K4-FP8, cyankiwi/gemma-4-12B-it-AWQ-INT4 and 1 more | #1194 |
-| 11 | new family spec | model_type deepseek_v41 | 6.47 M | 5 | deepseek-ai/DeepSeek-V4.1-Flash, nvidia/DeepSeek-V4.1-Flash-NVFP4, antirez/deepseek-v4.1-flash-gguf, deepseek-ai/DeepSeek-V4.1-Flash-1017 and 1 more | #1201 |
-| 12 | new family spec | model_type unlimited_ocr | 5.50 M | 1 | baidu/Unlimited-OCR | #1202 |
-| 13 | new family spec | model_type opt | 4.68 M | 1 | facebook/opt-125m | #1203 |
-| 14 | new family spec | model_type deepseek_v4 | 3.95 M | 9 | deepseek-ai/DeepSeek-V4-Flash, nvidia/DeepSeek-V4-Flash-NVFP4, huihui-ai/Huihui-DeepSeek-V4-Flash-abliterated-ds4-GGUF, deepseek-ai/DeepSeek-V4-Flash-0731 and 5 more | #1201 |
-| 15 | attention, block or MoE variant | GGUF tensor and metadata names for families that already load from safetensors | 3.42 M | 24 | webAI-Official/TwIL-LM3, llmfan46/Qwen3-Coder-Next-Uncensored-Heretic-GGUF, allenai/OLMo-2-0425-1B-GGUF, unsloth/DeepSeek-R1-GGUF and 20 more | #1204 |
-| 16 | new family spec | model_type spark2_5 | 3.30 M | 9 | XHToken/Spark-X2.5-4B-Base, XHToken/Spark-X2.5-4B-FP8, peculiar-ragdoll/Sharp-Spark-X2.5-4B-GGUF, XHToken/Spark-X2.6-4B and 5 more | #1209 |
-| 17 | new family spec | model_type lfm2_moe | 3.29 M | 6 | LiquidAI/LFM2.5-24B-A2B, primitive-ai/LFM2.5-24B-A2B-NVFP4A16, LiquidAI/LFM2.5-24B-A2B-FP8, cyankiwi/LFM2.5-24B-A2B-AWQ-INT4 and 2 more | #1205 |
-| 18 | quant format | compressed-tensors pack-quantized w4i-group weights | 2.84 M | 34 | TheUnderscore/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-W4A16-AWQ, drawais/SmolLM3-3B-AWQ-INT4, upshift/infomaniak-translategemma-4b-it-W4A16-awq, cyankiwi/Sage-A1.5-AWQ-INT4 and 30 more | #1200 |
-| 19 | new family spec | GGUF architecture dflash | 2.82 M | 2 | nerkyor/Qwen3.8-27B-EfficientThink-Uncensored-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-DFlash2, peasantsmith/GLM-5.3-Flash-Maya-GGUF | #1212 |
-| 20 | new family spec | model_type deepseek_v3 | 2.71 M | 7 | deepseek-ai/DeepSeek-R1, RedHatAI/DeepSeek-R1-NVFP4-FP8-BLOCK, QuixiAI/DeepSeek-R1-AWQ, OPEA/DeepSeek-R1-int4-gptq-sym-inc and 3 more | #1199 |
-| 21 | new family spec | model_type gpt_neox | 2.47 M | 4 | EleutherAI/pythia-160m, fbaldassarri/EleutherAI_pythia-160m-autoawq-int4-gs128-asym, fbaldassarri/EleutherAI_pythia-160m-autogptq-int4-gs128-sym, mradermacher/pythia-160m-i1-GGUF | #1203 |
-| 22 | new family spec | model_type moondream1 | 2.39 M | 1 | vikhyatk/moondream2 | #1208 |
-| 23 | new family spec | model_type inkling2_loop | 2.39 M | 3 | thinkingmachines/Inkling-2-Mini, OpenUncensored/Inkling-2-Mini-Uncensored, unsloth/Inkling-2-Mini-GGUF | #1210 |
-| 24 | new family spec | model_type smolvlm | 2.38 M | 1 | HuggingFaceTB/SmolVLM2-500M-Video-Instruct | #1208 |
-| 25 | new family spec | model_type internvl_chat | 2.28 M | 1 | OpenGVLab/InternVL2-1B | #1208 |
-| 26 | quant format | layer N mlp.gate_proj is in two groups | 1.98 M | 2 | unsloth/Qwen3.6-27B-NVFP4, unsloth/Qwen3.8-27B-NVFP4 | #1207 |
-| 27 | quant format | GGUF types | 1.84 M | 1 | prism-ml/Ternary-Bonsai-2-2B-gguf | #1213 |
-| 28 | new family spec | model_type deepseek_vl_v2 | 1.75 M | 1 | deepseek-ai/DeepSeek-OCR | #1202 |
-| 29 | new family spec | model_type inkling_mm_model | 1.74 M | 7 | thinkingmachines/Inkling, thinkingmachines/Inkling-NVFP4, RedHatAI/Inkling-FP8-dynamic, thinkingmachines/Inkling-Small and 3 more | #1210 |
-| 30 | attention, block or MoE variant | [mixer] is set but the pattern has no linear layer | 1.69 M | 3 | nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16, SergiioB/Nemotron-3.5-Lightning-30B-A3B-GPTQ-INT4-G64-sym, nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4 | #1206 |
-| 31 | new family spec | model_type qwen2_vl | 1.63 M | 7 | Qwen/Qwen2-VL-2B-Instruct, Qwen/Qwen2-VL-2B-Instruct-AWQ, Qwen/Qwen2-VL-2B-Instruct-GPTQ-Int4, ggml-org/Qwen2-VL-2B-Instruct-GGUF and 3 more | #1197 |
-| 32 | new family spec | model_type lfm3 | 1.58 M | 5 | LiquidAI/LFM3-1.7B, LiquidAI/LFM3-1.7B-NVFP4, LiquidAI/LFM3-1.7B-FP8, LiquidAI/LFM3-1.7B-GGUF and 1 more | #1205 |
-| 33 | new family spec | model_type minicpmv4_7 (wraps qwen3_5_moe_text, which specrt runs) | 1.55 M | 5 | openbmb/MiniCPM-V-4.7-35B-A3B, axteam/MiniCPM-V-4.7-35B-A3B-NVFP4A16, openbmb/MiniCPM-V-4.7-35B-A3B-FP8, openbmb/MiniCPM-V-4.7-35B-A3B-AWQ and 1 more | #1208 |
-| 34 | new family spec | model_type glm4_moe_lite | 1.51 M | 5 | zai-org/GLM-4.7-Flash, GadflyII/GLM-4.7-Flash-NVFP4, unsloth/GLM-4.7-Flash-FP8-Dynamic, cyankiwi/GLM-4.7-Flash-AWQ-4bit and 1 more | #1199 |
-| 35 | quant format | fp8 weights need hidden, intermediate, head_dim and the linear value dim to be multiples of N | 1.44 M | 7 | liodon-ai/SmolLM2-360M-FP8, RedHatAI/Qwen2.5-0.5B-FP8-dynamic, RedHatAI/Llama-3.2-1B-Instruct-FP8-dynamic, ArliAI/GLM-4.5-Air-Derestricted-FP8 and 3 more | #1207 |
-| 36 | attention, block or MoE variant | config.json has no num_hidden_layers | 1.31 M | 5 | cyankiwi/NVIDIA-Nemotron-3-Super-120B-A12B-AWQ-4bit, nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16, OpenYourMind/OpenYourMind-NVIDIA-Nemotron-3-Ultra-550B-A55B-abliterated-uncensored-NVFP4, RedHatAI/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8-dynamic and 1 more | #1206 |
-| 37 | new family spec | model_type k2_horizon | 1.30 M | 5 | IFM/K2-Horizon-7B, ProCreations/K2-Horizon-7B-Uno-NVFP4, IFM/K2-Horizon-7B-FP8, cyankiwi/K2-Horizon-7B-AWQ-INT4 and 1 more | #1211 |
-| 38 | quant format | gptq 4bit weights | 1.22 M | 33 | fbaldassarri/HuggingFaceTB_SmolLM2-360M-auto_gptq-int4-gs128-sym, Tech2wild/Nanbeige4.3-33B-W4A16-AutoRound, Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4, Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4 and 29 more | #1200 |
-| 39 | new family spec | model_type qwen3_vl_moe | 1.18 M | 6 | Qwen/Qwen3-VL-30B-A3B-Instruct, ig1/Qwen3-VL-30B-A3B-Instruct-NVFP4, Qwen/Qwen3-VL-30B-A3B-Instruct-FP8, QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ and 2 more | #1197 |
-| 40 | attention, block or MoE variant | config.json has no vocab_size | 1.07 M | 2 | gaunernst/gemma-3-12b-it-int4-awq, gaunernst/gemma-3-27b-it-int4-awq | #1213 |
-| 41 | new family spec | model_type gemma2 | 1.06 M | 5 | google/gemma-2-9b-it, RedHatAI/gemma-2-9b-it-FP8, hugging-quants/gemma-2-9b-it-AWQ-INT4, wath5/kgl_lmsys_pref_classif and 1 more | #1203 |
-| 42 | new family spec | model_type bloom | 0.92 M | 3 | bigscience/bloomz-560m, liodon-ai/bloomz-560m-FP8, mradermacher/bloomz-560m-GGUF | #1203 |
-| 43 | new family spec | model_type kimi_k3 | 0.90 M | 5 | moonshotai/Kimi-K3, nvidia/Kimi-K3-NVFP4, RedHatAI/Kimi-K3-FP8-BLOCK, open-inference/Kimi-K3-W4A8-K512-DenseChannel-GPTQ-Cal128-v2 and 1 more | #1214 |
-| 44 | quant format | quantisation declared only in hf_quant_config.json | 0.85 M | 2 | nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4, nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8 | #1206 |
-| 45 | new family spec | model_type muse_glimmer | 0.79 M | 6 | meta-models/Muse-Glimmer-30B, RadixArk/Muse-Glimmer-NVFP4, RedHatAI/Muse-Glimmer-30B-FP8-block, cyankiwi/Muse-Glimmer-30B-AWQ-INT4 and 2 more |  |
-| 46 | new family spec | model_type nemotron_parse | 0.77 M | 1 | nvidia/NVIDIA-Nemotron-Parse-2.0 |  |
-| 47 | new family spec | model_type unlimited-ocr | 0.65 M | 6 | sahilchachra/Unlimited-OCR-NVFP4, shadowrock-io/Unlimited-OCR-Community-FP8-Dynamic, sahilchachra/Unlimited-OCR-AWQ, baidu/Unlimited-OCR-2 and 2 more | #1202 |
-| 48 | new family spec | model_type llava | 0.64 M | 1 | llava-hf/llava-1.5-7b-hf | #1208 |
-| 49 | new family spec | model_type mistral3 (wraps qwen3, which specrt runs) | 0.62 M | 2 | lightonai/LightOnOCR-2-1B, switzerchees/LightOnOCR-2-1B-NVFP4 | #1208 |
-| 50 | quant format | nvfp4_g16 is supported for [mlp] quant only | 0.62 M | 22 | Firworks/SmolLM3-3B-nvfp4, axteam/Nanbeige4.3-33B-NVFP4, ilessio-aiflowlab/Qwen2.5-Coder-14B-Instruct-NVFP4-anima, JongYeop/Qwen2.5-3B-Instruct-FP4-W4A4 and 18 more | #1207 |
-| 51 | new family spec | model_type kimi_k25 | 0.61 M | 3 | moonshotai/Kimi-K2.5, nvidia/Kimi-K2.5-NVFP4, amd/Kimi-K2.5-MXFP4-AttnFP8 | #1199 |
-| 52 | new family spec | model_type bailing_hybrid | 0.47 M | 3 | inclusionAI/Ling-3.0-tiny, inclusionAI/LingSante-3.1-flash, inclusionAI/LingSante-3.1-flash-MXFP4 |  |
-| 53 | new family spec | GGUF architecture glm-dsa | 0.36 M | 4 | unsloth/GLM-5-GGUF, unsloth/GLM-5.2-GGUF, unsloth/GLM-5.3-GGUF, AesSedai/GLM-5.3-GGUF |  |
-| 54 | quant format | the quantisation config covers no attention projection | 0.26 M | 1 | nvidia/GLM-5.3-NVFP4 |  |
-| 55 | new family spec | GGUF architecture bailingmoe3 | 0.24 M | 1 | bloomer010/Ling-3.0-tiny-GGUF |  |
-| 56 | new family spec | model_type gemma3n | 0.24 M | 4 | google/gemma-3n-E2B-it, RedHatAI/gemma-3n-E2B-it-FP8-dynamic, unsloth/gemma-3n-E2B-it-GGUF, google/gemma-3n-E4B-it | #1214 |
-| 57 | quant format | compressed-tensors naive-quantized w8f-tensor a8 weights | 0.21 M | 2 | RedHatAI/Meta-Llama-3.1-70B-Instruct-FP8, RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8 |  |
-| 58 | new family spec | model_type llada | 0.11 M | 5 | GSAI-ML/LLaDA-1.5, mradermacher/LLaDA-1.5-GGUF, GSAI-ML/LLaDA-8B-Instruct, FunAGI/LLaDA-8B-Instruct-gptqmodel-4bit and 1 more | #1214 |
-| 59 | new family spec | model_type nemotron_h_puzzle | 0.11 M | 2 | nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4, nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-FP8 |  |
-| 60 | new family spec | model_type lfm3_omni | 0.10 M | 2 | LiquidAI/LFM3-Omni-2B, MichaelAnthony/LFM3-Omni-2B-98K-V2-FP8 |  |
-| 61 | new family spec | model_type kimi_k31 | 0.09 M | 4 | moonshotai/Kimi-K3.1-Pro, nvidia/Kimi-K3.1-Pro-NVFP4, manifoldlabs/Kimi-K3.1-Pro-Quark-MXFP4-AttnFP8, KarLexAI/Kimi-K3.1-Pro-GGUF | #1214 |
-| 62 | new family spec | model_type olala | 0.08 M | 3 | OVHaiLLM/Olala-v1.0-mini-7A1B, solfird/Olala-v1.0-mini-7A1B-NVFP4-experts, OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF |  |
-| 63 | quant format | modelopt_mixed weights | 0.07 M | 1 | nvidia/Qwen3.5-397B-A17B-NVFP4-V2 |  |
-| 64 | quant format | gptq 8bit weights | 0.05 M | 5 | Qwen/Qwen3-0.6B-GPTQ-Int8, Qwen/Qwen3-1.7B-GPTQ-Int8, JunHowie/Qwen3-4B-Instruct-2507-GPTQ-Int8, QuantTrio/Qwen3-Coder-30B-A3B-Instruct-GPTQ-Int8 and 1 more |  |
-| 65 | quant format | mixture-of-experts with Fp8Channel expert weights is not supported yet (bf16, nvfp4_g16 and fp8_block128 are) | 0.05 M | 4 | InternScience/Sage-A1.5-FP8, debackerl/KAT-Coder-V2.5-Dev-FP8, RedHatAI/Qwen3-Coder-Next-FP8-dynamic, lflare/Ornith-1.0-35B-FP8 | #1207 |
-| 66 | new family spec | GGUF architecture inkling | 0.05 M | 2 | unsloth/inkling-GGUF, unsloth/Inkling-Small-GGUF |  |
-| 67 | quant format | the quantisation config has no groups | 0.03 M | 1 | nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark |  |
-| 68 | new family spec | model_type raon1_nano | 0.02 M | 3 | KRAFTON/Raon-1-nano, Pilcothink/Raon-1-nano-NVFP4, KRAFTON/Raon-1-nano-gguf |  |
-| 69 | quant format | compressed-tensors float-quantized w8f-tensor a8 weights | 0.02 M | 2 | RedHatAI/Llama-3.2-1B-FP8, JongYeop/Mistral-7B-Instruct-v0.2-FP8-W8A8 |  |
-| 70 | new family spec | model_type maxwell_moe | 0.02 M | 3 | maxwell-model/Maxwell-V1-Flash, maxwell-model/Maxwell-V1-Flash-FP8, AtomicChat/Maxwell-V1-Flash-GGUF |  |
-| 71 | quant format | nvfp4_g16 needs hidden and intermediate to be multiples of N | 0.02 M | 2 | NVFP4/Qwen3-Coder-30B-A3B-Instruct-FP4, Firworks/GLM-4.5-Air-nvfp4 |  |
-| 72 | new family spec | GGUF architecture unlimited-ocr2 | 0.02 M | 1 | AtomicChat/Unlimited-OCR-2-GGUF |  |
-| 73 | new family spec | GGUF architecture deepseek2-ocr | 0.01 M | 2 | sahilchachra/Unlimited-OCR-GGUF, sabafallah/DeepSeek-OCR-GGUF |  |
-| 74 | quant format | gptq 2bit weights | 0.01 M | 1 | lilmeaty/SmolLM2-135M-Instruct-GPTQ |  |
-| 75 | new family spec | GGUF architecture phi2 | 0.01 M | 1 | ggml-org/moondream2-20250414-GGUF |  |
-| 76 | new family spec | model_type ernie5_5_moe | 0.01 M | 2 | baidu/ERNIE-5.5-Flash-Preview-BF16, baidu/ERNIE-5.5-Flash-Base |  |
-| 77 | new family spec | model_type aion_instruct | 0.00 M | 2 | microsoft/Aion-1.0-Instruct-2.3B, PureTensorAI/Aion-1.0-Instruct-2.3B-NVFP4 |  |
-| 78 | quant format | quark weights | 0.00 M | 3 | amd/gpt-oss-120b-w-mxfp4-a-fp8, amd/gpt-oss-20b-MoE-Quant-W-MXFP4-A-FP8-KV-FP8, amd/GLM-5-NVFP4 |  |
-| 79 | new family spec | model_type sarvam_mla | 0.00 M | 4 | sarvamai/sarvam-105b, sarvamai/sarvam-105b-1711, RedHatAI/sarvam-105b-FP8-dynamic, QuantTrio/sarvam-105b-AWQ |  |
-| 80 | new family spec | GGUF architecture aion | 0.00 M | 1 | Xylolabs/Aion-1.0-Instruct-2.3B-GGUF |  |
-| 81 | quant format | modelopt FP8_PB_WO+FP8_PER_CHANNEL_PER_TOKEN+MIXED_PRECISION+W4A16_NVFP4 weights | 0.00 M | 1 | dealignai/Ornith-1.5-122B-UNCENSORED-NVFP4 |  |
-| 82 | new family spec | model_type grug_moe | 0.00 M | 1 | open-athena/Marin-Mochi-535B-A23B |  |
-| 83 | quant format | fp8 e4m3 block None weights | 0.00 M | 2 | EliovpAI/Deepseek-R1-0528-Qwen3-8B-FP8-KV, RedHatAI/Meta-Llama-3-8B-Instruct-FP8-KV |  |
-| 84 | new family spec | model_type aurora2 | 0.00 M | 1 | AuroraAI-Research/Aurora2-400M-A20M |  |
-| 85 | quant format | compressed-tensors float-quantized w8f-block a8 weights | 0.00 M | 1 | Nanbeige/Nanbeige4.3-33B-FP8 |  |
-| 86 | attention, block or MoE variant | config.json has no num_attention_heads | 0.00 M | 1 | gaunernst/gemma-3-4b-it-int4-awq | #1213 |
-| 87 | quant format | w4afp8 weights | 0.00 M | 2 | PhalaCloud/GLM-5.3-W4AFP8, BitdeerAI/GLM-5.3-W4AFP8-AWQ |  |
-| 88 | new family spec | model_type philolm | 0.00 M | 1 | gustavecortal/PhiloLM |  |
-| 89 | quant format | layer N mlp.experts is in two groups | 0.00 M | 1 | kvallespin/Sage-A1.5-NVFP4 |  |
-| 90 | quant format | compressed-tensors pack-quantized w4i-channel, pack-quantized w4i-group, pack-quantized w8i-group weights | 0.00 M | 2 | nchapman/Ornith-1.5-35B-A3B-W4A16-HGPTQ, nchapman/Ornith-1.5-9B-W4A16-HGPTQ | #1200 |
-| 91 | quant format | compressed-tensors float-quantized w8f-tensor a8, nvfp4-pack-quantized w4f-tensor_group a4 weights | 0.00 M | 1 | primitive-ai/Ornith-1.5-35B-A3B-agentic-NVFP4-FP8 |  |
-| 92 | quant format | compressed-tensors pack-quantized w8i-group weights | 0.00 M | 1 | axteam/MiniCPM5-2B-AWQ-8bit |  |
-| 93 | quant format | dgpp_mixed346 weights | 0.00 M | 1 | HawkBearPig/GLM-5.3-Mixed346-GPTQ-H32-A8-g128 |  |
-| 94 | new family spec | GGUF architecture kolibri1 | 0.00 M | 1 | Harsha001/Kolibri-1.1-ROCmFPX |  |
-| 95 | quant format | pretensor_nvfp4_weight_only weights | 0.00 M | 1 | PreDoctor/DeepSeek-R1-0528-Qwen3-8B-NVFP4-W4A16-PreTensor |  |
-| 96 | quant format | torchao weights | 0.00 M | 1 | pytorch/Phi-4-mini-instruct-AWQ-INT4 |  |
-| 97 | quant format | gptq_marlin weights | 0.00 M | 1 | QuantTrio/GLM-4.5-Air-GPTQ-Int4-Int8Mix |  |
-| 98 | quant format | compressed-tensors pack-quantized w4i-group, pack-quantized w8i-group weights | 0.00 M | 1 | bot-lab-21/GLM-5.3-Int4-Int8Mix-Pollard-GPTQ | #1200 |
-| 99 | attention, block or MoE variant | model_type  is not supported | 0.00 M | 1 | amd/Phi-3-mini-4k-instruct-awq-g128-int4-asym-fp16-onnx-hybrid |  |
-| 100 | quant format | bitsandbytes 4bit weights | 0.00 M | 1 | rautaditya/llama-3.2-1b-4bit-gptq |  |
-| 101 | new family spec | model_type kolibri1_1 | 0.00 M | 1 | Aleph-Alpha/Kolibri-1.1 |  |
+| 1 | new family spec | model_type gpt2 | 35.99 M | 9 | distilbert/distilgpt2, mradermacher/distilgpt2-i1-GGUF, openai-community/gpt2, liodon-ai/gpt2-FP8 and 5 more | #1195 |
+| 2 | new family spec | model_type qwen4_exp | 32.17 M | 5 | Qwen/Qwen3.8-Flash-Next, RadixArk/Qwen3.8-Flash-Next-NVFP4, Qwen/Qwen3.8-Flash-Next-FP8, tcclaviger/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ and 1 more | #1196 |
+| 3 | new family spec | model_type florence2 | 22.83 M | 1 | microsoft/Florence-2-base | #1198 |
+| 4 | attention, block or MoE variant | Gemma 4 per-layer input embeddings (hidden_size_per_layer_input) are not supported yet | 20.20 M | 10 | google/gemma-4-E2B-it, unsloth/gemma-4-E2B-it-NVFP4, Xylolabs/gemma-4-E2B-Tenstorrent-Tensix-BFP8, cyankiwi/gemma-4-E2B-it-AWQ-INT4 and 6 more | #1239 |
+| 5 | attention, block or MoE variant | Gemma 4 mixture-of-experts layers (enable_moe_block) are not supported yet | 15.95 M | 5 | google/gemma-4-26B-A4B-it, nvidia/Gemma-4-26B-A4B-NVFP4, RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic, cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit and 1 more | #1238 |
+| 6 | new family spec | model_type qwen3_vl | 14.82 M | 18 | Qwen/Qwen3-VL-2B-Instruct, kaitchup/Qwen3-VL-2B-Instruct-NVFP4, Qwen/Qwen3-VL-2B-Instruct-FP8, cyankiwi/Qwen3-VL-2B-Instruct-AWQ-4bit and 14 more | #1197 |
+| 7 | attention, block or MoE variant | GGUF tensor and metadata names for families that already load from safetensors | 12.91 M | 29 | webAI-Official/TwIL-LM3, llmfan46/Qwen3-Coder-Next-Uncensored-Heretic-GGUF, allenai/OLMo-2-0425-1B-GGUF, unsloth/DeepSeek-R1-GGUF and 25 more | #1204 |
+| 8 | new family spec | model_type qwen2_5_vl | 11.10 M | 13 | Qwen/Qwen2.5-VL-32B-Instruct, BCCard/Qwen2.5-VL-32B-Instruct-FP8-Dynamic, Qwen/Qwen2.5-VL-32B-Instruct-AWQ, Qwen/Qwen2.5-VL-3B-Instruct and 9 more | #1197 |
+| 9 | new family spec | model_type deepseek_v32 | 11.00 M | 4 | XingChen-AGI/Xing4.1-Preview, deepseek-ai/DeepSeek-V3.2, RedHatAI/DeepSeek-V3.2-NVFP4-FP8-BLOCK, QuantTrio/DeepSeek-V3.2-AWQ | #1199 |
+| 10 | vision or audio input (text loads) | vision_config not read | 10.32 M | 1 | google/gemma-4-31B-it | #1237 |
+| 11 | quant format | awq 4bit weights | 7.79 M | 27 | fbaldassarri/HuggingFaceTB_SmolLM2-135M-auto_awq-int4-gs64-sym, fbaldassarri/HuggingFaceTB_SmolLM2-360M-auto_awq-int4-gs64-sym, Qwen/Qwen2.5-0.5B-Instruct-AWQ, Qwen/Qwen2.5-1.5B-Instruct-AWQ and 23 more | #1200 |
+| 12 | new family spec | model_type glm5_next | 7.46 M | 4 | zai-org/GLM-5.3-Flash, tattrongvu/GLM-5.3-Flash-NVFP4, wtdcode/GLM-5.3-Flash-AWQ-W4A16, Piecrust/GLM-5.3-Flash-FP4-Abliterated | #1179 |
+| 13 | vision or audio input (text loads) | vision_config and audio_config not read | 7.24 M | 2 | google/gemma-4-12B-it, AEON-7/Gemma-4-12B-it-AEON-Abliterated-K4-NVFP4-FP8 | #1237 |
+| 14 | new family spec | model_type deepseek_v41 | 6.47 M | 5 | deepseek-ai/DeepSeek-V4.1-Flash, nvidia/DeepSeek-V4.1-Flash-NVFP4, antirez/deepseek-v4.1-flash-gguf, deepseek-ai/DeepSeek-V4.1-Flash-1017 and 1 more | #1201 |
+| 15 | new family spec | model_type unlimited_ocr | 5.50 M | 1 | baidu/Unlimited-OCR | #1202 |
+| 16 | new family spec | model_type opt | 4.68 M | 1 | facebook/opt-125m | #1203 |
+| 17 | new family spec | model_type deepseek_v4 | 3.95 M | 9 | deepseek-ai/DeepSeek-V4-Flash, nvidia/DeepSeek-V4-Flash-NVFP4, huihui-ai/Huihui-DeepSeek-V4-Flash-abliterated-ds4-GGUF, deepseek-ai/DeepSeek-V4-Flash-0731 and 5 more | #1201 |
+| 18 | quant format | compressed-tensors pack-quantized w4i-group weights | 3.62 M | 36 | TheUnderscore/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-W4A16-AWQ, drawais/SmolLM3-3B-AWQ-INT4, upshift/infomaniak-translategemma-4b-it-W4A16-awq, cyankiwi/Sage-A1.5-AWQ-INT4 and 32 more | #1200 |
+| 19 | new family spec | model_type spark2_5 | 3.30 M | 9 | XHToken/Spark-X2.5-4B-Base, XHToken/Spark-X2.5-4B-FP8, peculiar-ragdoll/Sharp-Spark-X2.5-4B-GGUF, XHToken/Spark-X2.6-4B and 5 more | #1209 |
+| 20 | new family spec | model_type lfm2_moe | 3.29 M | 6 | LiquidAI/LFM2.5-24B-A2B, primitive-ai/LFM2.5-24B-A2B-NVFP4A16, LiquidAI/LFM2.5-24B-A2B-FP8, cyankiwi/LFM2.5-24B-A2B-AWQ-INT4 and 2 more | #1205 |
+| 21 | new family spec | GGUF architecture dflash | 2.82 M | 2 | nerkyor/Qwen3.8-27B-EfficientThink-Uncensored-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-DFlash2, peasantsmith/GLM-5.3-Flash-Maya-GGUF | #1212 |
+| 22 | new family spec | model_type deepseek_v3 | 2.71 M | 7 | deepseek-ai/DeepSeek-R1, RedHatAI/DeepSeek-R1-NVFP4-FP8-BLOCK, QuixiAI/DeepSeek-R1-AWQ, OPEA/DeepSeek-R1-int4-gptq-sym-inc and 3 more | #1199 |
+| 23 | new family spec | model_type gpt_neox | 2.47 M | 4 | EleutherAI/pythia-160m, fbaldassarri/EleutherAI_pythia-160m-autoawq-int4-gs128-asym, fbaldassarri/EleutherAI_pythia-160m-autogptq-int4-gs128-sym, mradermacher/pythia-160m-i1-GGUF | #1203 |
+| 24 | new family spec | model_type moondream1 | 2.39 M | 1 | vikhyatk/moondream2 | #1208 |
+| 25 | new family spec | model_type inkling2_loop | 2.39 M | 3 | thinkingmachines/Inkling-2-Mini, OpenUncensored/Inkling-2-Mini-Uncensored, unsloth/Inkling-2-Mini-GGUF | #1210 |
+| 26 | new family spec | model_type smolvlm | 2.38 M | 1 | HuggingFaceTB/SmolVLM2-500M-Video-Instruct | #1208 |
+| 27 | new family spec | model_type internvl_chat | 2.28 M | 1 | OpenGVLab/InternVL2-1B | #1208 |
+| 28 | quant format | layer N mlp.gate_proj is in two groups | 1.98 M | 2 | unsloth/Qwen3.6-27B-NVFP4, unsloth/Qwen3.8-27B-NVFP4 | #1207 |
+| 29 | quant format | GGUF types | 1.84 M | 1 | prism-ml/Ternary-Bonsai-2-2B-gguf | #1213 |
+| 30 | new family spec | model_type deepseek_vl_v2 | 1.75 M | 1 | deepseek-ai/DeepSeek-OCR | #1202 |
+| 31 | new family spec | model_type inkling_mm_model | 1.74 M | 7 | thinkingmachines/Inkling, thinkingmachines/Inkling-NVFP4, RedHatAI/Inkling-FP8-dynamic, thinkingmachines/Inkling-Small and 3 more | #1210 |
+| 32 | attention, block or MoE variant | [mixer] is set but the pattern has no linear layer | 1.69 M | 3 | nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16, SergiioB/Nemotron-3.5-Lightning-30B-A3B-GPTQ-INT4-G64-sym, nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4 | #1206 |
+| 33 | new family spec | model_type qwen2_vl | 1.63 M | 7 | Qwen/Qwen2-VL-2B-Instruct, Qwen/Qwen2-VL-2B-Instruct-AWQ, Qwen/Qwen2-VL-2B-Instruct-GPTQ-Int4, ggml-org/Qwen2-VL-2B-Instruct-GGUF and 3 more | #1197 |
+| 34 | new family spec | model_type lfm3 | 1.58 M | 5 | LiquidAI/LFM3-1.7B, LiquidAI/LFM3-1.7B-NVFP4, LiquidAI/LFM3-1.7B-FP8, LiquidAI/LFM3-1.7B-GGUF and 1 more | #1205 |
+| 35 | new family spec | model_type minicpmv4_7 (wraps qwen3_5_moe_text, which specrt runs) | 1.55 M | 5 | openbmb/MiniCPM-V-4.7-35B-A3B, axteam/MiniCPM-V-4.7-35B-A3B-NVFP4A16, openbmb/MiniCPM-V-4.7-35B-A3B-FP8, openbmb/MiniCPM-V-4.7-35B-A3B-AWQ and 1 more | #1208 |
+| 36 | quant format | nvfp4_g16 is supported for [mlp] quant only | 1.53 M | 23 | Firworks/SmolLM3-3B-nvfp4, axteam/Nanbeige4.3-33B-NVFP4, ilessio-aiflowlab/Qwen2.5-Coder-14B-Instruct-NVFP4-anima, JongYeop/Qwen2.5-3B-Instruct-FP4-W4A4 and 19 more | #1207 |
+| 37 | new family spec | model_type glm4_moe_lite | 1.51 M | 5 | zai-org/GLM-4.7-Flash, GadflyII/GLM-4.7-Flash-NVFP4, unsloth/GLM-4.7-Flash-FP8-Dynamic, cyankiwi/GLM-4.7-Flash-AWQ-4bit and 1 more | #1199 |
+| 38 | quant format | fp8 weights need hidden, intermediate, head_dim and the linear value dim to be multiples of N | 1.44 M | 7 | liodon-ai/SmolLM2-360M-FP8, RedHatAI/Qwen2.5-0.5B-FP8-dynamic, RedHatAI/Llama-3.2-1B-Instruct-FP8-dynamic, ArliAI/GLM-4.5-Air-Derestricted-FP8 and 3 more | #1207 |
+| 39 | attention, block or MoE variant | config.json has no num_hidden_layers | 1.31 M | 5 | cyankiwi/NVIDIA-Nemotron-3-Super-120B-A12B-AWQ-4bit, nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16, OpenYourMind/OpenYourMind-NVIDIA-Nemotron-3-Ultra-550B-A55B-abliterated-uncensored-NVFP4, RedHatAI/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8-dynamic and 1 more | #1206 |
+| 40 | new family spec | model_type k2_horizon | 1.30 M | 5 | IFM/K2-Horizon-7B, ProCreations/K2-Horizon-7B-Uno-NVFP4, IFM/K2-Horizon-7B-FP8, cyankiwi/K2-Horizon-7B-AWQ-INT4 and 1 more | #1211 |
+| 41 | quant format | gptq 4bit weights | 1.22 M | 35 | fbaldassarri/HuggingFaceTB_SmolLM2-360M-auto_gptq-int4-gs128-sym, Tech2wild/Nanbeige4.3-33B-W4A16-AutoRound, Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4, Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4 and 31 more | #1200 |
+| 42 | new family spec | model_type qwen3_vl_moe | 1.18 M | 6 | Qwen/Qwen3-VL-30B-A3B-Instruct, ig1/Qwen3-VL-30B-A3B-Instruct-NVFP4, Qwen/Qwen3-VL-30B-A3B-Instruct-FP8, QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ and 2 more | #1197 |
+| 43 | attention, block or MoE variant | config.json has no vocab_size | 1.07 M | 2 | gaunernst/gemma-3-12b-it-int4-awq, gaunernst/gemma-3-27b-it-int4-awq | #1213 |
+| 44 | new family spec | model_type gemma2 | 1.06 M | 5 | google/gemma-2-9b-it, RedHatAI/gemma-2-9b-it-FP8, hugging-quants/gemma-2-9b-it-AWQ-INT4, wath5/kgl_lmsys_pref_classif and 1 more | #1203 |
+| 45 | new family spec | model_type bloom | 0.92 M | 3 | bigscience/bloomz-560m, liodon-ai/bloomz-560m-FP8, mradermacher/bloomz-560m-GGUF | #1203 |
+| 46 | new family spec | model_type kimi_k3 | 0.90 M | 5 | moonshotai/Kimi-K3, nvidia/Kimi-K3-NVFP4, RedHatAI/Kimi-K3-FP8-BLOCK, open-inference/Kimi-K3-W4A8-K512-DenseChannel-GPTQ-Cal128-v2 and 1 more | #1214 |
+| 47 | quant format | quantisation declared only in hf_quant_config.json | 0.85 M | 2 | nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4, nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8 | #1206 |
+| 48 | new family spec | model_type muse_glimmer | 0.79 M | 6 | meta-models/Muse-Glimmer-30B, RadixArk/Muse-Glimmer-NVFP4, RedHatAI/Muse-Glimmer-30B-FP8-block, cyankiwi/Muse-Glimmer-30B-AWQ-INT4 and 2 more |  |
+| 49 | new family spec | model_type nemotron_parse | 0.77 M | 1 | nvidia/NVIDIA-Nemotron-Parse-2.0 |  |
+| 50 | new family spec | model_type unlimited-ocr | 0.65 M | 6 | sahilchachra/Unlimited-OCR-NVFP4, shadowrock-io/Unlimited-OCR-Community-FP8-Dynamic, sahilchachra/Unlimited-OCR-AWQ, baidu/Unlimited-OCR-2 and 2 more | #1202 |
+| 51 | new family spec | model_type llava | 0.64 M | 1 | llava-hf/llava-1.5-7b-hf | #1208 |
+| 52 | new family spec | model_type mistral3 (wraps qwen3, which specrt runs) | 0.62 M | 2 | lightonai/LightOnOCR-2-1B, switzerchees/LightOnOCR-2-1B-NVFP4 | #1208 |
+| 53 | new family spec | model_type kimi_k25 | 0.61 M | 3 | moonshotai/Kimi-K2.5, nvidia/Kimi-K2.5-NVFP4, amd/Kimi-K2.5-MXFP4-AttnFP8 | #1199 |
+| 54 | new family spec | model_type bailing_hybrid | 0.47 M | 3 | inclusionAI/Ling-3.0-tiny, inclusionAI/LingSante-3.1-flash, inclusionAI/LingSante-3.1-flash-MXFP4 |  |
+| 55 | new family spec | GGUF architecture glm-dsa | 0.36 M | 4 | unsloth/GLM-5-GGUF, unsloth/GLM-5.2-GGUF, unsloth/GLM-5.3-GGUF, AesSedai/GLM-5.3-GGUF |  |
+| 56 | quant format | compressed-tensors float-quantized w8f-block a8 weights | 0.34 M | 2 | Nanbeige/Nanbeige4.3-33B-FP8, RedHatAI/gemma-4-31B-it-FP8-block |  |
+| 57 | quant format | the quantisation config covers no attention projection | 0.26 M | 1 | nvidia/GLM-5.3-NVFP4 |  |
+| 58 | new family spec | GGUF architecture bailingmoe3 | 0.24 M | 1 | bloomer010/Ling-3.0-tiny-GGUF |  |
+| 59 | new family spec | model_type gemma3n | 0.24 M | 4 | google/gemma-3n-E2B-it, RedHatAI/gemma-3n-E2B-it-FP8-dynamic, unsloth/gemma-3n-E2B-it-GGUF, google/gemma-3n-E4B-it | #1214 |
+| 60 | quant format | compressed-tensors naive-quantized w8f-tensor a8 weights | 0.21 M | 2 | RedHatAI/Meta-Llama-3.1-70B-Instruct-FP8, RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8 |  |
+| 61 | quant format | the quantisation config has no groups | 0.14 M | 2 | AEON-7/Gemma-4-12B-it-AEON-Abliterated-K4-FP8, nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark |  |
+| 62 | new family spec | model_type llada | 0.11 M | 5 | GSAI-ML/LLaDA-1.5, mradermacher/LLaDA-1.5-GGUF, GSAI-ML/LLaDA-8B-Instruct, FunAGI/LLaDA-8B-Instruct-gptqmodel-4bit and 1 more | #1214 |
+| 63 | new family spec | model_type nemotron_h_puzzle | 0.11 M | 2 | nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4, nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-FP8 |  |
+| 64 | new family spec | model_type lfm3_omni | 0.10 M | 2 | LiquidAI/LFM3-Omni-2B, MichaelAnthony/LFM3-Omni-2B-98K-V2-FP8 |  |
+| 65 | new family spec | model_type kimi_k31 | 0.09 M | 4 | moonshotai/Kimi-K3.1-Pro, nvidia/Kimi-K3.1-Pro-NVFP4, manifoldlabs/Kimi-K3.1-Pro-Quark-MXFP4-AttnFP8, KarLexAI/Kimi-K3.1-Pro-GGUF | #1214 |
+| 66 | new family spec | model_type olala | 0.08 M | 3 | OVHaiLLM/Olala-v1.0-mini-7A1B, solfird/Olala-v1.0-mini-7A1B-NVFP4-experts, OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF |  |
+| 67 | quant format | quantisation {"quant_algo":"FP8"} is not supported | 0.07 M | 1 | nvidia/Qwen3.5-397B-A17B-NVFP4-V2 |  |
+| 68 | quant format | gptq 8bit weights | 0.05 M | 5 | Qwen/Qwen3-0.6B-GPTQ-Int8, Qwen/Qwen3-1.7B-GPTQ-Int8, JunHowie/Qwen3-4B-Instruct-2507-GPTQ-Int8, QuantTrio/Qwen3-Coder-30B-A3B-Instruct-GPTQ-Int8 and 1 more |  |
+| 69 | quant format | mixture-of-experts with Fp8Channel expert weights is not supported yet (bf16, nvfp4_g16 and fp8_block128 are) | 0.05 M | 4 | InternScience/Sage-A1.5-FP8, debackerl/KAT-Coder-V2.5-Dev-FP8, RedHatAI/Qwen3-Coder-Next-FP8-dynamic, lflare/Ornith-1.0-35B-FP8 | #1207 |
+| 70 | new family spec | GGUF architecture inkling | 0.05 M | 2 | unsloth/inkling-GGUF, unsloth/Inkling-Small-GGUF |  |
+| 71 | new family spec | model_type raon1_nano | 0.02 M | 3 | KRAFTON/Raon-1-nano, Pilcothink/Raon-1-nano-NVFP4, KRAFTON/Raon-1-nano-gguf |  |
+| 72 | quant format | compressed-tensors float-quantized w8f-tensor a8 weights | 0.02 M | 2 | RedHatAI/Llama-3.2-1B-FP8, JongYeop/Mistral-7B-Instruct-v0.2-FP8-W8A8 |  |
+| 73 | new family spec | model_type maxwell_moe | 0.02 M | 3 | maxwell-model/Maxwell-V1-Flash, maxwell-model/Maxwell-V1-Flash-FP8, AtomicChat/Maxwell-V1-Flash-GGUF |  |
+| 74 | quant format | nvfp4_g16 needs hidden and intermediate to be multiples of N | 0.02 M | 2 | NVFP4/Qwen3-Coder-30B-A3B-Instruct-FP4, Firworks/GLM-4.5-Air-nvfp4 |  |
+| 75 | new family spec | GGUF architecture unlimited-ocr2 | 0.02 M | 1 | AtomicChat/Unlimited-OCR-2-GGUF |  |
+| 76 | new family spec | GGUF architecture deepseek2-ocr | 0.01 M | 2 | sahilchachra/Unlimited-OCR-GGUF, sabafallah/DeepSeek-OCR-GGUF |  |
+| 77 | quant format | gptq 2bit weights | 0.01 M | 1 | lilmeaty/SmolLM2-135M-Instruct-GPTQ |  |
+| 78 | new family spec | GGUF architecture phi2 | 0.01 M | 1 | ggml-org/moondream2-20250414-GGUF |  |
+| 79 | new family spec | model_type ernie5_5_moe | 0.01 M | 2 | baidu/ERNIE-5.5-Flash-Preview-BF16, baidu/ERNIE-5.5-Flash-Base |  |
+| 80 | new family spec | model_type aion_instruct | 0.00 M | 2 | microsoft/Aion-1.0-Instruct-2.3B, PureTensorAI/Aion-1.0-Instruct-2.3B-NVFP4 |  |
+| 81 | quant format | quark weights | 0.00 M | 3 | amd/gpt-oss-120b-w-mxfp4-a-fp8, amd/gpt-oss-20b-MoE-Quant-W-MXFP4-A-FP8-KV-FP8, amd/GLM-5-NVFP4 |  |
+| 82 | new family spec | model_type sarvam_mla | 0.00 M | 4 | sarvamai/sarvam-105b, sarvamai/sarvam-105b-1711, RedHatAI/sarvam-105b-FP8-dynamic, QuantTrio/sarvam-105b-AWQ |  |
+| 83 | new family spec | GGUF architecture aion | 0.00 M | 1 | Xylolabs/Aion-1.0-Instruct-2.3B-GGUF |  |
+| 84 | quant format | quantisation {"quant_algo":"FP8_PER_CHANNEL_PER_TOKEN"} is not supported | 0.00 M | 1 | dealignai/Ornith-1.5-122B-UNCENSORED-NVFP4 |  |
+| 85 | new family spec | model_type grug_moe | 0.00 M | 1 | open-athena/Marin-Mochi-535B-A23B |  |
+| 86 | quant format | fp8 e4m3 block None weights | 0.00 M | 2 | EliovpAI/Deepseek-R1-0528-Qwen3-8B-FP8-KV, RedHatAI/Meta-Llama-3-8B-Instruct-FP8-KV |  |
+| 87 | new family spec | model_type aurora2 | 0.00 M | 1 | AuroraAI-Research/Aurora2-400M-A20M |  |
+| 88 | attention, block or MoE variant | config.json has no num_attention_heads | 0.00 M | 1 | gaunernst/gemma-3-4b-it-int4-awq | #1213 |
+| 89 | quant format | w4afp8 weights | 0.00 M | 2 | PhalaCloud/GLM-5.3-W4AFP8, BitdeerAI/GLM-5.3-W4AFP8-AWQ |  |
+| 90 | new family spec | model_type philolm | 0.00 M | 1 | gustavecortal/PhiloLM |  |
+| 91 | quant format | layer N mlp.experts is in two groups | 0.00 M | 1 | kvallespin/Sage-A1.5-NVFP4 |  |
+| 92 | quant format | compressed-tensors pack-quantized w4i-channel, pack-quantized w4i-group, pack-quantized w8i-group weights | 0.00 M | 2 | nchapman/Ornith-1.5-35B-A3B-W4A16-HGPTQ, nchapman/Ornith-1.5-9B-W4A16-HGPTQ | #1200 |
+| 93 | quant format | compressed-tensors float-quantized w8f-tensor a8, nvfp4-pack-quantized w4f-tensor_group a4 weights | 0.00 M | 1 | primitive-ai/Ornith-1.5-35B-A3B-agentic-NVFP4-FP8 |  |
+| 94 | quant format | compressed-tensors pack-quantized w8i-group weights | 0.00 M | 1 | axteam/MiniCPM5-2B-AWQ-8bit |  |
+| 95 | quant format | dgpp_mixed346 weights | 0.00 M | 1 | HawkBearPig/GLM-5.3-Mixed346-GPTQ-H32-A8-g128 |  |
+| 96 | new family spec | GGUF architecture kolibri1 | 0.00 M | 1 | Harsha001/Kolibri-1.1-ROCmFPX |  |
+| 97 | quant format | pretensor_nvfp4_weight_only weights | 0.00 M | 1 | PreDoctor/DeepSeek-R1-0528-Qwen3-8B-NVFP4-W4A16-PreTensor |  |
+| 98 | quant format | torchao weights | 0.00 M | 1 | pytorch/Phi-4-mini-instruct-AWQ-INT4 |  |
+| 99 | quant format | gptq_marlin weights | 0.00 M | 1 | QuantTrio/GLM-4.5-Air-GPTQ-Int4-Int8Mix |  |
+| 100 | quant format | compressed-tensors pack-quantized w4i-group, pack-quantized w8i-group weights | 0.00 M | 1 | bot-lab-21/GLM-5.3-Int4-Int8Mix-Pollard-GPTQ | #1200 |
+| 101 | attention, block or MoE variant | model_type  is not supported | 0.00 M | 1 | amd/Phi-3-mini-4k-instruct-awq-g128-int4-asym-fp16-onnx-hybrid |  |
+| 102 | quant format | bitsandbytes 4bit weights | 0.00 M | 1 | rautaditya/llama-3.2-1b-4bit-gptq |  |
+| 103 | new family spec | model_type kolibri1_1 | 0.00 M | 1 | Aleph-Alpha/Kolibri-1.1 |  |
 
 ## Quantisation formats in the safetensors indexes
 
@@ -161,7 +163,7 @@ Quantisation configs, from each `config.json` (`quantization_config`, or `hf_qua
 | None weights | 2 | 2 |
 | awq 4bit weights | 40 | 13 |
 | bitsandbytes 4bit weights | 1 | 0 |
-| compressed-tensors float-quantized w8f-block a8 weights | 7 | 6 |
+| compressed-tensors float-quantized w8f-block a8 weights | 7 | 5 |
 | compressed-tensors float-quantized w8f-block a8, nvfp4-pack-quantized w4f-tensor_group a4 weights | 2 | 2 |
 | compressed-tensors float-quantized w8f-channel a8 weights | 46 | 38 |
 | compressed-tensors float-quantized w8f-channel a8, nvfp4-pack-quantized w4f-tensor_group a4 weights | 3 | 1 |
@@ -175,7 +177,7 @@ Quantisation configs, from each `config.json` (`quantization_config`, or `hf_qua
 | compressed-tensors nvfp4-pack-quantized w4f-tensor_group weights | 10 | 8 |
 | compressed-tensors pack-quantized w4i-channel a8, pack-quantized w4i-group a8 weights | 1 | 1 |
 | compressed-tensors pack-quantized w4i-channel, pack-quantized w4i-group, pack-quantized w8i-group weights | 2 | 0 |
-| compressed-tensors pack-quantized w4i-group weights | 58 | 23 |
+| compressed-tensors pack-quantized w4i-group weights | 58 | 21 |
 | compressed-tensors pack-quantized w4i-group, pack-quantized w8i-group weights | 1 | 0 |
 | compressed-tensors pack-quantized w8i-group weights | 1 | 0 |
 | dgpp_mixed346 weights | 1 | 0 |
@@ -183,7 +185,7 @@ Quantisation configs, from each `config.json` (`quantization_config`, or `hf_qua
 | fp8 e4m3 block [128, 128] weights | 43 | 40 |
 | fp8 e4m3 block [32, 32] weights | 4 | 4 |
 | gptq 2bit weights | 1 | 0 |
-| gptq 4bit weights | 53 | 19 |
+| gptq 4bit weights | 53 | 17 |
 | gptq 8bit weights | 6 | 1 |
 | gptq_marlin weights | 1 | 0 |
 | modelopt FP8 weights | 2 | 1 |
@@ -191,8 +193,8 @@ Quantisation configs, from each `config.json` (`quantization_config`, or `hf_qua
 | modelopt FP8+MIXED_PRECISION+W4A16_NVFP4 weights | 5 | 5 |
 | modelopt FP8_PB_WO+FP8_PER_CHANNEL_PER_TOKEN+MIXED_PRECISION+W4A16_NVFP4 weights | 1 | 0 |
 | modelopt FP8_PB_WO+MIXED_PRECISION+MXFP8+NVFP4+W4A16_NVFP4 weights | 1 | 1 |
-| modelopt FP8_PER_CHANNEL_PER_TOKEN weights | 1 | 1 |
-| modelopt NVFP4 weights | 29 | 19 |
+| modelopt FP8_PER_CHANNEL_PER_TOKEN weights | 1 | 0 |
+| modelopt NVFP4 weights | 29 | 18 |
 | modelopt NVFP4_AWQ weights | 1 | 1 |
 | modelopt W4A16_NVFP4 weights | 1 | 0 |
 | modelopt_mixed weights | 3 | 2 |
@@ -240,12 +242,12 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | nvidia/Qwen3.6-35B-A3B-NVFP4 | nvfp4 | 3770795 | 23.4 | qwen3_5_moe | modelopt FP8+MIXED_PRECISION+W4A16_NVFP4 | LOADS | 40 layers (full+linear), hidden 2048, 256 experts top 8, mtp, vision, nvfp4_g16 | `family-qwen3_5.toml` | yes | ok, tools XmlFunction |  |
 | palmfuture/Qwen3.6-35B-A3B-GPTQ-Int4 | gptq | 86385 | 24.4 | qwen3_5_moe | gptq 4bit g128 | UNKNOWN-QUANT | quantization {"bits":4,"checkpoint_format":"gptq","desc_act":false,"dynamic":{"-:.*attn.*":{},"-:.*mlp\\.gate$":{},"-:.*mtp.*":{},"-:.*shared_expert.*":{},"-:.*visual.*":{},"lm_head":{},"model.language_model.embed_tokens... | `family-qwen3_5.toml` |  | ok, tools XmlFunction | #1200 |
 | microsoft/Florence-2-base | base | 22829852 | 0.5 | florence2 | none | REFUSED | model_type florence2 is not supported |  |  | no template | #1198 |
-| google/gemma-4-26B-A4B-it | base | 4701565 | 51.6 | gemma4 | none | REFUSED | model_type gemma4 is not supported |  |  | ok, tools Unparsed | #1194 |
-| RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic | fp8 | 945121 | 28.6 | gemma4 | compressed-tensors float-quantized w8f-channel a8 | REFUSED | model_type gemma4 is not supported |  |  | ok, tools Unparsed | #1194 |
-| cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit | awq | 1089331 | 17.2 | gemma4 | compressed-tensors pack-quantized w4i-group-g32 | REFUSED | model_type gemma4 is not supported |  |  | ok, tools Unparsed | #1194 |
-| nvidia/Gemma-4-26B-A4B-NVFP4 | nvfp4 | 1831177 | 18.8 | gemma4 | modelopt NVFP4 | REFUSED | model_type gemma4 is not supported |  |  | ok, tools Unparsed | #1194 |
-| positron-ai/google_gemma-4-26B-A4B-it-ingest-best-gptq | gptq | 673 | 15.9 | gemma4 | gptq 4bit g64 | REFUSED | model_type gemma4 is not supported |  |  | ok, tools Unparsed | #1194 |
-| unsloth/gemma-4-26B-A4B-it-GGUF | gguf | 4032247 | 16.6 | gemma4 | gguf | REFUSED | GGUF architecture gemma4 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1194 |
+| google/gemma-4-26B-A4B-it | base | 4701565 | 51.6 | gemma4 | none | REFUSED | Gemma 4 mixture-of-experts layers (enable_moe_block) are not supported yet | `family-gemma4.toml` |  | ok, tools Unparsed | #1238 |
+| RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic | fp8 | 945121 | 28.6 | gemma4 | compressed-tensors float-quantized w8f-channel a8 | REFUSED | Gemma 4 mixture-of-experts layers (enable_moe_block) are not supported yet | `family-gemma4.toml` |  | ok, tools Unparsed | #1238 |
+| cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit | awq | 1089331 | 17.2 | gemma4 | compressed-tensors pack-quantized w4i-group-g32 | REFUSED | Gemma 4 mixture-of-experts layers (enable_moe_block) are not supported yet | `family-gemma4.toml` |  | ok, tools Unparsed | #1238 |
+| nvidia/Gemma-4-26B-A4B-NVFP4 | nvfp4 | 1831177 | 18.8 | gemma4 | modelopt NVFP4 | REFUSED | Gemma 4 mixture-of-experts layers (enable_moe_block) are not supported yet | `family-gemma4.toml` |  | ok, tools Unparsed | #1238 |
+| positron-ai/google_gemma-4-26B-A4B-it-ingest-best-gptq | gptq | 673 | 15.9 | gemma4 | gptq 4bit g64 | REFUSED | Gemma 4 mixture-of-experts layers (enable_moe_block) are not supported yet | `family-gemma4.toml` |  | ok, tools Unparsed | #1238 |
+| unsloth/gemma-4-26B-A4B-it-GGUF | gguf | 4032247 | 16.6 | gemma4 | gguf | REFUSED | GGUF architecture gemma4 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) | `family-gemma4.toml` |  | in the GGUF | #1204 |
 | Qwen/Qwen3-14B | base | 13479677 | 29.5 | qwen3 | none | LOADS | 40 layers (dense), hidden 5120, bf16 | `family-qwen3.toml` | yes | ok, tools Hermes |  |
 | JunHowie/Qwen3-14B-GPTQ-Int4 | gptq | 2937 | 10 | qwen3 | gptq 4bit g128 | UNKNOWN-QUANT | quantization {"bits":4,"checkpoint_format":"gptq","desc_act":false,"group_size":128,"hyb_act":false,"lm_head":false,"meta":{"damp_auto_increment":0.01,"damp_percent":0.05,"mse":0.0,"quantizer":["gptqmodel:4.0.0"],"static... | `family-qwen3.toml` |  | ok, tools Hermes | #1200 |
 | Qwen/Qwen3-14B-AWQ | awq | 1686196 | 10 | qwen3 | awq 4bit g128 | UNKNOWN-QUANT | quantization {"bits":4,"group_size":128,"modules_to_not_convert":null,"quant_method":"awq","version":"gemm","zero_point":true} is not supported (fp8 e4m3 with 128x128 blocks and compressed-tensors fp8/nvfp4 are) (40 laye... | `family-qwen3.toml` |  | ok, tools Hermes | #1200 |
@@ -262,23 +264,23 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | RedHatAI/Qwen3.5-9B-FP8-dynamic | fp8 | 663268 | 14 | qwen3_5 | compressed-tensors float-quantized w8f-channel a8 | LOADS | 32 layers (full+linear), hidden 4096, mtp, vision, fp8_channel | `family-qwen3_5.toml` | yes | ok, tools XmlFunction |  |
 | cyankiwi/Qwen3.5-9B-AWQ-4bit | awq | 168312 | 33.6 | qwen3_5 | compressed-tensors pack-quantized w4i-group-g32 | UNKNOWN-QUANT | compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (32 layers (full+linear), hidden 4096, mtp, bf16) | `family-qwen3_5.toml` |  | ok, tools XmlFunction | #1200 |
 | unsloth/Qwen3.5-9B-GGUF | gguf | 2067631 | 17.9 | qwen35 | gguf | LOADS | GGUF qwen35; reads BF16 IQ2_M IQ2_XXS IQ3_XXS IQ4_NL IQ4_XS Q4_0 Q4_K_M Q4_K_S Q4_K_XL Q5_K_M Q5_K_S Q5_K_XL Q6_K Q6_K_XL Q8_0; not Q2_K_XL Q3_K_M Q3_K_S Q3_K_XL Q4_1 Q8_K_XL | `family-qwen3_5.toml` | yes | in the GGUF |  |
-| google/gemma-4-E4B-it | base | 4138365 | 16 | gemma4 | none | REFUSED | model_type gemma4 is not supported |  |  | ok, tools Unparsed | #1194 |
-| AEON-7/Gemma-4-E4B-DECKARD-HERETIC-NVFP4 | nvfp4 | 108514 | 11.9 | gemma4 | modelopt NVFP4_AWQ | REFUSED | model_type gemma4 is not supported |  |  | ok, tools Unparsed | #1194 |
-| Vishva007/gemma-4-E4B-it-W4A16-AutoRound-GPTQ | gptq | 5823 | 10 | gemma4 | gptq 4bit g128 | REFUSED | model_type gemma4 is not supported |  |  | ok, tools Unparsed | #1194 |
-| cyankiwi/gemma-4-E4B-it-AWQ-INT4 | awq | 1480 | 23.7 | gemma4 | compressed-tensors pack-quantized w4i-group-g32 | REFUSED | model_type gemma4 is not supported |  |  | ok, tools Unparsed | #1194 |
-| google/gemma-4-E4B-it-qat-q4_0-gguf | gguf | 1112181 | 5.2 | gemma4 | gguf | REFUSED | GGUF architecture gemma4 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1194 |
-| prithivMLmods/gemma-4-E4B-it-FP8 | fp8 | 1452 | 13.3 | gemma4 | compressed-tensors float-quantized w8f-channel a8 | REFUSED | model_type gemma4 is not supported |  |  | ok, tools Unparsed | #1194 |
+| google/gemma-4-E4B-it | base | 4138365 | 16 | gemma4 | none | REFUSED | Gemma 4 per-layer input embeddings (hidden_size_per_layer_input) are not supported yet | `family-gemma4.toml` |  | ok, tools Unparsed | #1239 |
+| AEON-7/Gemma-4-E4B-DECKARD-HERETIC-NVFP4 | nvfp4 | 108514 | 11.9 | gemma4 | modelopt NVFP4_AWQ | REFUSED | Gemma 4 per-layer input embeddings (hidden_size_per_layer_input) are not supported yet | `family-gemma4.toml` |  | ok, tools Unparsed | #1239 |
+| Vishva007/gemma-4-E4B-it-W4A16-AutoRound-GPTQ | gptq | 5823 | 10 | gemma4 | gptq 4bit g128 | REFUSED | Gemma 4 per-layer input embeddings (hidden_size_per_layer_input) are not supported yet | `family-gemma4.toml` |  | ok, tools Unparsed | #1239 |
+| cyankiwi/gemma-4-E4B-it-AWQ-INT4 | awq | 1480 | 23.7 | gemma4 | compressed-tensors pack-quantized w4i-group-g32 | REFUSED | Gemma 4 per-layer input embeddings (hidden_size_per_layer_input) are not supported yet | `family-gemma4.toml` |  | ok, tools Unparsed | #1239 |
+| google/gemma-4-E4B-it-qat-q4_0-gguf | gguf | 1112181 | 5.2 | gemma4 | gguf | REFUSED | GGUF architecture gemma4 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) | `family-gemma4.toml` |  | in the GGUF | #1204 |
+| prithivMLmods/gemma-4-E4B-it-FP8 | fp8 | 1452 | 13.3 | gemma4 | compressed-tensors float-quantized w8f-channel a8 | REFUSED | Gemma 4 per-layer input embeddings (hidden_size_per_layer_input) are not supported yet | `family-gemma4.toml` |  | ok, tools Unparsed | #1239 |
 | Qwen/Qwen2.5-7B-Instruct | base | 6420358 | 15.2 | qwen2 | none | LOADS | 28 layers (dense), hidden 3584, bf16 | `family-qwen2.toml` | no | ok, tools Hermes |  |
 | Qwen/Qwen2.5-7B-Instruct-AWQ | awq | 1337091 | 5.6 | qwen2 | awq 4bit g128 | UNKNOWN-QUANT | quantization {"bits":4,"group_size":128,"modules_to_not_convert":null,"quant_method":"awq","version":"gemm","zero_point":true} is not supported (fp8 e4m3 with 128x128 blocks and compressed-tensors fp8/nvfp4 are) (28 laye... | `family-qwen2.toml` |  | ok, tools Hermes | #1200 |
 | Qwen/Qwen2.5-7B-Instruct-GGUF | gguf | 791759 | 3 | qwen2 | gguf | LOADS | GGUF qwen2; reads Q4_0 Q4_K_M Q5_0 Q5_K_M Q6_K Q8_0; not Q2_K Q3_K_M | `family-qwen2.toml` | no | in the GGUF |  |
 | Qwen/Qwen2.5-Coder-7B-Instruct-GPTQ-Int4 | gptq | 302452 | 5.6 | qwen2 | gptq 4bit g128 | UNKNOWN-QUANT | quantization {"batch_size":1,"bits":4,"block_name_to_quantize":null,"cache_block_outputs":true,"damp_percent":0.01,"dataset":null,"desc_act":false,"exllama_config":{"version":1},"group_size":128,"max_input_length":null,"... | `family-qwen2.toml` |  | ok, tools Hermes | #1200 |
 | RedHatAI/Qwen2.5-7B-Instruct-FP8-dynamic | fp8 | 309500 | 8.7 | qwen2 | compressed-tensors float-quantized w8f-channel a8 | LOADS | 28 layers (dense), hidden 3584, fp8_channel | `family-qwen2.toml` | no | ok, tools Hermes |  |
-| google/gemma-4-31B-it | base | 5678445 | 62.5 | gemma4 | none | REFUSED | model_type gemma4 is not supported |  |  | ok, tools Unparsed | #1194 |
-| RedHatAI/gemma-4-31B-it-FP8-block | fp8 | 341129 | 33.3 | gemma4 | compressed-tensors float-quantized w8f-block a8 | REFUSED | model_type gemma4 is not supported |  |  | ok, tools Unparsed | #1194 |
-| cyankiwi/gemma-4-31B-it-AWQ-4bit | awq | 702667 | 20.9 | gemma4 | compressed-tensors pack-quantized w4i-group-g32 | REFUSED | model_type gemma4 is not supported |  |  | ok, tools Unparsed | #1194 |
-| nvidia/Gemma-4-31B-IT-NVFP4 | nvfp4 | 911142 | 32.6 | gemma4 | modelopt NVFP4 | REFUSED | model_type gemma4 is not supported |  |  | ok, tools Unparsed | #1194 |
-| positron-ai/google_gemma-4-31B-it-ingest-best-gptq | gptq | 685 | 19.8 | gemma4 | gptq 4bit g64 | REFUSED | model_type gemma4 is not supported |  |  | ok, tools Unparsed | #1194 |
-| unsloth/gemma-4-31B-it-GGUF | gguf | 506169 | 17.3 | gemma4 | gguf | REFUSED | GGUF architecture gemma4 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1194 |
+| google/gemma-4-31B-it | base | 5678445 | 62.5 | gemma4 | none | LOADS-TEXT-ONLY | vision_config not read; 60 layers (full+sliding), hidden 5376, bf16 | `family-gemma4.toml` | yes | ok, tools Unparsed | #1237 |
+| RedHatAI/gemma-4-31B-it-FP8-block | fp8 | 341129 | 33.3 | gemma4 | compressed-tensors float-quantized w8f-block a8 | UNKNOWN-QUANT | compressed-tensors group FP8_BLOCK is not supported (fp8 per-channel and nvfp4 group 16 are) (60 layers (full+sliding), hidden 5376, bf16) | `family-gemma4.toml` |  | ok, tools Unparsed |  |
+| cyankiwi/gemma-4-31B-it-AWQ-4bit | awq | 702667 | 20.9 | gemma4 | compressed-tensors pack-quantized w4i-group-g32 | UNKNOWN-QUANT | compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (60 layers (full+sliding), hidden 5376, bf16) | `family-gemma4.toml` |  | ok, tools Unparsed | #1200 |
+| nvidia/Gemma-4-31B-IT-NVFP4 | nvfp4 | 911142 | 32.6 | gemma4 | modelopt NVFP4 | UNKNOWN-QUANT | nvfp4_g16 is supported for [mlp] quant only (60 layers (full+sliding), hidden 5376, bf16) | `family-gemma4.toml` |  | ok, tools Unparsed | #1207 |
+| positron-ai/google_gemma-4-31B-it-ingest-best-gptq | gptq | 685 | 19.8 | gemma4 | gptq 4bit g64 | UNKNOWN-QUANT | quantization {"bits":4,"checkpoint_format":"gptq","desc_act":false,"dynamic":{"-:^language_model\\.lm_head$":{},"-:^lm_head$":{},"-:^model\\.embed_tokens$":{},"-:^model\\.language_model\\.embed_tokens$":{},"-:^model\\.la... | `family-gemma4.toml` |  | ok, tools Unparsed | #1200 |
+| unsloth/gemma-4-31B-it-GGUF | gguf | 506169 | 17.3 | gemma4 | gguf | REFUSED | GGUF architecture gemma4 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) | `family-gemma4.toml` |  | in the GGUF | #1204 |
 | Qwen/Qwen3-4B-Instruct-2507 | base | 9603541 | 8 | qwen3 | none | LOADS | 36 layers (dense), hidden 2560, bf16 | `family-qwen3.toml` | yes | ok, tools Hermes |  |
 | JunHowie/Qwen3-4B-Instruct-2507-GPTQ-Int8 | gptq | 2034 | 4.5 | qwen3 | gptq 8bit g128 | UNKNOWN-QUANT | quantization {"bits":8,"checkpoint_format":"gptq","desc_act":false,"group_size":128,"hyb_act":false,"lm_head":false,"meta":{"damp_auto_increment":0.01,"damp_percent":0.05,"mse":0.0,"quantizer":["gptqmodel:4.0.0"],"static... | `family-qwen3.toml` |  | ok, tools Hermes |  |
 | Qwen/Qwen3-4B-Instruct-2507-FP8 | fp8 | 1790128 | 5.2 | qwen3 | fp8 e4m3 block [128, 128] | LOADS | 36 layers (dense), hidden 2560, fp8_block128 | `family-qwen3.toml` | yes | ok, tools Hermes |  |
@@ -295,12 +297,12 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | btbtyler09/Qwen3.6-27B-GPTQ-4bit | gptq | 47657 | 21.9 | qwen3_5 | gptq 4bit g32 | UNKNOWN-QUANT | quantization {"bits":4,"checkpoint_format":"gptq","desc_act":false,"format":"gptq","group_size":32,"lm_head":false,"meta":{"act_group_aware":true,"auto_forward_data_parallel":false,"damp_auto_increment":0.01,"damp_percen... | `family-qwen3_5.toml` |  | ok, tools XmlFunction | #1200 |
 | cyankiwi/Qwen3.6-27B-AWQ-INT4 | awq | 299167 | 0.3 | qwen3_5 | compressed-tensors pack-quantized w4i-group-g32 | UNKNOWN-QUANT | compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (64 layers (full+linear), hidden 5120, mtp, bf16) | `family-qwen3_5.toml` |  | ok, tools XmlFunction | #1200 |
 | unsloth/Qwen3.6-27B-NVFP4 | nvfp4 | 224711 | 23.4 | qwen3_5 | compressed-tensors float-quantized w8f-channel a8, nvfp4-pack-quantized w4f-tensor_group-g16 a4 | UNKNOWN-QUANT | layer 56 mlp.gate_proj is in two groups (64 layers (full+linear), hidden 5120, mtp, bf16) | `family-qwen3_5.toml` |  | ok, tools XmlFunction | #1207 |
-| google/gemma-4-12B-it | base | 1510292 | 23.9 | gemma4_unified | none | REFUSED | model_type gemma4_unified is not supported |  |  | ok, tools Unparsed | #1194 |
-| AEON-7/Gemma-4-12B-it-AEON-Abliterated-K4-FP8 | fp8 | 108449 | 13 | gemma4_unified | modelopt FP8_PER_CHANNEL_PER_TOKEN | REFUSED | model_type gemma4_unified is not supported |  |  | ok, tools Unparsed | #1194 |
-| AEON-7/Gemma-4-12B-it-AEON-Abliterated-K4-NVFP4-FP8 | nvfp4 | 108698 | 13 | gemma4_unified | modelopt FP8+MIXED_PRECISION+NVFP4 | REFUSED | model_type gemma4_unified is not supported |  |  | ok, tools Unparsed | #1194 |
-| cyankiwi/gemma-4-12B-it-AWQ-INT4 | awq | 81571 | 47.8 | gemma4_unified | compressed-tensors pack-quantized w4i-group-g32 | REFUSED | model_type gemma4_unified is not supported |  |  | ok, tools Unparsed | #1194 |
-| positron-ai/google_gemma-4-12B-it-ingest-best-gptq-permuted | gptq | 747 | 8 | gemma4_unified | gptq 4bit g64 | REFUSED | model_type gemma4_unified is not supported |  |  | ok, tools Unparsed | #1194 |
-| unsloth/gemma-4-12b-it-GGUF | gguf | 2519842 | 23.8 | gemma4 | gguf | REFUSED | GGUF architecture gemma4 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1194 |
+| google/gemma-4-12B-it | base | 1510292 | 23.9 | gemma4_unified | none | LOADS-TEXT-ONLY | vision_config and audio_config not read; 48 layers (full+sliding), hidden 3840, bf16 | `family-gemma4.toml` | yes | ok, tools Unparsed | #1237 |
+| AEON-7/Gemma-4-12B-it-AEON-Abliterated-K4-FP8 | fp8 | 108449 | 13 | gemma4_unified | modelopt FP8_PER_CHANNEL_PER_TOKEN | UNKNOWN-QUANT | the quantisation config has no groups (48 layers (full+sliding), hidden 3840, bf16) | `family-gemma4.toml` |  | ok, tools Unparsed |  |
+| AEON-7/Gemma-4-12B-it-AEON-Abliterated-K4-NVFP4-FP8 | nvfp4 | 108698 | 13 | gemma4_unified | modelopt FP8+MIXED_PRECISION+NVFP4 | LOADS-TEXT-ONLY | vision_config and audio_config not read; 48 layers (full+sliding), hidden 3840, nvfp4_g16 | `family-gemma4.toml` | yes | ok, tools Unparsed | #1237 |
+| cyankiwi/gemma-4-12B-it-AWQ-INT4 | awq | 81571 | 47.8 | gemma4_unified | compressed-tensors pack-quantized w4i-group-g32 | UNKNOWN-QUANT | compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (48 layers (full+sliding), hidden 3840, bf16) | `family-gemma4.toml` |  | ok, tools Unparsed | #1200 |
+| positron-ai/google_gemma-4-12B-it-ingest-best-gptq-permuted | gptq | 747 | 8 | gemma4_unified | gptq 4bit g64 | UNKNOWN-QUANT | quantization {"bits":4,"checkpoint_format":"gptq","desc_act":true,"dynamic":{"-:^language_model\\.lm_head$":{},"-:^lm_head$":{},"-:^model\\.embed_tokens$":{},"-:^model\\.language_model\\.embed_tokens$":{},"-:^model\\.lan... | `family-gemma4.toml` |  | ok, tools Unparsed | #1200 |
+| unsloth/gemma-4-12b-it-GGUF | gguf | 2519842 | 23.8 | gemma4 | gguf | REFUSED | GGUF architecture gemma4 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) | `family-gemma4.toml` |  | in the GGUF | #1204 |
 | Qwen/Qwen3.5-4B | base | 3949818 | 9.3 | qwen3_5 | none | LOADS | 32 layers (full+linear), hidden 2560, mtp, vision, bf16 | `family-qwen3_5.toml` | yes | ok, tools XmlFunction |  |
 | Qwen/Qwen3.5-4B-Base | disk | 494290 | 9.3 | qwen3_5 | none | LOADS | 32 layers (full+linear), hidden 2560, mtp, vision, bf16 | `family-qwen3_5.toml` | yes | ok, tools XmlFunction |  |
 | RedHatAI/Qwen3.5-4B-FP8-dynamic | fp8 | 9414 | 8 | qwen3_5 | compressed-tensors float-quantized w8f-channel a8 | LOADS | 32 layers (full+linear), hidden 2560, mtp, vision, fp8_channel | `family-qwen3_5.toml` | yes | ok, tools XmlFunction |  |
@@ -343,12 +345,12 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | hfl/Qwen2.5-VL-7B-Instruct-GPTQ-Int4 | gptq | 709 | 6.9 | qwen2_5_vl | gptq 4bit g128 | REFUSED | model_type qwen2_5_vl is not supported |  |  | ok, tools Hermes | #1197 |
 | nvidia/Qwen2.5-VL-7B-Instruct-NVFP4 | nvfp4 | 612541 | 7.2 | qwen2_5_vl | modelopt NVFP4 | REFUSED | model_type qwen2_5_vl is not supported |  |  | ok, tools None | #1197 |
 | unsloth/Qwen2.5-VL-7B-Instruct-GGUF | gguf | 299663 | 15.2 | qwen2_5_vl | gguf | REFUSED | GGUF architecture qwen2vl is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1197 |
-| google/gemma-4-E2B-it | base | 2633119 | 10.2 | gemma4 | none | REFUSED | model_type gemma4 is not supported |  |  | ok, tools Unparsed | #1194 |
-| Vishva007/gemma-4-E2B-it-W4A16-AutoRound-GPTQ | gptq | 2218 | 7.5 | gemma4 | gptq 4bit g128 | REFUSED | model_type gemma4 is not supported |  |  | ok, tools Unparsed | #1194 |
-| Xylolabs/gemma-4-E2B-Tenstorrent-Tensix-BFP8 | fp8 | 118 | 11.1 | gemma4 | none | REFUSED | model_type gemma4 is not supported |  |  | no template | #1194 |
-| cyankiwi/gemma-4-E2B-it-AWQ-INT4 | awq | 18865 | 13.9 | gemma4 | compressed-tensors pack-quantized w4i-group-g32 | REFUSED | model_type gemma4 is not supported |  |  | ok, tools Unparsed | #1194 |
-| turintech/gemma-4-E2B-it-Artemis-GGUF | gguf | 1318727 | 1.8 | gemma4 | gguf | REFUSED | GGUF architecture gemma4 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1194 |
-| unsloth/gemma-4-E2B-it-NVFP4 | nvfp4 | 902 | 12.6 | gemma4 | compressed-tensors float-quantized w8f-channel a8, nvfp4-pack-quantized w4f-tensor_group-g16 a4, pack-quantized w8i-channel | REFUSED | model_type gemma4 is not supported |  |  | ok, tools Unparsed | #1194 |
+| google/gemma-4-E2B-it | base | 2633119 | 10.2 | gemma4 | none | REFUSED | Gemma 4 per-layer input embeddings (hidden_size_per_layer_input) are not supported yet | `family-gemma4.toml` |  | ok, tools Unparsed | #1239 |
+| Vishva007/gemma-4-E2B-it-W4A16-AutoRound-GPTQ | gptq | 2218 | 7.5 | gemma4 | gptq 4bit g128 | REFUSED | Gemma 4 per-layer input embeddings (hidden_size_per_layer_input) are not supported yet | `family-gemma4.toml` |  | ok, tools Unparsed | #1239 |
+| Xylolabs/gemma-4-E2B-Tenstorrent-Tensix-BFP8 | fp8 | 118 | 11.1 | gemma4 | none | REFUSED | Gemma 4 per-layer input embeddings (hidden_size_per_layer_input) are not supported yet | `family-gemma4.toml` |  | no template | #1239 |
+| cyankiwi/gemma-4-E2B-it-AWQ-INT4 | awq | 18865 | 13.9 | gemma4 | compressed-tensors pack-quantized w4i-group-g32 | REFUSED | Gemma 4 per-layer input embeddings (hidden_size_per_layer_input) are not supported yet | `family-gemma4.toml` |  | ok, tools Unparsed | #1239 |
+| turintech/gemma-4-E2B-it-Artemis-GGUF | gguf | 1318727 | 1.8 | gemma4 | gguf | REFUSED | GGUF architecture gemma4 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) | `family-gemma4.toml` |  | in the GGUF | #1204 |
+| unsloth/gemma-4-E2B-it-NVFP4 | nvfp4 | 902 | 12.6 | gemma4 | compressed-tensors float-quantized w8f-channel a8, nvfp4-pack-quantized w4f-tensor_group-g16 a4, pack-quantized w8i-channel | REFUSED | Gemma 4 per-layer input embeddings (hidden_size_per_layer_input) are not supported yet | `family-gemma4.toml` |  | ok, tools Unparsed | #1239 |
 | openai/gpt-oss-20b | base | 5464001 | 13.8 | gpt_oss | mxfp4 | LOADS | 24 layers (full+sliding), hidden 2880, 32 experts top 4, bf16 | `family-gpt_oss.toml` | yes | ok, tools Harmony |  |
 | amd/gpt-oss-20b-MoE-Quant-W-MXFP4-A-FP8-KV-FP8 | fp8 | 271 | 13.8 | gpt_oss | quark | UNKNOWN-QUANT | quantization {"algo_config":null,"exclude":["model.layers.0.self_attn.q_proj","model.layers.0.self_attn.k_proj","model.layers.0.self_attn.v_proj","model.layers.0.self_attn.o_proj","model.layers.1.self_attn.q_proj","model... | `family-gpt_oss.toml` |  | ok, tools Harmony |  |
 | unsloth/gpt-oss-20b-GGUF | gguf | 599648 | 13.8 | gpt_oss | gguf | REFUSED | GGUF architecture gpt-oss is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) | `family-gpt_oss.toml` |  | in the GGUF | #1204 |
@@ -580,7 +582,7 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | nvidia/Qwen3-30B-A3B-NVFP4 | nvfp4 | 9631 | 18.1 | qwen3_moe | modelopt NVFP4 | LOADS | 48 layers (dense), hidden 2048, 128 experts top 8, nvfp4_g16 | `family-qwen3.toml` | yes | ok, tools Hermes |  |
 | ornith-ai/Ornith-1.5-122B | base | 348807 | 250.2 | qwen3_5_moe | none | TOO-BIG | 250.2 GB of weights needs 3 cards of 96 GB; 48 layers (full+linear), hidden 3072, 256 experts top 8, mtp, vision, bf16 | `family-qwen3_5.toml` | yes | ok, tools XmlFunction |  |
 | cyankiwi/Ornith-1.5-122B-AWQ-INT4 | awq | 2127 | 85.3 | qwen3_5_moe | compressed-tensors pack-quantized w4i-group-g32 | UNKNOWN-QUANT | compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (48 layers (full+linear), hidden 3072, 256 experts top 8, mtp, bf16) | `family-qwen3_5.toml` |  | ok, tools XmlFunction | #1200 |
-| dealignai/Ornith-1.5-122B-UNCENSORED-NVFP4 | nvfp4 | 1629 | 75.6 | qwen3_5_moe | modelopt FP8_PB_WO+FP8_PER_CHANNEL_PER_TOKEN+MIXED_PRECISION+W4A16_NVFP4 | UNKNOWN-QUANT | compressed-tensors group FP8_PER_CHANNEL_PER_TOKEN is not supported (fp8 per-channel and nvfp4 group 16 are) (48 layers (full+linear), hidden 3072, 256 experts top 8, mtp, bf16) | `family-qwen3_5.toml` |  | ok, tools XmlFunction |  |
+| dealignai/Ornith-1.5-122B-UNCENSORED-NVFP4 | nvfp4 | 1629 | 75.6 | qwen3_5_moe | modelopt FP8_PB_WO+FP8_PER_CHANNEL_PER_TOKEN+MIXED_PRECISION+W4A16_NVFP4 | UNKNOWN-QUANT | lm_head: quantisation {"quant_algo":"FP8_PER_CHANNEL_PER_TOKEN"} is not supported (48 layers (full+linear), hidden 3072, 256 experts top 8, mtp, bf16) | `family-qwen3_5.toml` |  | ok, tools XmlFunction |  |
 | unsloth/Ornith-1.5-122B-GGUF | gguf | 1047706 | 40.4 | qwen35moe | gguf | LOADS | GGUF qwen35moe; reads BF16 IQ1_M IQ2_XXS IQ3_XXS Q4_K_XL Q5_K_XL Q6_K_XL Q8_0; not Q2_K_XL Q3_K_XL | `family-qwen3_5.toml` | yes | in the GGUF |  |
 | nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 | base | 701585 | 65.8 | nemotron_h | none | REFUSED | [mixer] is set but the pattern has no linear layer | `family-nemotron_h.toml` |  | ok, tools XmlFunction | #1206 |
 | RedHatAI/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-FP8 | fp8 | 351198 | 32.3 | nemotron_h | compressed-tensors float-quantized w8f-tensor a8 | REFUSED | config.json has no num_hidden_layers | `family-nemotron_h.toml` |  | ok, tools XmlFunction | #1206 |
@@ -778,7 +780,7 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | Qwen/Qwen3.5-397B-A17B-FP8 | fp8 | 85750 | 406.1 | qwen3_5_moe | fp8 e4m3 block [128, 128] | TOO-BIG | 406.1 GB of weights needs 5 cards of 96 GB; 60 layers (full+linear), hidden 4096, 512 experts top 10, mtp, vision, fp8_block128 | `family-qwen3_5.toml` | yes | ok, tools XmlFunction |  |
 | Qwen/Qwen3.5-397B-A17B-GPTQ-Int4 | gptq | 4375 | 235.7 | qwen3_5_moe | gptq 4bit g128 | UNKNOWN-QUANT | quantization {"bits":4,"group_size":128,"damp_percent":0.01,"desc_act":false,"static_groups":false,"sym":true,"true_sequential":true,"quant_method":"gptq","dynamic":{"lm_head":{},"model.language_model.embed_tokens":{},"-... | `family-qwen3_5.toml` |  | ok, tools XmlFunction | #1200 |
 | cyankiwi/Qwen3.5-397B-A17B-AWQ-4bit | awq | 742 | 237 | qwen3_5_moe | compressed-tensors pack-quantized w4i-group-g32 | UNKNOWN-QUANT | compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (60 layers (full+linear), hidden 4096, 512 experts top 10, mtp, bf16) | `family-qwen3_5.toml` |  | ok, tools XmlFunction | #1200 |
-| nvidia/Qwen3.5-397B-A17B-NVFP4-V2 | nvfp4 | 70590 | 243.5 | qwen3_5_moe | modelopt_mixed | UNKNOWN-QUANT | quantization {"config_groups":{"group_0":{"input_activations":{"dynamic":false,"num_bits":8,"type":"float"},"weights":{"dynamic":false,"num_bits":8,"type":"float"},"targets":["model.language_model.layers.0.linear_attn.in... | `family-qwen3_5.toml` |  | ok, tools XmlFunction |  |
+| nvidia/Qwen3.5-397B-A17B-NVFP4-V2 | nvfp4 | 70590 | 243.5 | qwen3_5_moe | modelopt_mixed | UNKNOWN-QUANT | model.language_model.layers.0.linear_attn.out_proj: quantisation {"quant_algo":"FP8"} is not supported (60 layers (full+linear), hidden 4096, 512 experts top 10, mtp, bf16) | `family-qwen3_5.toml` |  | ok, tools XmlFunction |  |
 | unsloth/Qwen3.5-397B-A17B-GGUF | gguf | 27497 | 793 | qwen3_5_moe | gguf | TOO-BIG | 793 GB of weights needs 10 cards of 96 GB; GGUF qwen35moe; reads BF16 IQ1_M IQ2_M IQ2_XXS IQ3_S IQ3_XXS IQ4_NL IQ4_XS Q4_K_M Q4_K_S Q4_K_XL Q5_K_M Q5_K_S Q5_K_XL Q6_K Q6_K_XL Q8_0; not MXFP4_MOE Q3_K_M Q3_K_S Q3_K_XL Q8_... | `family-qwen3_5.toml` | yes | in the GGUF |  |
 | Qwen/Qwen2.5-VL-32B-Instruct | base | 222823 | 68.3 | qwen2_5_vl | none | REFUSED | model_type qwen2_5_vl is not supported |  |  | ok, tools None | #1197 |
 | BCCard/Qwen2.5-VL-32B-Instruct-FP8-Dynamic | fp8 | 120 | 35 | qwen2_5_vl | compressed-tensors float-quantized w8f-channel a8 | REFUSED | model_type qwen2_5_vl is not supported |  |  | ok, tools None | #1197 |
@@ -838,7 +840,7 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | RedHatAI/Mistral-Small-24B-Instruct-2501-FP8-dynamic | fp8 | 68614 | 24.9 | mistral | compressed-tensors float-quantized w8f-channel a8 | LOADS | 40 layers (dense), hidden 5120, fp8_channel | `family-llama.toml` | yes | ok, tools None |  |
 | dwetzel/Mistral-Small-24B-Instruct-2501-GPTQ-INT4 | gptq | 127 | 14.1 | mistral | compressed-tensors pack-quantized w4i-group-g128 | UNKNOWN-QUANT | compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (40 layers (dense), hidden 5120, bf16) | `family-llama.toml` |  | ok, tools None | #1200 |
 | fbaldassarri/mistralai_Mistral-Small-24B-Base-2501-autoawq-int4-gs128-sym | awq | 9 | 16.9 | mistral | awq 4bit g128 | UNKNOWN-QUANT | quantization {"amp":false,"autoround_version":"0.4.6","batch_size":4,"bits":4,"data_type":"int","dataset":"NeelNanda/pile-10k","enable_minmax_tuning":true,"enable_norm_bias_tuning":false,"enable_quanted_input":true,"grad... | `family-llama.toml` |  | no template | #1200 |
-| culturerevolt/gemma-4-12b-heretic-abliterated | base | 1415 | 23.9 | gemma4_unified | gguf | UNCHECKED | the hub reports the vision projector's architecture (clip), not the model's |  |  | in the GGUF |  |
+| culturerevolt/gemma-4-12b-heretic-abliterated | base | 1415 | 23.9 | gemma4_unified | gguf | UNCHECKED | the hub reports the vision projector's architecture (clip), not the model's | `family-gemma4.toml` |  | in the GGUF |  |
 | meta-llama/Meta-Llama-3-8B (config from local snapshot (gated on the hub)) | base | 101196 | 16.1 | llama | none | LOADS | 32 layers (dense), hidden 4096, bf16 | `family-llama.toml` | yes | no template |  |
 | astronomer/Llama-3-8B-GPTQ-4-Bit | gptq | 34 | 30 | llama | gptq 4bit g128 | UNKNOWN-QUANT | quantization {"bits":4,"damp_percent":0.1,"desc_act":true,"group_size":128,"is_marlin_format":false,"model_file_base_name":null,"model_name_or_path":null,"quant_method":"gptq","static_groups":false,"sym":true,"true_seque... | `family-llama.toml` |  | no template | #1200 |
 | dphn/dolphin-2.9-llama3-8b-gguf | gguf | 5808 | 4 | llama | gguf | LOADS | GGUF llama; reads Q4_K_M Q5_K_M Q6_K Q8_0; not Q3_K_M | `family-llama.toml` | yes | in the GGUF |  |
