@@ -27,8 +27,7 @@ fn meta(file: &str) -> Value {
 #[test]
 fn the_tiny_glm5_next_config_describes_hyper_connections_nope_pools_kda_and_dsa() {
     let json = config();
-    let refusal = Spec::from_hf_config(&json).unwrap_err().to_string();
-    assert!(refusal.contains("model_type glm5_next is not supported"), "{refusal}");
+    Spec::from_hf_config(&json).unwrap_or_else(|e| panic!("{e:#}")).runnable().unwrap_or_else(|e| panic!("{e:#}"));
     let spec = Spec::describe_hf_config(&json).unwrap();
     assert_eq!(spec.layers.pattern, vec![Block::Linear, Block::Linear, Block::Linear, Block::Full]);
     let hyper = spec.hyper.as_ref().expect("hc_mult names hyper-connections");
@@ -50,7 +49,6 @@ fn the_tiny_glm5_next_config_describes_hyper_connections_nope_pools_kda_and_dsa(
     for piece in ["\"hyper\":{\"streams\":4", "\"kind\":\"dsa\"", "\"kpool\":4", "\"kind\":\"kda\"", "\"nope_layers\":[0,1,2,3]"] {
         assert!(text.contains(piece), "{piece} missing from {text}");
     }
-    assert!(spec.runnable().is_err(), "the engine does not run glm5_next yet");
 }
 
 #[test]
@@ -127,9 +125,7 @@ const TOLERANCE: f32 = 3.8e-4;
 const BF16_SPLIT_TOLERANCE: f32 = 5.0e-4;
 
 fn engine_spec() -> Spec {
-    let family = std::fs::read_to_string(fixture().join("family.toml")).unwrap();
-    let registry = specrt::family::Registry::from_texts(specrt::spec::EMBEDDED.iter().map(|(_, t)| *t).chain([family.as_str()])).unwrap();
-    let mut spec = Spec::from_hf_config_serving_in(&registry, &config()).unwrap_or_else(|e| panic!("{e:#}"));
+    let mut spec = Spec::from_hf_config_serving(&config()).unwrap_or_else(|e| panic!("{e:#}"));
     spec.name = NAME.into();
     spec.repo = fixture().display().to_string();
     spec
@@ -159,7 +155,6 @@ fn the_engine_family_plans_hyper_connections_and_no_rope_nodes() {
     for k in ["hyper_pre", "hyper_post", "hyper_expand", "hyper_mean", "pool_index_topk", "dsa_latent_attention", "kda_recurrence", "kda_conv_q", "kda_gated_norm"] {
         assert!(module.kernels.contains(&k) && module.source.contains(&format!("{k}(")), "{k}");
     }
-    assert!(Spec::from_hf_config(&config()).is_err(), "the library itself still refuses glm5_next");
     let mixer = specrt::codegen::mixer_kernels(&spec, 1, 256, &kir::Target::sm_120()).unwrap();
     let kda = mixer.iter().find(|k| k.name == "kda_recurrence").unwrap();
     assert!(kda.chunk_form().is_none(), "KDA prefill runs the recurrent form: the chunked lowering takes one read stage and KDA reads the state twice");

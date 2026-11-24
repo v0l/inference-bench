@@ -11,6 +11,9 @@ architectures = ["Glm5NextForConditionalGeneration", "Glm5NextForCausalLM"]
 [vision]
 ignore = true
 
+[quantization]
+per_tensor = true
+
 [blocks.layer_types]
 deepseek_sparse_attention = "full"
 
