@@ -152,6 +152,10 @@ fn norm(name: &str) -> Result<NormKind> {
 }
 
 impl Node {
+    pub fn owner_only(&self) -> bool {
+        self.when.as_deref().is_some_and(|w| w.split('+').any(|c| c == "kv_owner"))
+    }
+
     pub fn present_in(&self, block: Block) -> bool {
         self.layers.is_empty() || self.layers.iter().any(|l| l == block.name())
     }

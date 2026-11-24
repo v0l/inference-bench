@@ -84,24 +84,28 @@ slot = "q_w"
 tensor = "k_proj"
 rows = "kvh_s * hd_s"
 layers = ["sliding"]
+kv_owner = true
 slot = "k_w"
 
 [[attention.projection]]
 tensor = "k_proj"
 rows = "kvh_g * hd_g"
 layers = ["full"]
+kv_owner = true
 slot = "k_w"
 
 [[attention.projection]]
 tensor = "v_proj"
 rows = "kvh_s * hd_s"
 layers = ["sliding"]
+kv_owner = true
 slot = "v_w"
 
 [[attention.projection]]
 tensor = "v_proj"
 rows = "kvh_g * hd_g"
 layers = ["full"]
+kv_owner = true
 slot = "v_w"
 when = "!k_eq_v"
 
@@ -109,6 +113,7 @@ when = "!k_eq_v"
 tensor = "k_proj"
 rows = "kvh_g * hd_g"
 layers = ["full"]
+kv_owner = true
 slot = "v_w"
 when = "k_eq_v"
 
@@ -162,6 +167,7 @@ w = { weight = "q_norm.weight", len = "hd_s" }
 op = "kernel"
 kernel = "g4_k_norm_s"
 layers = ["sliding"]
+when = "kv_owner"
 grid = ["kvh_s", "rows"]
 
 [attention.node.bind]
@@ -172,6 +178,7 @@ w = { weight = "k_norm.weight", len = "hd_s" }
 op = "kernel"
 kernel = "g4_v_norm_s"
 layers = ["sliding"]
+when = "kv_owner"
 grid = ["kvh_s", "rows"]
 
 [attention.node.bind]
@@ -190,6 +197,7 @@ x = { buffer = "qkv" }
 op = "kernel"
 kernel = "g4_k_rope_s"
 layers = ["sliding"]
+when = "kv_owner"
 grid = ["kvh_s", "rows"]
 
 [attention.node.bind]
@@ -199,6 +207,7 @@ x = { buffer = "qkv" }
 op = "kernel"
 kernel = "g4_k_write_s"
 layers = ["sliding"]
+when = "kv_owner"
 grid = ["kvh_s", "rows"]
 
 [attention.node.bind]
@@ -210,6 +219,7 @@ layer = "kind_layer"
 op = "kernel"
 kernel = "g4_v_write_s"
 layers = ["sliding"]
+when = "kv_owner"
 grid = ["kvh_s", "rows"]
 
 [attention.node.bind]
@@ -243,6 +253,7 @@ w = { weight = "q_norm.weight", len = "hd_g" }
 op = "kernel"
 kernel = "g4_k_norm_g"
 layers = ["full"]
+when = "kv_owner"
 grid = ["kvh_g", "rows"]
 
 [attention.node.bind]
@@ -253,6 +264,7 @@ w = { weight = "k_norm.weight", len = "hd_g" }
 op = "kernel"
 kernel = "g4_v_norm_g"
 layers = ["full"]
+when = "kv_owner"
 grid = ["kvh_g", "rows"]
 
 [attention.node.bind]
@@ -271,6 +283,7 @@ x = { buffer = "qkv" }
 op = "kernel"
 kernel = "g4_k_rope_g"
 layers = ["full"]
+when = "kv_owner"
 grid = ["kvh_g", "rows"]
 
 [attention.node.bind]
@@ -280,6 +293,7 @@ x = { buffer = "qkv" }
 op = "kernel"
 kernel = "g4_k_write_g"
 layers = ["full"]
+when = "kv_owner"
 grid = ["kvh_g", "rows"]
 
 [attention.node.bind]
@@ -291,6 +305,7 @@ layer = "kind_layer"
 op = "kernel"
 kernel = "g4_v_write_g"
 layers = ["full"]
+when = "kv_owner"
 grid = ["kvh_g", "rows"]
 
 [attention.node.bind]

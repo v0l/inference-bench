@@ -120,7 +120,7 @@ pub fn dim(spec: &Spec, text: &str) -> Result<usize> {
 impl State {
     pub fn layer_count(&self, spec: &Spec) -> usize {
         match self.layers {
-            Layers::Attention if !self.blocks.is_empty() => (0..spec.layers.count).filter(|&i| self.blocks.iter().any(|b| b == spec.block(i).name())).count(),
+            Layers::Attention if !self.blocks.is_empty() => (0..spec.layers.count).filter(|&i| spec.owns_kv(i) && self.blocks.iter().any(|b| b == spec.block(i).name())).count(),
             Layers::Attention => spec.kv_layers(),
             Layers::Linear => spec.linear_layers(),
         }
@@ -186,7 +186,7 @@ pub fn kv_block_bytes(spec: &Spec, planes: usize) -> usize {
 }
 
 pub fn kv_bytes_per_token_at(spec: &Spec, attention_index: usize) -> u64 {
-    let layer = (0..spec.layers.count).filter(|&i| spec.block(i).is_attention()).nth(attention_index);
+    let layer = (0..spec.layers.count).filter(|&i| spec.owns_kv(i)).nth(attention_index);
     positional(spec)
         .filter(|s| s.layers == Layers::Attention && s.keeps(spec, layer))
         .map(|s| s.token_layer_bytes(spec, attention_index, 1) as u64)

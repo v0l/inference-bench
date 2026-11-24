@@ -1142,7 +1142,7 @@ impl Checkpoint {
             (None, None)
         };
         let mut extra = Vec::new();
-        for bind in spec.attention.node.iter().filter(|n| n.present_in(block)).flat_map(|n| n.bind.values()) {
+        for bind in spec.attention.node.iter().filter(|n| n.present_in(block) && !(shared && n.owner_only())).flat_map(|n| n.bind.values()) {
             if let crate::graph::Bind::Weight { weight, len } = bind
                 && !extra.iter().any(|(n, _): &(String, Vec<f32>)| n == weight)
             {

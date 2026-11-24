@@ -100,6 +100,30 @@ fn the_wide_tail_plan_runs_the_wide_mlp_and_the_rest_is_unchanged() {
 }
 
 #[test]
+fn shared_layers_own_no_cache_and_read_their_source() {
+    use specrt::plan::{Op, Phase, Plan};
+    let spec = Spec::from_hf_config_serving_in(&unrefused(), &popular("google__gemma-4-E2B-it")).unwrap();
+    let owners = (0..spec.layers.count).filter(|&l| spec.owns_kv(l)).count();
+    assert_eq!(owners, 15);
+    let states: Vec<(&str, usize)> = spec.state.iter().map(|s| (s.name.as_str(), s.layer_count(&spec))).collect();
+    assert_eq!(states, vec![("k_s", 12), ("v_s", 12), ("k_g", 3), ("v_g", 3)]);
+    for layer in 15..35 {
+        assert_eq!(spec.kv_index(layer), spec.attention_before(spec.kv_source(layer)));
+        assert!(spec.kv_index(layer) < 15);
+    }
+    assert_eq!(spec.kind_index(34), spec.kind_before(spec.kv_source(34)));
+    let plan = Plan::build(&spec, Phase::Prefill, true);
+    let writes = |tail: bool, block: specrt::spec::Block| plan.layer_for(block, false, tail).iter().filter(|o| matches!(o, Op::Kernel { node } if spec.attention.node[*node as usize].kernel.as_deref().is_some_and(|k| k.contains("write")))).count();
+    assert_eq!((writes(false, specrt::spec::Block::Sliding), writes(true, specrt::spec::Block::Sliding)), (2, 0));
+    assert_eq!((writes(false, specrt::spec::Block::Full), writes(true, specrt::spec::Block::Full)), (2, 0));
+    let per_token: u64 = (0..owners).map(|i| specrt::state::kv_bytes_per_token_at(&spec, i)).sum();
+    let mut all_own = spec.clone();
+    all_own.layers.shared_tail = 0;
+    let full: u64 = (0..35).map(|i| specrt::state::kv_bytes_per_token_at(&all_own, i)).sum();
+    assert!(per_token < full);
+}
+
+#[test]
 fn the_kv_cache_holds_each_layer_kind_at_its_own_width() {
     let spec = Spec::from_hf_config_serving(&popular("google__gemma-4-31B-it")).unwrap();
     let sliding = specrt::state::kv_bytes_per_token_at(&spec, 0);
