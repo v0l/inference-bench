@@ -144,7 +144,7 @@ fn the_moe_modules_compile_to_ptx() {
     let big = Spec::from_hf_config_serving(&popular("google__gemma-4-26B-A4B-it")).unwrap();
     for spec in [tiny_named("tiny-gemma4-moe"), big] {
         let m = specrt::codegen::Module::generate_kv(&spec, 256, 1, &kir::Target::sm_120()).unwrap();
-        assert!(m.source.contains("constexpr bool MOE_EXPERT_SCALE = true;"));
+        assert!(m.source.contains("const float* expert_scale,"));
         let opts = cudarc::nvrtc::CompileOptions { arch: Some("compute_120a"), options: vec!["--std=c++17".to_string()], ..Default::default() };
         cudarc::nvrtc::compile_ptx_with_opts(m.source.as_str(), opts).unwrap_or_else(|e| panic!("{}: {e:?}", spec.name));
     }
