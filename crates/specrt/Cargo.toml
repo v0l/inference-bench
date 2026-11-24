@@ -40,7 +40,7 @@ toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
-minijinja = { version = "2", features = ["json", "serde_json", "preserve_order"] }
+minijinja = { version = "2", features = ["json", "serde_json", "preserve_order", "loop_controls"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 fancy-regex = "0.17"
 

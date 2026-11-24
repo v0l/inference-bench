@@ -159,3 +159,25 @@ fn the_gpt_oss_template_renders_with_tools_and_a_date() {
     assert!(text.contains("Current date: 20") && text.contains("functions.get_weather") || text.contains("get_weather"), "{text}");
     assert!(text.ends_with("<|start|>assistant"), "{text}");
 }
+
+#[test]
+fn hub_templates_render_the_same_text_as_transformers() {
+    let hub = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/templates/hub");
+    let cases: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(hub.join("cases.json")).unwrap()).unwrap();
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&hub).unwrap() {
+        let dir = entry.unwrap().path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap();
+        let t = ChatTemplate::from_files(&read("tokenizer_config.json"), Some(&read("chat_template.jinja"))).unwrap().unwrap();
+        let want: serde_json::Value = serde_json::from_str(&read("expected.json")).unwrap();
+        for (name, case) in cases.as_object().unwrap() {
+            let text = t.render_with(case["messages"].as_array().unwrap(), &case["vars"]).unwrap();
+            assert_eq!(text, want[name].as_str().unwrap(), "{} {name}", dir.display());
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 12);
+}

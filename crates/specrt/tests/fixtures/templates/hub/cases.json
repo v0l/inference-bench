@@ -1,0 +1,25 @@
+{
+  "user": {
+    "messages": [{"role": "user", "content": "Hello there"}],
+    "vars": {"enable_thinking": false}
+  },
+  "tool_call": {
+    "messages": [
+      {"role": "user", "content": "Weather in Dublin?"},
+      {"role": "assistant", "content": "", "tool_calls": [{"type": "function", "function": {"name": "get_weather", "arguments": {"city": "Dublin", "days": 3}}}]},
+      {"role": "tool", "content": "rain"}
+    ],
+    "vars": {
+      "enable_thinking": false,
+      "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get the weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city"]}}}]
+    }
+  },
+  "thinking": {
+    "messages": [
+      {"role": "user", "content": "What is 2+2?"},
+      {"role": "assistant", "content": "4", "reasoning_content": "Add the numbers."},
+      {"role": "user", "content": "And 3+3?"}
+    ],
+    "vars": {"enable_thinking": true}
+  }
+}

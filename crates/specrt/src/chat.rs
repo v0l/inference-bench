@@ -191,7 +191,18 @@ impl ChatTemplate {
                 .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))?;
             Ok(minijinja::Value::from_safe_string(py_json(&json)))
         });
-        env.add_template("chat", &self.source).map_err(|e| anyhow!("chat template: {e}"))?;
+        env.add_filter("string", |v: minijinja::Value| -> Result<minijinja::Value, minijinja::Error> {
+            use minijinja::value::ValueKind;
+            if !matches!(v.kind(), ValueKind::Map | ValueKind::Seq) {
+                return Ok(minijinja::Value::from(v.to_string()));
+            }
+            let json = serde_json::to_value(&v)
+                .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))?;
+            let mut out = String::new();
+            write_py_repr(&json, &mut out);
+            Ok(minijinja::Value::from(out))
+        });
+        env.add_template_owned("chat", generation_blocks_as_ifs(&self.source).into_owned()).map_err(|e| anyhow!("chat template: {e}"))?;
         let base = context! {
             messages => messages,
             add_generation_prompt => true,
@@ -201,6 +212,18 @@ impl ChatTemplate {
         let ctx = context! { ..minijinja::Value::from_serialize(vars), ..base };
         env.get_template("chat").and_then(|t| t.render(ctx)).map_err(|e| anyhow!("chat template: {e}"))
     }
+}
+
+const MONTHS: [&str; 12] =
+    ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+fn generation_blocks_as_ifs(source: &str) -> std::borrow::Cow<'_, str> {
+    static TAG: std::sync::LazyLock<fancy_regex::Regex> =
+        std::sync::LazyLock::new(|| fancy_regex::Regex::new(r"\{%([-+]?)\s*(end)?generation\s*([-+]?)%\}").unwrap());
+    TAG.replace_all(source, |caps: &fancy_regex::Captures| {
+        let keyword = if caps.get(2).is_some() { "endif" } else { "if true" };
+        format!("{{%{} {keyword} {}%}}", &caps[1], &caps[3])
+    })
 }
 
 fn strftime_now(format: &str) -> String {
@@ -217,6 +240,8 @@ fn strftime_now(format: &str) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
     format
+        .replace("%B", MONTHS[month as usize - 1])
+        .replace("%b", &MONTHS[month as usize - 1][..3])
         .replace("%Y", &format!("{year:04}"))
         .replace("%m", &format!("{month:02}"))
         .replace("%d", &format!("{day:02}"))
@@ -287,6 +312,54 @@ fn prepare(messages: &[Value], vars: &Value, iterates_content: bool) -> (Vec<Val
         }
     }
     (messages, vars)
+}
+
+fn write_py_repr(v: &Value, out: &mut String) {
+    match v {
+        Value::Null => out.push_str("None"),
+        Value::Bool(b) => out.push_str(if *b { "True" } else { "False" }),
+        Value::Number(n) => out.push_str(&n.to_string()),
+        Value::String(s) => {
+            let quote = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
+            out.push(quote);
+            for c in s.chars() {
+                match c {
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    c if c == quote => {
+                        out.push('\\');
+                        out.push(c);
+                    }
+                    c => out.push(c),
+                }
+            }
+            out.push(quote);
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_py_repr(item, out);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            out.push('{');
+            for (i, (k, item)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_py_repr(&Value::String(k.clone()), out);
+                out.push_str(": ");
+                write_py_repr(item, out);
+            }
+            out.push('}');
+        }
+    }
 }
 
 pub fn py_json(v: &Value) -> String {
