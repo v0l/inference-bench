@@ -1384,7 +1384,7 @@ mod tests {
         }
         assert_eq!(b.end_step(&mut eng).unwrap(), 0);
         assert!(eng.copies.is_empty());
-        assert_eq!(pointer_table_of(|p| b.resident(p), |e| e, 8, 0, 8).1, true);
+        assert!(pointer_table_of(|p| b.resident(p), |e| e, 8, 0, 8).1);
         assert!(b.evict(3));
         let g = b.plan(&[3], false).unwrap();
         assert_eq!(g, vec![vec![Placed { page: 3, slot: 3, copy: true }]], "with no scratch a miss reuses a free cache slot");
