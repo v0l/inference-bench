@@ -44,8 +44,16 @@ fn the_12b_unified_config_maps_like_the_31b() {
 fn the_parts_not_built_yet_are_refused_by_name() {
     let moe = Spec::from_hf_config_serving(&popular("google__gemma-4-26B-A4B-it")).unwrap_err().to_string();
     assert!(moe.contains("enable_moe_block"), "{moe}");
-    let small = Spec::from_hf_config_serving(&popular("google__gemma-4-E2B-it")).unwrap_err().to_string();
-    assert!(small.contains("hidden_size_per_layer_input"), "{small}");
+    for repo in ["google__gemma-4-E2B-it", "google__gemma-4-E4B-it"] {
+        let spec = Spec::from_hf_config_serving(&popular(repo)).unwrap();
+        assert!(spec.layers.shared_tail > 0 && spec.per_layer().is_some(), "{repo}");
+    }
+    let e2b = Spec::from_hf_config_serving(&popular("google__gemma-4-E2B-it")).unwrap();
+    let e4b = Spec::from_hf_config_serving(&popular("google__gemma-4-E4B-it")).unwrap();
+    assert!(e2b.mlp.wide_shared_tail, "E2B uses the double wide mlp");
+    assert!(!e4b.mlp.wide_shared_tail, "E4B does not use the double wide mlp");
+    assert_eq!((e4b.layers.count, e4b.layers.shared_tail, e4b.per_layer().unwrap().dim), (42, 18, 256));
+    assert_eq!((param(&e4b, "hd_s"), param(&e4b, "hd_g")), (256.0, 512.0));
 }
 
 fn unrefused() -> specrt::family::Registry {

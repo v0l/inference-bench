@@ -10,18 +10,6 @@ architectures = ["Gemma4ForConditionalGeneration", "Gemma4ForCausalLM", "Gemma4U
 when = "enable_moe_block"
 message = "Gemma 4 mixture-of-experts layers (enable_moe_block) are not supported yet"
 
-[[refuse]]
-when = "hidden_size_per_layer_input > 0"
-message = "Gemma 4 per-layer input embeddings (hidden_size_per_layer_input) are not supported yet"
-
-[[refuse]]
-when = "num_kv_shared_layers > 0"
-message = "Gemma 4 KV sharing across layers (num_kv_shared_layers) is not supported yet"
-
-[[refuse]]
-when = "use_double_wide_mlp"
-message = "Gemma 4 double wide MLP layers (use_double_wide_mlp) are not supported yet"
-
 [per_layer]
 dim = "hidden_size_per_layer_input"
 
