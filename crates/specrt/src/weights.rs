@@ -227,9 +227,11 @@ pub struct View<'a> {
 }
 
 fn shard_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let index = dir.join(INDEX);
+    let diffusers = ["diffusion_pytorch_model.safetensors.index.json", "diffusion_pytorch_model.safetensors"];
+    let (index_name, single_name) = if !dir.join(INDEX).exists() && !dir.join(SINGLE).exists() && (dir.join(diffusers[0]).exists() || dir.join(diffusers[1]).exists()) { (diffusers[0], diffusers[1]) } else { (INDEX, SINGLE) };
+    let index = dir.join(index_name);
     if !index.exists() {
-        return Ok(vec![dir.join(SINGLE)]);
+        return Ok(vec![dir.join(single_name)]);
     }
     let text = std::fs::read_to_string(&index).with_context(|| index.display().to_string())?;
     let json: serde_json::Value = serde_json::from_str(&text).with_context(|| index.display().to_string())?;
@@ -501,6 +503,10 @@ impl Checkpoint {
             Dtype::F8_E4M3 => bail!("{name} is FP8; use quant = \"fp8_block128\""),
             other => bail!("{name} is {other:?}, expected bf16, f16 or f32"),
         })
+    }
+
+    pub fn f32_values(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
+        self.floats(name, shape)
     }
 
     fn floats(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {

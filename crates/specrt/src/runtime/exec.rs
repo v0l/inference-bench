@@ -131,6 +131,7 @@ impl Runtime {
             Op::Gemv { .. } | Op::GemvStore { .. } | Op::StepAttention | Op::GdnStep => unreachable!("{} runs on the single row plan", op.label()),
             Op::HyperExpand | Op::HyperPre { .. } | Op::HyperPost | Op::HyperMean => self.hyper_op(op, layer, n),
             Op::PerLayer { node, stage } => self.per_layer_op(node, stage, layer, run),
+            Op::Dit(_) => anyhow::bail!("{} runs in the denoiser, not the token runtime", op.label()),
         }
     }
 

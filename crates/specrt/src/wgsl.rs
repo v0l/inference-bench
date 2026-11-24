@@ -53,6 +53,7 @@ pub fn kernels_for(op: &Op, spec: &Spec, tokens: usize) -> Result<Vec<&'static s
         Op::AllReduce | Op::AllReduceNorm { .. } => anyhow::bail!("tensor parallel is not on wgpu"),
         Op::Gemv { .. } | Op::GemvStore { .. } | Op::StepAttention | Op::GdnStep => anyhow::bail!("the single row cuda plan is not on wgpu"),
         Op::HyperExpand | Op::HyperPre { .. } | Op::HyperPost | Op::HyperMean => anyhow::bail!("hyper-connections are not yet on wgpu"),
+        Op::Dit(_) => anyhow::bail!("the denoiser is not yet on wgpu"),
     })
 }
 

@@ -523,23 +523,22 @@ impl Description {
         out
     }
 
-    fn tile(&self, width: u32, layout: &Option<String>, at: &[String]) -> Result<Option<Tile>, String> {
+    fn tile(&self, shape: &Shape, width: u32, layout: &Option<String>, at: &[String]) -> Result<Option<Tile>, String> {
         let Some(text) = layout else {
             return if at.is_empty() { Ok(None) } else { Err(format!("{}: stage has `at` without a layout", self.name)) };
         };
         let bad = || format!("{}: layout {text:?} is not (shape):(stride)", self.name);
-        let (shape, stride) = text.split_once(':').ok_or_else(bad)?;
-        let list = |part: &str| -> Result<Vec<u64>, String> {
-            let inner = part.trim().strip_prefix('(').and_then(|p| p.strip_suffix(')')).ok_or_else(bad)?;
-            inner
-                .split(',')
-                .map(|x| match x.trim() {
-                    "width" => Ok(width as u64),
-                    n => n.parse::<u64>().map_err(|_| bad()),
-                })
-                .collect()
+        let (shape_text, stride_text) = split_top(text, ':').ok_or_else(bad)?;
+        let leaf = |tok: &str| -> Result<u64, String> {
+            match tok.trim() {
+                "width" => Ok(width as u64),
+                t => match t.parse::<u64>() {
+                    Ok(n) => Ok(n),
+                    Err(_) => self.size(shape, &Value::String(t.to_string()), "layout").map(u64::from),
+                },
+            }
         };
-        let layout = Layout::flat(&list(shape)?, &list(stride)?)?;
+        let layout = Layout::new(nest(shape_text, &leaf).map_err(|e| format!("{}: {e}", bad()))?, nest(stride_text, &leaf).map_err(|e| format!("{}: {e}", bad()))?)?;
         Ok(Some(Tile { layout, at: at.to_vec() }))
     }
 
@@ -1085,14 +1084,14 @@ impl Description {
         for s in &self.stage {
             let expr = |s: &StageDesc| -> Result<Expr, String> { Expr::parse(&self.text(&words, &need(&s.expr, "expr", &s.op)?)).map_err(|e| format!("{}: {e}", self.name)) };
             stages.push(match s.op.as_str() {
-                "tile_load" => Stage::TileLoad { dst: need(&s.name, "name", &s.op)?, src: need(&s.src, "src", &s.op)?, tile: self.tile(width, &s.layout, &s.at)?, mat: self.mat(&s.materialize)? },
+                "tile_load" => Stage::TileLoad { dst: need(&s.name, "name", &s.op)?, src: need(&s.src, "src", &s.op)?, tile: self.tile(shape, width, &s.layout, &s.at)?, mat: self.mat(&s.materialize)? },
                 "epilogue" => Stage::Epilogue { dst: need(&s.name, "name", &s.op)?, expr: expr(s)?, mat: self.mat(&s.materialize)? },
                 "block_sum" => Stage::BlockSum { dst: need(&s.name, "name", &s.op)?, expr: expr(s)? },
                 "gather" => Stage::Gather { dst: need(&s.name, "name", &s.op)?, src: need(&s.src, "src", &s.op)?, index: need(&s.index, "index", &s.op)? },
                 "lookup" => Stage::Lookup { dst: need(&s.name, "name", &s.op)?, src: need(&s.src, "src", &s.op)?, index: need(&s.index, "index", &s.op)? },
                 "scatter" => Stage::Scatter { dst: need(&s.dst, "dst", &s.op)?, value: need(&s.value, "value", &s.op)?, index: need(&s.index, "index", &s.op)? },
-                "tile_store" => Stage::TileStore { dst: need(&s.dst, "dst", &s.op)?, value: need(&s.value, "value", &s.op)?, tile: self.tile(width, &s.layout, &s.at)? },
-                "split_store" => Stage::SplitStore { hi: need(&s.dst, "dst", &s.op)?, lo: need(&s.lo, "lo", &s.op)?, value: need(&s.value, "value", &s.op)?, tile: self.tile(width, &s.layout, &s.at)? },
+                "tile_store" => Stage::TileStore { dst: need(&s.dst, "dst", &s.op)?, value: need(&s.value, "value", &s.op)?, tile: self.tile(shape, width, &s.layout, &s.at)? },
+                "split_store" => Stage::SplitStore { hi: need(&s.dst, "dst", &s.op)?, lo: need(&s.lo, "lo", &s.op)?, value: need(&s.value, "value", &s.op)?, tile: self.tile(shape, width, &s.layout, &s.at)? },
                 "index" => Stage::Index { dst: need(&s.name, "name", &s.op)? },
                 o => return Err(format!("{}: unknown stage op {o:?}", self.name)),
             });
@@ -1207,6 +1206,34 @@ impl Description {
         };
         AttentionKernel::new(t, family, resolved).map_err(|e| format!("{}: {e}", self.name))
     }
+}
+
+fn split_top(text: &str, sep: char) -> Option<(&str, &str)> {
+    let mut depth = 0i32;
+    for (i, c) in text.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            c if c == sep && depth == 0 => return Some((&text[..i], &text[i + 1..])),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn nest(text: &str, leaf: &dyn Fn(&str) -> Result<u64, String>) -> Result<crate::layout::Nest, String> {
+    let t = text.trim();
+    let Some(inner) = t.strip_prefix('(').and_then(|p| p.strip_suffix(')')) else {
+        return leaf(t).map(crate::layout::leaf);
+    };
+    let mut parts = Vec::new();
+    let mut rest = inner;
+    while let Some((head, tail)) = split_top(rest, ',') {
+        parts.push(nest(head, leaf)?);
+        rest = tail;
+    }
+    parts.push(nest(rest, leaf)?);
+    Ok(crate::layout::tuple(parts))
 }
 
 pub fn build_builtin(name: &str, t: &Target, shape: &Shape) -> Result<Kernel, String> {

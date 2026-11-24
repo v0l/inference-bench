@@ -6,6 +6,88 @@ pub enum Phase {
     Prefill,
     Decode,
     Verify,
+    Forward,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Stream {
+    Image,
+    Text,
+    Joint,
+    Seqs,
+}
+
+impl Stream {
+    pub fn label(self) -> &'static str {
+        match self {
+            Stream::Image => "image",
+            Stream::Text => "text",
+            Stream::Joint => "joint",
+            Stream::Seqs => "seqs",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DitOp {
+    Patchify { from: &'static str, into: &'static str },
+    Unpatchify { from: &'static str, into: &'static str },
+    Split { from: &'static str, into: &'static str, rows: Stream, act: bool },
+    Copy { from: &'static str, into: &'static str, rows: Stream },
+    TimestepEmbed { from: &'static str, into: &'static str },
+    Linear { weight: &'static str, input: &'static str, output: &'static str, rows: Stream, add: bool },
+    Modulate { from: &'static str, into: &'static str, rows: Stream, set: &'static str, shift: u8, scale: u8 },
+    GatedAdd { from: &'static str, into: &'static str, rows: Stream, set: &'static str, gate: u8 },
+    Glu { from: &'static str, into: &'static str, offset: &'static str },
+    AxisRope { from: &'static str, text: &'static str, image: &'static str },
+    JointAttention { into: &'static str },
+}
+
+impl DitOp {
+    pub fn label(&self) -> String {
+        match self {
+            DitOp::Patchify { .. } => "patchify".into(),
+            DitOp::Unpatchify { .. } => "unpatchify".into(),
+            DitOp::Split { act: true, from, .. } => format!("silu {from}"),
+            DitOp::Split { from, .. } => format!("split {from}"),
+            DitOp::Copy { from, .. } => format!("copy {from}"),
+            DitOp::TimestepEmbed { .. } => "timestep embed".into(),
+            DitOp::Linear { weight, rows, .. } => format!("{weight} ({})", rows.label()),
+            DitOp::Modulate { rows, set, shift, scale, .. } => format!("{} modulate {set}[{shift},{scale}]", rows.label()),
+            DitOp::GatedAdd { rows, from, set, gate, .. } => format!("{} gated add {from} {set}[{gate}]", rows.label()),
+            DitOp::Glu { from, .. } => format!("swiglu {from}"),
+            DitOp::AxisRope { .. } => "qk norm and axis rope".into(),
+            DitOp::JointAttention { .. } => "joint attention".into(),
+        }
+    }
+
+    pub fn flow(&self) -> String {
+        match self {
+            DitOp::Patchify { from, into } | DitOp::Unpatchify { from, into } | DitOp::TimestepEmbed { from, into } | DitOp::Glu { from, into, .. } => format!("{from} to {into}"),
+            DitOp::Split { from, into, rows, .. } | DitOp::Copy { from, into, rows } | DitOp::Modulate { from, into, rows, .. } => format!("{from} to {into} ({})", rows.label()),
+            DitOp::Linear { input, output, rows, add, .. } => format!("{input} to {output} ({}{})", rows.label(), if *add { ", added" } else { "" }),
+            DitOp::GatedAdd { from, into, rows, .. } => format!("{from} gated into {into} ({})", rows.label()),
+            DitOp::AxisRope { from, .. } => format!("{from} to attention planes"),
+            DitOp::JointAttention { into } => format!("attention planes to {into}"),
+        }
+    }
+
+    pub fn kernel(&self) -> &'static str {
+        match self {
+            DitOp::Patchify { .. } => "dit_patchify",
+            DitOp::Unpatchify { .. } => "dit_unpatchify",
+            DitOp::Split { act: true, .. } => "dit_silu_split",
+            DitOp::Split { .. } => "dit_split",
+            DitOp::Copy { .. } => "dit_copy",
+            DitOp::TimestepEmbed { .. } => "dit_timestep",
+            DitOp::Linear { .. } => "vis_mma",
+            DitOp::Modulate { .. } => "dit_modulate",
+            DitOp::GatedAdd { .. } => "dit_gated_add",
+            DitOp::Glu { .. } => "dit_glu",
+            DitOp::AxisRope { .. } => "vis_axis_rope",
+            DitOp::JointAttention { .. } => "vis_flash",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -271,6 +353,7 @@ pub enum Op {
     HyperPost,
     HyperMean,
     PerLayer { node: u8, stage: u8 },
+    Dit(DitOp),
 }
 
 pub const PLE_HEAD: u8 = 0;
@@ -340,6 +423,7 @@ impl Op {
             Op::HyperMean => "hyper mean".into(),
             Op::PerLayer { stage: PLE_HEAD, .. } => "per layer inputs".into(),
             Op::PerLayer { .. } => "per layer residual".into(),
+            Op::Dit(d) => d.label(),
         }
     }
 
@@ -382,6 +466,7 @@ impl Op {
             Op::HyperMean => "streams to x".into(),
             Op::PerLayer { stage: PLE_HEAD, .. } => "tokens and hidden to per layer inputs".into(),
             Op::PerLayer { .. } => "x and per layer inputs into x".into(),
+            Op::Dit(d) => d.flow(),
         }
     }
 
@@ -540,6 +625,7 @@ impl Op {
             Op::HyperPost => names(&["hyper_post"]),
             Op::HyperMean => names(&["hyper_mean"]),
             Op::PerLayer { node, .. } => spec.per_layer.as_ref().and_then(|p| p.node.get(*node as usize)).and_then(|n| n.kernel.clone()).into_iter().collect(),
+            Op::Dit(d) => names(&[d.kernel()]),
         }
     }
 }

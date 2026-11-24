@@ -301,6 +301,47 @@ pub fn pool_kernel() -> String {
     )
 }
 
+pub fn joint_kernels() -> String {
+    r#"extern "C" __global__ void vis_axis_rope(const float* qkv, const float* qw_text, const float* kw_text, const float* qw_image, const float* kw_image,
+                                         const float* cosv, const float* sinv, bf16_t* planes, int tokens, int heads, int head_dim,
+                                         int row_stride, int text_rows, float eps) {
+    __shared__ float red[32];
+    int tok = blockIdx.x;
+    int h = blockIdx.y;
+    size_t plane = (size_t)heads * tokens * AT_HDP;
+    size_t dst = ((size_t)h * tokens + tok) * AT_HDP;
+    bool text = tok < text_rows;
+    for (int part = 0; part < 3; part++) {
+        const float* src = qkv + (size_t)tok * row_stride + (size_t)part * heads * head_dim + (size_t)h * head_dim;
+        const float* w = part == 0 ? (text ? qw_text : qw_image) : (text ? kw_text : kw_image);
+        float ss = 0.0f;
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) ss += src[d] * src[d];
+        float inv = part < 2 ? rsqrtf(block_sum(ss, red) / head_dim + eps) : 1.0f;
+        bf16_t* hi = planes + (2 * part) * plane + dst;
+        bf16_t* lo = planes + (2 * part + 1) * plane + dst;
+        for (int d = threadIdx.x; d < AT_HDP; d += blockDim.x) {
+            float v = 0.0f;
+            if (d < head_dim) {
+                v = src[d];
+                if (part < 2) {
+                    float other = src[d ^ 1] * inv * w[d ^ 1];
+                    v = v * inv * w[d];
+                    float c = cosv[(size_t)tok * head_dim + d];
+                    float s = sinv[(size_t)tok * head_dim + d];
+                    v = (d & 1) ? v * c + other * s : v * c - other * s;
+                }
+            }
+            unsigned b = f16_bits(v);
+            hi[d] = (bf16_t)b;
+            if (ATT_SPLIT) lo[d] = (bf16_t)f16_bits(v - f16_float(b));
+        }
+    }
+}
+
+"#
+    .to_string()
+}
+
 pub fn tiled_kernels() -> String {
     format!(
         r#"

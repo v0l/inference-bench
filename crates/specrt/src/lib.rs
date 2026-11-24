@@ -15,6 +15,8 @@ pub mod direct;
 pub mod discovery;
 pub mod codegen;
 pub mod compile;
+pub mod denoiser;
+pub mod denoiser_host;
 pub mod gemm;
 pub mod engine;
 pub mod executor;

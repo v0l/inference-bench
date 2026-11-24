@@ -32,7 +32,7 @@ pub enum Layout {
     Paged,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Rows {
     Tokens,
     Out,
@@ -41,6 +41,9 @@ pub enum Rows {
     Pairs(usize),
     Experts { total: usize, top_k: usize },
     Fixed(usize),
+    Image,
+    Text,
+    Joint,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -69,19 +72,22 @@ pub struct Signature {
     pub writes: Vec<Tensor>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Count {
     pub tokens: usize,
     pub out: usize,
     pub seqs: usize,
     pub context: usize,
+    pub image: usize,
+    pub text: usize,
 }
 
 impl Count {
     pub fn new(phase: Phase, tokens: usize, context: usize) -> Count {
         match phase {
-            Phase::Prefill => Count { tokens, out: 1, seqs: 1, context },
-            Phase::Decode | Phase::Verify => Count { tokens, out: tokens, seqs: tokens, context },
+            Phase::Prefill => Count { tokens, out: 1, seqs: 1, context, ..Count::default() },
+            Phase::Decode | Phase::Verify => Count { tokens, out: tokens, seqs: tokens, context, ..Count::default() },
+            Phase::Forward => Count { tokens, out: tokens, seqs: 1, context, ..Count::default() },
         }
     }
 
@@ -94,6 +100,9 @@ impl Count {
             Rows::Pairs(p) => self.tokens * p,
             Rows::Experts { total, top_k } => total.min(self.tokens * top_k),
             Rows::Fixed(n) => n,
+            Rows::Image => self.image,
+            Rows::Text => self.text,
+            Rows::Joint => self.image + self.text,
         }
     }
 }
@@ -574,6 +583,7 @@ impl<'a> Signer<'a> {
                     _ => sig(Class::Elementwise, vec![streams], vec![self.x()]),
                 }
             }
+            Op::Dit(_) => bail!("{} is a denoiser op; sign it with denoiser::Signer", op.label()),
         })
     }
 }
