@@ -41,7 +41,6 @@
     "shared_intermediate": 1408,
     "dense_layers": [
       0
-    ],
-    "shared_gate": true
+    ]
   }
 }

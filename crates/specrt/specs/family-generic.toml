@@ -6,6 +6,38 @@ mtp = true
 [blocks]
 kind = "from_config"
 
+[norm]
+no_offset_keys = ["linear_attn_config.kda_layers"]
+
+[rope]
+nope_zero_key = "qk_rope_head_dim"
+
+[moe]
+shared_gate_key = "shared_expert_intermediate_size"
+
+[hyper]
+streams = "hc_mult"
+sinkhorn_iters = "hc_sinkhorn_iters"
+eps = "hc_eps"
+
+[[attention.kinds]]
+kind = "dsa"
+keys = ["kv_lora_rank", "index_topk"]
+
+[[attention.kinds]]
+kind = "mla"
+keys = ["kv_lora_rank"]
+
+[attention.indexer]
+heads = "index_n_heads"
+head_dim = "index_head_dim"
+topk = "index_topk"
+kpool = "index_kpool"
+
+[[linear.kinds]]
+kind = "kda"
+keys = ["linear_attn_config.kda_layers"]
+
 [fields]
 num_experts = ["n_routed_experts"]
 mtp_num_hidden_layers = ["num_nextn_predict_layers"]

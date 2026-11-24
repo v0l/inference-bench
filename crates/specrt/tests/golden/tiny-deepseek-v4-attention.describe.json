@@ -28,7 +28,12 @@
     "head_dim": 64,
     "qkv_bias": false,
     "qk_norm": false,
-    "rotary_dim": 16
+    "rotary_dim": 16,
+    "indexer": {
+      "heads": 16,
+      "head_dim": 32,
+      "topk": 3
+    }
   },
   "rope": {
     "style": "neox",
@@ -42,7 +47,11 @@
     "active": 2,
     "expert_intermediate": 512,
     "shared_intermediate": 512,
-    "shared_gate": true,
     "routed_scale": 1.5
+  },
+  "hyper": {
+    "streams": 2,
+    "sinkhorn_iters": 20,
+    "eps": 1e-6
   }
 }

@@ -19,7 +19,7 @@
     "eps": 1e-6
   },
   "attention": {
-    "kind": "gqa",
+    "kind": "mla",
     "heads": 16,
     "kv_heads": 16,
     "head_dim": 128,
@@ -52,7 +52,6 @@
     "dense_layers": [
       0
     ],
-    "norm_topk": false,
-    "shared_gate": true
+    "norm_topk": false
   }
 }

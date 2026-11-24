@@ -19,12 +19,17 @@
     "eps": 1e-6
   },
   "attention": {
-    "kind": "gqa",
+    "kind": "dsa",
     "heads": 4,
     "kv_heads": 4,
     "head_dim": 32,
     "qkv_bias": false,
-    "qk_norm": false
+    "qk_norm": false,
+    "indexer": {
+      "heads": 8,
+      "head_dim": 64,
+      "topk": 8
+    }
   },
   "rope": {
     "style": "neox",
@@ -42,7 +47,6 @@
       0,
       1
     ],
-    "shared_gate": true,
     "routed_scale": 2.5
   }
 }

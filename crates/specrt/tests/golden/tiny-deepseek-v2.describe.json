@@ -19,7 +19,7 @@
     "eps": 1e-6
   },
   "attention": {
-    "kind": "gqa",
+    "kind": "mla",
     "heads": 4,
     "kv_heads": 4,
     "head_dim": 32,
@@ -44,7 +44,6 @@
       2,
       3
     ],
-    "norm_topk": false,
-    "shared_gate": true
+    "norm_topk": false
   }
 }

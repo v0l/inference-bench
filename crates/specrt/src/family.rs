@@ -101,6 +101,65 @@ pub struct FamilyAttention {
     pub qk_norm_unit: bool,
     pub fused_qkv: bool,
     pub o_tensor: Option<String>,
+    pub kinds: Vec<KindRule<crate::spec::AttentionKind>>,
+    pub indexer: Option<FamilyIndexer>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KindRule<T> {
+    pub kind: T,
+    pub keys: Vec<String>,
+}
+
+pub fn first_kind<T: Copy>(rules: &[KindRule<T>], config: &serde_json::Value) -> Option<T> {
+    rules.iter().find(|r| r.keys.iter().all(|k| dotted(config, k).is_some_and(|v| !v.is_null()))).map(|r| r.kind)
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FamilyIndexer {
+    pub heads: String,
+    pub head_dim: String,
+    pub topk: String,
+    #[serde(default)]
+    pub kpool: Option<String>,
+}
+
+impl FamilyIndexer {
+    pub fn read(&self, config: &serde_json::Value) -> Option<crate::spec::Indexer> {
+        let n = |k: &str| dotted(config, k).and_then(|v| v.as_u64()).map(|n| n as usize);
+        Some(crate::spec::Indexer {
+            heads: n(&self.heads)?,
+            head_dim: n(&self.head_dim)?,
+            topk: n(&self.topk)?,
+            kpool: self.kpool.as_deref().and_then(n).unwrap_or(1),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyHyper {
+    pub streams: Option<String>,
+    pub sinkhorn_iters: Option<String>,
+    pub eps: Option<String>,
+}
+
+impl FamilyHyper {
+    pub fn read(&self, config: &serde_json::Value) -> Option<crate::spec::Hyper> {
+        let at = |k: &Option<String>| k.as_deref().and_then(|k| dotted(config, k));
+        let streams = at(&self.streams)?.as_u64().filter(|n| *n > 1)? as usize;
+        Some(crate::spec::Hyper {
+            streams,
+            sinkhorn_iters: at(&self.sinkhorn_iters).and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            eps: at(&self.eps).and_then(|v| v.as_f64()).unwrap_or(0.0),
+        })
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &str> {
+        [&self.streams, &self.sinkhorn_iters, &self.eps].into_iter().flatten().map(String::as_str)
+    }
 }
 
 impl Default for FamilyAttention {
@@ -120,6 +179,8 @@ impl Default for FamilyAttention {
             qk_norm_unit: false,
             fused_qkv: false,
             o_tensor: None,
+            kinds: Vec::new(),
+            indexer: None,
         }
     }
 }
@@ -130,11 +191,12 @@ pub struct FamilyNorm {
     pub unit_offset: Option<bool>,
     pub sandwich: bool,
     pub pre: bool,
+    pub no_offset_keys: Vec<String>,
 }
 
 impl Default for FamilyNorm {
     fn default() -> Self {
-        FamilyNorm { unit_offset: None, sandwich: false, pre: true }
+        FamilyNorm { unit_offset: None, sandwich: false, pre: true, no_offset_keys: Vec::new() }
     }
 }
 
@@ -169,6 +231,7 @@ pub struct FamilyGated {
 pub struct FamilyMoe {
     pub shared_module: Option<String>,
     pub shared_gate: Option<bool>,
+    pub shared_gate_key: Option<String>,
     pub router: Option<crate::spec::RouterAct>,
     pub norm_topk: Option<bool>,
     pub score_bias: bool,
@@ -263,6 +326,7 @@ pub struct FamilyBlocks {
 #[serde(default, deny_unknown_fields)]
 pub struct FamilyLinear {
     pub fused_interleaved: bool,
+    pub kinds: Vec<KindRule<crate::spec::LinearKind>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -324,6 +388,7 @@ pub struct FamilyRope {
     pub nope_key: Option<String>,
     pub nope_value: Option<String>,
     pub nope_all: bool,
+    pub nope_zero_key: Option<String>,
     pub interleaved: bool,
 }
 
@@ -521,6 +586,8 @@ pub struct Family {
     #[serde(default)]
     pub linear: FamilyLinear,
     #[serde(default)]
+    pub hyper: FamilyHyper,
+    #[serde(default)]
     pub tensors: std::collections::BTreeMap<String, String>,
 }
 
@@ -579,6 +646,23 @@ impl Family {
             push(k, &mut out);
         }
         if let Some(k) = self.rope.nope_key.as_deref() {
+            push(k, &mut out);
+        }
+        if let Some(k) = self.rope.nope_zero_key.as_deref() {
+            push(k, &mut out);
+        }
+        for k in self.hyper.keys() {
+            push(k, &mut out);
+        }
+        if let Some(i) = &self.attention.indexer {
+            for k in [Some(&i.heads), Some(&i.head_dim), Some(&i.topk), i.kpool.as_ref()].into_iter().flatten() {
+                push(k, &mut out);
+            }
+        }
+        for k in self.attention.kinds.iter().flat_map(|r| &r.keys).chain(self.linear.kinds.iter().flat_map(|r| &r.keys)).chain(&self.norm.no_offset_keys) {
+            push(k, &mut out);
+        }
+        if let Some(k) = self.moe.shared_gate_key.as_deref() {
             push(k, &mut out);
         }
         for k in &self.rope.type_keys {
