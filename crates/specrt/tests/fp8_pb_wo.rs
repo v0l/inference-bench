@@ -49,9 +49,9 @@ impl Case {
         Case { rows, cols, codes, grid }
     }
 
-    fn bf16_weight(&self, r: usize, c: usize) -> f64 {
+    fn exact_weight(&self, r: usize, c: usize) -> f64 {
         let s = self.grid[r / FP8_BLOCK * self.cols.div_ceil(FP8_BLOCK) + c / FP8_BLOCK];
-        bf16_to_f32(f32_to_bf16(e4m3_to_f32(self.codes[r * self.cols + c]) * s)) as f64
+        e4m3_to_f32(self.codes[r * self.cols + c]) as f64 * s as f64
     }
 
     fn checkpoint(&self, tag: &str) -> PathBuf {
@@ -114,8 +114,8 @@ fn the_weight_only_fp8_block_gemm_matches_the_bf16_reference() {
     let most = 96;
     let x: Vec<f32> = (0..most * k).map(|_| rng.float() * 3.0).collect();
     let hi: Vec<u16> = x.iter().map(|&v| f32_to_bf16(v)).collect();
-    let lo: Vec<u16> = x.iter().zip(&hi).map(|(&v, &h)| f32_to_bf16(v - bf16_to_f32(h))).collect();
-    let xs: Vec<f64> = hi.iter().zip(&lo).map(|(&h, &l)| (bf16_to_f32(h) + bf16_to_f32(l)) as f64).collect();
+    let lo: Vec<u16> = vec![0; hi.len()];
+    let xs: Vec<f64> = hi.iter().map(|&h| bf16_to_f32(h) as f64).collect();
     let w = stream.clone_htod(&values[..]).unwrap();
     let sc = stream.clone_htod(&scales).unwrap();
     let dh = stream.clone_htod(&hi).unwrap();
@@ -166,13 +166,13 @@ fn the_weight_only_fp8_block_gemm_matches_the_bf16_reference() {
         let mut err = 0f64;
         for t in 0..tokens {
             for r in 0..n {
-                let want: f64 = (0..k).map(|i| c.bf16_weight(r, i) * xs[t * k + i]).sum();
+                let want: f64 = (0..k).map(|i| c.exact_weight(r, i) * xs[t * k + i]).sum();
                 scale = scale.max(want.abs());
                 err = err.max((got[t * n + r] as f64 - want).abs());
             }
         }
         eprintln!("{} ({:?}) tokens {tokens}: max err {err:.3e} of {scale:.3e}", choice.name, choice.path);
-        assert!(err <= 4e-3 * scale, "{}: {err} of {scale}", choice.name);
+        assert!(err <= 1e-5 * scale, "{}: {err} of {scale}", choice.name);
         paths.push(choice.path);
     }
     assert!(paths.contains(&GemmPath::F8b) && paths.contains(&GemmPath::Mma), "{paths:?}");

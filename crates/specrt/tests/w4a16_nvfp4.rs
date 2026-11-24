@@ -91,7 +91,11 @@ fn w4a16_nvfp4_decoded_by_kir_then_the_bf16_gemm_matches_the_bf16_reference() {
     let x: Vec<f32> = (0..tokens * k).map(|_| rng.float() * 3.0).collect();
     let hi: Vec<u16> = x.iter().map(|&v| f32_to_bf16(v)).collect();
     let lo: Vec<u16> = x.iter().zip(&hi).map(|(&v, &h)| f32_to_bf16(v - bf16_to_f32(h))).collect();
-    let xs: Vec<f64> = hi.iter().zip(&lo).map(|(&h, &l)| (bf16_to_f32(h) + bf16_to_f32(l)) as f64).collect();
+    let xs: Vec<f64> = if spec.split_activations() {
+        hi.iter().zip(&lo).map(|(&h, &l)| (bf16_to_f32(h) + bf16_to_f32(l)) as f64).collect()
+    } else {
+        hi.iter().map(|&h| bf16_to_f32(h) as f64).collect()
+    };
     let choice = specrt::gemm::select(&spec, &target, "o", tokens, WeightKind::Bf16).unwrap();
     assert_eq!(choice.path, GemmPath::Mma, "{}", choice.name);
     assert!(choice.quant.is_none(), "activations stay bf16");
@@ -121,6 +125,6 @@ fn w4a16_nvfp4_decoded_by_kir_then_the_bf16_gemm_matches_the_bf16_reference() {
         }
     }
     eprintln!("{}: max err {err:.3e} of {scale:.3e}", choice.name);
-    assert!(err <= 1e-3 * scale, "{err} of {scale}");
+    assert!(err <= 1e-5 * scale, "{err} of {scale}");
     std::fs::remove_dir_all(&cache).ok();
 }
