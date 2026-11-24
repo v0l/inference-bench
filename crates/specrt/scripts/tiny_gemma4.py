@@ -9,7 +9,10 @@ import torch
 SEED = 0
 PROMPT = 96
 GREEDY = 32
-FIXTURE = Path(__file__).parent.parent / "tests/fixtures/tiny-gemma4"
+MOE = os.environ.get("G4_MOE") == "1"
+NAME = "tiny-gemma4-moe" if MOE else "tiny-gemma4"
+FIXTURE = Path(__file__).parent.parent / "tests/fixtures" / NAME
+MOE_FIELDS = {"enable_moe_block": True, "num_experts": 4, "top_k_experts": 2, "moe_intermediate_size": 64}
 
 
 def config():
@@ -37,7 +40,6 @@ def config():
         hidden_size_per_layer_input=0,
         vocab_size_per_layer_input=512,
         num_kv_shared_layers=0,
-        enable_moe_block=False,
         use_double_wide_mlp=False,
         rms_norm_eps=1e-6,
         tie_word_embeddings=True,
@@ -46,6 +48,7 @@ def config():
         bos_token_id=None,
         pad_token_id=None,
         attn_implementation="eager",
+        **(MOE_FIELDS if MOE else {"enable_moe_block": False}),
     )
     for key, value in json.loads(os.environ.get("G4_OVERRIDE", "{}")).items():
         setattr(cfg, key, value)
@@ -60,12 +63,16 @@ def weights(model):
             continue
         if name.endswith("layer_scalar"):
             v = 0.5 + torch.rand(p.shape, generator=g)
+        elif name.endswith("per_expert_scale"):
+            v = 0.5 + torch.rand(p.shape, generator=g)
         elif p.dim() == 1:
             v = 1.0 + 0.2 * torch.randn(p.shape, generator=g)
         elif "embed_tokens" in name:
             v = torch.randn(p.shape, generator=g) * 0.5
+        elif "router.proj" in name:
+            v = torch.randn(p.shape, generator=g) * 2.0
         else:
-            v = torch.randn(p.shape, generator=g) / p.shape[1] ** 0.5
+            v = torch.randn(p.shape, generator=g) / p.shape[-1] ** 0.5
         out[name] = v.to(torch.bfloat16).contiguous()
     return out
 
@@ -106,16 +113,16 @@ def main(out_dir):
     with torch.inference_mode():
         logits = model(ids[None]).logits[0]
         greedy = model.generate(ids[None], max_new_tokens=GREEDY, do_sample=False)[0, PROMPT:]
-    logits.float().numpy().astype(np.float32).tofile(out / "tiny-gemma4.ref.bin")
+    logits.float().numpy().astype(np.float32).tofile(out / f"{NAME}.ref.bin")
     meta = {"tokens": ids.tolist(), "greedy": greedy.tolist(), "vocab": 512}
-    (out / "tiny-gemma4.ref.json").write_text(json.dumps(meta))
-    print("tiny-gemma4 ->", out)
+    (out / f"{NAME}.ref.json").write_text(json.dumps(meta))
+    print(NAME, "->", out)
 
 
 def layer_states(out_dir):
     out = Path(out_dir)
     model = build()
-    meta = json.loads((out / "tiny-gemma4.ref.json").read_text())
+    meta = json.loads((out / f"{NAME}.ref.json").read_text())
     ids = torch.tensor(meta["tokens"])
     seen = []
     hooks = [l.register_forward_hook(lambda _m, _i, o: seen.append(o[0] if isinstance(o, tuple) else o)) for l in model.model.layers]
@@ -128,7 +135,7 @@ def layer_states(out_dir):
     for layer, s in zip(model.model.layers, seen):
         scale *= float(layer.layer_scalar)
         rows.append(s[0] / scale)
-    torch.stack(rows).float().numpy().astype(np.float32).tofile(out / "tiny-gemma4.layers.bin")
+    torch.stack(rows).float().numpy().astype(np.float32).tofile(out / f"{NAME}.layers.bin")
 
 
 if __name__ == "__main__":

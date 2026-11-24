@@ -738,6 +738,16 @@ pub struct Moe {
     pub hash_table: Option<String>,
     #[serde(default, skip_serializing_if = "TpSplit::is_auto")]
     pub tp_split: TpSplit,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub parallel_dense: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_norm: Option<String>,
+    #[serde(default = "default_routed_scale", skip_serializing_if = "is_default_routed_scale")]
+    pub router_norm_scale: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_norm: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert_scale: Option<String>,
     #[serde(skip)]
     pub local: Option<ExpertRange>,
 }
@@ -1674,6 +1684,14 @@ impl Spec {
         ensure!(m.expert_intermediate.is_multiple_of(256) || experts_quant == Quant::Bf16, "nvfp4 experts need an intermediate size that is a multiple of 256");
         ensure!(m.expert_intermediate.is_multiple_of(16) && m.shared_intermediate.is_multiple_of(16), "expert intermediate sizes must be multiples of 16");
         ensure!(
+            m.parallel_dense || (m.router_norm.is_none() && m.input_norm.is_none() && m.expert_scale.is_none() && m.router_norm_scale == 1.0),
+            "[moe] router_norm, router_norm_scale, input_norm and expert_scale take parallel_dense = true"
+        );
+        ensure!(
+            !m.parallel_dense || (self.norm.sandwich && self.dims.intermediate > 0 && m.dense_layers.is_empty() && m.sparse_step <= 1),
+            "[moe] parallel_dense needs sandwich norms, a dense intermediate size and experts on every layer"
+        );
+        ensure!(
             m.shared_intermediate == 0 || m.shared_intermediate.is_multiple_of(m.expert_intermediate),
             "the shared experts ({} wide) must be a whole number of routed expert widths ({})",
             m.shared_intermediate,
@@ -1933,6 +1951,14 @@ impl Spec {
                     hash_layers: if family.moe.hash_table.is_some() { hf.num_hash_layers.unwrap_or(0) } else { 0 },
                     hash_table: family.moe.hash_table.clone(),
                     tp_split: TpSplit::Auto,
+                    parallel_dense: family.moe.parallel_dense,
+                    router_norm: family.moe.router_norm.clone(),
+                    router_norm_scale: match &family.moe.router_norm_scale {
+                        Some(expr) => crate::family::ParamSource::Expr { expr: expr.clone() }.read("router_norm_scale", &value)?,
+                        None => 1.0,
+                    },
+                    input_norm: family.moe.input_norm.clone(),
+                    expert_scale: family.moe.expert_scale.clone(),
                     local: None,
                 })
             }
@@ -2315,6 +2341,10 @@ impl Spec {
             }
         }
         Ok(())
+    }
+
+    pub fn parallel_moe(&self) -> bool {
+        self.moe.as_ref().is_some_and(|m| m.parallel_dense)
     }
 
     pub fn weight_len(&self, symbol: &str) -> Result<usize> {

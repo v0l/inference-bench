@@ -571,6 +571,11 @@ fn opt_bytes(v: &Option<CudaSlice<f32>>) -> u64 {
 }
 
 impl DeviceLayer {
+    fn moe_norms(&self) -> (&CudaSlice<f32>, &CudaSlice<f32>) {
+        let p = self.moe.as_ref().and_then(|m| m.parallel()).expect("a parallel moe layer has its post norms");
+        (&p.post_dense, &p.post_experts)
+    }
+
     fn bytes(&self) -> u64 {
         let mixer = match &self.mixer {
             DeviceMixer::Attention(a) => {
@@ -793,6 +798,7 @@ struct PrefillBuffers {
     branch: CudaSlice<f32>,
     streams: CudaSlice<f32>,
     hyper_mix: CudaSlice<f32>,
+    merged: CudaSlice<f32>,
     qkv: CudaSlice<f32>,
     attn: CudaSlice<f32>,
     gate_up: CudaSlice<f32>,
@@ -1160,6 +1166,7 @@ impl Runtime {
             branch: stream.alloc_zeros(if spec.uses_branch() { chunk * d.hidden } else { 1 })?,
             streams: stream.alloc_zeros(spec.hyper.as_ref().map_or(1, |h| chunk * h.streams * d.hidden))?,
             hyper_mix: stream.alloc_zeros(spec.hyper.as_ref().map_or(1, |h| chunk * (2 + h.streams) * h.streams))?,
+            merged: stream.alloc_zeros(if spec.parallel_moe() { chunk * d.hidden } else { 1 })?,
             qkv: stream.alloc_zeros(chunk * spec.qkv_rows())?,
             attn: stream.alloc_zeros(mma_only(chunk * spec.q_dim().max(spec.o_dim())))?,
             gate_up: stream.alloc_zeros(mma_only(chunk * 2 * d.intermediate))?,

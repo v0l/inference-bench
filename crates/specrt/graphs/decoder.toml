@@ -983,6 +983,134 @@ op = "moe_experts"
 op = "moe_combine"
 
 [[block]]
+name = "attention_parallel_moe"
+when = "sandwich+tensor_core+parallel"
+layers = ["dense", "full", "sliding", "shared", "compressed", "indexed"]
+mlp = "sparse"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+in = "x"
+out = "xn_planes"
+when = "pre"
+
+[[block.node]]
+op = "split"
+in = "x"
+out = "xn_planes"
+when = "nopre"
+
+[[block.node]]
+op = "linear"
+weight = "qkv"
+shard = "column"
+quant = "attn"
+in = "xn_planes"
+out = "qkv"
+
+[[block.node]]
+op = "qk_norm"
+when = "qk_norm_full"
+
+[[block.node]]
+op = "kv_rope"
+phase = "prefill"
+when = "stock"
+
+[[block.node]]
+op = "flash"
+phase = "prefill"
+when = "stock"
+
+[[block.node]]
+op = "decode_attention"
+phase = "rows"
+when = "stock"
+
+[[block.node]]
+op = "attention_nodes"
+when = "described"
+
+[[block.node]]
+op = "clear"
+out = "branch"
+
+[[block.node]]
+op = "linear"
+weight = "o"
+shard = "row"
+quant = "attn"
+in = "attn_planes"
+out = "branch"
+
+[[block.node]]
+op = "norm_add"
+weight = "post_attention_layernorm.weight"
+in = "branch"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "pre_feedforward_layernorm.weight"
+in = "x"
+out = "xn_planes"
+
+[[block.node]]
+op = "linear"
+weight = "gate_up"
+shard = "column"
+quant = "mlp"
+in = "xn_planes"
+out = "act_planes"
+
+[[block.node]]
+op = "clear"
+out = "branch"
+
+[[block.node]]
+op = "linear"
+weight = "down"
+shard = "row"
+quant = "mlp"
+in = "act_planes"
+out = "branch"
+
+[[block.node]]
+op = "clear"
+out = "merged"
+
+[[block.node]]
+op = "norm_add"
+weight = "post_feedforward_layernorm_1.weight"
+in = "branch"
+out = "merged"
+
+[[block.node]]
+op = "moe_route"
+
+[[block.node]]
+op = "moe_experts"
+
+[[block.node]]
+op = "clear"
+out = "branch"
+
+[[block.node]]
+op = "moe_combine"
+out = "branch"
+
+[[block.node]]
+op = "norm_add"
+weight = "post_feedforward_layernorm_2.weight"
+in = "branch"
+out = "merged"
+
+[[block.node]]
+op = "norm_add"
+weight = "post_feedforward_layernorm.weight"
+in = "merged"
+
+[[block]]
 name = "attention_branch_moe"
 when = "scaled+tensor_core+moe"
 layers = ["dense", "full", "sliding", "shared", "compressed", "indexed"]
