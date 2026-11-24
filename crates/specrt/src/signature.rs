@@ -164,7 +164,7 @@ fn class_of(body: &kir::Body) -> Class {
         kir::Body::Rows(r) => match r {
             RowBody::HeadRms { .. } | RowBody::LayerNorm { .. } => Class::RowReduce,
             RowBody::SpanRope { .. } => Class::Elementwise,
-            RowBody::StateWrite { .. } | RowBody::BlockPool { .. } | RowBody::IndexTopk { .. } | RowBody::PoolTopk { .. } => Class::Gather,
+            RowBody::StateWrite { .. } | RowBody::BlockPool { .. } | RowBody::IndexTopk { .. } | RowBody::PoolTopk { .. } | RowBody::GroupPool { .. } | RowBody::GroupTopk { .. } => Class::Gather,
             RowBody::HeadMatvec { .. } => Class::Gemm,
             RowBody::HyperPre { .. } => Class::RowReduce,
             RowBody::HyperPost { .. } | RowBody::HyperExpand { .. } | RowBody::HyperMean { .. } => Class::Elementwise,

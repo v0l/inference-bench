@@ -1,0 +1,65 @@
+kind = "kir-kernel"
+family = "state_write"
+name = "qsa_index_raw_write"
+threads = 64
+
+[args]
+src_row = "qkv_row"
+src_offset = "qkv_append + index_heads * index_head_dim"
+layers = "index_raw_layers"
+rows = 1
+width = "index_head_dim"
+
+[[param]]
+name = "src"
+type = "f32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "dst"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "pos"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "layer"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "pos_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "row_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "block_table"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "slots"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "pages"
+type = "i32"
+role = "value"
+access = "read"

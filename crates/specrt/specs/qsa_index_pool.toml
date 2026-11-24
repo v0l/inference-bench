@@ -1,0 +1,72 @@
+kind = "kir-kernel"
+family = "group_pool"
+name = "qsa_index_pool"
+threads = 64
+
+[args]
+dim = "index_head_dim"
+rot = "rotary_dim"
+layers = "index_pool_layers"
+ratio = "index_ratio"
+eps = "norm_eps"
+unit = "norm_unit_offset"
+
+[[param]]
+name = "raw"
+type = "bf16"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "norm"
+type = "f32"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "dst"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "pos"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "layer"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "pos_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "row_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "block_table"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "slots"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "pages"
+type = "i32"
+role = "value"
+access = "read"

@@ -1048,7 +1048,7 @@ impl Checkpoint {
         };
         let mut parts = Vec::new();
         let mut gates = Vec::new();
-        if !a.projection.is_empty() {
+        if a.projection.iter().any(|p| !p.append) {
             let mut first: Option<Raw<'_>> = None;
             let mut layout: Vec<(Option<usize>, usize, usize)> = Vec::new();
             let mut loaded = Vec::new();
@@ -1096,6 +1096,24 @@ impl Checkpoint {
             parts.push(w("v_proj", kv, h)?);
         }
         parts.extend(gates);
+        if a.projection.iter().any(|p| p.append) {
+            for (group, width) in spec.projection_groups() {
+                let live: Vec<_> = group.iter().filter(|p| spec.projection_live(p, block)).collect();
+                ensure!(live.len() <= 1, "{attn}: {} appended projections share one slot in {} layers", live.len(), block.name());
+                let rows = match live.first() {
+                    Some(p) => {
+                        let rows = crate::state::dim(spec, &p.rows)?;
+                        parts.push(w(&p.tensor, rows, h)?);
+                        rows
+                    }
+                    None => 0,
+                };
+                if width > rows {
+                    let zero = parts.first().context("appended projection without q")?.zero_rows(width - rows);
+                    parts.push(zero);
+                }
+            }
+        }
         let qkv_bias = if a.qkv_bias {
             ensure!(!a.output_gate, "qkv bias with an output gate is not supported");
             let mut b = self.f32(&format!("{attn}.q_proj.bias"), q)?;
@@ -1201,6 +1219,11 @@ impl Checkpoint {
 
     pub fn layer(&self, spec: &Spec, i: usize) -> Result<Layer<'_>> {
         self.layer_at(spec, i, i)
+    }
+
+    pub fn layer_attention(&self, spec: &Spec, i: usize) -> Result<Attn<'_>> {
+        ensure!(spec.block(i).is_attention(), "layer {i} is not an attention layer");
+        self.attention(spec, &format!("{}.layers.{i}.self_attn", self.root()), spec.block(i))
     }
 
     pub fn layer_at(&self, spec: &Spec, i: usize, global: usize) -> Result<Layer<'_>> {

@@ -240,6 +240,43 @@ def references(model, head):
     print(NAME, "prefill", tuple(prefill.shape), "greedy", greedy, "decode vs recompute", recompute)
 
 
+def indexer_reference(model, head):
+    out = FIXTURE / "reference"
+    cfg = model.config
+    layer = next(i for i, l in enumerate(model.layers) if hasattr(l, "self_attn"))
+    attn = model.layers[layer].self_attn
+    width = cfg.indexer_budget + cfg.indexer_compress_ratio - 1
+    inputs, masks, outputs = [], [], []
+    hooks = [
+        attn.register_forward_pre_hook(lambda _m, args, kwargs: inputs.append((args[0] if args else kwargs["hidden_states"])[0].detach().clone()), with_kwargs=True),
+        attn.indexer.register_forward_hook(lambda _m, _a, o: masks.append(o[0, 0].detach().clone())),
+        attn.o_proj.register_forward_pre_hook(lambda _m, args: outputs.append(args[0][0].detach().clone())),
+    ]
+    ids = prompt_tokens(cfg.vocab_size)
+    with torch.inference_mode():
+        _, state = logits_of(model, head, ids, use_cache=True)
+        past = state.past_key_values
+        greedy = [int(head(state.last_hidden_state)[0, -1].argmax())]
+        for _ in range(DECODE):
+            row, state = logits_of(model, head, torch.tensor([greedy[-1]]), past_key_values=past, use_cache=True)
+            past = state.past_key_values
+            greedy.append(int(row[-1].argmax()))
+    for h in hooks:
+        h.remove()
+    rows = []
+    for mask in masks:
+        for q in range(mask.shape[0]):
+            chosen = torch.nonzero(mask[q]).flatten().tolist()
+            assert len(chosen) <= width, (q, chosen)
+            rows.append(chosen + [-1] * (width - len(chosen)))
+    selected = torch.tensor(rows, dtype=torch.float32)
+    hidden = torch.cat(inputs)
+    gated = torch.cat(outputs)
+    assert hidden.shape[0] == PROMPT + DECODE and gated.shape[0] == PROMPT + DECODE and selected.shape[0] == PROMPT + DECODE
+    save(out, f"{NAME}.indexer", {"input": hidden, "selected": selected, "attn": gated}, {"layer": layer, "rows": PROMPT + DECODE, "prompt": PROMPT, "width": width, "greedy": greedy})
+    print(NAME, "indexer layer", layer, "rows", PROMPT + DECODE, "width", width)
+
+
 def fixture_bytes():
     return sum(p.stat().st_size for p in FIXTURE.rglob("*") if p.is_file())
 
@@ -253,6 +290,8 @@ def main():
     load(model, head)
     if command in ("all", "reference"):
         references(model, head)
+    if command in ("all", "reference", "indexer"):
+        indexer_reference(model, head)
     size = fixture_bytes()
     print(NAME, size, "bytes")
     assert size < MAX_BYTES, size
