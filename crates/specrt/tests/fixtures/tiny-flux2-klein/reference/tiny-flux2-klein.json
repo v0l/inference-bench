@@ -1,0 +1,206 @@
+{
+ "files": {
+  "text.ids": {
+   "file": "tiny-flux2-klein.text.ids.bin",
+   "shape": [
+    1,
+    16
+   ]
+  },
+  "text.mask": {
+   "file": "tiny-flux2-klein.text.mask.bin",
+   "shape": [
+    1,
+    16
+   ]
+  },
+  "text.hidden": {
+   "file": "tiny-flux2-klein.text.hidden.bin",
+   "shape": [
+    1,
+    3,
+    16,
+    32
+   ]
+  },
+  "text.embeds": {
+   "file": "tiny-flux2-klein.text.embeds.bin",
+   "shape": [
+    1,
+    16,
+    96
+   ]
+  },
+  "negative.ids": {
+   "file": "tiny-flux2-klein.negative.ids.bin",
+   "shape": [
+    1,
+    16
+   ]
+  },
+  "negative.mask": {
+   "file": "tiny-flux2-klein.negative.mask.bin",
+   "shape": [
+    1,
+    16
+   ]
+  },
+  "negative.embeds": {
+   "file": "tiny-flux2-klein.negative.embeds.bin",
+   "shape": [
+    1,
+    16,
+    96
+   ]
+  },
+  "noise": {
+   "file": "tiny-flux2-klein.noise.bin",
+   "shape": [
+    1,
+    64,
+    16
+   ]
+  },
+  "step0.velocity": {
+   "file": "tiny-flux2-klein.step0.velocity.bin",
+   "shape": [
+    1,
+    64,
+    16
+   ]
+  },
+  "step0.latent": {
+   "file": "tiny-flux2-klein.step0.latent.bin",
+   "shape": [
+    1,
+    64,
+    16
+   ]
+  },
+  "step1.velocity": {
+   "file": "tiny-flux2-klein.step1.velocity.bin",
+   "shape": [
+    1,
+    64,
+    16
+   ]
+  },
+  "step1.latent": {
+   "file": "tiny-flux2-klein.step1.latent.bin",
+   "shape": [
+    1,
+    64,
+    16
+   ]
+  },
+  "step2.velocity": {
+   "file": "tiny-flux2-klein.step2.velocity.bin",
+   "shape": [
+    1,
+    64,
+    16
+   ]
+  },
+  "step2.latent": {
+   "file": "tiny-flux2-klein.step2.latent.bin",
+   "shape": [
+    1,
+    64,
+    16
+   ]
+  },
+  "vae.latent": {
+   "file": "tiny-flux2-klein.vae.latent.bin",
+   "shape": [
+    1,
+    4,
+    16,
+    16
+   ]
+  },
+  "vae.decoded": {
+   "file": "tiny-flux2-klein.vae.decoded.bin",
+   "shape": [
+    1,
+    3,
+    32,
+    32
+   ]
+  },
+  "image": {
+   "file": "tiny-flux2-klein.image.bin",
+   "shape": [
+    1,
+    3,
+    32,
+    32
+   ]
+  },
+  "cfg.image": {
+   "file": "tiny-flux2-klein.cfg.image.bin",
+   "shape": [
+    1,
+    3,
+    32,
+    32
+   ]
+  },
+  "cfg.step0.latent": {
+   "file": "tiny-flux2-klein.cfg.step0.latent.bin",
+   "shape": [
+    1,
+    64,
+    16
+   ]
+  },
+  "cfg.step1.latent": {
+   "file": "tiny-flux2-klein.cfg.step1.latent.bin",
+   "shape": [
+    1,
+    64,
+    16
+   ]
+  },
+  "cfg.step2.latent": {
+   "file": "tiny-flux2-klein.cfg.step2.latent.bin",
+   "shape": [
+    1,
+    64,
+    16
+   ]
+  }
+ },
+ "pipeline": "Flux2KleinPipeline",
+ "seed": 0,
+ "steps": 3,
+ "height": 32,
+ "width": 32,
+ "latent": [
+  16,
+  16
+ ],
+ "image_tokens": 64,
+ "text_tokens": 16,
+ "prompt_tokens": 10,
+ "text_encoder_out_layers": [
+  1,
+  2,
+  3
+ ],
+ "sigmas": [
+  1.0,
+  0.9340106248855591,
+  0.7796623110771179,
+  0.0
+ ],
+ "timesteps": [
+  1000.0,
+  934.0106201171875,
+  779.6622924804688
+ ],
+ "guidance": 1.0,
+ "cfg_guidance": 4.0,
+ "cfg_velocities_per_step": 2,
+ "diffusers": "0.43.0",
+ "torch": "2.15.0+cpu"
+}
