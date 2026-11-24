@@ -1466,12 +1466,35 @@ impl Checkpoint {
         let weight = if self.has(&format!("{module}.weight_packed")) { format!("{module}.weight_packed") } else { format!("{module}.weight") };
         let packed = self.shaped(&weight, &[rows, cols / 2])?;
         ensure!(packed.dtype == Dtype::U8, "{weight} is {:?}, expected U8", packed.dtype);
-        let scales = self.shaped(&format!("{module}.weight_scale"), &[rows, cols / GROUP])?;
-        ensure!(scales.dtype == Dtype::F8_E4M3, "{module}.weight_scale is {:?}, expected F8_E4M3", scales.dtype);
+        let scale_name = format!("{module}.weight_scale");
+        let decoded;
+        let scale_bytes: Cow<'_, [u8]> = if !self.has(&scale_name) && self.has(&format!("{scale_name}.csf32_bases")) {
+            decoded = self.csf_scales(&scale_name, rows, cols / GROUP)?;
+            Cow::Owned(decoded)
+        } else {
+            let scales = self.shaped(&scale_name, &[rows, cols / GROUP])?;
+            ensure!(scales.dtype == Dtype::F8_E4M3, "{module}.weight_scale is {:?}, expected F8_E4M3", scales.dtype);
+            Cow::Borrowed(scales.data)
+        };
         let global = self.global_scale(module, "weight_global_scale", "weight_scale_2")?.with_context(|| format!("{module} has no weight_global_scale or weight_scale_2"))?;
-        let mut m = crate::nvfp4::Fp4::new(Cow::Borrowed(packed.data), Cow::Borrowed(scales.data), global, rows, cols)?;
+        let mut m = crate::nvfp4::Fp4::new(Cow::Borrowed(packed.data), scale_bytes, global, rows, cols)?;
         m.input_global = self.global_scale(module, "input_global_scale", "input_scale")?.unwrap_or(0.0);
         Ok(m)
+    }
+
+    pub fn csf_scales(&self, scale: &str, rows: usize, columns: usize) -> Result<Vec<u8>> {
+        let part = |p: &str, dtype: Dtype| -> Result<&[u8]> {
+            let name = format!("{scale}.csf32_{p}");
+            let v = self.view(&name)?;
+            ensure!(v.dtype == dtype && v.shape.len() == 1, "{name} is {:?} {:?}, expected {dtype:?} [n]", v.dtype, v.shape);
+            Ok(v.data)
+        };
+        let words16 = |b: &[u8]| -> Vec<u16> { b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect() };
+        let page_bases: Vec<u32> = part("page_bases", Dtype::U32)?.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let offsets = words16(part("offsets", Dtype::U16)?);
+        let exceptions = words16(part("exceptions", Dtype::U16)?);
+        let plane = crate::csf::CsfPlane { rows, columns, bases: part("bases", Dtype::U8)?, codes: part("codes", Dtype::U8)?, page_bases: &page_bases, offsets: &offsets, exceptions: &exceptions };
+        plane.decode().with_context(|| scale.to_string())
     }
 
     pub fn mtp<'a>(&'a self, spec: &Spec) -> Result<MtpWeights<'a>> {
