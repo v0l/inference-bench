@@ -71,6 +71,9 @@ pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::Mo
         input_scaled: m.input_scaled,
     };
     let mut out = vec![kir::moe::MoeKernel::new(target, kir::moe::Family::Experts, shape.clone()).map_err(anyhow::Error::msg)?];
+    if spec.runtime.offload.pointer_table && spec.runtime.offload.enabled() {
+        out.push(kir::moe::MoeKernel::new(target, kir::moe::Family::ExpertTable, shape.clone()).map_err(anyhow::Error::msg)?);
+    }
     if moe_ggml_experts(spec) {
         out.push(kir::moe::MoeKernel::new(target, kir::moe::Family::ExpertsGgml, shape.clone()).map_err(anyhow::Error::msg)?);
     }

@@ -12,6 +12,7 @@ pub use crate::ops::MoeShape;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Family {
     Experts,
+    ExpertTable,
     ExpertsGgml,
     GroupedMma,
     GroupedMx,
@@ -45,7 +46,8 @@ impl Family {
                 "moe_group_up_mx",
                 "moe_group_down_mx",
             ],
-            Family::ExpertsGgml => &["moe_up_gg", "moe_down_gg", "moe_group_up_gg", "moe_group_down_gg"],
+            Family::ExpertTable => &["moe_up_t_bf16", "moe_up_t_fp4", "moe_up_t_fp8", "moe_up_t_mx", "moe_down_t_bf16", "moe_down_t_fp4", "moe_down_t_fp8", "moe_down_t_mx"],
+            Family::ExpertsGgml => &["moe_up_gg", "moe_down_gg", "moe_up_t_gg", "moe_down_t_gg", "moe_group_up_gg", "moe_group_down_gg"],
             Family::GroupedMma => &["moe_quant_f32", "moe_tiles", "moe_mma_up", "moe_mma_up_s", "moe_mma_down", "moe_mma_down_s"],
             Family::GroupedMmaBf16 => &["moe_split_bf16", "moe_tiles_b16", "moe_mma_up_b16", "moe_mma_up_b16_s", "moe_mma_down_b16", "moe_mma_down_b16_s"],
             Family::GroupedMmaFp8 => &["moe_quant_f8", "moe_tiles_f8", "moe_mma_up_f8", "moe_mma_up_f8_s", "moe_mma_down_f8", "moe_mma_down_f8_s"],
@@ -66,7 +68,7 @@ impl Family {
 
     pub fn needs(self) -> &'static [Feature] {
         match self {
-            Family::Experts | Family::ExpertsGgml => &[Feature::WarpShuffle],
+            Family::Experts | Family::ExpertTable | Family::ExpertsGgml => &[Feature::WarpShuffle],
             Family::GroupedMma | Family::GroupedMx => &[Feature::BlockScaledFp4, Feature::CpAsync],
             Family::GroupedMmaFp8 => &[Feature::Fp8Mma, Feature::CpAsync],
             Family::GroupedMmaBf16 => &[Feature::Mma16816, Feature::CpAsync],
@@ -186,6 +188,7 @@ impl MoeKernel {
     pub fn smem(&self) -> Vec<(&'static str, u32)> {
         let up = if self.shape.mapped { 1 } else { 2 };
         match self.family {
+            Family::ExpertTable => vec![],
             Family::Experts => vec![("moe_route_logits", route_logits_smem(self.shape.hidden))],
             Family::ExpertsGgml => Vec::new(),
             Family::GroupedMma => vec![

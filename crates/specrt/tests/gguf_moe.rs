@@ -95,7 +95,7 @@ fn the_option_adds_only_the_ggml_expert_kernels_and_leaves_the_rest_of_the_modul
         let off = Module::generate(&spec(file, false), 256).unwrap();
         let on = Module::generate(&spec(file, true), 256).unwrap();
         let added: Vec<&str> = on.kernels.iter().copied().filter(|k| !off.kernels.contains(k)).collect();
-        assert_eq!(added, ["moe_up_gg", "moe_down_gg", "moe_group_up_gg", "moe_group_down_gg"], "{file}");
+        assert_eq!(added, ["moe_up_gg", "moe_down_gg", "moe_up_t_gg", "moe_down_t_gg", "moe_group_up_gg", "moe_group_down_gg"], "{file}");
         assert!(on.source.as_str().starts_with(off.source.as_str().trim_end()), "{file}: the option must only append the ggml expert family");
         assert_ne!(on.kir_hash, off.kir_hash);
     }
@@ -131,6 +131,73 @@ fn each_expert_of_a_ggml_stack_is_one_fixed_size_slot_for_the_expert_cache() {
         assert_eq!(t[rows] as usize * 16, stride);
         assert!(t[..rows].iter().all(|r| ((r >> 3) as usize) * 16 < stride), "expert {x} rows stay inside its slot");
         assert_eq!(t, &tables[..rows + 1], "every expert has the same relative row table, so a cache slot can hold any of them");
+    }
+}
+
+#[test]
+fn the_pointer_table_gets_ggml_table_kernels_that_resolve_slots_and_read_bias_by_expert_id() {
+    use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
+    let mut s = spec(FILES[0], true);
+    s.runtime.offload.pointer_table = true;
+    s.runtime.offload.vram_budget = 1 << 30;
+    let module = Module::generate(&s, 256).unwrap();
+    for k in ["moe_up_t_gg", "moe_down_t_gg", "moe_up_gg", "moe_down_gg"] {
+        assert!(module.kernels.contains(&k), "{k}");
+    }
+    let text = module.source.as_str();
+    let body = |name: &str| {
+        let at = text.find(&format!(" {name}(")).unwrap_or_else(|| panic!("{name}"));
+        &text[at..at + text[at..].find("\n}\n").unwrap()]
+    };
+    for name in ["moe_up_gg_tbl_impl", "moe_down_gg_tbl_impl"] {
+        let b = body(name);
+        assert!(b.contains("expert = tbl[expert];") && b.contains("expert -= 1;"), "{name} resolves the slot from the table");
+        assert!(b.contains("b[(size_t)eid") && !b.contains("b[(size_t)expert"), "{name} reads the bias by expert id");
+        assert!(b.contains("moe_dot_gg<"), "{name} dots ggml rows");
+    }
+    for name in ["moe_up_gg_impl", "moe_down_gg_impl", "moe_group_up_gg_impl", "moe_group_down_gg_impl"] {
+        assert!(body(name).contains("b[(size_t)expert"), "{name} reads the staged bias by slot");
+    }
+    let opts = CompileOptions { arch: Some("compute_120"), options: vec!["--std=c++17".to_string()], ..Default::default() };
+    let ptx = compile_ptx_with_opts(text, opts).unwrap().to_src();
+    for k in ["moe_up_t_gg", "moe_down_t_gg", "moe_up_t_bf16"] {
+        assert!(ptx.contains(&format!(".entry {k}(")), "{k}");
+    }
+}
+
+fn cached(file: &str, slots: usize, table: bool) -> Spec {
+    let mut s = spec(file, true);
+    s.runtime.offload.vram_budget = u64::MAX / 4;
+    s.runtime.offload.expert_slots = slots;
+    s.runtime.offload.pointer_table = table;
+    s
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn kept_experts_through_the_expert_cache_and_the_pointer_table_decode_like_resident_ones() {
+    let long: Vec<u32> = (0..40u32).map(|i| (i * 53 + 7) % 1000).collect();
+    for file in FILES {
+        let mut full = Runtime::load(&spec(file, true), 256).unwrap();
+        let want = full.trace_decode(&PROMPT[..6]).unwrap();
+        let want_tokens = full.generate(&long, 16, Sampling::GREEDY).unwrap().tokens;
+        let want_prefill = full.prompt_logits(&long).unwrap();
+        drop(full);
+        let e = spec(file, true).moe.unwrap().experts;
+        let layers = spec(file, true).layers.count;
+        for (slots, table) in [(e / 2, false), (e * layers, true), (e / 2, true)] {
+            let mut rt = Runtime::load(&cached(file, slots, table), 256).unwrap();
+            assert_eq!(rt.expert_slots(), slots, "{file}");
+            let got = rt.trace_decode(&PROMPT[..6]).unwrap();
+            assert_eq!(got.logits, want.logits, "{file} slots {slots} table {table}: decode logits");
+            assert_eq!(rt.generate(&long, 16, Sampling::GREEDY).unwrap().tokens, want_tokens, "{file} slots {slots} table {table}");
+            let pre = rt.prompt_logits(&long).unwrap();
+            let worst = pre.iter().zip(&want_prefill).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            assert!(worst < 1e-3, "{file} slots {slots} table {table}: prefill differs by {worst}");
+            let launches = rt.expert_table_launches();
+            eprintln!("{file} slots {slots} table {table}: table launches {launches}, prefill worst {worst:.2e}, {:?}", rt.offload_stats());
+            assert_eq!(launches > 0, table && slots == e * layers, "{file} slots {slots} table {table}");
+        }
     }
 }
 
