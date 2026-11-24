@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use kir as kir;
 
-pub const SPEC_FORMAT: u32 = 14;
+pub const SPEC_FORMAT: u32 = 15;
 
 pub fn modelopt_verified() -> bool {
     include_str!("../modelopt-verified.txt").trim() == "pass"
@@ -1237,6 +1237,11 @@ impl Quantization {
     fn weights(quant: Quant) -> Self {
         Quantization { quant, mlp: None, act: ActQuant::None, mlp_act: ActQuant::None }
     }
+
+    fn per_tensor(map: &crate::quant_map::QuantMap, experts: bool, layers: usize) -> Self {
+        let mlp = (experts && map.fp4_experts(layers)).then_some((Quant::Nvfp4G16, None));
+        Quantization { quant: Quant::Bf16, mlp, act: ActQuant::None, mlp_act: ActQuant::None }
+    }
 }
 
 fn compressed_act(rule: &crate::family::FamilyQuant, g: &serde_json::Value) -> ActQuant {
@@ -1700,6 +1705,10 @@ impl Spec {
             (Some(Err(e)), true) => return Err(e),
             (Some(Err(_)), false) => Default::default(),
         };
+        let quantization = match quantization {
+            Err(_) if family.quantization.per_tensor && !quant_map.is_empty() => Ok(Quantization::per_tensor(&quant_map, hf.num_experts.is_some_and(|e| e > 0), hf.num_hidden_layers)),
+            other => other,
+        };
         let Quantization { quant, mlp: mlp_quant, act, mlp_act } = match (quantization, strict) {
             (Ok(q), _) => q,
             (Err(e), true) => return Err(e),
@@ -2150,6 +2159,7 @@ impl Spec {
 
     pub fn mlp_quant(&self, layer: usize) -> Quant {
         match self.mlp.quant {
+            Some(Quant::Nvfp4G16) if !self.quant_map.is_empty() && self.quant_map.mlp_fp4(layer) != Some(true) => self.quant,
             Some(q) if self.mlp.quant_until.is_none_or(|u| layer < u) => q,
             _ => self.quant,
         }
@@ -2184,6 +2194,7 @@ impl Spec {
         s.layers.pattern = (start..end).map(|i| self.block(i)).collect();
         s.layers.count = end - start;
         s.mlp.quant_until = self.mlp.quant_until.map(|u| u.saturating_sub(start));
+        s.quant_map = self.quant_map.stage(start, end);
         if !s.layers.pattern.iter().any(|b| b.is_linear()) {
             s.linear_attention = None;
         }
