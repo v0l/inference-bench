@@ -120,3 +120,40 @@ fn gemma4_logits_and_greedy_match_transformers() {
     let got = rt.generate(&tokens, greedy.len(), specrt::runtime::Sampling::GREEDY).unwrap();
     assert_eq!(got.tokens, greedy);
 }
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/tiny_gemma4.py output in SPECRT_REF_DIR"]
+fn gemma4_served_two_slots_match_transformers_greedy() {
+    use specrt::runtime::{DecodeRow, Layout, Runtime, Sampling};
+    let (tokens, greedy, _, _) = reference();
+    let max_ctx = 256;
+    let pages = max_ctx / specrt::codegen::PAGE;
+    let layout = Layout { max_ctx, slots: 2, kv_blocks: 2 * pages, prefill_chunk: 64, kv_planes: 1, kv_headroom: 0, state_on_demand: false };
+    let mut rt = Runtime::load_layout(&tiny(), layout).unwrap();
+    rt.set_block_table(0, &(0..pages as u32).rev().collect::<Vec<_>>()).unwrap();
+    rt.set_block_table(1, &(pages as u32..2 * pages as u32).collect::<Vec<_>>()).unwrap();
+    let mut st = rt.stepper().unwrap();
+    let short = &tokens[..40];
+    let mut firsts = [None, None];
+    for (slot, prompt) in [(0usize, &tokens[..]), (1, short)] {
+        let mut start = 0;
+        while start < prompt.len() {
+            let end = (start + 64).min(prompt.len());
+            let last = end == prompt.len();
+            firsts[slot] = rt.prefill_slot(&mut st, slot, &prompt[start..end], start, last.then_some((Sampling::GREEDY, 0))).unwrap();
+            start = end;
+        }
+    }
+    let mut out = vec![firsts[0].unwrap()];
+    let mut other = vec![firsts[1].unwrap()];
+    while out.len() < greedy.len() {
+        let rows = [
+            DecodeRow { slot: 0, token: *out.last().unwrap(), pos: tokens.len() + out.len() - 1, sampling: Sampling::GREEDY, step: out.len() as u32 },
+            DecodeRow { slot: 1, token: *other.last().unwrap(), pos: short.len() + other.len() - 1, sampling: Sampling::GREEDY, step: other.len() as u32 },
+        ];
+        let next = rt.decode(&mut st, &rows).unwrap();
+        out.push(next[0]);
+        other.push(next[1]);
+    }
+    assert_eq!(out, greedy, "served greedy beside a second sequence");
+}

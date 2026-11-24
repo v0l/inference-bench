@@ -194,6 +194,7 @@ $PY crates/specrt/scripts/reference.py tiny-mtp crates/specrt/tests/fixtures/tin
 | `vision_multi_gpu.rs` | tiny27b image logits on TP=2 virtual ranks and 2 pipeline stages vs the single GPU path (KL), rank and stage specs keep vision (#910); `scripts/gate910_spark.sh` | CPU (2 spec tests), 2 | 4 | none, uses the tiny27b references | 1 GB, 60 s |
 | `real27b.rs` | 12 real-checkpoint gates: greedy and logits vs transformers and vLLM, MTP acceptance, per-layer trace, needle at 500k and 1M | 5 | 12 | `SPECRT_REF_DIR=~/.cache/specrt-ref-375`; `SPECRT_27B_SPEC`, `SPECRT_27B_NVFP4_SPEC`, `SPECRT_27B_NEEDLE_MODEL` | 25 to 96 GB; 1 to 30 min each |
 | `gemma3.rs`, `gemma3_tiny_vision.rs`, `gemma3_vision.rs`, `gemma3_27b.rs` | Gemma 3 text, SigLIP, pan and scan, 27B FP8 vs vLLM (see `specrt-gemma3.md`) | CPU (4), 2, 5 | 12 | `SPECRT_REF_DIR`, `GEMMA3_1B_DIR`, `GEMMA3_4B_DIR`, `GEMMA3_27B_DIR` | 3 to 36 GB |
+| `gemma4.rs` | Gemma 4 dense: 31B and 12B configs map, MoE and E-models refused, per kind KV bytes, kernels build; tiny-gemma4 logits, greedy and layer states vs transformers (`scripts/tiny_gemma4.py <dir>`) | CPU (5), 2 (2) | 7 | `SPECRT_REF_DIR` | 1 GB, 2 s |
 | `vision_encoder.rs`, `vision_lm.rs` | vision tower and image/video chat vs vLLM | 5 | 4, 10 | `SPECRT_VISION_REF_DIR`, `SPECRT_VISION_PRECISION` | 28 to 36 GB |
 | `nvfp4.rs` | real NVFP4 dequant vs `nvfp4-dequant` reference | 5 | 1 | the NVFP4 checkpoint | 26 GB |
 
