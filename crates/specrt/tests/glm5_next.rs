@@ -124,6 +124,7 @@ fn the_reference_loads_with_finite_prefill_decode_hidden_and_mtp_outputs() {
 }
 
 const TOLERANCE: f32 = 3.8e-4;
+const BF16_SPLIT_TOLERANCE: f32 = 5.0e-4;
 
 fn engine_spec() -> Spec {
     let family = std::fs::read_to_string(fixture().join("family.toml")).unwrap();
@@ -200,37 +201,39 @@ fn the_engine_matches_the_reference_streams_prefill_and_four_decode_steps() {
         assert!(g < TOLERANCE, "layer {layer} streams max abs {g}");
     }
     let prefill = floats(&format!("{NAME}.ref.bin"));
+    let top = |row: &[f32]| row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+    let tops = |logits: &[f32]| -> Vec<u32> { logits.chunks(vocab).map(top).collect() };
     let p = gap(&trace.logits, &prefill);
     eprintln!("engine prefill max abs {p}");
     let weights = Weights::load(&fixture().join("model.safetensors"));
     let c = Config::read(&config());
-    let head_of = |streams: &[f32], round: bool| -> Vec<f32> {
+    let head_of = |streams: &[f32], round: fn(&[f32]) -> Vec<f32>| -> Vec<f32> {
         (0..tokens.len())
             .flat_map(|t| {
                 let row = &streams[t * 4 * 128..(t + 1) * 4 * 128];
                 let mean: Vec<f32> = (0..128).map(|d| (0..4).map(|s| row[s * 128 + d]).sum::<f32>() / 4.0).collect();
                 let normed = glm5_host::rms(&mean, Some(weights.get("model.language_model.norm.weight")), c.eps);
-                let normed = if round { glm5_host::planes(&normed) } else { normed };
-                glm5_host::matvec(weights.get("lm_head.weight"), vocab, &normed)
+                glm5_host::matvec(weights.get("lm_head.weight"), vocab, &round(&normed))
             })
             .collect()
     };
+    let exact: fn(&[f32]) -> Vec<f32> = |x| x.to_vec();
+    let one_plane: fn(&[f32]) -> Vec<f32> = |x| x.iter().map(|v| glm5_host::bf16(*v)).collect();
     let last = &trace.layers[3 * per..4 * per];
-    let host_head = head_of(last, false);
+    let host_head = head_of(last, exact);
     let f32_head = gap(&host_head, &prefill);
-    eprintln!("engine head against a host head on the engine's layer 3 streams max abs {}", gap(&trace.logits, &host_head));
-    eprintln!("engine head against a host head with bf16 hi+lo planes on the engine's layer 3 streams max abs {}", gap(&trace.logits, &head_of(last, true)));
+    let planes_head = gap(&trace.logits, &head_of(last, glm5_host::planes));
+    let one_plane_head = gap(&head_of(last, one_plane), &prefill);
+    eprintln!("engine head against a host head with bf16 hi+lo planes on the engine's layer 3 streams max abs {planes_head}");
     eprintln!("f32 head on the engine's layer 3 streams against the reference max abs {f32_head}");
-    eprintln!("f32 head on the saved layer 3 streams against the reference max abs {}", gap(&head_of(&saved[2 * per..3 * per], false), &prefill));
+    eprintln!("one plane bf16 head input on the engine's layer 3 streams against the reference max abs {one_plane_head}");
+    assert!(f32_head < TOLERANCE, "f32 head on the engine streams max abs {f32_head}");
+    assert!(planes_head < 1e-4, "engine head against the two plane host head max abs {planes_head}");
+    assert!(p < BF16_SPLIT_TOLERANCE, "engine prefill max abs {p}");
+    assert!(one_plane_head > BF16_SPLIT_TOLERANCE, "a one plane bf16 head input stays inside the split bar ({one_plane_head})");
+    assert_eq!(tops(&trace.logits), tops(&prefill), "prefill greedy tokens");
+    assert_eq!(top(&trace.logits[(tokens.len() - 1) * vocab..]), greedy[0], "prefill greedy token");
     let mut failed = Vec::new();
-    if f32_head >= TOLERANCE {
-        failed.push(format!("f32 head on the engine streams max abs {f32_head}"));
-    }
-    let planes_head = gap(&trace.logits, &head_of(last, true));
-    if planes_head >= 1e-4 {
-        failed.push(format!("engine head against the two plane host head max abs {planes_head}"));
-    }
-    eprintln!("engine prefill with bf16 hi+lo split activations, not asserted against the f32 bar: max abs {p}");
     let decode = floats(&format!("{NAME}.decode.logits.bin"));
     let mut st = rt.stepper().unwrap();
     let mut st_prefill = rt.stepper().unwrap();
@@ -240,28 +243,29 @@ fn the_engine_matches_the_reference_streams_prefill_and_four_decode_steps() {
         let next = rt.decode(&mut st, &[row]).unwrap();
         let got = rt.step_logits(&st, 0, 1).unwrap();
         let d = gap(&got, &decode[s * vocab..(s + 1) * vocab]);
-        eprintln!("decode step {s} max abs {d}");
+        eprintln!("decode step {s} max abs {d}, greedy {} (reference {})", next[0], greedy[s + 1]);
         if d >= TOLERANCE {
             failed.push(format!("decode step {s} max abs {d}"));
         }
+        assert_eq!(top(&got), top(&decode[s * vocab..(s + 1) * vocab]), "decode step {s} logits argmax");
         assert_eq!(next[0], greedy[s + 1], "decode step {s}");
     }
     drop(rt);
-    let layer_gap = |spec: &Spec, layer: usize, slot: usize| {
+    let wrong = |spec: &Spec, layer: usize, slot: usize| {
         let mut rt = Runtime::load_batched(spec, 256, 1).unwrap();
         let t = rt.trace_prefill(&tokens).unwrap();
-        gap(&t.layers[layer * per..(layer + 1) * per], &saved[slot * per..(slot + 1) * per])
+        (gap(&t.layers[layer * per..(layer + 1) * per], &saved[slot * per..(slot + 1) * per]), gap(&t.logits, &prefill))
     };
     let mut short = engine_spec();
     short.hyper.as_mut().unwrap().sinkhorn_iters = 1;
-    let g = layer_gap(&short, 0, 0);
-    eprintln!("one Sinkhorn iteration: layer 0 streams max abs {g}");
-    assert!(g > TOLERANCE, "one Sinkhorn iteration still matches layer 0 ({g})");
+    let (g, lp) = wrong(&short, 0, 0);
+    eprintln!("one Sinkhorn iteration: layer 0 streams max abs {g}, prefill max abs {lp}");
+    assert!(g > TOLERANCE && lp > BF16_SPLIT_TOLERANCE, "one Sinkhorn iteration still matches ({g}, {lp})");
     let mut tailless = engine_spec();
     tailless.attention.params.insert("index_tail".into(), 0.0);
-    let g = layer_gap(&tailless, 3, 2);
-    eprintln!("tail pool dropped: layer 3 streams max abs {g}");
-    assert!(g > TOLERANCE, "dropping the tail pool still matches layer 3 ({g})");
+    let (g, lp) = wrong(&tailless, 3, 2);
+    eprintln!("tail pool dropped: layer 3 streams max abs {g}, prefill max abs {lp}");
+    assert!(g > TOLERANCE && lp > BF16_SPLIT_TOLERANCE, "dropping the tail pool still matches ({g}, {lp})");
     assert!(failed.is_empty(), "{failed:?}");
 }
 

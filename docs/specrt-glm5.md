@@ -118,11 +118,14 @@ GPU1, 2026-11-24 (deterministic across runs):
 | f32 host head on the engine's layer 3 streams | 3.39e-4 |
 | engine head against the host head with two plane bf16 inputs | 4.6e-5 |
 | engine prefill logits (split activations) | 4.15e-4 |
-| decode steps 0 to 3 | 1.84e-4, 2.40e-4, 3.02e-4, 1.58e-4 |
-| one Sinkhorn iteration, layer 0 streams | 0.0799 (red) |
-| tail pool dropped, layer 3 streams | 6.17 (red) |
+| one plane bf16 head input on the engine's streams | 0.0777 |
+| decode steps 0 to 3 | 1.84e-4, 2.40e-4, 3.02e-4, 1.58e-4, greedy 75, 313, 310, 203 as the reference |
+| one Sinkhorn iteration, layer 0 streams / prefill | 0.0799 / 21.9 (red) |
+| tail pool dropped, layer 3 streams / prefill | 6.17 / 23.9 (red) |
 
 The prefill logits pass 3.8e-4 only in f32. The streams are right, the f32 head on them is right, and the engine head equals its own arithmetic (activations split into bf16 hi and lo planes before every tensor core GEMM, `split_activations`). The host model with the same two plane rounding on every matvec input gives 4.6e-4 on its own (`the_host_model_with_two_plane_bf16_inputs_shows_the_split_activation_rounding`), so 4.15e-4 is the bf16 number. The logits here reach 50, so 4e-4 is 1e-5 relative.
+
+Decision (supervisor, 2026-11-24): the 3.8e-4 bar came from the f32 host model and does not apply to the bf16 hi plus lo split activation engine, whose rounding is the whole gap. The engine prefill logits on this fixture are held to `BF16_SPLIT_TOLERANCE` 5.0e-4 (about 20 percent over the measured 4.15e-4), with every prefill and decode greedy token equal to the reference. The f32 head on the engine streams, the streams and the decode logits stay at 3.8e-4. The bar still catches a real regression: one plane bf16 on the head input alone gives 0.0777, and the wrong Sinkhorn count and the dropped tail pool give 21.9 and 23.9 on the prefill logits.
 | Q6 | bf16 tensors from a second file | `tensors/native-QB.safetensors` is in the index `weight_map`, and `shard_files` reads every file the map names: **have** |
 
 ## Memory: resident set and KV per token

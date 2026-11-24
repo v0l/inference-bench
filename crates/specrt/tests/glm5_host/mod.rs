@@ -34,14 +34,15 @@ pub struct Knobs {
 }
 
 pub fn planes(x: &[f32]) -> Vec<f32> {
-    let bf16 = |v: f32| {
-        let u = v.to_bits();
-        f32::from_bits(((u + 0x7fff + ((u >> 16) & 1)) >> 16) << 16)
-    };
     x.iter().map(|&v| {
         let hi = bf16(v);
         hi + bf16(v - hi)
     }).collect()
+}
+
+pub fn bf16(v: f32) -> f32 {
+    let u = v.to_bits();
+    f32::from_bits(((u + 0x7fff + ((u >> 16) & 1)) >> 16) << 16)
 }
 
 pub struct Config {
