@@ -363,7 +363,7 @@ def fetch_files(entry, m, config_repo, local):
             continue
         cache.mkdir(parents=True, exist_ok=True)
         (cache / name).write_bytes(body)
-        keep = len(body) <= COMMIT_LIMIT and (name in COMMITTED or entry["role"] in ("base", "disk"))
+        keep = len(body) <= COMMIT_LIMIT and (name in COMMITTED or entry["role"] in ("base", "disk", "lab"))
         if keep:
             dest.mkdir(parents=True, exist_ok=True)
             (dest / name).write_bytes(body)
