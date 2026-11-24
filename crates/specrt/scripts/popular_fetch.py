@@ -449,8 +449,9 @@ def machine_inputs():
         "ram_available_gb": round(meminfo["MemAvailable"] / 1e9, 1),
         "host_share": cfg["host_share"],
         "host_bandwidth_gbs": cfg["host_bandwidth_gbs"],
-        "nvme_free_gb": round(sum(free.values()) / 1e9, 1),
-        "nvme_paths": sorted(free),
+        "nvme_free_gb": round(max(free.values()) / 1e9, 1),
+        "nvme_path": max(free, key=free.get),
+        "nvme_free_by_path_gb": {p: round(v / 1e9, 1) for p, v in sorted(free.items())},
         "cards": cfg["cards"],
         "card_gib": cfg["card_gib"],
     }
