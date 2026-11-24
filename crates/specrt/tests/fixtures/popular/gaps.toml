@@ -7,6 +7,10 @@ excluded = [
   "bigscience/bloomz-560m",
 ]
 
+[parked."model_type llada"]
+issue = 1336
+reason = "masked diffusion LM: every step re-runs the whole block bidirectionally, so no KV reuse and a separate scheduler loop; not on the main-lab list and vLLM does not serve it. The forward pass is the llama family with a non-causal mask"
+
 [issues]
 "chat template: syntax error: unknown statement generation" = 1193
 "chat template: syntax error: unknown statement break" = 1193
@@ -69,7 +73,7 @@ excluded = [
 "model_type kimi_k3" = 1214
 "model_type kimi_k31" = 1214
 "model_type gemma3n" = 1214
-"model_type llada" = 1214
+"model_type llada" = 1336
 "modelopt_fp4 weights" = 1320
 "modelopt FP8 weights" = 1320
 "layer N mixer.experts.N.down_proj is Nvfp4G16 but other attention projections are Some(Fp8Channel)" = 1321
