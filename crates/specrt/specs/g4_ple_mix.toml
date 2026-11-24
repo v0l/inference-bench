@@ -1,7 +1,7 @@
 kind = "kir-kernel"
 family = "group_map"
 name = "g4_ple_mix"
-threads = 128
+threads = 32
 
 [args]
 width = "ple_dim"

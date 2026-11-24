@@ -150,7 +150,30 @@ fn the_kv_cache_holds_each_layer_kind_at_its_own_width() {
 }
 
 #[test]
-fn the_tiny_fixture_has_a_spec_that_builds_every_kernel() {
+fn the_tiny_e_fixture_builds_every_kernel() {
+    let spec = tiny_e();
+    specrt::codegen::Module::generate(&spec, 256).unwrap();
+    let states: Vec<(&str, usize)> = spec.state.iter().map(|s| (s.name.as_str(), s.layer_count(&spec))).collect();
+    assert_eq!(states, vec![("k_s", 3), ("v_s", 3), ("k_g", 1), ("v_g", 1)]);
+    assert_eq!(spec.layers.shared_tail, 2);
+    assert!(spec.mlp.wide_shared_tail);
+    assert_eq!(spec.per_layer().unwrap().dim, 16);
+    assert_eq!((param(&spec, "kvh_s"), param(&spec, "kvh_g")), (1.0, 1.0));
+    assert_eq!(spec.max_intermediate(), 512);
+}
+
+fn tiny_e() -> Spec {
+    let dir = fixture(&std::env::var("G4_E_DIR").unwrap_or_else(|_| "tiny-gemma4-e".into()));
+    let json = std::fs::read_to_string(dir.join("config.json")).unwrap();
+    let mut spec = Spec::from_hf_config_serving_in(&unrefused(), &json).unwrap();
+    spec.name = "tiny-gemma4-e".into();
+    spec.repo = dir.display().to_string();
+    spec.runtime.split_activations = Some(true);
+    spec
+}
+
+#[test]
+fn the_tiny_e_fixture_has_a_spec_that_builds_every_kernel() {
     let spec = tiny();
     specrt::codegen::Module::generate(&spec, 256).unwrap();
     let states: Vec<(&str, usize)> = spec.state.iter().map(|s| (s.name.as_str(), s.layer_count(&spec))).collect();
@@ -175,6 +198,64 @@ fn reference() -> (Vec<u32>, Vec<u32>, usize, Vec<f32>) {
     let bytes = std::fs::read(dir.join("tiny-gemma4.ref.bin")).unwrap();
     let logits = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
     (ids("tokens"), ids("greedy"), meta["vocab"].as_u64().unwrap() as usize, logits)
+}
+
+fn e_reference() -> (Vec<u32>, Vec<u32>, usize, Vec<f32>) {
+    let dir = std::env::var_os("SPECRT_REF_DIR_E").map(PathBuf::from).expect("SPECRT_REF_DIR_E holds scripts/tiny_gemma4.py output for the E fixture");
+    let name = std::env::var("G4_E_NAME").unwrap_or_else(|_| "tiny-gemma4-e".into());
+    let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join(format!("{name}.ref.json"))).unwrap()).unwrap();
+    let ids = |k: &str| -> Vec<u32> { meta[k].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect() };
+    let bytes = std::fs::read(dir.join(format!("{name}.ref.bin"))).unwrap();
+    let logits = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+    (ids("tokens"), ids("greedy"), meta["vocab"].as_u64().unwrap() as usize, logits)
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/tiny_gemma4.py E output in SPECRT_REF_DIR_E"]
+fn gemma4_e_logits_and_greedy_match_transformers() {
+    let (tokens, greedy, vocab, want) = e_reference();
+    let mut rt = specrt::runtime::Runtime::load(&tiny_e(), 256).unwrap();
+    let ours = rt.prompt_logits(&tokens).unwrap();
+    assert_eq!(ours.len(), want.len());
+    let max_abs = ours.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    eprintln!("e max_abs {max_abs}");
+    assert!(max_abs < 5e-2, "max abs diff {max_abs}");
+    for r in 0..tokens.len() {
+        let row = |v: &[f32]| v[r * vocab..(r + 1) * vocab].iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+        assert_eq!(row(&ours), row(&want), "row {r}");
+    }
+    let got = rt.generate(&tokens, greedy.len(), specrt::runtime::Sampling::GREEDY).unwrap();
+    assert_eq!(got.tokens, greedy);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/tiny_gemma4.py E output in SPECRT_REF_DIR_E"]
+fn gemma4_e_layer_states_match_transformers() {
+    let (tokens, _, _, _) = e_reference();
+    let dir = std::env::var_os("SPECRT_REF_DIR_E").map(PathBuf::from).unwrap();
+    let bytes = std::fs::read(dir.join(format!("{}.layers.bin", std::env::var("G4_E_NAME").unwrap_or_else(|_| "tiny-gemma4-e".into())))).unwrap();
+    let want: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+    let mut rt = specrt::runtime::Runtime::load(&tiny_e(), 256).unwrap();
+    let trace = rt.trace_prefill(&tokens).unwrap();
+    let per = tokens.len() * 128;
+    for layer in 0..6 {
+        let (a, b) = (&trace.layers[layer * per..(layer + 1) * per], &want[layer * per..(layer + 1) * per]);
+        let max_abs = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        let size = b.iter().map(|y| y.abs()).fold(0f32, f32::max);
+        eprintln!("e layer {layer} max_abs {max_abs} of {size}");
+        assert!(max_abs < 2e-2 * size.max(1.0), "layer {layer} max abs diff {max_abs}");
+    }
+}
+
+#[test]
+fn e_kv_cache_is_smaller_by_the_shared_layers() {
+    let spec = tiny_e();
+    let owners: u64 = (0..spec.attention_layers()).map(|i| specrt::state::kv_bytes_per_token_at(&spec, i)).sum();
+    let mut all = spec.clone();
+    all.layers.shared_tail = 0;
+    let full: u64 = (0..all.attention_layers()).map(|i| specrt::state::kv_bytes_per_token_at(&all, i)).sum();
+    assert_eq!((owners, full), (3 * 32 * 2 + 3 * 32 * 2 + 64 * 2 + 64 * 2, 4 * 32 * 2 + 4 * 32 * 2 + 2 * 64 * 2 + 2 * 64 * 2));
+    assert!(owners < full);
 }
 
 #[test]

@@ -34,7 +34,7 @@ ple_out = "ple_dim"
 [[per_layer.node]]
 op = "head"
 kernel = "g4_ple_proj"
-grid = ["hidden", "rows"]
+grid = ["ple_one", "rows"]
 
 [per_layer.node.bind]
 x = { buffer = "x" }
@@ -44,19 +44,19 @@ y = { buffer = "ple_proj" }
 [[per_layer.node]]
 op = "head"
 kernel = "g4_ple_mix"
-grid = ["ple_width", "rows"]
+grid = ["ple_layers", "rows"]
 
 [per_layer.node.bind]
 idx = { buffer = "tokens" }
 table = { weight = "embed_tokens_per_layer.weight", len = "ple_vocab * ple_width" }
 proj = { buffer = "ple_proj" }
-w = { weight = "per_layer_projection_norm.weight", len = "ple_width" }
+w = { weight = "per_layer_projection_norm.weight", len = "ple_dim" }
 ple = { buffer = "ple" }
 
 [[per_layer.node]]
 op = "layer"
 kernel = "g4_ple_gate"
-grid = ["ple_dim", "rows"]
+grid = ["ple_one", "rows"]
 
 [per_layer.node.bind]
 x = { buffer = "x" }
@@ -66,7 +66,7 @@ y = { buffer = "ple_gate" }
 [[per_layer.node]]
 op = "layer"
 kernel = "g4_ple_act"
-grid = ["ple_dim", "rows"]
+grid = ["ple_one", "rows"]
 
 [per_layer.node.bind]
 gate = { buffer = "ple_gate" }
@@ -77,7 +77,7 @@ gp = { buffer = "ple_gate" }
 [[per_layer.node]]
 op = "layer"
 kernel = "g4_ple_out"
-grid = ["hidden", "rows"]
+grid = ["ple_one", "rows"]
 
 [per_layer.node.bind]
 x = { buffer = "ple_gate" }
@@ -87,7 +87,7 @@ y = { buffer = "ple_out" }
 [[per_layer.node]]
 op = "layer"
 kernel = "g4_ple_add"
-grid = ["hidden", "rows"]
+grid = ["ple_one", "rows"]
 
 [per_layer.node.bind]
 pout = { buffer = "ple_out" }
@@ -122,6 +122,8 @@ ple_embed_scale = { expr = "sqrt(hidden_size_per_layer_input)" }
 ple_proj_scale = { expr = "rsqrt(hidden_size)" }
 ple_mix_scale = { expr = "sqrt(0.5)" }
 ple_vocab = { config = "vocab_size_per_layer_input", alt = "vocab_size" }
+ple_layers = { expr = "num_hidden_layers" }
+ple_one = { expr = "1" }
 hd_s = { config = "head_dim" }
 hd_g = { config = "global_head_dim", alt = "head_dim" }
 heads_n = { config = "num_attention_heads" }
