@@ -7,6 +7,7 @@ import re
 import socket
 import sys
 import time
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -25,6 +26,7 @@ VISION_TOP = 30
 CARD_GB = 96
 FILES = ["config.json", "generation_config.json", "hf_quant_config.json", "tokenizer_config.json", "chat_template.jinja"]
 INDEX = "model.safetensors.index.json"
+LABS = tomllib.loads((OUT / "labs.toml").read_text())
 EXPAND = ["downloads", "likes", "trendingScore", "gated", "tags", "safetensors", "gguf", "pipeline_tag", "createdAt", "siblings", "config", "cardData"]
 SKIP = re.compile(r"(?i)(tiny-random|internal-testing|dummy|/tiny[-_]|testing|-test$|random-)")
 FORMATS = ["NVFP4", "FP8", "AWQ", "GPTQ", "GGUF"]
@@ -394,6 +396,38 @@ def row(repo, role, base, lists, m):
     }
 
 
+def months_ago(today, months):
+    d = datetime.date.fromisoformat(today)
+    y, m = divmod(d.year * 12 + d.month - 1 - months, 12)
+    return datetime.date(y, m + 1, min(d.day, 28)).isoformat()
+
+
+def lab_of_repo(repo, created, cutoff):
+    org, _, name = repo.partition("/")
+    if re.search(LABS["selection"]["exclude"], name):
+        return None
+    for lab in LABS["lab"]:
+        if org.lower() in [o.lower() for o in lab["orgs"]] and re.search(lab["pattern"], name):
+            if created >= cutoff or re.search(lab["current"], name):
+                return lab["key"]
+    return None
+
+
+def lab_listing(cutoff):
+    found = {}
+    allowed = set(LABS["selection"]["pipelines"]) | {None}
+    for lab in LABS["lab"]:
+        for org in lab["orgs"]:
+            for term in lab["search"]:
+                for m in listing(author=org, search=term, sort="lastModified", limit=LABS["selection"]["limit"]):
+                    remember(m)
+                    if m.get("pipeline_tag") not in allowed:
+                        continue
+                    if lab_of_repo(m["id"], (m.get("createdAt") or "")[:10], cutoff) == lab["key"]:
+                        found[m["id"]] = lab["key"]
+    return found
+
+
 def main():
     today = datetime.date.today().isoformat()
     previous = OUT / "manifest.json"
@@ -409,6 +443,8 @@ def main():
     for items in lists.values():
         for m in items:
             remember(m)
+    cutoff = months_ago(today, LABS["selection"]["months"])
+    lab_repos = lab_listing(cutoff)
     OUT.mkdir(parents=True, exist_ok=True)
     for d in OUT.iterdir():
         if d.is_dir():
@@ -446,6 +482,14 @@ def main():
         chosen.setdefault(r, set()).add("trending")
     for r in vision:
         chosen.setdefault(r, set()).add("vision")
+    for repo in lab_repos:
+        root = root_of(repo)
+        g = groups.setdefault(root, {"members": set(), "lists": set(), "downloads": 0})
+        if repo not in g["members"]:
+            g["members"].add(repo)
+            g["downloads"] += (meta(repo) or {}).get("downloads", 0)
+        g.setdefault("lab_members", set()).add(repo)
+        chosen.setdefault(root, set()).add("lab")
     on_disk = []
     if HUB.is_dir():
         for d in sorted(HUB.iterdir()):
@@ -493,6 +537,9 @@ def main():
             if fmt in FORMATS and fmt not in variants and fmt != weight_format(meta(primary)):
                 variants[fmt] = r
         picks = [(primary, "base")] + [(variants[f], f.lower()) for f in FORMATS if f in variants]
+        for repo in sorted(g.get("lab_members", ())):
+            if repo not in [p for p, _ in picks] and meta(repo):
+                picks.append((repo, "lab"))
         for repo in disk:
             if repo not in [p for p, _ in picks]:
                 picks.append((repo, "disk"))
@@ -500,6 +547,9 @@ def main():
             m = meta(repo)
             entry = row(repo, role, root, chosen[root] if role == "base" else ({"disk"} if role == "disk" else set()), m)
             entry["group_downloads"] = g["downloads"] if role == "base" else 0
+            lab_key = lab_repos.get(root) or lab_repos.get(repo)
+            if lab_key:
+                entry["lab"] = lab_key
             local = local_snapshot(repo)
             config_repo = repo
             if entry["format"] == "GGUF":
@@ -535,7 +585,8 @@ def main():
         "source": "Hugging Face API: pipeline_tag text-generation (sort downloads, limit 1000; sort trendingScore, limit 200), image-text-to-text (downloads 400, trending 100) and any-to-any (downloads 100); downloads are the hub's last-30-day counts",
         "card_gb": CARD_GB,
         "commit_limit_bytes": COMMIT_LIMIT,
-        "selection": f"top {TEXT_TOP} text groups by summed downloads, the top {TRENDING_TOP} trending text groups not already in, the top {VISION_TOP} vision groups not already in, and every text model in the local hub cache; a group is every repo whose base_model chain ends at the same root; repos whose names look like test fixtures are skipped",
+        "labs_since": cutoff,
+        "selection": f"every model of the labs in labs.toml released since {cutoff} or still shipped by its lab, then top {TEXT_TOP} text groups by summed downloads, the top {TRENDING_TOP} trending text groups not already in, the top {VISION_TOP} vision groups not already in, and every text model in the local hub cache; a group is every repo whose base_model chain ends at the same root; repos whose names look like test fixtures are skipped",
         "models": rows,
     }
     OUT.mkdir(parents=True, exist_ok=True)
