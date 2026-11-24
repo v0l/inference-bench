@@ -558,10 +558,10 @@ gaunernst/gemma-3-4b-it-int4-awq	REFUSED	config.json has no num_attention_heads	
 dongchengli/gemma-3-4b-it-text-int4-gptq	UNKNOWN-QUANT	compressed-tensors pack-quantized w4i-group weights	compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (34 layers (full+sliding), hidden 2560, bf16)
 unsloth/gemma-3-4b-it-GGUF	REFUSED	GGUF tensor and metadata names for families that already load from safetensors	GGUF architecture gemma3 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe, qwen3vl, qwen3vlmoe are)
 unsloth/gemma-3-4b-it	LOADS		34 layers (full+sliding), hidden 2560, vision, bf16
-google/gemma-3n-E2B-it	REFUSED	model_type gemma3n	model_type gemma3n is not supported
-RedHatAI/gemma-3n-E2B-it-FP8-dynamic	REFUSED	model_type gemma3n	model_type gemma3n is not supported
-unsloth/gemma-3n-E2B-it-GGUF	REFUSED	GGUF architecture gemma3n	GGUF architecture gemma3n is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe, qwen3vl, qwen3vlmoe are)
-google/gemma-3n-E4B-it	REFUSED	model_type gemma3n	model_type gemma3n is not supported
+google/gemma-3n-E2B-it	REFUSED	Gemma 3n AltUp residual streams (altup_num_inputs) are not supported yet	Gemma 3n AltUp residual streams (altup_num_inputs) are not supported yet
+RedHatAI/gemma-3n-E2B-it-FP8-dynamic	REFUSED	Gemma 3n AltUp residual streams (altup_num_inputs) are not supported yet	Gemma 3n AltUp residual streams (altup_num_inputs) are not supported yet
+unsloth/gemma-3n-E2B-it-GGUF	REFUSED	GGUF tensor and metadata names for families that already load from safetensors	GGUF architecture gemma3n is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe, qwen3vl, qwen3vlmoe are)
+google/gemma-3n-E4B-it	REFUSED	Gemma 3n AltUp residual streams (altup_num_inputs) are not supported yet	Gemma 3n AltUp residual streams (altup_num_inputs) are not supported yet
 google/gemma-4-12B-it	LOADS-TEXT-ONLY	vision_config and audio_config not read	vision_config and audio_config not read; 48 layers (full+sliding), hidden 3840, bf16
 AEON-7/Gemma-4-12B-it-AEON-Abliterated-K4-NVFP4-FP8	LOADS-TEXT-ONLY	vision_config and audio_config not read	vision_config and audio_config not read; 48 layers (full+sliding), hidden 3840, nvfp4_g16
 AEON-7/Gemma-4-12B-it-AEON-Abliterated-K4-FP8	UNKNOWN-QUANT	the quantisation config has no groups	the quantisation config has no groups (48 layers (full+sliding), hidden 3840, bf16)

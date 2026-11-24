@@ -1,0 +1,30 @@
+name = "gemma3n"
+kind = "family"
+min_engine = 15
+extends = "gemma3"
+
+[match]
+model_types = ["gemma3n", "gemma3n_text"]
+architectures = ["Gemma3nForConditionalGeneration", "Gemma3nForCausalLM"]
+
+[[refuse]]
+when = "altup_num_inputs > 1"
+message = "Gemma 3n AltUp residual streams (altup_num_inputs) are not supported yet"
+
+[[refuse]]
+when = "laurel_rank > 0"
+message = "Gemma 3n Laurel blocks (laurel_rank) are not supported yet"
+
+[[refuse]]
+when = "hidden_size_per_layer_input > 0"
+message = "Gemma 3n per-layer input embeddings (hidden_size_per_layer_input) are not supported yet"
+
+[[refuse]]
+when = "num_kv_shared_layers > 0"
+message = "Gemma 3n KV sharing across layers (num_kv_shared_layers) is not supported yet"
+
+[norm]
+unit_offset = false
+
+[vision]
+ignore = true
