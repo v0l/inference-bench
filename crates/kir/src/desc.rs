@@ -10,7 +10,7 @@ use toml::Value;
 
 pub const KIND: &str = "kir-kernel";
 
-pub const ROW_FAMILIES: [&str; 12] = ["span_rope", "state_write", "head_matvec", "index_topk", "layernorm_segment", "head_rms", "block_pool", "hyper_pre", "hyper_post", "hyper_expand", "hyper_mean", "pool_topk"];
+pub const ROW_FAMILIES: [&str; 14] = ["span_rope", "state_write", "head_matvec", "index_topk", "layernorm_segment", "head_rms", "block_pool", "hyper_pre", "hyper_post", "hyper_expand", "hyper_mean", "pool_topk", "group_pool", "group_topk"];
 
 pub const SEQ_FAMILIES: [&str; 3] = ["recurrence", "seq_conv", "group_norm"];
 
@@ -426,6 +426,13 @@ impl Description {
         !matches!(key, "op" | "act")
     }
 
+    fn boolean(&self, shape: &Shape, key: &str) -> Result<bool, String> {
+        match self.arg(shape, key)? {
+            Value::Boolean(b) => Ok(*b),
+            v => Err(format!("{}: arg {key:?} is {v}, not a boolean", self.name)),
+        }
+    }
+
     fn number(&self, shape: &Shape, key: &str) -> Result<f64, String> {
         if let Some(Value::String(text)) = self.args.get(key)
             && self.is_symbol(key)
@@ -820,6 +827,26 @@ impl Description {
             "block_pool" => {
                 let n = self.sizes(shape, &self.args, &["dim", "rot", "layers", "raw_width", "gate_offset"], "[args]")?;
                 RowBody::BlockPool { dim: n["dim"], rot: n["rot"], layers: n["layers"], raw_width: n["raw_width"], gate_offset: n["gate_offset"], eps: self.number(shape, "eps")? as f32 }
+            }
+            "group_pool" => {
+                let n = self.sizes_except(shape, &self.args, &["dim", "rot", "layers", "ratio"], &["eps", "unit"], "[args]")?;
+                RowBody::GroupPool { dim: n["dim"], rot: n["rot"], layers: n["layers"], ratio: n["ratio"], eps: self.number(shape, "eps")? as f32, unit: self.boolean(shape, "unit")? }
+            }
+            "group_topk" => {
+                let n = self.sizes_except(shape, &self.args, &["heads", "dim", "rot", "topk", "ratio", "max_groups", "q_row", "q_offset", "layers"], &["eps", "unit"], "[args]")?;
+                RowBody::GroupTopk {
+                    heads: n["heads"],
+                    dim: n["dim"],
+                    rot: n["rot"],
+                    topk: n["topk"],
+                    ratio: n["ratio"],
+                    max_groups: n["max_groups"],
+                    q_row: n["q_row"],
+                    q_offset: n["q_offset"],
+                    layers: n["layers"],
+                    eps: self.number(shape, "eps")? as f32,
+                    unit: self.boolean(shape, "unit")?,
+                }
             }
             "layernorm_segment" => {
                 let n = self.sizes(shape, &self.args, &["width", "row", "head", "offset"], "[args]")?;
