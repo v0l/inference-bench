@@ -1050,7 +1050,7 @@ fn kimi_k3_reads_needs_family_then_offload() {
     let doc = report().doc;
     let kimi = section(&doc, "Main labs");
     let line = kimi.lines().find(|l| l.starts_with("| moonshotai/Kimi-K3 |")).expect("Kimi-K3 row");
-    assert!(line.contains("needs family #1214, then offload:"), "{line}");
+    assert!(line.contains("needs family #1340, then offload:"), "{line}");
     assert!(line.contains(" cards plus ") && line.contains(" GB host plus ") && line.contains(" GB NVMe"), "{line}");
     assert!(!line.contains("refused for size"));
 }
