@@ -9,7 +9,7 @@ card_gib = 96.0
 months = 9
 limit = 400
 pipelines = ["text-generation", "image-text-to-text", "any-to-any"]
-exclude = "(?i)(OCR|Embed|Rerank|Transcribe|ASR|TTS|Image|Video|Guard|Voxtral|Timestral|LIDstral|SCAIL|Kaleido|SSVAE|eagle|dflash|dspark|draft|assistant|GGUF|ONNX|litert|mobile|qat|Diffusers|Diarization|Parse|Music|Audio|VoiceChat|Foley|3D|World|Nomas|Sports|Cosmos|GR00T|Metatron|MotionBricks|SAE-|Aligner|Proteina|Kimodo|colembed|WeMM|Reward|GenRM|Safety|mcore|Flamingo|Sigma|Teacher|tokenizer|MTP|-Vision-Exp)"
+exclude = "(?i)(OCR|Embed|Rerank|Transcribe|ASR|TTS|Image|Video|Guard|Voxtral|Timestral|LIDstral|SCAIL|Kaleido|SSVAE|eagle|dflash|dspark|draft|assistant|GGUF|ONNX|litert|mobile|qat|Diffusers|Diarization|Parse|Music|Audio|VoiceChat|Foley|3D|World|Nomas|Sports|Cosmos|GR00T|Metatron|MotionBricks|SAE-|Aligner|Proteina|Kimodo|colembed|WeMM|Reward|GenRM|Safety|mcore|Flamingo|Sigma|Teacher|tokenizer|MTP|-Vision-Exp|-pytorch|-keras|-flax|-tf|-jax)"
 quantised = "(?i)(fp8|nvfp4|mxfp4|mxfp8|awq|gptq|int4|int8|w4a16|w8a8|bnb|fp4|LiLiCorr)"
 
 [[lab]]
@@ -108,9 +108,10 @@ current = "Nemotron-H-|Nemotron-Nano-(9B|12B)-v2$|Nemotron-3-Nano-30B-A3B-BF16$|
 key = "google"
 name = "Google"
 orgs = ["google"]
-search = ["gemma-4"]
-pattern = "^gemma-4-"
-current = "^$"
+search = ["gemma-4", "gemma-2"]
+pattern = "^gemma-(4|2)-"
+current = "^gemma-4-(E2B|E4B|12B|26B-A4B|31B)(-it)?$|^gemma-2-(2b|9b|27b)(-it)?$"
+note = "Gemma 3 dense (1B, 4B, 12B, 27B, 270m) loads today and Gemma 3n is the `model_type gemma3n` gap on #1214. Gemma 2 is still documented and downloadable from Google (gemma.ai/models/gemma-2/, listed under Previous Gemma models beside Gemma 3), so its `model_type gemma2` gap is split out of #1203 into its own issue; opt, gpt_neox and bloom stay parked in #1203."
 
 [[lab]]
 key = "inclusionai"

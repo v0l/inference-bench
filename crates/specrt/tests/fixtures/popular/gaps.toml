@@ -1,3 +1,12 @@
+excluded = [
+  "openai-community/gpt2",
+  "openai-community/gpt2-large",
+  "distilbert/distilgpt2",
+  "facebook/opt-125m",
+  "EleutherAI/pythia-160m",
+  "bigscience/bloomz-560m",
+]
+
 [issues]
 "chat template: syntax error: unknown statement generation" = 1193
 "chat template: syntax error: unknown statement break" = 1193
@@ -31,7 +40,7 @@
 "model_type deepseek_vl_v2" = 1202
 "model_type opt" = 1203
 "model_type gpt_neox" = 1203
-"model_type gemma2" = 1203
+"model_type gemma2" = 1319
 "model_type bloom" = 1203
 "GGUF tensor and metadata names for families that already load from safetensors" = 1204
 "model_type lfm2_moe" = 1205
@@ -62,3 +71,35 @@
 "model_type gemma3n" = 1214
 "model_type llada" = 1214
 "model_type glm5_next" = 1179
+"model_type kimi_linear" = 1287
+"model_type kimi_k2" = 1288
+"model_type hy_v4_flash" = 1289
+"model_type hy_v3" = 1290
+"model_type hunyuan_v1_moe" = 1291
+"model_type hy_v4" = 1292
+"model_type hunyuan_v1_dense" = 1293
+"model_type hy_v4_vl" = 1294
+"model_type hunyuan" = 1295
+"model_type mimo_v2" = 1296
+"model_type mimo" = 1297
+"model_type minimax_m3_vl" = 1298
+"model_type minimax_m2" = 1299
+"model_type minimax_m1" = 1300
+"model_type qwen_drive" = 1301
+"model_type mistral3" = 1302
+"model_type mistral3 (wraps mistral, which specrt runs)" = 1303
+"model_type mistral_large4" = 1304
+"model_type inkling2" = 1305
+"no_rope_layers names 0 layers but num_hidden_layers is 48" = 1306
+"model_type nemotron_h_omni" = 1307
+"model_type nemotron_labs_diffusion" = 1308
+"model_type NemotronH_Nano_Omni_Reasoning_V3" = 1309
+"model_type nemotron_h_puzzle" = 1310
+"model_type dory" = 1311
+"model_type nemotron-nas" = 1312
+"model_type nemotron_labs_audex" = 1313
+"model_type nemotron_labs_diffusion_vlm" = 1314
+"model_type bailing_hybrid" = 1315
+"model_type bailing_moe_v3_vl" = 1316
+"model_type sing_probe_attn" = 1317
+"model_type beam" = 1318
