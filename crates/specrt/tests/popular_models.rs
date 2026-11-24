@@ -619,7 +619,7 @@ fn report() -> Report {
             _ => "",
         };
         let size = r.size().map(|s| format!("{s}")).unwrap_or_default();
-        let issue = v.gap.as_ref().map(&fold).or(chats[i].1.clone().filter(|_| v.class.arch_ok())).and_then(|g| filed.get(&g.key)).map(|n| format!("#{n}")).unwrap_or_default();
+        let issue = v.gap.as_ref().map(fold).or(chats[i].1.clone().filter(|_| v.class.arch_ok())).and_then(|g| filed.get(&g.key)).map(|n| format!("#{n}")).unwrap_or_default();
         let config_note = r.m["config_from"].as_str().map(|c| format!(" (config from {c})")).unwrap_or_default();
         writeln!(
             doc,
