@@ -248,17 +248,17 @@ Quantised copies under this lab: 33, of which 12 load.
 | nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16 | 2026-10-16 | 8 | dory | REFUSED | model_type dory | #1311 |
 | nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-MXFP8 | 2026-10-16 | 4.6 | dory | REFUSED | model_type dory | #1311 |
 | nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4 | 2026-10-16 | 4.6 | dory | REFUSED | model_type dory | #1311 |
-| nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr | 2026-10-12 | 0.9 | qwen3 | UNKNOWN-QUANT | modelopt_fp4 weights |  |
+| nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr | 2026-10-12 | 0.9 | qwen3 | UNKNOWN-QUANT | modelopt_fp4 weights | #1320 |
 | nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16 | 2026-10-12 | 248.9 | nemotron_h_omni | needs family #1307, then offload: 2 cards plus 21 GB host plus 55 GB NVMe; planner not run until the family exists | model_type nemotron_h_omni | #1307 |
 | nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-Base-BF16 | 2026-10-12 | 248.9 | nemotron_h_omni | needs family #1307, then offload: 2 cards plus 21 GB host plus 55 GB NVMe; planner not run until the family exists | model_type nemotron_h_omni | #1307 |
 | nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 | 2026-10-12 | 75 | nemotron_h_omni | REFUSED | model_type nemotron_h_omni | #1307 |
-| nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr | 2026-10-11 | 1.2 | qwen3 | UNKNOWN-QUANT | modelopt_fp4 weights |  |
+| nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr | 2026-10-11 | 1.2 | qwen3 | UNKNOWN-QUANT | modelopt_fp4 weights | #1320 |
 | nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16 | 2026-10-09 | 149.8 | nemotron_h_omni | needs family #1307, then offload: 2 cards plus 0 GB host plus 0 GB NVMe; planner not run until the family exists | model_type nemotron_h_omni | #1307 |
 | nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB | 2026-10-07 | 24.1 | nemotron_h_omni | REFUSED | model_type nemotron_h_omni | #1307 |
 | nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF | 2026-10-07 | 22 | nemotron_h_moe | REFUSED | GGUF tensor and metadata names for families that already load from safetensors | #1204 |
 | nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB | 2026-10-05 | 6.2 | gemma4 | REFUSED | GGUF tensor and metadata names for families that already load from safetensors | #1204 |
 | nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16 | 2026-10-05 | 16 | gemma4 | REFUSED | Gemma 4 per-layer input embeddings (hidden_size_per_layer_input) are not supported yet | #1239 |
-| nvidia/NVIDIA-Nemotron-Labs-3-Competitive-Coding-550B-A55B-NVFP4 | 2026-09-04 | 352.3 | nemotron_h | needs quantisation support (no issue yet), then offload: 2 cards plus 21 GB host plus 158 GB NVMe; planner not run until the family exists | layer N mixer.experts.N.down_proj is Nvfp4G16 but other attention projections are Some(Fp8... |  |
+| nvidia/NVIDIA-Nemotron-Labs-3-Competitive-Coding-550B-A55B-NVFP4 | 2026-09-04 | 352.3 | nemotron_h | needs quantisation support #1321, then offload: 2 cards plus 21 GB host plus 158 GB NVMe; planner not run until the family exists | layer N mixer.experts.N.down_proj is Nvfp4G16 but other attention projections are Some(Fp8... | #1321 |
 | nvidia/Nemotron-3-Labs-Ultra-Math-RL | 2026-09-02 | 1121 | nemotron_h | DOES-NOT-FIT: 2 cards plus 21 GB host plus 927 GB NVMe; does not fit this machine, short by 325 GB of NVMe |  |  |
 | nvidia/Nemotron-3-Labs-Ultra-Math-SFT | 2026-09-02 | 1121 | nemotron_h | DOES-NOT-FIT: 2 cards plus 21 GB host plus 927 GB NVMe; does not fit this machine, short by 325 GB of NVMe |  |  |
 | nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Base-BF16 | 2026-08-05 | 65.8 | nemotron_h | REFUSED | [mixer] is set but the pattern has no linear layer | #1206 |
@@ -288,8 +288,8 @@ Quantised copies under this lab: 33, of which 12 load.
 | nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8 | 2026-03-12 | 5.3 | nemotron_h | UNKNOWN-QUANT | quantisation declared only in hf_quant_config.json | #1206 |
 | nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 | 2026-03-10 | 247.2 | nemotron_h | SUPPORTED-WITH-OFFLOAD: 2 cards plus 21 GB host plus 53 GB NVMe; planner models cards and host only, the NVMe tier is the expert cache and layer spill path |  |  |
 | nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-Base-BF16 | 2026-03-10 | 247.2 | nemotron_h | SUPPORTED-WITH-OFFLOAD: 2 cards plus 21 GB host plus 53 GB NVMe; planner models cards and host only, the NVMe tier is the expert cache and layer spill path |  |  |
-| nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8 | 2026-03-10 | 128.3 | nemotron_h | needs quantisation support (no issue yet), then offload: 2 cards plus 0 GB host plus 0 GB NVMe; planner not run until the family exists | modelopt FP8 weights |  |
-| nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 | 2026-03-10 | 80.3 | nemotron_h | UNKNOWN-QUANT | layer N mixer.experts.N.up_proj is Nvfp4G16 but other attention projections are Some(Fp8Ch... |  |
+| nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8 | 2026-03-10 | 128.3 | nemotron_h | needs quantisation support #1320, then offload: 2 cards plus 0 GB host plus 0 GB NVMe; planner not run until the family exists | modelopt FP8 weights | #1320 |
+| nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 | 2026-03-10 | 80.3 | nemotron_h | UNKNOWN-QUANT | layer N mixer.experts.N.up_proj is Nvfp4G16 but other attention projections are Some(Fp8Ch... | #1321 |
 | nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16 | 2026-03-07 | 7.9 | nemotron_h | LOADS |  |  |
 | nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF | 2026-03-07 | 2.8 | nemotron_h | REFUSED | GGUF tensor and metadata names for families that already load from safetensors | #1204 |
 | nvidia/Nemotron-Labs-Diffusion-3B | 2026-03-02 | 7.7 | nemotron_labs_diffusion | REFUSED | model_type nemotron_labs_diffusion | #1308 |
@@ -441,12 +441,12 @@ Labs in the order of `labs.toml`, then by how many of that lab's own models a ga
 | NVIDIA | model_type nemotron_h_puzzle | 3 | nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4, nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-FP8, nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-BF16 | #1310 |
 | NVIDIA | model_type nemotron-nas | 2 | nvidia/Llama-3_1-Nemotron-Ultra-253B-v1, nvidia/Llama-3_3-Nemotron-Super-49B-v1_5 | #1312 |
 | NVIDIA | model_type nemotron_labs_audex | 2 | nvidia/Nemotron-Labs-Audex-2B, nvidia/Nemotron-Labs-Audex-30B-A3B | #1313 |
-| NVIDIA | modelopt_fp4 weights | 2 | nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr, nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr |  |
+| NVIDIA | modelopt_fp4 weights | 2 | nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr, nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr | #1320 |
 | NVIDIA | Gemma 4 per-layer input embeddings (hidden_size_per_layer_input) are not supported yet | 1 | nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16 | #1239 |
-| NVIDIA | layer N mixer.experts.N.down_proj is Nvfp4G16 but other attention projections are Some(Fp8Channel) | 1 | nvidia/NVIDIA-Nemotron-Labs-3-Competitive-Coding-550B-A55B-NVFP4 |  |
-| NVIDIA | layer N mixer.experts.N.up_proj is Nvfp4G16 but other attention projections are Some(Fp8Channel) | 1 | nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 |  |
+| NVIDIA | layer N mixer.experts.N.down_proj is Nvfp4G16 but other attention projections are Some(Fp8Channel) | 1 | nvidia/NVIDIA-Nemotron-Labs-3-Competitive-Coding-550B-A55B-NVFP4 | #1321 |
+| NVIDIA | layer N mixer.experts.N.up_proj is Nvfp4G16 but other attention projections are Some(Fp8Channel) | 1 | nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 | #1321 |
 | NVIDIA | model_type nemotron_labs_diffusion_vlm | 1 | nvidia/Nemotron-Labs-Diffusion-VLM-8B | #1314 |
-| NVIDIA | modelopt FP8 weights | 1 | nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8 |  |
+| NVIDIA | modelopt FP8 weights | 1 | nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8 | #1320 |
 | NVIDIA | the quantisation config has no groups | 1 | nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark |  |
 | Google | model_type gemma2 | 6 | google/gemma-2-27b-it, google/gemma-2-27b, google/gemma-2-2b-it, google/gemma-2-2b and 2 more | #1319 |
 | Google | Gemma 4 per-layer input embeddings (hidden_size_per_layer_input) are not supported yet | 4 | google/gemma-4-E2B-it, google/gemma-4-E2B, google/gemma-4-E4B-it, google/gemma-4-E4B | #1239 |
@@ -504,7 +504,7 @@ Selection: every model of the labs in labs.toml released since 2026-02-24 or sti
 
 ## Ranked gaps
 
-Each gap is one missing piece, ranked by the summed downloads of the rows it blocks (a base row counts its whole group less the quantised copies listed beside it). Chat and tokenizer gaps are counted only on rows whose architecture passes. The issue column maps a gap to its tracker issue through `crates/specrt/tests/fixtures/popular/gaps.toml`; every gap over 1.00 M downloads has one.
+The same gaps as above, ordered by the summed downloads of the rows they block. This is the older view and it is not the queue order: the lab priority at the top of this section is, because downloads reward CI and tutorial traffic. A base row counts its whole group less the quantised copies listed beside it. Chat and tokenizer gaps are counted only on rows whose architecture passes. The issue column maps a gap to its tracker issue through `crates/specrt/tests/fixtures/popular/gaps.toml`; every gap over 1.00 M downloads has one.
 
 | # | kind | gap | blocked downloads | rows | models | issue |
 |---|---|---|---|---|---|---|
@@ -559,7 +559,7 @@ Each gap is one missing piece, ranked by the summed downloads of the rows it blo
 | 49 | new family spec | model_type llava | 0.64 M | 1 | llava-hf/llava-1.5-7b-hf | #1208 |
 | 50 | new family spec | model_type mistral3 (wraps qwen3, which specrt runs) | 0.62 M | 2 | lightonai/LightOnOCR-2-1B, switzerchees/LightOnOCR-2-1B-NVFP4 | #1208 |
 | 51 | new family spec | model_type minimax_m3_vl | 0.57 M | 7 | MiniMaxAI/MiniMax-M3, nvidia/MiniMax-M3-NVFP4, MiniMaxAI/MiniMax-M3-MXFP8, cyankiwi/MiniMax-M3-AWQ-INT4 and 3 more | #1298 |
-| 52 | quant format | layer N mixer.experts.N.up_proj is Nvfp4G16 but other attention projections are Some(Fp8Channel) | 0.50 M | 1 | nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 |  |
+| 52 | quant format | layer N mixer.experts.N.up_proj is Nvfp4G16 but other attention projections are Some(Fp8Channel) | 0.50 M | 1 | nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 | #1321 |
 | 53 | new family spec | model_type bailing_hybrid | 0.48 M | 7 | inclusionAI/Ling-3.0-tiny, inclusionAI/Ling-3.1-flash, Hikari07jp/Ling-3.1-flash-NVFP4-Ablitrated-MTP-RTX-PRO-6000-TP4, inclusionAI/Ling-3.1-flash-1019 and 3 more | #1315 |
 | 54 | new family spec | model_type nemotron_h_omni | 0.41 M | 6 | nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16, nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4, RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-FP8, nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB and 2 more | #1307 |
 | 55 | new family spec | model_type hy_v4_flash | 0.40 M | 7 | tencent/Hy4-flash, Avifenesh/Hy4-flash-NVFP4, leoncca/Hy4-flash-AWQ-g32, peasantsmith/Hy4-Flash-Maya-GGUF and 3 more | #1289 |
@@ -596,7 +596,7 @@ Each gap is one missing piece, ranked by the summed downloads of the rows it blo
 | 86 | new family spec | model_type mimo | 0.03 M | 1 | XiaomiMiMo/MiMo-7B-RL | #1297 |
 | 87 | new family spec | model_type raon1_nano | 0.02 M | 3 | KRAFTON/Raon-1-nano, Pilcothink/Raon-1-nano-NVFP4, KRAFTON/Raon-1-nano-gguf |  |
 | 88 | quant format | compressed-tensors float-quantized w8f-tensor a8 weights | 0.02 M | 2 | RedHatAI/Llama-3.2-1B-FP8, JongYeop/Mistral-7B-Instruct-v0.2-FP8-W8A8 |  |
-| 89 | quant format | modelopt FP8 weights | 0.02 M | 2 | daeunj/DeepSeek-V2-Lite-FP8-GPTQ, nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8 |  |
+| 89 | quant format | modelopt FP8 weights | 0.02 M | 2 | daeunj/DeepSeek-V2-Lite-FP8-GPTQ, nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8 | #1320 |
 | 90 | new family spec | GGUF architecture inkling2_vq | 0.02 M | 1 | Baekpica/Inkling-2-Small-VQ-GGUF |  |
 | 91 | new family spec | model_type beam | 0.02 M | 4 | reflection/Beam-1.0-501B-A23B, Bespoke-Intelligence/Beam-1.0-501B-A23B-NVFP4-TP3-3x-DGX-Spark, reflection/Beam-1.0-501B-A23B-FP8, reflection/Beam-1.0-501B-A23B-NVFP4 | #1318 |
 | 92 | new family spec | model_type maxwell_moe | 0.02 M | 3 | maxwell-model/Maxwell-V1-Flash, maxwell-model/Maxwell-V1-Flash-FP8, AtomicChat/Maxwell-V1-Flash-GGUF |  |
@@ -606,7 +606,7 @@ Each gap is one missing piece, ranked by the summed downloads of the rows it blo
 | 96 | new family spec | GGUF architecture deepseek2-ocr | 0.01 M | 2 | sahilchachra/Unlimited-OCR-GGUF, sabafallah/DeepSeek-OCR-GGUF |  |
 | 97 | new family spec | model_type kimi_k2 | 0.01 M | 1 | moonshotai/Kimi-K2-Instruct-0905 | #1288 |
 | 98 | quant format | gptq 2bit weights | 0.01 M | 1 | lilmeaty/SmolLM2-135M-Instruct-GPTQ |  |
-| 99 | quant format | modelopt_fp4 weights | 0.01 M | 2 | nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr, nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr |  |
+| 99 | quant format | modelopt_fp4 weights | 0.01 M | 2 | nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr, nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr | #1320 |
 | 100 | new family spec | model_type nemotron-nas | 0.01 M | 4 | nvidia/Llama-3_1-Nemotron-Ultra-253B-v1, nvidia/Llama-3_3-Nemotron-Super-49B-v1_5, Ithanil/Llama-3_3-Nemotron-Super-49B-v1_5-FP8-Dynamic, etsien/Llama-3_3-Nemotron-Super-49B-v1_5-GPTQ-w4a8 | #1312 |
 | 101 | new family spec | GGUF architecture hunyuan-dense | 0.01 M | 1 | bartowski/tencent_Hunyuan-7B-Instruct-GGUF |  |
 | 102 | new family spec | GGUF architecture phi2 | 0.01 M | 1 | ggml-org/moondream2-20250414-GGUF |  |
@@ -630,7 +630,7 @@ Each gap is one missing piece, ranked by the summed downloads of the rows it blo
 | 120 | new family spec | model_type aurora2 | 0.00 M | 1 | AuroraAI-Research/Aurora2-400M-A20M |  |
 | 121 | quant format | None weights | 0.00 M | 1 | NVFP4/Qwen3-30B-A3B-Thinking-2507-FP4 |  |
 | 122 | new family spec | model_type bailing_moe_v3_vl | 0.00 M | 2 | inclusionAI/LingSante-3.1-air-VL, inclusionAI/LingSante-3.1-air-VL-MXFP4 | #1316 |
-| 123 | quant format | layer N mixer.experts.N.down_proj is Nvfp4G16 but other attention projections are Some(Fp8Channel) | 0.00 M | 1 | nvidia/NVIDIA-Nemotron-Labs-3-Competitive-Coding-550B-A55B-NVFP4 |  |
+| 123 | quant format | layer N mixer.experts.N.down_proj is Nvfp4G16 but other attention projections are Some(Fp8Channel) | 0.00 M | 1 | nvidia/NVIDIA-Nemotron-Labs-3-Competitive-Coding-550B-A55B-NVFP4 | #1321 |
 | 124 | attention, block or MoE variant | config.json has no num_attention_heads | 0.00 M | 1 | gaunernst/gemma-3-4b-it-int4-awq | #1213 |
 | 125 | new family spec | model_type nemotron_labs_diffusion_vlm | 0.00 M | 3 | nvidia/Nemotron-Labs-Diffusion-VLM-8B, yury-kapoyko/nemotron-diff-vlm-8b-fp8, yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq | #1314 |
 | 126 | quant format | compressed-tensors pack-quantized w8i-group weights | 0.00 M | 2 | cyankiwi/Qwen3-4B-Thinking-2507-AWQ-8bit, axteam/MiniCPM5-2B-AWQ-8bit |  |
@@ -1371,10 +1371,10 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-FP8 | fp8 | 1025 | 128.8 | nemotron_h_omni | compressed-tensors float-quantized w8f-channel a8 | REFUSED | model_type nemotron_h_omni is not supported; 128.8 GB of weights, then offload: 2 cards plus 0 GB host plus 0 GB NVMe; planner not run until the family exists |  |  | ok, tools XmlFunction | #1307 |
 | nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB | lab | 52767 | 24.1 | nemotron_h_omni | modelopt IQ2_XXS+MIXED_PRECISION+Q8_0+W4A16_NVFP4 | REFUSED | model_type nemotron_h_omni is not supported |  |  | ok, tools XmlFunction | #1307 |
 | nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF | gguf | 190946 | 22 | nemotron_h_moe | gguf | REFUSED | GGUF architecture nemotron_h_moe is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1204 |
-| nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr | lab | 4863 | 0.9 | qwen3 | modelopt_fp4 | UNKNOWN-QUANT | quantization {"quant_algo":"W4A16_NVFP4","kv_cache_quant_algo":null,"group_size":16,"exclude_modules":["*attention_conv*","*mlp_conv*","*self_attn*","*norm","*lilicorr.anchor_out_head","*lilicorr.factor_input_proj","lili... | `family-qwen3.toml` |  | no tokenizer.json |  |
+| nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr | lab | 4863 | 0.9 | qwen3 | modelopt_fp4 | UNKNOWN-QUANT | quantization {"quant_algo":"W4A16_NVFP4","kv_cache_quant_algo":null,"group_size":16,"exclude_modules":["*attention_conv*","*mlp_conv*","*self_attn*","*norm","*lilicorr.anchor_out_head","*lilicorr.factor_input_proj","lili... | `family-qwen3.toml` |  | no tokenizer.json | #1320 |
 | nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16 | lab | 7775 | 149.8 | nemotron_h_omni | none | REFUSED | model_type nemotron_h_omni is not supported; 149.8 GB of weights, then offload: 2 cards plus 0 GB host plus 0 GB NVMe; planner not run until the family exists |  |  | ok, tools XmlFunction | #1307 |
 | nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 | nvfp4 | 136546 | 75 | nemotron_h_omni | modelopt_mixed | REFUSED | model_type nemotron_h_omni is not supported |  |  | ok, tools XmlFunction | #1307 |
-| nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr | lab | 4672 | 1.2 | qwen3 | modelopt_fp4 | UNKNOWN-QUANT | quantization {"quant_algo":"W4A16_NVFP4","kv_cache_quant_algo":null,"group_size":16,"exclude_modules":["*attention_conv*","*mlp_conv*","*self_attn*","*norm","*lilicorr.anchor_out_head","*lilicorr.factor_input_proj","*lil... | `family-qwen3.toml` |  | no tokenizer.json |  |
+| nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr | lab | 4672 | 1.2 | qwen3 | modelopt_fp4 | UNKNOWN-QUANT | quantization {"quant_algo":"W4A16_NVFP4","kv_cache_quant_algo":null,"group_size":16,"exclude_modules":["*attention_conv*","*mlp_conv*","*self_attn*","*norm","*lilicorr.anchor_out_head","*lilicorr.factor_input_proj","*lil... | `family-qwen3.toml` |  | no tokenizer.json | #1320 |
 | mistralai/Ministral-3-14B-Reasoning-2512 | base | 296366 | 27.9 | mistral3 | none | REFUSED | model_type mistral3 is not supported |  |  | ok, tools Unparsed | #1302 |
 | cyankiwi/Ministral-3-14B-Reasoning-2512-AWQ-4bit | awq | 203 | 10.4 | mistral3 | compressed-tensors pack-quantized w4i-group-g32 | REFUSED | model_type mistral3 is not supported |  |  | ok, tools Unparsed | #1302 |
 | hascrack/Minivoxtral-3-14B-Reasoning-2512_ASR | gptq | 8 |  | mistral3 | gptq 4bit g64 | REFUSED | model_type mistral3 is not supported |  |  | no tokenizer.json | #1302 |
@@ -1401,7 +1401,7 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | amd/gemma-2-2b-awq-uint4-asym-g128-lmhead-g32-fp16-onnx-hybrid_v2 | awq | 0 |  |  | none | UNCHECKED | no config.json |  |  | no template |  |
 | bartowski/gemma-2-2b-it-GGUF | gguf | 68320 | 10.5 | gemma2 | gguf | REFUSED | GGUF architecture gemma2 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1319 |
 | google/gemma-2-2b (config from unsloth/gemma-2-2b) | lab | 84034 | 10.5 | gemma2 | none | REFUSED | model_type gemma2 is not supported |  |  | no template | #1319 |
-| nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 | base | 488757 | 80.3 | nemotron_h | modelopt FP8+MIXED_PRECISION+NVFP4 | UNKNOWN-QUANT | layer 1 mixer.experts.0.up_proj is Nvfp4G16 but other attention projections are Some(Fp8Channel) (88 layers (full+linear+mlp), hidden 4096, 512 experts top 22, ssm mixer, bf16) | `family-nemotron_h.toml` |  | ok, tools XmlFunction |  |
+| nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 | base | 488757 | 80.3 | nemotron_h | modelopt FP8+MIXED_PRECISION+NVFP4 | UNKNOWN-QUANT | layer 1 mixer.experts.0.up_proj is Nvfp4G16 but other attention projections are Some(Fp8Channel) (88 layers (full+linear+mlp), hidden 4096, 512 experts top 22, ssm mixer, bf16) | `family-nemotron_h.toml` |  | ok, tools XmlFunction | #1321 |
 | grumd0/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4-GGUF | gguf | 88 | 79.4 | nemotron_h_moe | gguf | REFUSED | GGUF architecture nemotron_h_moe is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1204 |
 | zai-org/GLM-5.1 | base | 417617 | 1507.7 | glm_moe_dsa | none | DOES-NOT-FIT | 1507.7 GB of weights, 2 cards plus 21 GB host plus 1314 GB NVMe; does not fit this machine, short by 712 GB of NVMe; 78 layers (dense), hidden 6144, 256 experts top 8, bf16 | `family-glm_moe_dsa.toml` | yes | ok, tools KeyValueXml |  |
 | cyankiwi/GLM-5.1-AWQ-4bit | awq | 133 | 429.9 | glm_moe_dsa | compressed-tensors pack-quantized w4i-group-g32 | UNKNOWN-QUANT | compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (78 layers (dense), hidden 6144, 256 experts top 8, bf16); 429.9 GB of weights, then offload: 2 cards plus 21 GB host plus 236 GB... | `family-glm_moe_dsa.toml` |  | ok, tools KeyValueXml | #1200 |
@@ -1532,7 +1532,7 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | deepseek-ai/DeepSeek-V2-Lite | base | 110081 | 31.4 | deepseek_v2 | none | LOADS | 27 layers (dense), hidden 2048, 64 experts top 6, bf16 | `family-deepseek_v2.toml` | yes | ok, tools None |  |
 | Beambutbetter/Deepseek-V2-Lite-16B-NVFP4 | nvfp4 | 34 | 9.4 | deepseek_v2 | modelopt NVFP4 | UNKNOWN-QUANT | nvfp4_g16 needs hidden and intermediate to be multiples of 256 (27 layers (dense), hidden 2048, 64 experts top 6, bf16) | `family-deepseek_v2.toml` |  | ok, tools None |  |
 | Etelis/DeepSeek-V2-Lite-FP8-BLOCK-padded | fp8 | 34 | 16.1 | deepseek_v2 | compressed-tensors float-quantized w8f-block a8 | UNKNOWN-QUANT | compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (27 layers (dense), hidden 2048, 64 experts top 6, bf16) | `family-deepseek_v2.toml` |  | ok, tools None |  |
-| daeunj/DeepSeek-V2-Lite-FP8-GPTQ | gptq | 26 | 16.1 | deepseek_v2 | modelopt FP8 | UNKNOWN-QUANT | compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (27 layers (dense), hidden 2048, 64 experts top 6, bf16) | `family-deepseek_v2.toml` |  | ok, tools None |  |
+| daeunj/DeepSeek-V2-Lite-FP8-GPTQ | gptq | 26 | 16.1 | deepseek_v2 | modelopt FP8 | UNKNOWN-QUANT | compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (27 layers (dense), hidden 2048, 64 experts top 6, bf16) | `family-deepseek_v2.toml` |  | ok, tools None | #1320 |
 | legraphista/DeepSeek-V2-Lite-IMat-GGUF | gguf | 14915 | 31.4 | deepseek2 | gguf | REFUSED | GGUF architecture deepseek2 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1204 |
 | Qwen/Qwen3-235B-A22B-Instruct-2507 | base | 49293 | 470.2 | qwen3_moe | none | SUPPORTED-WITH-OFFLOAD | 470.2 GB of weights, 2 cards plus 21 GB host plus 276 GB NVMe; planner models cards and host only, the NVMe tier is the expert cache and layer spill path; 94 layers (dense), hidden 4096, 128 experts top 8, bf16 | `family-qwen3.toml` | yes | ok, tools Hermes |  |
 | QuantTrio/Qwen3-235B-A22B-Instruct-2507-AWQ | awq | 2434 | 124.1 | qwen3_moe | awq 4bit g128 | UNKNOWN-QUANT | quantization {"quant_method":"awq","bits":4,"group_size":128,"version":"gemm","zero_point":true,"modules_to_not_convert":[".mlp.gate"]} is not supported (fp8 e4m3 with 128x128 blocks and compressed-tensors fp8/nvfp4 are)... | `family-qwen3.toml` |  | ok, tools Hermes | #1200 |
@@ -1677,7 +1677,7 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | KRAFTON/Raon-1-nano-gguf | gguf | 20272 | 6.3 | raon1nano | gguf | REFUSED | GGUF architecture raon1nano is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF |  |
 | Pilcothink/Raon-1-nano-NVFP4 | nvfp4 | 88 | 3.8 | raon1_nano | modelopt NVFP4 | REFUSED | model_type raon1_nano is not supported |  |  | ok, tools XmlFunction |  |
 | zai-org/GLM-5.1-FP8 | base | 23678 | 756.2 | glm_moe_dsa | fp8 e4m3 block [128, 128] | UNKNOWN-QUANT | fp8 weights need hidden, intermediate, head_dim and the linear value dim to be multiples of 128 (78 layers (dense), hidden 6144, 256 experts top 8, bf16); 756.2 GB of weights, then offload: 2 cards plus 21 GB host plus 5... | `family-glm_moe_dsa.toml` |  | ok, tools KeyValueXml | #1207 |
-| nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8 | base | 22812 | 128.3 | nemotron_h | modelopt FP8 | UNKNOWN-QUANT | compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (88 layers (full+linear+mlp), hidden 4096, 512 experts top 22, ssm mixer, bf16); 128.3 GB of weights, then offload: 2 cards plus ... | `family-nemotron_h.toml` |  | ok, tools XmlFunction |  |
+| nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8 | base | 22812 | 128.3 | nemotron_h | modelopt FP8 | UNKNOWN-QUANT | compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (88 layers (full+linear+mlp), hidden 4096, 512 experts top 22, ssm mixer, bf16); 128.3 GB of weights, then offload: 2 cards plus ... | `family-nemotron_h.toml` |  | ok, tools XmlFunction | #1320 |
 | nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16 | base | 13467 | 8 | dory | none | REFUSED | model_type dory is not supported |  |  | ok, tools XmlFunction | #1311 |
 | cloudnathan5/Dory1.0-4B-GGUF | gguf | 9242 | 8 | dory | gguf | REFUSED | GGUF architecture dory is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1311 |
 | XiaomiMiMo/MiMo-V2.6-Pro-MOPD | base | 21082 | 566 | mimo_v2 | fp8 e4m3 block [128, 128] | REFUSED | model_type mimo_v2 is not supported; 566 GB of weights, then offload: 2 cards plus 21 GB host plus 372 GB NVMe; planner not run until the family exists |  |  | ok, tools XmlFunction | #1296 |
@@ -1797,7 +1797,7 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | inclusionAI/LingSante-3.1-flash | base | 1070 | 573.8 | bailing_hybrid | fp8 e4m3 block [128, 128] | REFUSED | model_type bailing_hybrid is not supported; 573.8 GB of weights, then offload: 2 cards plus 21 GB host plus 380 GB NVMe; planner not run until the family exists |  |  | ok, tools KeyValueXml | #1315 |
 | tencent/Hy4-FP8 | base | 970 | 786.3 | hy_v4_vl | compressed-tensors float-quantized w8f-block a8 | REFUSED | model_type hy_v4_vl is not supported; 786.3 GB of weights, then offload: 2 cards plus 21 GB host plus 592 GB NVMe; planner not run until the family exists |  |  | ok, tools Unparsed | #1294 |
 | tencent/Hy4-base | base | 873 | 1542.3 | hy_v4_vl | none | REFUSED | model_type hy_v4_vl is not supported; 1542.3 GB of weights, then offload: 2 cards plus 21 GB host plus 1348 GB NVMe; does not fit this machine, short by 746 GB of NVMe |  |  | ok, tools Unparsed | #1294 |
-| nvidia/NVIDIA-Nemotron-Labs-3-Competitive-Coding-550B-A55B-NVFP4 | base | 788 | 352.3 | nemotron_h | modelopt FP8+MIXED_PRECISION+NVFP4 | UNKNOWN-QUANT | layer 1 mixer.experts.0.down_proj is Nvfp4G16 but other attention projections are Some(Fp8Channel) (108 layers (full+linear+mlp), hidden 8192, 512 experts top 22, ssm mixer, bf16); 352.3 GB of weights, then offload: 2 ca... | `family-nemotron_h.toml` |  | ok, tools XmlFunction |  |
+| nvidia/NVIDIA-Nemotron-Labs-3-Competitive-Coding-550B-A55B-NVFP4 | base | 788 | 352.3 | nemotron_h | modelopt FP8+MIXED_PRECISION+NVFP4 | UNKNOWN-QUANT | layer 1 mixer.experts.0.down_proj is Nvfp4G16 but other attention projections are Some(Fp8Channel) (108 layers (full+linear+mlp), hidden 8192, 512 experts top 22, ssm mixer, bf16); 352.3 GB of weights, then offload: 2 ca... | `family-nemotron_h.toml` |  | ok, tools XmlFunction | #1321 |
 | nvidia/Nemotron-Labs-Audex-2B | base | 746 |  | nemotron_labs_audex | none | REFUSED | model_type nemotron_labs_audex is not supported |  |  | no tokenizer.json | #1313 |
 | nvidia/Nemotron-Labs-Diffusion-VLM-8B | base | 653 | 17.8 | nemotron_labs_diffusion_vlm | none | REFUSED | model_type nemotron_labs_diffusion_vlm is not supported |  |  | ok, tools XmlFunction | #1314 |
 | IntellAgents/Nemotron-Labs-Diffusion-VLM-8B-GGUF | gguf | 42 | 17 | mistral3 | gguf | REFUSED | GGUF architecture mistral3 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1302 |
