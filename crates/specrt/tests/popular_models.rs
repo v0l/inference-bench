@@ -367,6 +367,9 @@ fn chat(row: &Row) -> (String, Option<Gap>) {
             Ok(_) => (format!("ok, tools {:?}", t.tool_format()), None),
             Err(e) => {
                 let msg = error_text(e);
+                if msg.contains("invalid operation") && t.source().contains("raise_exception") {
+                    return (format!("the template refuses a plain user turn by design: {}", short(&msg, 60)), None);
+                }
                 let key = msg.split(" (in ").next().unwrap_or(&msg).trim_start_matches("chat template: ").to_string();
                 (format!("fails: {msg}"), Some(Gap { kind: Kind::Chat, key: format!("chat template: {key}") }))
             }
