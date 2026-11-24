@@ -1,6 +1,6 @@
 name = "base"
 kind = "family"
-min_engine = 8
+min_engine = 14
 
 [activation]
 lenient_default = "swiglu"
@@ -63,6 +63,36 @@ when = { quant_method = "modelopt", quant_algo = { any = ["NVFP4", "W4A16_NVFP4"
 [[quantization.flat_rules]]
 quant = "fp8_channel"
 when = { quant_method = "modelopt", quant_algo = "FP8" }
+
+[[quantization.tensor_rules]]
+quant = "fp8"
+when = { quant_method = "modelopt", quant_algo = "FP8" }
+
+[[quantization.tensor_rules]]
+quant = "fp8_block128"
+when = { quant_method = "modelopt", quant_algo = "FP8_PB_WO", weight_block_size = [128, 128] }
+
+[[quantization.tensor_rules]]
+quant = "mxfp8"
+when = { quant_method = "modelopt", quant_algo = "MXFP8", weight_block_size = [1, 32] }
+
+[[quantization.tensor_rules]]
+quant = "mxfp8"
+when = { quant_method = "modelopt", quant_algo = "MXFP8", group_size = 32 }
+
+[[quantization.tensor_rules]]
+quant = "nvfp4"
+when = { quant_method = "modelopt", quant_algo = "NVFP4", group_size = 16, weight_scale_encoding = "plain" }
+defaults = { weight_scale_encoding = "plain" }
+
+[[quantization.tensor_rules]]
+quant = "nvfp4_csf"
+when = { quant_method = "modelopt", quant_algo = "NVFP4", group_size = 16, weight_scale_encoding = "csf_32x2_v1" }
+
+[[quantization.tensor_rules]]
+quant = "w4a16_nvfp4"
+when = { quant_method = "modelopt", quant_algo = "W4A16_NVFP4", group_size = 16, weight_scale_encoding = "plain" }
+defaults = { weight_scale_encoding = "plain" }
 
 [[quantization.flat_rules]]
 quant = "fp8_block128"

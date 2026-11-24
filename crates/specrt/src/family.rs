@@ -360,6 +360,7 @@ pub struct FamilyQuant {
     pub group_rules: Vec<Rule<crate::spec::Quant>>,
     pub flat_rules: Vec<Rule<crate::spec::Quant>>,
     pub act_rules: Vec<Rule<crate::spec::ActQuant>>,
+    pub tensor_rules: Vec<Rule<crate::quant_map::TensorQuant>>,
     pub group_error: String,
     pub flat_error: String,
 }

@@ -1077,6 +1077,7 @@ impl Runtime {
             Some((n, rank, _)) => Checkpoint::for_repo(&spec.repo)?.renamed(&spec.tensors).for_rank(crate::tp::RankCut::new(&full, crate::graph::Graph::decoder(), n, rank)?)?,
             None => Checkpoint::for_repo(&spec.repo)?.renamed(&spec.tensors),
         };
+        checkpoint.check_quant_layout(&checkpoint.quant_map()?.renamed(&spec.tensors))?;
         let weights_started = Instant::now();
         let Weights { mut layers, embed, norm, lm_head, mtp: mtp_weights, direct: weights_direct } =
             load_weights(&ctx, &stream, &checkpoint, spec, range, role)?;

@@ -335,6 +335,41 @@ impl Checkpoint {
         Ok(items)
     }
 
+    pub fn quant_config(&self) -> Result<Option<serde_json::Value>> {
+        let Some(dir) = self.files.first().and_then(|f| f.parent()).filter(|_| self.gguf.is_none()) else { return Ok(None) };
+        let read = |name: &str| -> Result<Option<serde_json::Value>> {
+            let path = dir.join(name);
+            if !path.is_file() {
+                return Ok(None);
+            }
+            let text = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
+            Ok(Some(serde_json::from_str(&text).with_context(|| path.display().to_string())?))
+        };
+        if let Some(q) = read("hf_quant_config.json")? {
+            return Ok(Some(q.get("quantization").filter(|v| v.is_object()).cloned().unwrap_or(q)));
+        }
+        Ok(read("config.json")?.and_then(|c| c.get("quantization_config").or_else(|| c.get("text_config")?.get("quantization_config")).cloned()))
+    }
+
+    pub fn quant_map(&self) -> Result<crate::quant_map::QuantMap> {
+        match self.quant_config()? {
+            Some(q) => crate::quant_map::QuantMap::from_quant_config(&q),
+            None => Ok(Default::default()),
+        }
+    }
+
+    pub fn check_quant_layout(&self, map: &crate::quant_map::QuantMap) -> Result<()> {
+        if map.is_empty() {
+            return Ok(());
+        }
+        let mut tensors = std::collections::BTreeMap::new();
+        for (name, (i, stored)) in self.names.iter() {
+            let info = self.shards[*i].meta.info(stored).context("tensor info")?;
+            tensors.insert(name.clone(), crate::quant_map::Tensor { dtype: info.dtype, shape: info.shape.clone() });
+        }
+        map.check_layout(&tensors)
+    }
+
     pub fn names_under(&self, prefix: &str) -> Vec<String> {
         self.names.keys().filter(|n| n.starts_with(prefix)).cloned().collect()
     }
