@@ -242,10 +242,27 @@ fn classify_config(json: &str, row: &Row) -> Verdict {
             match serving(&core) {
                 Ok(spec) if quantised => Verdict::new(Class::UnknownQuant, format!("{full} ({})", describe(&spec)), Some(Gap { kind: Kind::Quant, key: quant_gap(&full, label) })),
                 Ok(spec) => Verdict::new(Class::Refused, format!("{full} ({})", describe(&spec)), Some(refusal_gap(&full))),
-                Err(arch) => Verdict::new(Class::Refused, arch.clone(), Some(refusal_gap(&arch))),
+                Err(arch) => match inner_text_model(&v) {
+                    Some((outer, inner, spec)) => Verdict::new(
+                        Class::Refused,
+                        format!("{arch}; its text model ({inner}) passes on its own ({})", describe(&spec)),
+                        Some(Gap { kind: Kind::Family, key: format!("model_type {outer} (wraps {inner}, which specrt runs)") }),
+                    ),
+                    None => Verdict::new(Class::Refused, arch.clone(), Some(refusal_gap(&arch))),
+                },
             }
         }
     }
+}
+
+fn inner_text_model(v: &Value) -> Option<(String, String, Spec)> {
+    let outer = v["model_type"].as_str()?.to_string();
+    let text = v.get("text_config").filter(|t| t.is_object())?;
+    let inner = text["model_type"].as_str()?.to_string();
+    if inner == outer || specrt::family::active().for_model_type(&outer).is_some() {
+        return None;
+    }
+    serving(text).ok().map(|spec| (outer, inner, spec))
 }
 
 fn gguf_header(arch: &str) -> Vec<u8> {
@@ -299,6 +316,9 @@ fn classify_gguf(row: &Row) -> Verdict {
     let labels: Vec<String> = row.m["gguf_labels"].as_array().map(|a| a.iter().filter_map(|l| l.as_str().map(String::from)).collect()).unwrap_or_default();
     let (read, unread): (Vec<&String>, Vec<&String>) = labels.iter().partition(|l| readable.contains(&ggml_main_type(l)));
     let join = |v: &[&String]| v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ");
+    if labels.is_empty() {
+        return Verdict::new(Class::Unchecked, format!("GGUF {arch}: no file name names a GGUF type, so the type is unknown without reading a header"), None);
+    }
     if read.is_empty() {
         return Verdict::new(Class::UnknownQuant, format!("GGUF {arch}: no file in a type specrt reads ({})", join(&unread)), Some(Gap { kind: Kind::Quant, key: "GGUF types".into() }));
     }
@@ -400,6 +420,10 @@ fn weights(rows: &[Row]) -> Vec<u64> {
         .collect()
 }
 
+fn unread_of<'a>(mut rows: impl Iterator<Item = &'a Row<'a>>) -> Vec<String> {
+    rows.find_map(|r| fetched(r.repo(), "config.json")).map(|c| specrt::spec::unread_hf_keys(&c).into_iter().map(|(k, _)| k).collect()).unwrap_or_default()
+}
+
 fn cell(s: &str) -> String {
     s.replace('|', "\\|").replace('\n', " ")
 }
@@ -419,6 +443,7 @@ fn millions(n: u64) -> String {
 struct Report {
     tsv: String,
     doc: String,
+    gaps: Value,
 }
 
 fn report() -> Report {
@@ -468,6 +493,21 @@ fn report() -> Report {
     }
     let mut ranked: Vec<(&Gap, &(u64, Vec<usize>))> = gaps.iter().collect();
     ranked.sort_by(|a, b| b.1.0.cmp(&a.1.0).then(a.0.cmp(b.0)));
+    let gaps_json = Value::Array(
+        ranked
+            .iter()
+            .map(|(g, (sum, idx))| {
+                let members: Vec<Value> = idx
+                    .iter()
+                    .map(|&i| {
+                        let why = verdicts[i].gap.as_ref().filter(|v| fold(v) == **g).map(|_| verdicts[i].why.clone()).unwrap_or_else(|| chats[i].0.clone());
+                        serde_json::json!({"repo": rows[i].repo(), "downloads": weight[i], "class": verdicts[i].class.label(), "size_gb": rows[i].size(), "why": why})
+                    })
+                    .collect();
+                serde_json::json!({"key": g.key, "kind": g.kind.label(), "downloads": sum, "rows": members, "unread_keys": unread_of(idx.iter().map(|&i| &rows[i]))})
+            })
+            .collect(),
+    );
 
     let mut doc = String::new();
     let fetched_on = man["fetched"].as_str().unwrap();
@@ -593,7 +633,7 @@ fn report() -> Report {
         )
         .unwrap();
     }
-    Report { tsv, doc }
+    Report { tsv, doc, gaps: gaps_json }
 }
 
 fn expected() -> BTreeMap<String, (String, String, String)> {
@@ -664,6 +704,7 @@ fn popular_model_coverage_report() {
     if std::env::var_os("POPULAR_WRITE").is_some() {
         std::fs::write(popular().join("classes.tsv"), &r.tsv).unwrap();
         std::fs::write(root().join("../../docs/specrt-model-coverage.md"), &r.doc).unwrap();
+        std::fs::write(cache().join("gaps.json"), serde_json::to_string_pretty(&r.gaps).unwrap()).unwrap();
     }
     print!("{}", r.doc);
 }
