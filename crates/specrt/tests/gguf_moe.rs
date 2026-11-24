@@ -259,6 +259,36 @@ fn quantised_experts_match_the_bf16_expanded_experts_within_max_kl_2e_5_measured
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU and GGUF_MOE_REAL=<moe.gguf>"]
+fn kept_experts_on_a_real_moe_gguf_stay_within_max_kl_1e_2_of_the_expanded_experts_measured_4_9e_3() {
+    let Some(file) = std::env::var_os("GGUF_MOE_REAL") else { return };
+    let layers: usize = std::env::var("GGUF_MOE_LAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let prompt: Vec<u32> = (0..64u32).map(|i| 1000 + (i * 7) % 5000).collect();
+    let run = |quantized: bool| {
+        let mut s = Spec::from_gguf_file(Path::new(&file)).unwrap();
+        s.layers.count = layers;
+        s.runtime.loader.workers = 1;
+        s.moe.as_mut().unwrap().quantized_experts = quantized;
+        let mut rt = Runtime::load(&s, 256).unwrap();
+        let decode = rt.trace_decode(&prompt[..16]).unwrap().logits;
+        (rt.prompt_logits(&prompt).unwrap(), decode, rt.generate(&prompt, 32, Sampling::GREEDY).unwrap().tokens, rt.weight_bytes)
+    };
+    let (a, da, ga, wa) = run(false);
+    let (b, db, gb, wb) = run(true);
+    let vocab = a.len() / prompt.len();
+    let stats = |x: &[f32], y: &[f32]| {
+        let kls: Vec<f64> = (0..x.len() / vocab).map(|r| kl(&x[r * vocab..(r + 1) * vocab], &y[r * vocab..(r + 1) * vocab])).collect();
+        (kls.iter().sum::<f64>() / kls.len() as f64, kls.iter().copied().fold(0.0, f64::max))
+    };
+    let ((mean, max), (dmean, dmax)) = (stats(&a, &b), stats(&da, &db));
+    let same = ga.iter().zip(&gb).take_while(|(x, y)| x == y).count();
+    eprintln!("{} layers {layers}: weights {wa} bytes expanded, {wb} bytes kept; prefill mean KL {mean:.3e} max KL {max:.3e}; decode mean KL {dmean:.3e} max KL {dmax:.3e}; greedy prefix {same}/32", Path::new(&file).display());
+    assert!(wb < wa);
+    assert_eq!(same, 32);
+    assert!(max < 1e-2 && dmax < 1e-2, "max KL prefill {max:.3e} decode {dmax:.3e}");
+}
+
+#[test]
 fn a_quant_q8_spec_is_what_a_q8_moe_gguf_gives() {
     assert_eq!(Spec::from_gguf_file(&path(FILES[1])).unwrap().quant, Quant::Q8);
 }

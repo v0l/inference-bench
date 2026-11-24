@@ -48,7 +48,9 @@ Keeping experts quantised on the tiny qwen3moe fixture (`tests/fixtures/moe-gguf
 bench <file.gguf> --ab --b-set spec.moe.quantized_experts=true 128 256
 ```
 
-`--a-set` and `--b-set` take `spec.<path>=<value>` for any spec key besides the `runtime.*` and `speculative.*` options. The default stays off until that run shows decode within 5 percent.
+`--a-set` and `--b-set` take `spec.<path>=<value>` for any spec key besides the `runtime.*` and `speculative.*` options, and `--set` applies the same keys to a plain `bench` run. The default stays off until that run shows decode within 5 percent.
+
+On Qwen3.5-122B-A10B Q4_K_M cut to 12 of 48 layers (#1184, the full expanded model needs about 250 GB), kept experts decode 5 percent faster at batch 1 and the same at batch 8, prefill 25 to 29 percent slower, with 22.8 GB of weights against 63.3 GB. Logits differ from the expanded path by max KL 4.9e-3 (greedy tokens equal), far above the tiny fixture's 7.3e-6, so the default stays off. The routed experts set the slot size; the shared expert (Q8_0 in that file) gets its own size as the last slot, so it no longer pads every Q4_K expert to 272 bytes per block. Numbers are in `docs/perf/scoreboard.md`.
 
 For `gguf`, every matrix carries a row table: each row has its own byte offset and type (Q4_K, Q5_K, Q6_K, Q8_0, BF16), so a fused matrix (qkv, gate and up interleaved) can mix types the way Q4_K_M does (`attn_v` and some `ffn_down` are Q6_K). Q6_K blocks are padded from 210 to 224 bytes so every row starts 16-byte aligned.
 

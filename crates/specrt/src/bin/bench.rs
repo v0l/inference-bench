@@ -271,8 +271,11 @@ fn main() -> Result<()> {
 }
 
 fn spec_prompts(spec: &Spec) -> Result<Vec<Vec<u32>>> {
-    let path = specrt::weights::find_in_snapshot(&spec.repo, "tokenizer.json")?;
-    let tok = tokenizers::Tokenizer::from_file(path).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    let tok = if spec.repo.ends_with(".gguf") {
+        std::str::FromStr::from_str(&specrt::gguf::Gguf::open(Path::new(&spec.repo))?.tokenizer_json()?).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?
+    } else {
+        tokenizers::Tokenizer::from_file(specrt::weights::find_in_snapshot(&spec.repo, "tokenizer.json")?).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?
+    };
     let text = include_str!("../../scripts/spec_prompts.txt");
     text.split("\n---\n")
         .map(|p| Ok(tok.encode(p.trim_end(), false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().to_vec()))
