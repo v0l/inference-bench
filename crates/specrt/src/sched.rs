@@ -124,6 +124,9 @@ pub struct HostSeq {
 }
 
 pub trait Executor {
+    fn measured_step_secs(&mut self) -> Option<f64> {
+        None
+    }
     fn swap_bytes(&self, _blocks: usize) -> usize {
         0
     }
@@ -1511,7 +1514,7 @@ impl<E: Executor> Scheduler<E> {
                 })
                 .collect();
             let out = self.exec.speculate_with(&spec, draft_k)?;
-            report.decode_secs = started.elapsed().as_secs_f64();
+            report.decode_secs = self.exec.measured_step_secs().unwrap_or_else(|| started.elapsed().as_secs_f64());
             report.speculated = true;
             report.decode_rows = rows.len();
             report.drafted = rows.len() * draft_k;
@@ -1617,7 +1620,7 @@ impl<E: Executor> Scheduler<E> {
             let masks = self.row_masks(&rows);
             self.exec.set_masks(masks, None);
             let next = self.exec.decode(&plain)?;
-            report.decode_secs = started.elapsed().as_secs_f64();
+            report.decode_secs = self.exec.measured_step_secs().unwrap_or_else(|| started.elapsed().as_secs_f64());
             report.decode_rows = rows.len();
             if let Some(c) = self.chooser.as_mut()
                 && rows.len() <= cap
@@ -1735,6 +1738,8 @@ mod tests {
         pub k_used: Vec<usize>,
         pub verify_cost: Option<fn(usize, usize) -> Duration>,
         pub accept_all: bool,
+        pub virtual_clock: bool,
+        step_cost: Option<Duration>,
         last_decode: Vec<u32>,
         last_prefill: Option<u32>,
         masks: Vec<Option<Mask>>,
@@ -1781,6 +1786,8 @@ mod tests {
                 k_used: Vec::new(),
                 verify_cost: None,
                 accept_all: false,
+                virtual_clock: false,
+                step_cost: None,
                 last_decode: Vec::new(),
                 last_prefill: None,
                 masks: Vec::new(),
@@ -1800,6 +1807,14 @@ mod tests {
                 bail!("pinned host pool is full");
             }
             Ok(HostGuard(self.host_used.clone(), bytes))
+        }
+
+        fn pause(&mut self, d: Duration) {
+            if self.virtual_clock {
+                self.step_cost = Some(d);
+            } else {
+                std::thread::sleep(d);
+            }
         }
 
         fn write(&mut self, slot: usize, pos: usize, t: u32) -> u64 {
@@ -1827,6 +1842,9 @@ mod tests {
     }
 
     impl Executor for Fake {
+        fn measured_step_secs(&mut self) -> Option<f64> {
+            self.step_cost.take().map(|d| d.as_secs_f64())
+        }
         fn max_ctx(&self) -> usize {
             self.max_ctx
         }
@@ -1872,7 +1890,7 @@ mod tests {
             let mut seen = std::collections::HashSet::new();
             assert!(rows.iter().all(|r| seen.insert(r.slot)), "a slot twice in one batch");
             self.decode_calls.push(rows.len());
-            std::thread::sleep(self.row_cost * rows.len() as u32);
+            self.pause(self.row_cost * rows.len() as u32);
             let masks = std::mem::take(&mut self.masks);
             self.masked_calls += usize::from(!masks.is_empty());
             self.last_decode = rows.iter().enumerate().map(|(i, r)| constrain(next_token(self.write(r.slot, r.pos, r.token)), masks.get(i).unwrap_or(&None))).collect();
@@ -1996,7 +2014,7 @@ mod tests {
             assert!(rows.iter().all(|r| seen.insert(r.slot)), "a slot twice in one batch");
             assert!(rows.len() <= self.spec_cap);
             self.spec_calls.push(rows.len());
-            std::thread::sleep(match self.verify_cost {
+            self.pause(match self.verify_cost {
                 Some(f) => f(rows.len(), k),
                 None => self.row_cost * rows.len() as u32,
             });
@@ -2294,6 +2312,7 @@ mod tests {
         fake.spec_cap = 8;
         fake.verify_cost = Some(cost);
         fake.accept_all = accept_all;
+        fake.virtual_clock = true;
         let cfg = Config { max_num_seqs: 8, adaptive_drafts: true, ..Config::default() };
         let mut s = Scheduler::new(fake, cfg);
         let mut want = HashMap::new();
