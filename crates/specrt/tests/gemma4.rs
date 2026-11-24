@@ -71,6 +71,7 @@ fn tiny() -> Spec {
     let mut spec = Spec::from_hf_config(&json).unwrap();
     spec.name = "tiny-gemma4".into();
     spec.repo = dir.display().to_string();
+    spec.runtime.split_activations = Some(true);
     spec
 }
 
@@ -81,6 +82,25 @@ fn reference() -> (Vec<u32>, Vec<u32>, usize, Vec<f32>) {
     let bytes = std::fs::read(dir.join("tiny-gemma4.ref.bin")).unwrap();
     let logits = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
     (ids("tokens"), ids("greedy"), meta["vocab"].as_u64().unwrap() as usize, logits)
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/tiny_gemma4.py output in SPECRT_REF_DIR"]
+fn gemma4_layer_states_match_transformers() {
+    let (tokens, _, _, _) = reference();
+    let dir = std::env::var_os("SPECRT_REF_DIR").map(PathBuf::from).unwrap();
+    let bytes = std::fs::read(dir.join("tiny-gemma4.layers.bin")).unwrap();
+    let want: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+    let mut rt = specrt::runtime::Runtime::load(&tiny(), 256).unwrap();
+    let trace = rt.trace_prefill(&tokens).unwrap();
+    let per = tokens.len() * 128;
+    for layer in 0..6 {
+        let (a, b) = (&trace.layers[layer * per..(layer + 1) * per], &want[layer * per..(layer + 1) * per]);
+        let max_abs = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        let size = b.iter().map(|y| y.abs()).fold(0f32, f32::max);
+        eprintln!("layer {layer} max_abs {max_abs} of {size}");
+        assert!(max_abs < 2e-2 * size.max(1.0), "layer {layer} max abs diff {max_abs}");
+    }
 }
 
 #[test]

@@ -112,5 +112,25 @@ def main(out_dir):
     print("tiny-gemma4 ->", out)
 
 
+def layer_states(out_dir):
+    out = Path(out_dir)
+    model = build()
+    meta = json.loads((out / "tiny-gemma4.ref.json").read_text())
+    ids = torch.tensor(meta["tokens"])
+    seen = []
+    hooks = [l.register_forward_hook(lambda _m, _i, o: seen.append(o[0] if isinstance(o, tuple) else o)) for l in model.model.layers]
+    with torch.inference_mode():
+        model(ids[None])
+    for h in hooks:
+        h.remove()
+    scale = 1.0
+    rows = []
+    for layer, s in zip(model.model.layers, seen):
+        scale *= float(layer.layer_scalar)
+        rows.append(s[0] / scale)
+    torch.stack(rows).float().numpy().astype(np.float32).tofile(out / "tiny-gemma4.layers.bin")
+
+
 if __name__ == "__main__":
     main(sys.argv[1])
+    layer_states(sys.argv[1])
