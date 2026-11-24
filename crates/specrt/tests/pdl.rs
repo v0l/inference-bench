@@ -20,8 +20,13 @@ fn prompt(n: usize) -> Vec<u32> {
 }
 
 fn run(spec: &Spec, pdl: bool, graphs: bool, tokens: &[u32]) -> (Vec<f32>, Vec<u32>) {
+    run_hoisted(spec, pdl, false, graphs, tokens)
+}
+
+fn run_hoisted(spec: &Spec, pdl: bool, hoist: bool, graphs: bool, tokens: &[u32]) -> (Vec<f32>, Vec<u32>) {
     let mut spec = spec.clone();
     spec.runtime.pdl = pdl;
+    spec.runtime.pdl_hoist = hoist;
     spec.runtime.graphs = graphs;
     let mut rt = Runtime::load(&spec, 256).unwrap();
     let logits = rt.prompt_logits(tokens).unwrap();
@@ -42,6 +47,21 @@ fn pdl_on_and_off_are_bit_identical_on_tiny_fixtures() {
     for dir in ["tiny-qwen3.5", "tiny-qwen3.5-nvfp4", "tiny-qwen3.5-fp8", "tiny-mistral", "tiny-phi3", "tiny-granite", "tiny-olmo2", "tiny-gemma3", "tiny-smollm3", "tiny-qwen3.5-27b"] {
         let spec = fixture(dir);
         same_with_and_without_pdl(&spec, &prompt(40));
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn pdl_hoist_on_and_off_are_bit_identical_on_tiny_fixtures() {
+    for dir in ["tiny-qwen3.5", "tiny-qwen3.5-nvfp4", "tiny-qwen3.5-fp8", "tiny-mistral", "tiny-granite", "tiny-olmo2", "tiny-gemma3", "tiny-qwen3.5-27b"] {
+        let spec = fixture(dir);
+        let tokens = prompt(40);
+        let off = run(&spec, false, true, &tokens);
+        for graphs in [true, false] {
+            let hoisted = run_hoisted(&spec, true, true, graphs, &tokens);
+            assert_eq!(hoisted.1, off.1, "{dir}: greedy differs with pdl_hoist, graphs {graphs}");
+            assert!(hoisted.0.iter().zip(&off.0).all(|(a, b)| a.to_bits() == b.to_bits()), "{dir}: logits differ with pdl_hoist, graphs {graphs}");
+        }
     }
 }
 
