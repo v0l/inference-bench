@@ -27,6 +27,7 @@ struct Flags {
     a_set: Vec<String>,
     b_set: Vec<String>,
     set: Vec<String>,
+    logits: bool,
 }
 
 static FLAGS: std::sync::OnceLock<Flags> = std::sync::OnceLock::new();
@@ -40,7 +41,7 @@ fn runs() -> usize {
 }
 
 fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
-    let mut f = Flags { runs: 6, serve: false, cold: false, profile: false, fp8_act: false, kv_gb: None, mlp_act_fp4: false, mlp_planes: 1, pdl: false, ab: false, rounds: specrt::abstats::MIN_ROUNDS, b_graphs: None, drafts: None, vram_gb: None, expert_slots: None, host_gb: None, nvme_path: None, layers: None, hotlist: None, save_hotlist: None, a_set: Vec::new(), b_set: Vec::new(), set: Vec::new() };
+    let mut f = Flags { runs: 6, serve: false, cold: false, profile: false, fp8_act: false, kv_gb: None, mlp_act_fp4: false, mlp_planes: 1, pdl: false, ab: false, rounds: specrt::abstats::MIN_ROUNDS, b_graphs: None, drafts: None, vram_gb: None, expert_slots: None, host_gb: None, nvme_path: None, layers: None, hotlist: None, save_hotlist: None, a_set: Vec::new(), b_set: Vec::new(), set: Vec::new(), logits: false };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -50,6 +51,7 @@ fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
             "--fp8-act" => f.fp8_act = true,
             "--pdl" => f.pdl = true,
             "--ab" => f.ab = true,
+            "--logits" => f.logits = true,
             "--mlp-act-fp4" => f.mlp_act_fp4 = true,
             "--mlp-act-planes" => f.mlp_planes = 2,
             "--runs" | "--kv-gb" | "--rounds" | "--b-graphs" | "--drafts" | "--vram-gb" | "--expert-slots" | "--host-gb" | "--nvme-path" | "--layers" | "--hotlist" | "--save-hotlist" | "--a-set" | "--b-set" | "--set" => {
@@ -186,6 +188,9 @@ fn main() -> Result<()> {
         println!("TEXT_BEGIN{}TEXT_END", reply.text);
         return Ok(());
     }
+    if flags().logits {
+        return bench_logits(args);
+    }
     if flags().ab && (!flags().a_set.is_empty() || !flags().b_set.is_empty()) {
         return bench_ab_option(args);
     }
@@ -256,7 +261,7 @@ fn main() -> Result<()> {
         );
     }
     if let Some(s) = rt.offload_stats() {
-        println!("  offload stats: {s:?} hit_ratio={:.4}", s.hit_ratio());
+        println!("  offload stats: {s:?} hit_ratio={:.4} table_launches={}", s.hit_ratio(), rt.expert_table_launches());
         println!("  nvme: reads={} bytes={} failures={} wait={:.3}s", s.nvme_reads, s.nvme_read_bytes, s.nvme_read_failures, s.nvme_wait_nanos as f64 / 1e9);
     }
     if let Some(p) = &flags().save_hotlist {
@@ -588,21 +593,42 @@ fn load_arm(base: &Spec, sets: &[String], batch: usize, max_ctx: usize) -> Resul
     Ok(Arm { sched: specrt::serve::scheduler(&spec, opts, 0)?, drafts })
 }
 
-fn option_round(arm: &mut Arm, prompts: &[Vec<u32>], new_tokens: usize) -> Result<f64> {
+fn option_round(arm: &mut Arm, prompts: &[Vec<u32>], new_tokens: usize) -> Result<Round> {
     use specrt::sched::Request;
     for p in prompts {
         arm.sched.submit(Request { prompt: p.clone(), max_tokens: new_tokens, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new(), grammar: None })?;
     }
-    let (mut secs, mut tokens) = (0.0, 0usize);
+    let (mut secs, mut tokens, mut prefill_secs, mut prefill_tokens) = (0.0, 0usize, 0.0, 0usize);
     while !arm.sched.idle() {
         let mut events = Vec::new();
         let r = arm.sched.step(&mut events)?;
         if r.prefill_tokens == 0 {
             secs += r.decode_secs;
             tokens += r.decode_rows + r.accepted;
+        } else {
+            prefill_secs += r.prefill_secs;
+            prefill_tokens += r.prefill_tokens;
         }
     }
-    Ok(tokens as f64 / secs)
+    Ok(Round { decode: tokens as f64 / secs, prefill: prefill_tokens as f64 / prefill_secs })
+}
+
+fn arm_counters(arm: &Arm) -> (specrt::offload::OffloadStats, u64) {
+    (arm.sched.offload_stats().unwrap_or_default(), arm.sched.exec.rt.expert_table_launches())
+}
+
+fn counter_line(before: (specrt::offload::OffloadStats, u64), after: (specrt::offload::OffloadStats, u64)) -> String {
+    let (b, a) = (before.0, after.0);
+    let hits = a.vram_hits - b.vram_hits;
+    let misses = a.host_hits - b.host_hits;
+    format!(
+        "hits={hits} misses={misses} miss_rate={:.4} promotions={} evictions={} host_to_vram={:.2} GB table_launches={}",
+        misses as f64 / (hits + misses).max(1) as f64,
+        a.promotions - b.promotions,
+        a.evictions - b.evictions,
+        (a.host_to_vram_bytes - b.host_to_vram_bytes) as f64 / 1e9,
+        after.1 - before.1,
+    )
 }
 
 fn bench_ab_option(args: Vec<String>) -> Result<()> {
@@ -622,7 +648,11 @@ fn bench_ab_option(args: Vec<String>) -> Result<()> {
     for arm in [&mut a, &mut b] {
         option_round(arm, &prompts, new_tokens)?;
     }
+    let d = |r: &[Round]| r.iter().map(|x| x.decode).collect::<Vec<_>>();
+    let p = |r: &[Round]| r.iter().map(|x| x.prefill).collect::<Vec<_>>();
     let (mut control, mut passes, mut a_all, mut b_all) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut a_prefill, mut b_prefill) = (Vec::new(), Vec::new());
+    let (mut a_count, mut b_count) = ((specrt::offload::OffloadStats::default(), 0), (specrt::offload::OffloadStats::default(), 0));
     for pass in 1..=2 {
         let (mut c1, mut c2, mut ra, mut rb) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for _ in 0..rounds {
@@ -630,17 +660,31 @@ fn bench_ab_option(args: Vec<String>) -> Result<()> {
             c2.push(option_round(&mut a, &prompts, new_tokens)?);
         }
         for _ in 0..rounds {
+            let before = arm_counters(&a);
             ra.push(option_round(&mut a, &prompts, new_tokens)?);
+            let after = arm_counters(&a);
+            a_count = (a_count.0.plus(&delta(&before.0, &after.0)), a_count.1 + after.1 - before.1);
+            let before = arm_counters(&b);
             rb.push(option_round(&mut b, &prompts, new_tokens)?);
+            let after = arm_counters(&b);
+            b_count = (b_count.0.plus(&delta(&before.0, &after.0)), b_count.1 + after.1 - before.1);
         }
-        control.push(summarize(&ratios(&c1, &c2)));
-        passes.push(summarize(&ratios(&ra, &rb)));
+        control.push(summarize(&ratios(&d(&c1), &d(&c2))));
+        passes.push(summarize(&ratios(&d(&ra), &d(&rb))));
         println!("pass {pass}: A/A {}", describe("ratio", &control[pass - 1]));
         println!("pass {pass}: A/B {}", describe("ratio", &passes[pass - 1]));
-        a_all.extend(ra);
-        b_all.extend(rb);
+        println!("pass {pass}: A/A prefill {}", describe("ratio", &summarize(&ratios(&p(&c1), &p(&c2)))));
+        println!("pass {pass}: A/B prefill {}", describe("ratio", &summarize(&ratios(&p(&ra), &p(&rb)))));
+        a_all.extend(d(&ra));
+        b_all.extend(d(&rb));
+        a_prefill.extend(p(&ra));
+        b_prefill.extend(p(&rb));
     }
     println!("A: {:.1} tok/s, B: {:.1} tok/s (median aggregate decode)", summarize(&a_all).median, summarize(&b_all).median);
+    println!("A: {:.1} tok/s, B: {:.1} tok/s (median prefill)", summarize(&a_prefill).median, summarize(&b_prefill).median);
+    let zero = (specrt::offload::OffloadStats::default(), 0);
+    println!("A counters over the timed A/B rounds: {}", counter_line(zero, a_count));
+    println!("B counters over the timed A/B rounds: {}", counter_line(zero, b_count));
     for (name, arm) in [("A", &a), ("B", &b)] {
         if let Some(c) = arm.sched.draft_chooser() {
             println!("{name}: adaptive steps per k (0..=3) {:?}", c.chosen());
@@ -649,6 +693,95 @@ fn bench_ab_option(args: Vec<String>) -> Result<()> {
     let v = verdict_with_min_rounds(&control, &passes, rounds);
     println!("verdict (decode, B over A): {}", v.label());
     anyhow::ensure!(!matches!(v, specrt::abstats::Verdict::Refused(_)), "refused: rerun on a quiet card");
+    Ok(())
+}
+
+fn delta(before: &specrt::offload::OffloadStats, after: &specrt::offload::OffloadStats) -> specrt::offload::OffloadStats {
+    specrt::offload::OffloadStats {
+        vram_hits: after.vram_hits - before.vram_hits,
+        host_hits: after.host_hits - before.host_hits,
+        nvme_reads: after.nvme_reads - before.nvme_reads,
+        nvme_read_bytes: after.nvme_read_bytes - before.nvme_read_bytes,
+        nvme_read_failures: after.nvme_read_failures - before.nvme_read_failures,
+        nvme_wait_nanos: after.nvme_wait_nanos - before.nvme_wait_nanos,
+        host_to_vram_bytes: after.host_to_vram_bytes - before.host_to_vram_bytes,
+        evictions: after.evictions - before.evictions,
+        promotions: after.promotions - before.promotions,
+    }
+}
+
+fn log_softmax(x: &[f32]) -> Vec<f64> {
+    let m = x.iter().cloned().fold(f32::MIN, f32::max) as f64;
+    let z = x.iter().map(|v| (*v as f64 - m).exp()).sum::<f64>().ln();
+    x.iter().map(|v| *v as f64 - m - z).collect()
+}
+
+fn kl(reference: &[f32], got: &[f32]) -> f64 {
+    let (p, q) = (log_softmax(reference), log_softmax(got));
+    p.iter().zip(&q).map(|(lp, lq)| lp.exp() * (lp - lq)).sum()
+}
+
+fn argmax(v: &[f32]) -> usize {
+    v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |m| m.0)
+}
+
+struct LogitsCompare {
+    positions: usize,
+    identical: usize,
+    top1_agree: usize,
+    mean_kl: f64,
+    max_kl: f64,
+    max_abs: f32,
+}
+
+fn compare_logits(a: &[Vec<f32>], b: &[Vec<f32>]) -> LogitsCompare {
+    let mut c = LogitsCompare { positions: 0, identical: 0, top1_agree: 0, mean_kl: 0.0, max_kl: 0.0, max_abs: 0.0 };
+    for (x, y) in a.iter().zip(b) {
+        let d = kl(x, y);
+        c.positions += 1;
+        c.identical += (x == y) as usize;
+        c.top1_agree += (argmax(x) == argmax(y)) as usize;
+        c.mean_kl += d;
+        c.max_kl = c.max_kl.max(d);
+        c.max_abs = x.iter().zip(y).map(|(p, q)| (p - q).abs()).fold(c.max_abs, f32::max);
+    }
+    c.mean_kl /= c.positions.max(1) as f64;
+    c
+}
+
+fn bench_logits(args: Vec<String>) -> Result<()> {
+    let usage = "usage: bench --logits [--a-set key=value].. [--b-set key=value].. <spec> [prompts] [decode_tokens]";
+    let mut args = args.into_iter();
+    let spec_path = PathBuf::from(args.next().context(usage)?);
+    let n: usize = args.next().map(|s| s.parse()).transpose().context(usage)?.unwrap_or(8);
+    let steps: usize = args.next().map(|s| s.parse()).transpose().context(usage)?.unwrap_or(32);
+    let spec = load_spec(&spec_path)?;
+    let prompts = spec_prompts(&spec)?;
+    let corpus: Vec<u32> = prompts.iter().flatten().copied().collect();
+    let cases: Vec<(Vec<u32>, Vec<u32>)> = (0..n).map(|i| (prompts[i % prompts.len()].clone(), (0..steps).map(|j| corpus[(i * 131 + j) % corpus.len()]).collect())).collect();
+    let max_ctx = cases.iter().map(|(p, t)| p.len() + t.len()).max().unwrap_or(0) + 16;
+    let vocab = spec.dims.vocab;
+    let mut arms = Vec::new();
+    for sets in [&flags().a_set, &flags().b_set] {
+        let (s, _) = with_options(&spec, sets)?;
+        let mut rt = Runtime::load(&s, max_ctx)?;
+        let mut out = Vec::new();
+        for (p, t) in &cases {
+            out.extend(rt.prefill_then_decode(p, t)?.chunks(vocab).map(|c| c.to_vec()));
+        }
+        println!("{sets:?}: positions={} table_launches={} offload={:?}", out.len(), rt.expert_table_launches(), rt.offload_stats());
+        arms.push(out);
+    }
+    let c = compare_logits(&arms[0], &arms[1]);
+    println!(
+        "logits B against A: prompts={n} decode={steps} positions={} bit_identical={} top1_agree={:.4} mean_kl={:.3e} max_kl={:.3e} max_abs={:.3e}",
+        c.positions,
+        c.identical,
+        c.top1_agree as f64 / c.positions.max(1) as f64,
+        c.mean_kl,
+        c.max_kl,
+        c.max_abs
+    );
     Ok(())
 }
 
@@ -776,6 +909,18 @@ mod tests {
         assert!(!base.moe.as_ref().unwrap().quantized_experts);
         let (s, _) = with_options(&base, &["spec.runtime.offload.expert_slots=3".into()]).unwrap();
         assert_eq!(s.runtime.offload.expert_slots, 3);
+    }
+
+    #[test]
+    fn identical_logits_compare_as_bit_identical_and_a_flipped_top1_shows() {
+        let a = vec![vec![1.0f32, 2.0, 0.5], vec![0.0, 0.1, 3.0]];
+        let c = compare_logits(&a, &a);
+        assert_eq!((c.positions, c.identical, c.top1_agree), (2, 2, 2));
+        assert_eq!((c.max_kl, c.max_abs), (0.0, 0.0));
+        let b = vec![vec![1.0f32, 2.0, 0.5], vec![3.5, 0.1, 3.0]];
+        let c = compare_logits(&a, &b);
+        assert_eq!((c.identical, c.top1_agree), (1, 1));
+        assert!(c.max_kl > 0.1 && c.max_abs == 3.5);
     }
 
     #[test]
