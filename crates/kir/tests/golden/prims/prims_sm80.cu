@@ -31,6 +31,14 @@ extern "C" __global__ void splice_rows(float* x, const int* rows, const float* e
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < 1024; i += gridDim.x * blockDim.x) dst[i] = src[i];
 }
 
+extern "C" __global__ void add_rows(float* x, const int* rows, const float* embeds) {
+    int row = rows[blockIdx.y];
+    if (row < 0) return;
+    float* dst = x + (size_t)blockIdx.y * 1024;
+    const float* src = embeds + (size_t)row * 1024;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < 1024; i += gridDim.x * blockDim.x) dst[i] += src[i];
+}
+
 __device__ float gumbel(unsigned seed, unsigned step, unsigned i) {
     unsigned x = seed * 747796405u + step * 2891336453u + i * 2246822519u + 1u;
     x ^= x >> 16; x *= 2246822507u; x ^= x >> 13; x *= 3266489909u; x ^= x >> 16;
