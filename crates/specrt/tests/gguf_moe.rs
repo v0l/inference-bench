@@ -4,11 +4,11 @@ use specrt::spec::{Quant, Spec};
 use specrt::weights::{Checkpoint, Stacked, ggml_expert_row};
 use std::path::{Path, PathBuf};
 
-const FILES: [&str; 2] = ["tiny-qwen3moe-Q4_K_M.gguf", "tiny-qwen3moe-Q8_0.gguf"];
+const FILES: [&str; 2] = ["tiny-moe-Q4_K_M.gguf", "tiny-moe-Q8_0.gguf"];
 const PROMPT: [u32; 16] = [11, 400, 23, 999, 5, 77, 301, 88, 640, 2, 19, 250, 512, 33, 701, 90];
 
 fn path(file: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3moe-gguf").join(file)
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/moe-gguf").join(file)
 }
 
 fn spec(file: &str, quantized: bool) -> Spec {

@@ -67,13 +67,13 @@ tok.save(str(work / "tokenizer.json"))
 (work / "merges.txt").write_text("#version: 0.2\n")
 (work / "chat_template.jinja").write_text("{% for m in messages %}<|im_start|>{{ m['role'] }}\n{{ m['content'] }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}")
 
-bf16 = out / "tiny-qwen3moe-BF16.gguf"
+bf16 = out / "tiny-moe-BF16.gguf"
 cls = get_model_class("Qwen3MoeForCausalLM")
 cls.get_vocab_base_pre = lambda self, tokenizer: "qwen2"
 conv = cls(work, gguf.LlamaFileType.MOSTLY_BF16, bf16, is_big_endian=False, use_temp_file=False, eager=True)
 conv.write()
 shutil.rmtree(work)
 for q in ["Q4_K_M", "Q8_0"]:
-    subprocess.run([str(LLAMA / "build/bin/llama-quantize"), str(bf16), str(out / f"tiny-qwen3moe-{q}.gguf"), q], check=True, capture_output=True)
+    subprocess.run([str(LLAMA / "build/bin/llama-quantize"), str(bf16), str(out / f"tiny-moe-{q}.gguf"), q], check=True, capture_output=True)
 bf16.unlink()
 print(out)

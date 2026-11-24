@@ -755,7 +755,7 @@ mod tests {
     use super::*;
 
     fn moe_gguf() -> Spec {
-        Spec::from_gguf_file(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3moe-gguf/tiny-qwen3moe-Q4_K_M.gguf")).unwrap()
+        Spec::from_gguf_file(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/moe-gguf/tiny-moe-Q4_K_M.gguf")).unwrap()
     }
 
     #[test]
