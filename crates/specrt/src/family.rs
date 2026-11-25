@@ -94,6 +94,27 @@ pub struct Match {
     pub model_types: Vec<String>,
     pub architectures: Vec<String>,
     pub gguf: Vec<String>,
+    pub pipelines: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyPipeline {
+    pub kind: String,
+    pub graph: String,
+    pub components: Vec<String>,
+    pub resident: Vec<String>,
+    pub sizes: Vec<String>,
+    pub default_size: String,
+    pub samplers: Vec<String>,
+    pub max_images: usize,
+    pub text_encoder_family: String,
+}
+
+impl FamilyPipeline {
+    pub fn is_set(&self) -> bool {
+        !self.kind.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -770,6 +791,8 @@ pub struct Family {
     pub tensors: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub refuse: Vec<FamilyRefuse>,
+    #[serde(default)]
+    pub pipeline: FamilyPipeline,
 }
 
 impl Family {
@@ -997,6 +1020,10 @@ impl Registry {
 
     pub fn for_gguf(&self, arch: &str) -> Option<&Family> {
         self.families.iter().find(|f| f.matches.gguf.iter().any(|m| m == arch))
+    }
+
+    pub fn for_pipeline(&self, class: &str) -> Option<&Family> {
+        self.families.iter().find(|f| f.pipeline.is_set() && f.matches.pipelines.iter().any(|m| m == class))
     }
 
     pub fn named(&self, name: &str) -> Option<&Family> {

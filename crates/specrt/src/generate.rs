@@ -42,6 +42,36 @@ pub struct Memory {
     pub vae_arena: u64,
     pub encoder_resident_in_loop: bool,
     pub vae_resident_in_loop: bool,
+    pub sequential_cfg: bool,
+    pub vae_tile: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Plan {
+    pub sequential_cfg: bool,
+    pub vae_tile: Option<crate::vae::tiled::Tiling>,
+}
+
+pub struct Hooks<'a> {
+    pub on_step: &'a mut dyn FnMut(usize, usize, &[f32]) -> bool,
+}
+
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cancelled between steps")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+struct Cached {
+    shapes: Shapes,
+    guided: bool,
+    sequential: bool,
+    den: Denoiser,
 }
 
 pub struct Generator {
@@ -52,6 +82,8 @@ pub struct Generator {
     jit: Jit,
     encoder: Option<Runtime>,
     vae: Option<CudaVae>,
+    denoiser: Option<Cached>,
+    pub keep_denoiser: bool,
     max_tokens: usize,
 }
 
@@ -63,7 +95,11 @@ impl Generator {
     pub fn open(ctx: Arc<CudaContext>, jit: Jit, dir: &Path, max_tokens: usize) -> Result<Generator> {
         let pipeline = Pipeline::from_dir(dir)?;
         let stream = ctx.default_stream();
-        Ok(Generator { dir: dir.to_path_buf(), pipeline, ctx, stream, jit, encoder: None, vae: None, max_tokens })
+        Ok(Generator { dir: dir.to_path_buf(), pipeline, ctx, stream, jit, encoder: None, vae: None, denoiser: None, keep_denoiser: false, max_tokens })
+    }
+
+    pub fn context(&self) -> &Arc<CudaContext> {
+        &self.ctx
     }
 
     pub fn encoder_spec(&self) -> Result<Spec> {
@@ -127,7 +163,7 @@ impl Generator {
         Ok(self.vae.as_ref().unwrap())
     }
 
-    fn decode(&mut self, tokens: &[f32], d: Dims) -> Result<Vec<f32>> {
+    fn decode(&mut self, tokens: &[f32], d: Dims, tiling: Option<crate::vae::tiled::Tiling>) -> Result<Vec<f32>> {
         let p = self.pipeline.clone();
         let patch = p.values["latent_patch"] as usize;
         let ck = crate::weights::Checkpoint::open(&self.dir.join("vae"))?;
@@ -139,11 +175,44 @@ impl Generator {
         let (ph, pw) = (d.h / patch, d.w / patch);
         let grid_cf = crate::denoiser_host::unpatchify(&x, channels, patch, ph, pw);
         let latent = Grid::from_channels_first(&grid_cf, channels, 1, d.h, d.w);
-        let out = self.load_vae(d)?.decode(&latent)?.to_channels_first();
+        let scale = p.values["vae_scale"] as usize;
+        let vae = self.load_vae(d)?;
+        let out = match tiling {
+            Some(t) => crate::vae::tiled::decode_tiled(&latent, scale, t, &mut |g| vae.decode(g))?,
+            None => vae.decode(&latent)?,
+        }
+        .to_channels_first();
         p.postprocess(&out)
     }
 
     pub fn generate(&mut self, req: &Request) -> Result<Image> {
+        self.generate_with(req, Plan::default(), &mut Hooks { on_step: &mut |_, _, _| true })
+    }
+
+    fn denoiser_for(&mut self, shapes: Shapes, guided: bool, sequential: bool) -> Result<&Denoiser> {
+        let fits = self.denoiser.as_ref().is_some_and(|c| c.shapes == shapes && c.guided == guided && c.sequential == sequential);
+        if !fits {
+            self.denoiser = None;
+            let rule = self.pipeline.step_rule(guided && !sequential)?;
+            let den = Denoiser::load_with(&self.stream, &self.jit, &self.dir, shapes.clone(), &rule, guided && !sequential)?;
+            self.denoiser = Some(Cached { shapes, guided, sequential, den });
+        }
+        Ok(&self.denoiser.as_ref().unwrap().den)
+    }
+
+    pub fn release_denoiser(&mut self) {
+        self.denoiser = None;
+    }
+
+    pub fn denoiser_loaded(&self) -> bool {
+        self.denoiser.is_some()
+    }
+
+    pub fn free_bytes(&self) -> Result<u64> {
+        Ok(self.ctx.mem_get_info()?.0 as u64)
+    }
+
+    pub fn generate_with(&mut self, req: &Request, plan: Plan, hooks: &mut Hooks) -> Result<Image> {
         let p = self.pipeline.clone();
         let opts = p.options;
         let steps = req.steps.unwrap_or(p.steps);
@@ -154,7 +223,7 @@ impl Generator {
         let (ph, pw) = (d.h / patch, d.w / patch);
         let image = ph * pw;
         let text = req.prompt.ids.len();
-        let mut memory = Memory::default();
+        let mut memory = Memory { sequential_cfg: guided && plan.sequential_cfg, vae_tile: plan.vae_tile.map(|t| t.tile), ..Memory::default() };
         let cond = self.encode(&req.prompt)?;
         let uncond = if guided {
             let neg = req.negative.as_ref().context("a guided run needs a negative prompt (the empty prompt when none is given)")?;
@@ -171,30 +240,56 @@ impl Generator {
             self.vae = None;
         }
         let shapes = Shapes { image, text, patch_h: ph, patch_w: pw };
-        let rule = p.step_rule(guided)?;
-        let den = Denoiser::load_with(&self.stream, &self.jit, &self.dir, shapes, &rule, guided)?;
-        let mut arena = den.arena_for(if guided { 2 } else { 1 })?;
-        memory.denoiser_weights = den.weight_bytes as u64;
-        memory.arena = arena.bytes as u64;
-        memory.encoder_resident_in_loop = self.encoder_loaded();
-        memory.vae_resident_in_loop = self.vae_loaded();
-        let texts: Vec<&[f32]> = std::iter::once(cond.as_slice()).chain(uncond.as_deref()).collect();
-        den.prepare(&mut arena, &texts)?;
+        let sequential = guided && plan.sequential_cfg;
         let channels = p.values["token_channels"] as usize;
         let grid = noise(req.seed, image * channels);
         let tokens: Vec<f32> = (0..image).flat_map(|t| (0..channels).map(move |c| (t, c))).map(|(t, c)| grid[c * image + t]).collect();
-        den.set_latent(&mut arena, &tokens)?;
         let sched = p.schedule(steps, image)?;
+        memory.encoder_resident_in_loop = self.encoder_loaded();
+        memory.vae_resident_in_loop = self.vae_loaded();
         let mut latents = Vec::with_capacity(steps);
-        for i in 0..steps {
-            den.step(&mut arena, sched.model_timestep(i), sched.sigmas[i + 1], guidance)?;
-            latents.push(den.latent(&arena)?);
+        {
+            let den = self.denoiser_for(shapes.clone(), guided, sequential)?;
+            memory.denoiser_weights = den.weight_bytes as u64;
+            if sequential {
+                let (mut ca, mut ua) = (den.arena_for(1)?, den.arena_for(1)?);
+                memory.arena = 2 * ca.bytes as u64;
+                den.prepare(&mut ca, &[cond.as_slice()])?;
+                den.prepare(&mut ua, &[uncond.as_deref().context("no negative embedding")?])?;
+                let mut x = tokens.clone();
+                for i in 0..steps {
+                    let s0 = sched.model_timestep(i);
+                    let c = den.forward(&mut ca, &x, s0, None)?;
+                    let u = den.forward(&mut ua, &x, s0, None)?;
+                    p.step_host(&mut x, &c, Some(&u), &sched, i, guidance)?;
+                    if !(hooks.on_step)(i + 1, steps, &x) {
+                        return Err(Cancelled.into());
+                    }
+                    latents.push(x.clone());
+                }
+            } else {
+                let mut arena = den.arena_for(if guided { 2 } else { 1 })?;
+                memory.arena = arena.bytes as u64;
+                let texts: Vec<&[f32]> = std::iter::once(cond.as_slice()).chain(uncond.as_deref()).collect();
+                den.prepare(&mut arena, &texts)?;
+                den.set_latent(&mut arena, &tokens)?;
+                for i in 0..steps {
+                    den.step(&mut arena, sched.model_timestep(i), sched.sigmas[i + 1], guidance)?;
+                    let l = den.latent(&arena)?;
+                    if !(hooks.on_step)(i + 1, steps, &l) {
+                        return Err(Cancelled.into());
+                    }
+                    latents.push(l);
+                }
+            }
+        }
+        if !self.keep_denoiser {
+            self.denoiser = None;
         }
         let last = latents.last().cloned().context("no steps ran")?;
-        drop(arena);
-        drop(den);
-        let pixels = self.decode(&last, d)?;
-        memory.vae_arena = self.vae.as_ref().map_or(Ok(0), |v| v.arena_of(d, true))?;
+        let pixels = self.decode(&last, d, plan.vae_tile)?;
+        let arena_dims = plan.vae_tile.map_or(d, |t| Dims { t: 1, h: t.tile.min(d.h), w: t.tile.min(d.w) });
+        memory.vae_arena = self.vae.as_ref().map_or(Ok(0), |v| v.arena_of(arena_dims, true))?;
         if opts.offload_vae {
             self.vae = None;
         }

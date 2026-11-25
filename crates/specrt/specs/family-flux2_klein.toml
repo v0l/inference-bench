@@ -1,0 +1,17 @@
+name = "flux2_klein"
+kind = "family"
+min_engine = 18
+
+[match]
+pipelines = ["Flux2KleinPipeline"]
+
+[pipeline]
+kind = "image"
+graph = "flow-euler"
+components = ["text_encoder", "transformer", "vae"]
+resident = ["transformer", "vae"]
+sizes = ["512x512", "768x768", "1024x1024", "1024x768", "768x1024", "1280x720", "720x1280"]
+default_size = "1024x1024"
+samplers = ["euler"]
+max_images = 4
+text_encoder_family = "qwen3"

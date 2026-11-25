@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use kir as kir;
 
-pub const SPEC_FORMAT: u32 = 17;
+pub const SPEC_FORMAT: u32 = 18;
 
 pub fn modelopt_verified() -> bool {
     include_str!("../modelopt-verified.txt").trim() == "pass"
