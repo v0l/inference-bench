@@ -181,6 +181,7 @@ pub struct Native {
     tools: specrt::chat::ToolFormat,
     progress: Option<specrt::progress::Sink>,
     media: Option<specrt::media::MediaInfo>,
+    device: Option<usize>,
 }
 
 impl Native {
@@ -193,7 +194,12 @@ impl Native {
     }
 
     pub fn with_factory(max_ctx: Option<usize>, factory: Factory) -> Self {
-        Self { max_ctx, factory, worker: None, vision: false, thinking: Default::default(), tools: Default::default(), progress: None, media: None }
+        Self { max_ctx, factory, worker: None, vision: false, thinking: Default::default(), tools: Default::default(), progress: None, media: None, device: None }
+    }
+
+    pub fn on_device(mut self, device: Option<usize>) -> Self {
+        self.device = device;
+        self
     }
 
     fn send(&mut self, job: Job) -> Result<(), BackendError> {
@@ -281,11 +287,12 @@ fn run_engine(
     max_ctx: Option<usize>,
     factory: Factory,
     progress: Option<specrt::progress::Sink>,
+    device: Option<usize>,
     loaded: Sender<Result<Opened, BackendError>>,
     jobs: std::sync::mpsc::Receiver<Job>,
     panic: Arc<Mutex<Option<String>>>,
 ) {
-    let mut engine = match catch_unwind(AssertUnwindSafe(|| specrt::progress::with_sink(progress, || factory(&model, max_ctx)))) {
+    let mut engine = match catch_unwind(AssertUnwindSafe(|| specrt::media::with_device(device, || specrt::progress::with_sink(progress, || factory(&model, max_ctx))))) {
         Ok(Ok(e)) => e,
         Ok(Err(e)) => {
             let _ = loaded.send(Err(engine_error(&e)));
@@ -368,11 +375,11 @@ impl Target for Native {
         let (jobs, inbox) = channel();
         let (loaded_tx, loaded_rx) = channel();
         let panic = Arc::new(Mutex::new(None));
-        let (name, max_ctx, factory, shared, progress) =
-            (model.to_string(), self.max_ctx, self.factory.clone(), panic.clone(), self.progress.clone());
+        let (name, max_ctx, factory, shared, progress, device) =
+            (model.to_string(), self.max_ctx, self.factory.clone(), panic.clone(), self.progress.clone(), self.device);
         let thread = std::thread::Builder::new()
             .name("native-engine".into())
-            .spawn(move || run_engine(name, max_ctx, factory, progress, loaded_tx, inbox, shared))
+            .spawn(move || run_engine(name, max_ctx, factory, progress, device, loaded_tx, inbox, shared))
             .map_err(|e| BackendError::failed(format!("cannot start the engine thread: {e}")))?;
         let worker = Worker { jobs: Some(jobs), thread: Some(thread), panic };
         let outcome = loaded_rx.recv().unwrap_or_else(|_| Err(BackendError::failed("the native engine stopped while loading")));

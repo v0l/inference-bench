@@ -491,14 +491,15 @@ fn open(
     serving: &ServingFactory,
     progress: &specrt::progress::Sink,
 ) -> Result<Opened, BackendError> {
-    serve_options(max_ctx, seqs, kv_cache_bytes, engine)?;
     if specrt::media::resolve_dir(model_id).is_some() {
-        let mut native = Native::with_factory(max_ctx, factory.clone());
+        let device = engine.overrides.get(specrt::media::DEVICE_KEY).and_then(|v| v.as_u64()).map(|d| d as usize);
+        let mut native = Native::with_factory(max_ctx, factory.clone()).on_device(device);
         native.set_progress(Some(progress.clone()));
         native.load(model_id)?;
         let caps = native.capabilities();
         return Ok(Opened { backend: Backend::Single(native), vision: caps.vision, thinking: caps.thinking, tools: caps.tools, seqs: 1, note: None, speculation: None, share: None });
     }
+    serve_options(max_ctx, seqs, kv_cache_bytes, engine)?;
     if let Some(solved) = &engine.solved
         && let Some(mut target) = serving(serve_options(max_ctx, solved.slots, None, engine)?)
     {

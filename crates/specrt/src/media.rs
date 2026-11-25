@@ -357,9 +357,23 @@ pub fn to_rgb(pixels: &[f32], width: usize, height: usize) -> Vec<u8> {
 pub struct ImageModel {
     pub info: MediaInfo,
     pub dir: PathBuf,
+    pub device: usize,
     generator: Generator,
     prompts: PromptEncoder,
 }
+
+thread_local! {
+    static DEVICE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+pub fn with_device<T>(device: Option<usize>, f: impl FnOnce() -> T) -> T {
+    let before = DEVICE.with(|d| d.replace(device));
+    let out = f();
+    DEVICE.with(|d| d.set(before));
+    out
+}
+
+pub const DEVICE_KEY: &str = "media.device";
 
 impl ImageModel {
     pub fn load(model: &str, runtime: Option<&crate::spec::RuntimeOptions>) -> Result<ImageModel> {
@@ -367,7 +381,8 @@ impl ImageModel {
         let info = info(&dir)?;
         let cache = runtime.and_then(|r| r.cache_dir.clone()).unwrap_or_else(crate::jit::default_cache_dir);
         crate::hardware::ensure_nvrtc(&cache)?;
-        let ctx = cudarc::driver::CudaContext::new(0).context("cuda init")?;
+        let device = DEVICE.with(|d| d.get()).unwrap_or(0);
+        let ctx = cudarc::driver::CudaContext::new(device).with_context(|| format!("cuda init on device {device}"))?;
         let jit = crate::jit::Jit::new(ctx.clone(), cache)?;
         let probe = Pipeline::from_dir(&dir)?;
         let max_tokens = PromptEncoder::open(&dir.join("tokenizer")).map(|p| p.max_length(&probe)).unwrap_or(probe.max_length).max(16).next_multiple_of(64);
@@ -375,7 +390,7 @@ impl ImageModel {
         generator.keep_denoiser = true;
         let prompts = generator.prompt_encoder()?;
         crate::progress::report(crate::progress::Stage::Weights, 1, 1);
-        Ok(ImageModel { info, dir, generator, prompts })
+        Ok(ImageModel { info, dir, device, generator, prompts })
     }
 
     pub fn set_offload_text_encoder(&mut self, on: bool) {

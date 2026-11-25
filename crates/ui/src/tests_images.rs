@@ -174,6 +174,35 @@ fn the_real_engine_loads_the_tiny_pipeline_through_the_page_and_generates() {
 }
 
 #[test]
+fn a_remembered_size_the_family_no_longer_offers_falls_back_to_its_default() {
+    let mut h = image_app("img-stale-size", egui::vec2(1280.0, 800.0));
+    let m = image_model();
+    h.state_mut().settings.model_image.insert(m.name.clone(), inference_bench_core::settings::ImageDefaults { size: "1024x1024".into(), ..Default::default() });
+    h.state_mut().open_load_dialog(&m);
+    h.run();
+    let d = h.state().image_load.as_ref().unwrap();
+    assert_eq!(d.defaults.size, d.info.default_size);
+    assert!(shows(&h, &d.info.default_size.clone()));
+}
+
+#[test]
+fn the_image_load_page_picks_the_freest_gpu_and_loads_there() {
+    let mut h = image_app("img-gpu", egui::vec2(1280.0, 800.0));
+    let mk = |i: usize, used: u64| inference_bench_core::gpu::GpuStats { name: format!("card{i}"), used_bytes: used, total_bytes: 96 << 30, util_percent: None, uuid: format!("GPU-{i}"), own_bytes: 0, display: false, index: Some(i as u32) };
+    h.state_mut().gpu = vec![mk(0, 60 << 30), mk(1, 1 << 30)];
+    let m = image_model();
+    h.state_mut().open_load_dialog(&m);
+    h.run();
+    assert_eq!(h.state().image_load.as_ref().unwrap().device, Some(1), "the card with the most free memory");
+    assert!(shows(&h, "GPU 1"));
+    h.get_by_label("load model").click();
+    h.run();
+    pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+    let l = h.state().loaded().unwrap();
+    assert_eq!(l.engine.overrides.get(specrt::media::DEVICE_KEY), Some(&serde_json::json!(1)));
+}
+
+#[test]
 #[ignore = "renders with wgpu; run with SHOTS=dir"]
 fn screenshots_of_the_image_load_page_and_generate_page_at_desktop_and_phone_width() {
     let out = shots_dir();

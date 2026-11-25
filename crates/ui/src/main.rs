@@ -135,7 +135,10 @@ impl App {
     }
 
     pub fn landing(&self, l: &inference_bench_core::engine::Loaded) -> Option<inference_bench_core::inventory::Landing> {
-        let planned = l.engine.solved.as_deref().map(inference_bench_core::inventory::planned_names).unwrap_or_default();
+        let mut planned = l.engine.solved.as_deref().map(inference_bench_core::inventory::planned_names).unwrap_or_default();
+        if let Some(d) = l.engine.overrides.get(specrt::media::DEVICE_KEY).and_then(|v| v.as_u64()) {
+            planned.extend(self.inventory().local().filter(|c| c.ordinal == Some(d as usize)).map(|c| c.name.clone()));
+        }
         self.inventory().where_landed(&l.landed, &planned)
     }
 

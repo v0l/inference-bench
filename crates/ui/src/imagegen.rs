@@ -400,12 +400,17 @@ pub struct ImageLoad {
     pub model: LocalModel,
     pub info: MediaInfo,
     pub defaults: ImageDefaults,
+    pub device: Option<usize>,
 }
 
 impl ImageLoad {
     pub fn open(app: &App, model: &LocalModel, info: MediaInfo) -> Self {
-        let defaults = app.settings.model_image.get(&model.name).cloned().unwrap_or_else(|| ImageDefaults::from_info(&info));
-        Self { model: model.clone(), info, defaults }
+        let mut defaults = app.settings.model_image.get(&model.name).cloned().unwrap_or_else(|| ImageDefaults::from_info(&info));
+        if !info.sizes.contains(&defaults.size) {
+            defaults.size = info.default_size.clone();
+        }
+        let device = app.inventory().local().filter(|c| c.selected).max_by_key(|c| c.free_bytes).and_then(|c| c.ordinal);
+        Self { model: model.clone(), info, defaults, device }
     }
 
     pub fn resident_bytes(&self) -> u64 {
@@ -419,7 +424,9 @@ pub fn load_page(app: &mut App, ui: &mut egui::Ui) -> bool {
     if !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         back = true;
     }
-    let free = app.free_gpu_bytes();
+    let inv = app.inventory();
+    let cards: Vec<(usize, String, u64)> = inv.local().filter(|c| c.selected).filter_map(|c| c.ordinal.map(|o| (o, c.short(), c.free_bytes))).collect();
+    let free = d.device.and_then(|o| cards.iter().find(|c| c.0 == o)).map(|c| c.2).or_else(|| app.free_gpu_bytes());
     egui::Panel::top("img-load-head").frame(egui::Frame::NONE.fill(CHASSIS).inner_margin(egui::Margin { left: 12, right: 12, top: 10, bottom: 8 })).show_inside(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("load image model").font(legend_font(16.0)).extra_letter_spacing(2.0).color(VALUE));
@@ -459,6 +466,15 @@ pub fn load_page(app: &mut App, ui: &mut egui::Ui) -> bool {
                     switch(ui, "text encoder", &mut d.defaults.offload_text_encoder, "release after encoding", "The text encoder runs once per prompt. Released, its memory goes back to the GPU before the denoiser steps; kept, the next prompt starts sooner.");
                 });
                 section(ui, "components", "where each part lives", |ui| {
+                    if !cards.is_empty() {
+                        row(ui, "gpu", |ui| {
+                            let mut picked = d.device.unwrap_or(cards[0].0);
+                            ui.allocate_ui(egui::vec2(220.0, KEY_H), |ui| {
+                                choice(ui, "img-gpu", &mut picked, cards.iter().map(|(o, name, f)| (*o, format!("{name}, {} free", human_size(*f)))));
+                            });
+                            d.device = Some(picked);
+                        });
+                    }
                     for c in &d.info.components {
                         let place = match (c.resident, c.name.as_str()) {
                             (true, _) => "on the GPU for every request",
@@ -483,7 +499,10 @@ pub fn load_page(app: &mut App, ui: &mut egui::Ui) -> bool {
         app.settings.model_image.insert(d.model.name.clone(), d.defaults.clone());
         let _ = app.settings.save(&app.dir);
         app.generate.for_model.clear();
-        let engine = app.settings.engine_for(&d.model.name);
+        let mut engine = app.settings.engine_for(&d.model.name);
+        if let Some(dev) = d.device {
+            engine.overrides.insert(specrt::media::DEVICE_KEY.into(), serde_json::json!(dev));
+        }
         app.load_model_placed(&d.model, 0, 1, None, Vec::new(), engine, false);
         if app.tab == crate::Tab::Models {
             app.tab = crate::Tab::Chat;
