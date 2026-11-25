@@ -9,6 +9,9 @@ index_scale = 0.125
 [attention.int_scratch]
 index_sel = "index_out"
 
+[attention.scratch]
+index_scores = "floor(max_context / index_ratio)"
+
 [[attention.projection]]
 tensor = "indexer.index_qk_proj"
 rows = "(index_heads + 1) * index_head_dim"
@@ -68,6 +71,7 @@ norm = { weight = "indexer.q_layernorm.weight", len = "index_head_dim" }
 keys = { state = "index_pool" }
 idx = { buffer = "index_sel" }
 scale = "index_scale"
+scores = { buffer = "index_scores" }
 
 [[attention.node]]
 op = "kernel"

@@ -98,7 +98,10 @@
           "q": {
             "buffer": "qkv"
           },
-          "scale": "index_scale"
+          "scale": "index_scale",
+          "scores": {
+            "buffer": "index_scores"
+          }
         }
       },
       {
@@ -130,6 +133,9 @@
         "append": true
       }
     ],
+    "scratch": {
+      "index_scores": "floor(max_context / index_ratio)"
+    },
     "int_scratch": {
       "index_sel": "index_out"
     }

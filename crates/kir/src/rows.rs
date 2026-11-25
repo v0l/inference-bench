@@ -26,6 +26,8 @@ pub enum RowBody {
 
 const MAX_STREAMS: u32 = 8;
 
+const GROUP_TOPK_SHARED: u32 = 12288;
+
 const POSITION: [(&str, Scalar, Role, Access); 4] = [
     ("pos", Scalar::I32, Role::Activation, Access::Read),
     ("layer", Scalar::I32, Role::Value, Access::Read),
@@ -61,6 +63,10 @@ impl RowBody {
 
     pub fn describe(&self) -> String {
         format!("{self:?}")
+    }
+
+    fn shared_scores(heads: u32, dim: u32, max_groups: u32) -> bool {
+        heads * dim + max_groups <= GROUP_TOPK_SHARED
     }
 
     fn planes(params: &[Param]) -> bool {
@@ -124,6 +130,9 @@ impl RowBody {
                 out.extend(POSITION);
                 out.extend(PAGED);
                 out.push(("scale", Scalar::F32, Role::Value, Access::Read));
+                if params.iter().any(|p| p.name == "scores") {
+                    out.push(("scores", Scalar::F32, Role::Activation, Access::Write));
+                }
             }
             RowBody::LayerNorm { .. } => {
                 out.push(("x", Scalar::F32, Role::Activation, Access::Write));
@@ -212,7 +221,10 @@ impl RowBody {
             RowBody::GroupPool { dim, .. } if *dim > 1024 => Err("group_pool rows live in shared memory, at most 1024 wide".into()),
             RowBody::GroupTopk { heads, topk, max_groups, .. } if *heads == 0 || *topk == 0 || *max_groups == 0 => Err("group_topk needs positive heads, topk and max_groups".into()),
             RowBody::GroupTopk { topk, max_groups, .. } if topk > max_groups => Err("group_topk cannot select more groups than it scores".into()),
-            RowBody::GroupTopk { heads, dim, max_groups, .. } if heads * dim + max_groups > 12288 => Err("group_topk keeps the query and the group scores in shared memory, at most 12288 values".into()),
+            RowBody::GroupTopk { heads, dim, .. } if heads * dim > GROUP_TOPK_SHARED => Err(format!("group_topk keeps the query in shared memory, at most {GROUP_TOPK_SHARED} values")),
+            RowBody::GroupTopk { heads, dim, max_groups, .. } if !Self::shared_scores(*heads, *dim, *max_groups) && !params.iter().any(|p| p.name == "scores") => Err(format!(
+                "group_topk keeps the query and the group scores in shared memory, at most {GROUP_TOPK_SHARED} values; bind a scores scratch of max_groups floats per row for more"
+            )),
             RowBody::IndexTopk { heads, dim, topk, max_keys, .. } if *heads == 0 || *dim == 0 || *topk == 0 || *max_keys == 0 => Err("index_topk needs positive heads, dim, topk and max_keys".into()),
             RowBody::IndexTopk { topk, max_keys, .. } if topk > max_keys => Err("index_topk cannot select more keys than it scores".into()),
             RowBody::IndexTopk { max_keys, .. } if *max_keys > 12288 => Err("index_topk scores live in shared memory, at most 12288 keys".into()),
@@ -740,10 +752,10 @@ impl RowBody {
     constexpr int MAX_GROUPS = {max_groups};
     constexpr int OUT = TOPK * RATIO + RATIO - 1;
     __shared__ float qs[HEADS * DIM];
-    __shared__ float score[MAX_GROUPS];
-    __shared__ float best_v[32];
+{score_decl}    __shared__ float best_v[32];
     __shared__ int best_i[32];
     const int row = blockIdx.y;
+{score_row}
     const int p = pos[row * pos_step] + row * row_step;
     const int n = min((p + 1) / RATIO, MAX_GROUPS);
     const int cnt = min(TOPK, n);
@@ -770,20 +782,16 @@ impl RowBody {
         }}
     }}
     __syncthreads();
-    for (int g = threadIdx.x; g < MAX_GROUPS; g += blockDim.x) {{
-        if (g < n) {{
-            const int tp = g * RATIO + RATIO - 1;
-            const bf16_t* kr = keys + (((size_t)table[tp / PAGE] * {layers} + layer) * PAGE + tp % PAGE) * DIM * KV_PLANES;
-            float s = 0.0f;
-            for (int h = 0; h < HEADS; h++) {{
-                float d = 0.0f;
-                for (int j = 0; j < DIM; j++) d += qs[h * DIM + j] * (attn_float(kr[j]) + (KV_PLANES == 2 ? attn_float(kr[DIM + j]) : 0.0f));
-                s += fmaxf(d, 0.0f);
-            }}
-            score[g] = s * scale;
-        }} else {{
-            score[g] = -3.0e30f;
+    for (int g = threadIdx.x; g < n; g += blockDim.x) {{
+        const int tp = g * RATIO + RATIO - 1;
+        const bf16_t* kr = keys + (((size_t)table[tp / PAGE] * {layers} + layer) * PAGE + tp % PAGE) * DIM * KV_PLANES;
+        float s = 0.0f;
+        for (int h = 0; h < HEADS; h++) {{
+            float d = 0.0f;
+            for (int j = 0; j < DIM; j++) d += qs[h * DIM + j] * (attn_float(kr[j]) + (KV_PLANES == 2 ? attn_float(kr[DIM + j]) : 0.0f));
+            s += fmaxf(d, 0.0f);
         }}
+        score[g] = s * scale;
     }}
     __syncthreads();
     for (int r = 0; r < cnt; r++) {{
@@ -817,6 +825,8 @@ impl RowBody {
 ",
                 eps = crate::lit(*eps),
                 weight = if *unit { "(1.0f + norm[d])" } else { "norm[d]" },
+                score_decl = if Self::shared_scores(*heads, *dim, *max_groups) { "    __shared__ float score[MAX_GROUPS];\n" } else { "" },
+                score_row = if Self::shared_scores(*heads, *dim, *max_groups) { "" } else { "    float* score = scores + (size_t)row * MAX_GROUPS;\n" },
             ),
             RowBody::HeadMatvec { x_row, x_head, x_offset, inner, w_head, w_inner, w_out, w_offset, out, y_row, y_head, y_offset } => {
                 let store = if Self::planes(&k.params) {

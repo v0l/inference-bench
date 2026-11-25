@@ -1410,13 +1410,13 @@ impl Runtime {
                 .attention
                 .scratch
                 .iter()
-                .map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim(spec, w)?)?)))
+                .map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim_at(spec, w, max_ctx)?)?)))
                 .collect::<Result<_>>()?,
             int_scratch: spec
                 .attention
                 .int_scratch
                 .iter()
-                .map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim(spec, w)?)?)))
+                .map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim_at(spec, w, max_ctx)?)?)))
                 .collect::<Result<_>>()?,
             buf,
             kernels,

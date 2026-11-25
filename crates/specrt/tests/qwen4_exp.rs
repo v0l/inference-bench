@@ -135,6 +135,22 @@ fn the_real_qwen3_8_flash_next_config_serves_text_with_offload_sized_pieces() {
 }
 
 #[test]
+fn the_real_qsa_select_builds_at_256k_with_its_group_scores_in_global_scratch() {
+    let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/popular/Qwen__Qwen3.8-Flash-Next/config.json")).unwrap();
+    let s = Spec::from_hf_config_serving(&json).unwrap_or_else(|e| panic!("{e:#}"));
+    let select = |ctx: usize| {
+        let k = specrt::codegen::described_kernels(&s, 2, ctx, &kir::Target::sm_120()).unwrap_or_else(|e| panic!("{ctx}: {e:#}")).into_iter().flatten().find(|k| k.name == "qsa_index_select").unwrap();
+        kir::cuda::emit_module(&[k]).unwrap()
+    };
+    let long = select(262_144);
+    assert!(long.contains("constexpr int MAX_GROUPS = 65536;") && long.contains("float* score = scores + (size_t)row * MAX_GROUPS;"), "{long}");
+    assert!(select(32_768).contains("__shared__ float score[MAX_GROUPS];"), "32 K slots keep the scores in shared memory");
+    assert_eq!(specrt::state::dim_at(&s, &s.attention.scratch["index_scores"], 262_144).unwrap(), 65536, "one float per group per row");
+    let m = specrt::codegen::Module::generate_kv(&s, 262_144, 2, &kir::Target::sm_120()).unwrap_or_else(|e| panic!("{e:#}"));
+    assert!(m.kernels.contains(&"qsa_index_select"));
+}
+
+#[test]
 fn the_planner_counts_the_ngram_table_and_the_residual_weights_near_the_hub_sizes() {
     for (repo, hub_gb) in [("Qwen__Qwen3.8-Flash-Next", 360.0), ("RadixArk__Qwen3.8-Flash-Next-NVFP4", 135.2), ("Qwen__Qwen3.8-Flash-Next-FP8", 185.5)] {
         let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/popular").join(repo).join("config.json")).unwrap();

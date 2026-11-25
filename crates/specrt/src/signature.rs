@@ -339,7 +339,7 @@ impl<'a> Signer<'a> {
 
     fn bound(&self, kernel: &kir::Kernel, bind: &BTreeMap<String, Bind>, scratch: &BTreeMap<String, String>, ints: &BTreeMap<String, String>, defaults: &dyn Fn(&str) -> Option<Tensor>) -> Result<Signature> {
         let (mut reads, mut writes): (Vec<Tensor>, Vec<Tensor>) = (Vec::new(), Vec::new());
-        let dim = |s: &str| crate::state::dim(self.spec, s);
+        let dim = |s: &str| crate::state::dim_at(self.spec, s, crate::engine::DEFAULT_CTX);
         let mut planes_out = false;
         for p in kernel.params.iter().filter(|p| p.role != kir::Role::Value) {
             let t = match bind.get(p.name) {

@@ -2660,7 +2660,7 @@ impl Spec {
             crate::state::dim(self, c).context("[attention] o_cols")?;
         }
         for (n, w) in self.attention.scratch.iter().chain(&self.attention.int_scratch) {
-            crate::state::dim(self, w).with_context(|| format!("[attention.scratch] {n}"))?;
+            crate::state::dim_at(self, w, crate::engine::DEFAULT_CTX).with_context(|| format!("[attention.scratch] {n}"))?;
         }
         ensure!(self.attention.int_scratch.keys().all(|n| !self.attention.scratch.contains_key(n)), "[attention.int_scratch] repeats an [attention.scratch] name");
         if nodes.is_empty() {
