@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 const VELOCITY_TOLERANCE: f32 = 1e-4;
 const HIDDEN_TOLERANCE: f32 = 1e-4;
+const BF16_WEIGHT_BOUND: f32 = 5e-3;
 
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-flux2-klein")
@@ -211,6 +212,23 @@ fn decoder_costs_have_no_compute_term() {
     assert_eq!(c.peak_flops_per_byte, None);
     assert!(!c.compute_bound(1, u64::MAX));
     assert_eq!(c.time_bytes(10, 1 << 40), 10);
+}
+
+#[test]
+fn the_host_plan_with_bf16_weights_matches_the_bf16_weight_reference() {
+    let plan = DenoiserGraph::embedded().plan().unwrap();
+    for step in 0..3 {
+        let (v, trace) = run_host(true, step, &plan);
+        let d = max_diff(&v, &reference(&format!("bf16.step{step}.velocity")));
+        let to_f32 = max_diff(&v, &pipeline(&format!("step{step}.velocity")));
+        eprintln!("step {step}: bf16 weights, {d:e} to the bf16 weight reference, {to_f32:e} to the f32 pipeline");
+        assert!(d < VELOCITY_TOLERANCE, "step {step}: {d}");
+        assert!(to_f32 < BF16_WEIGHT_BOUND, "step {step}: {to_f32}");
+        for (name, x) in &trace.blocks {
+            let d = max_diff(x, &reference(&format!("bf16.step{step}.{name}")));
+            assert!(d < HIDDEN_TOLERANCE, "step {step} {name}: {d}");
+        }
+    }
 }
 
 #[test]

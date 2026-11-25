@@ -5,9 +5,10 @@ use specrt::denoiser_host::{patchify, unpatchify};
 use specrt::jit::Jit;
 use std::path::{Path, PathBuf};
 
-const VELOCITY_TOLERANCE: f32 = 2e-3;
-const HIDDEN_TOLERANCE: f32 = 2e-3;
-const IDENTITY_TOLERANCE: f32 = 2e-4;
+const VELOCITY_TOLERANCE: f32 = 1e-4;
+const HIDDEN_TOLERANCE: f32 = 1e-4;
+const BF16_WEIGHT_BOUND: f32 = 5e-3;
+const IDENTITY_TOLERANCE: f32 = 1e-4;
 
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-flux2-klein")
@@ -70,9 +71,10 @@ fn the_engine_denoiser_matches_diffusers_on_every_recorded_step() {
         let to_f32 = max_diff(&v, &pipeline(&format!("step{step}.velocity")));
         let to_bf16 = max_diff(&v, &reference(&format!("bf16.step{step}.velocity")));
         eprintln!("step {step}: velocity max diff {to_f32:e} to the f32 reference, {to_bf16:e} to the bf16 weight reference");
-        assert!(to_f32 < VELOCITY_TOLERANCE, "step {step}: velocity max diff {to_f32}");
+        assert!(to_bf16 < VELOCITY_TOLERANCE, "step {step}: velocity max diff {to_bf16} to the bf16 weight reference");
+        assert!(to_f32 < BF16_WEIGHT_BOUND, "step {step}: velocity max diff {to_f32} to the f32 reference");
         for (name, x) in &trace.blocks {
-            let d = max_diff(&joint_rows(x, h), &reference(&format!("step{step}.{name}")));
+            let d = max_diff(&joint_rows(x, h), &reference(&format!("bf16.step{step}.{name}")));
             eprintln!("step {step} {name}: hidden max diff {d:e}");
             assert!(d < HIDDEN_TOLERANCE, "step {step} {name}: hidden max diff {d}");
         }
