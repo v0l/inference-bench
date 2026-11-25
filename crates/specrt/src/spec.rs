@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use kir as kir;
 
-pub const SPEC_FORMAT: u32 = 17;
+pub const SPEC_FORMAT: u32 = 18;
 
 pub fn modelopt_verified() -> bool {
     include_str!("../modelopt-verified.txt").trim() == "pass"
@@ -1283,9 +1283,14 @@ pub struct MtpLayout {
     pub fc: String,
     pub norm_embed: String,
     pub norm_hidden: String,
+    #[serde(default)]
     pub norm: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fc_hidden: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixer: Option<String>,
 }
 
 impl MtpLayout {
@@ -1297,21 +1302,38 @@ impl MtpLayout {
             norm_hidden: "mtp.pre_fc_norm_hidden.weight".into(),
             norm: "mtp.norm.weight".into(),
             head: None,
+            fc_hidden: None,
+            mixer: None,
         }
     }
 
     fn at(&self, layers: usize) -> MtpLayout {
         let sub = |t: &str| t.replace("{n}", &layers.to_string());
-        MtpLayout { layer: sub(&self.layer), fc: sub(&self.fc), norm_embed: sub(&self.norm_embed), norm_hidden: sub(&self.norm_hidden), norm: sub(&self.norm), head: self.head.as_deref().map(sub) }
+        MtpLayout {
+            layer: sub(&self.layer),
+            fc: sub(&self.fc),
+            norm_embed: sub(&self.norm_embed),
+            norm_hidden: sub(&self.norm_hidden),
+            norm: sub(&self.norm),
+            head: self.head.as_deref().map(sub),
+            fc_hidden: self.fc_hidden.as_deref().map(sub),
+            mixer: self.mixer.as_deref().map(sub),
+        }
     }
 
     fn validate(&self) -> Result<()> {
-        for (name, v) in [("layer", &self.layer), ("fc", &self.fc), ("norm_embed", &self.norm_embed), ("norm_hidden", &self.norm_hidden), ("norm", &self.norm)] {
+        for (name, v) in [("layer", &self.layer), ("fc", &self.fc), ("norm_embed", &self.norm_embed), ("norm_hidden", &self.norm_hidden)] {
             ensure!(!v.is_empty(), "[mtp.layout] {name} is empty");
         }
-        for (name, v) in [("fc", &self.fc), ("norm_embed", &self.norm_embed), ("norm_hidden", &self.norm_hidden), ("norm", &self.norm)] {
+        ensure!(!self.norm.is_empty() || self.mixer.is_some(), "[mtp.layout] norm is empty; only a layout with a mixer collapses its streams instead of a norm");
+        for (name, v) in [("fc", &self.fc), ("norm_embed", &self.norm_embed), ("norm_hidden", &self.norm_hidden)] {
             ensure!(v.ends_with(".weight"), "[mtp.layout] {name} must name a .weight tensor, not {v:?}");
         }
+        ensure!(self.norm.is_empty() || self.norm.ends_with(".weight"), "[mtp.layout] norm must name a .weight tensor, not {:?}", self.norm);
+        if let Some(v) = &self.fc_hidden {
+            ensure!(v.ends_with(".weight"), "[mtp.layout] fc_hidden must name a .weight tensor, not {v:?}");
+        }
+        ensure!(self.mixer.as_deref().is_none_or(|m| !m.is_empty() && !m.ends_with(".weight")), "[mtp.layout] mixer names a module, not a tensor");
         Ok(())
     }
 }
@@ -2306,6 +2328,18 @@ impl Spec {
             if let Some(l) = &m.layout {
                 l.validate()?;
             }
+            if let Some(h) = self.gated_residual() {
+                let l = self.mtp_layout();
+                ensure!(
+                    l.fc_hidden.is_some() && l.mixer.is_some(),
+                    "[mtp] on a [gated_residual] spec takes the {} stream hidden: its [mtp.layout] needs fc_hidden and mixer",
+                    h.streams
+                );
+                ensure!(self.moe.is_some(), "[mtp] on a [gated_residual] spec runs the gated MoE block, so it needs [moe]");
+            } else {
+                let l = self.mtp_layout();
+                ensure!(l.fc_hidden.is_none() && l.mixer.is_none(), "[mtp.layout] fc_hidden and mixer take the streams of a [gated_residual] spec");
+            }
             ensure!(
                 self.linear_attention.is_some() || m.layout.is_some(),
                 "[mtp] on a spec without [linear_attention] needs a [mtp.layout] naming its tensors"
@@ -2560,7 +2594,7 @@ impl Spec {
         ensure!(self.hyper.is_none(), "[gated_residual] and [hyper] are two different residuals, a spec takes one");
         ensure!(!h.module.is_empty() && !h.sites.is_empty() && h.sites.len() <= 2, "[gated_residual] needs a module and one or two sites");
         ensure!(!self.uses_branch() && !self.layers.split && !self.norm.pre, "[gated_residual] replaces the block norms and the residual, so it takes no pre, sandwich, scaled or split layers");
-        ensure!(self.speculative().is_none() && self.mixer.is_none(), "[gated_residual] cannot be combined with [mtp] or [mixer] yet");
+        ensure!(self.mixer.is_none(), "[gated_residual] cannot be combined with [mixer] yet");
         ensure!(h.node.len() <= 64, "[[gated_residual.node]] has more than 64 nodes");
         for stage in [GatedStage::Expand, GatedStage::Pre, GatedStage::Post, GatedStage::Collapse] {
             ensure!(h.nodes(stage).next().is_some(), "[[gated_residual.node]] has no {:?} node", stage);
@@ -2873,6 +2907,17 @@ impl Spec {
 
     pub fn speculative(&self) -> Option<&Mtp> {
         self.mtp.as_ref().filter(|m| m.speculate)
+    }
+
+    pub fn streamed_mtp(&self) -> bool {
+        self.gated_residual().is_some() && self.mtp.as_ref().is_some_and(|m| m.layout.as_ref().is_some_and(|l| l.fc_hidden.is_some()))
+    }
+
+    pub fn draft_width(&self) -> usize {
+        match self.gated_residual() {
+            Some(h) if self.streamed_mtp() => h.width(self.dims.hidden),
+            _ => self.dims.hidden,
+        }
     }
 
     pub fn kv_f16_layers(&self) -> usize {

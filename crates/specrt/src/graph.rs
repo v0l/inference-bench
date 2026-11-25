@@ -101,6 +101,8 @@ fn buffer(name: &str) -> Result<Buf> {
         "branch" => Buf::Branch,
         "merged" => Buf::Merged,
         "fc_planes" => Buf::FcPlanes,
+        "draft_planes" => Buf::DraftPlanes,
+        "streams" => Buf::Streams,
         "mtp_logits" => Buf::MtpLogits,
         "latent" => Buf::Latent,
         "latent_planes" => Buf::LatentPlanes,
@@ -123,6 +125,7 @@ fn weight(name: &str) -> Result<Weight> {
         "mix_out" => Weight::MixOut,
         "lm_head" => Weight::LmHead,
         "mtp_fc" => Weight::MtpFc,
+        "mtp_fc_hidden" => Weight::MtpFcHidden,
         "mtp_qkv" => Weight::MtpQkv,
         "mtp_o" => Weight::MtpO,
         "mtp_gate_up" => Weight::MtpGateUp,
@@ -331,9 +334,10 @@ fn lower(nodes: &[Node], phase: Phase, tensor_core: bool, spec: &Spec, kind: Opt
             let h = spec.gated_residual().with_context(|| format!("{} needs a [gated_residual]", n.op))?;
             let site = match stage {
                 GatedStage::Pre | GatedStage::Post => n.weight.as_deref().context("a gated pre or post node names its site in weight")?.parse::<u8>().context("gated site")?,
+                GatedStage::Collapse if n.weight.as_deref() == Some("draft") => crate::plan::GATED_DRAFT,
                 GatedStage::Expand | GatedStage::Collapse => GATED_MODULE,
             };
-            ensure!(site == GATED_MODULE || (site as usize) < h.sites.len(), "gated site {site} is not one of the {} [gated_residual] sites", h.sites.len());
+            ensure!(site >= crate::plan::GATED_DRAFT || (site as usize) < h.sites.len(), "gated site {site} is not one of the {} [gated_residual] sites", h.sites.len());
             for (i, _) in h.nodes(stage) {
                 ops.push(Op::Gated { node: i as u8, site });
             }

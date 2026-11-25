@@ -43,6 +43,20 @@ pub(super) struct Run<'a> {
     pub mtp: Option<super::mtp::MtpArgs<'a>>,
 }
 
+pub(super) struct PreludeGeom<'a> {
+    pub seqs: usize,
+    pub rows_per_seq: usize,
+    pub slot_base: i32,
+    pub slot_step: i32,
+    pub slots: cudarc::driver::CudaView<'a, i32>,
+}
+
+pub(super) struct PreludeBufs<'a> {
+    pub tokens: cudarc::driver::CudaView<'a, i32>,
+    pub scratch: &'a std::collections::BTreeMap<String, CudaSlice<f32>>,
+    pub ints: &'a std::collections::BTreeMap<String, CudaSlice<i32>>,
+}
+
 impl PlanBackend<Run<'_>> for Runtime {
     fn layers(&self) -> usize {
         self.layers.len()
@@ -528,6 +542,7 @@ impl Runtime {
         let launch = &hb.launch[node as usize];
         let spec_node = &h.node[node as usize];
         let weights = match layer {
+            _ if site == crate::plan::GATED_DRAFT => self.mtp_mixer(),
             Some(l) if site != crate::plan::GATED_MODULE => &l.gated[site as usize],
             _ => &hb.head,
         };
@@ -554,23 +569,35 @@ impl Runtime {
     }
 
     fn prelude_op(&self, node: u8, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
-        let Some((slot, weights)) = layer.and_then(|l| l.prelude.as_ref()) else { return Ok(()) };
+        if layer.and_then(|l| l.prelude.as_ref()).is_none() {
+            return Ok(());
+        }
+        let pb = self.prelude.as_ref().expect("a prelude has buffers");
+        let verify_slots = if run.qlen > 1 && run.mtp.is_none() { self.mtp_seq_slots() } else { None };
+        let geom = match run.bb {
+            Some(_) if run.n > 0 && verify_slots.is_some() => PreludeGeom { seqs: run.n / run.qlen, rows_per_seq: run.qlen, slot_base: 0, slot_step: 1, slots: verify_slots.expect("checked") },
+            Some(bb) if run.n > 0 => PreludeGeom { seqs: run.n / run.qlen.max(1), rows_per_seq: run.qlen.max(1), slot_base: 0, slot_step: 1, slots: bb.slots.as_view() },
+            _ => PreludeGeom { seqs: 1, rows_per_seq: run.n, slot_base: self.seq, slot_step: 0, slots: self.buf.zero_slots.as_view() },
+        };
+        let buffers = PreludeBufs { tokens: run.tokens.as_view(), scratch: &pb.scratch, ints: &pb.int_scratch };
+        self.prelude_launch(node, layer.expect("a prelude layer"), &geom, &buffers)
+    }
+
+    pub(super) fn prelude_launch(&self, node: u8, layer: &DeviceLayer, geom: &PreludeGeom, buffers: &PreludeBufs) -> Result<()> {
+        let (slot, weights) = layer.prelude.as_ref().map(|(s, w)| (*s, w)).context("a prelude layer")?;
+        let layer = Some(layer);
         let pb = self.prelude.as_ref().expect("a prelude has buffers");
         let p = self.spec.prelude.as_ref().expect("a prelude");
         let launch = &pb.launch[node as usize];
         let spec_node = &p.node[node as usize];
-        let (seqs, rows_per_seq, slot_base, slot_step, slots) = match run.bb {
-            Some(bb) if run.n > 0 => (run.n / run.qlen.max(1), run.qlen.max(1), 0, 1, &bb.slots),
-            _ => (1, run.n, self.seq, 0, &self.buf.zero_slots),
-        };
         let mut b = self.launcher(self.kernel(launch.name));
         let mut values: Vec<(i32, f32)> = Vec::with_capacity(launch.params.len());
         for q in &launch.params {
             let v = match q.name {
-                "layer" => f64::from(*slot),
-                "slot_base" => f64::from(slot_base),
-                "slot_step" => f64::from(slot_step),
-                "rows_per_seq" => rows_per_seq as f64,
+                "layer" => f64::from(slot),
+                "slot_base" => f64::from(geom.slot_base),
+                "slot_step" => f64::from(geom.slot_step),
+                "rows_per_seq" => geom.rows_per_seq as f64,
                 name => match spec_node.bind.get(name) {
                     Some(Bind::Number(v)) => *v,
                     Some(Bind::Name(n)) => *p.params.get(n).with_context(|| format!("{n:?} is not a [prelude.params] entry"))?,
@@ -592,21 +619,21 @@ impl Runtime {
                 (_, Some(Bind::Buffer { buffer })) => match buffer.as_str() {
                     "x" => b.arg(&self.pre.x),
                     "streams" => b.arg(&self.gated.as_ref().context("[prelude] streams needs a [gated_residual]")?.streams),
-                    "tokens" => b.arg(run.tokens),
-                    other => match pb.int_scratch.get(other) {
+                    "tokens" => b.arg(&buffers.tokens),
+                    other => match buffers.ints.get(other) {
                         Some(ints) => b.arg(ints),
-                        None => b.arg(pb.scratch.get(other).with_context(|| format!("no prelude scratch {other:?}"))?),
+                        None => b.arg(buffers.scratch.get(other).with_context(|| format!("no prelude scratch {other:?}"))?),
                     },
                 },
                 (_, Some(Bind::State { state })) => b.arg(&pb.states.iter().find(|s| s.name == *state).with_context(|| format!("no prelude state {state:?}"))?.slice),
-                (_, None) if q.name == "slots" => b.arg(slots),
+                (_, None) if q.name == "slots" => b.arg(&geom.slots),
                 _ => bail!("param {:?} of {} is not bound to a buffer, state or weight", q.name, launch.name),
             };
         }
         let dim = |symbol: &String| -> Result<u32> {
             Ok(match symbol.as_str() {
-                "rows" => run.n as u32,
-                "seqs" => seqs as u32,
+                "rows" => (geom.seqs * geom.rows_per_seq) as u32,
+                "seqs" => geom.seqs as u32,
                 other => crate::state::dim(&self.spec, other)? as u32,
             })
         };
@@ -664,6 +691,7 @@ impl Runtime {
             Buf::MixPlanes => &self.mixer.as_ref().expect("a described mixer has buffers").planes,
             Buf::FcPlanes => self.mtp_fc_planes(),
             Buf::LatentPlanes => &self.residual_of().latent_planes,
+            Buf::DraftPlanes => self.mtp_draft_planes(),
             other => unreachable!("{} is not a plane pair", other.label()),
         }
     }
@@ -686,6 +714,10 @@ impl Runtime {
             Buf::MtpLogits => self.mtp_logits(),
             Buf::Partial => &self.partial,
             Buf::Latent => &self.residual_of().latent,
+            Buf::Streams => match &self.gated {
+                Some(hb) => &hb.streams,
+                None => &self.pre.streams,
+            },
             other => unreachable!("{} is not an f32 buffer", other.label()),
         }
     }
@@ -709,7 +741,7 @@ impl Runtime {
             Weight::MtpO => (&attn().o, None),
             Weight::MtpGateUp => (&layer_of().gate_up, None),
             Weight::MtpDown => (&layer_of().down, None),
-            Weight::MtpFc | Weight::MtpHead => (self.mtp_weight(weight), None),
+            Weight::MtpFc | Weight::MtpFcHidden | Weight::MtpHead => (self.mtp_weight(weight), None),
             Weight::LatentDown => (&self.latent_of(layer).down, None),
             Weight::LatentUp => (&self.latent_of(layer).up, None),
             Weight::SharedGateUp => (&self.latent_of(layer).shared_gate_up, None),
@@ -788,7 +820,7 @@ impl Runtime {
         let rows = weight.rows(&self.spec);
         let hidden = self.spec.dims.hidden;
         let head = weight == Weight::LmHead;
-        let tokens = if head { run.rows.len() } else { run.n };
+        let tokens = if head { run.rows.len() } else if weight == Weight::MtpFcHidden { run.n * self.spec.draft_width() / hidden } else { run.n };
         if input.is_planes() {
             let planes = self.planes(input);
             let x = if head { planes.rows(0, tokens, hidden) } else { planes.all() };

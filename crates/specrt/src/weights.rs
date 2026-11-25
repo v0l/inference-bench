@@ -178,10 +178,12 @@ pub struct Outside<'a> {
 
 pub struct MtpWeights<'a> {
     pub fc: Matrix<'a>,
+    pub fc_hidden: Option<Matrix<'a>>,
     pub norm_embed: Vec<f32>,
     pub norm_hidden: Vec<f32>,
     pub layer: Layer<'a>,
     pub norm: Vec<f32>,
+    pub mixer: Vec<(String, Vec<f32>)>,
 }
 
 pub fn hub_dir() -> PathBuf {
@@ -1937,13 +1939,20 @@ impl Checkpoint {
             let down = self.raw(&format!("{p}.mlp.down_proj.weight"), h, inter)?;
             (Raw::interleave(gate, up)?.into_matrix(Quant::Bf16, "mtp gate_up")?, bf16(down, "mtp down_proj")?, None)
         };
+        let streamed = spec.streamed_mtp();
+        let gated = spec.gated_residual().is_some();
+        let width = spec.draft_width();
         Ok(MtpWeights {
-            fc: bf16(self.raw(&lay.fc, h, 2 * h)?, "mtp.fc")?,
+            fc: bf16(self.raw(&lay.fc, h, if streamed { h } else { 2 * h })?, "mtp.fc")?,
+            fc_hidden: match lay.fc_hidden.as_deref() {
+                Some(name) => Some(bf16(self.raw(name, h, h)?, "mtp.fc_hidden")?),
+                None => None,
+            },
             norm_embed: self.norm(spec, &lay.norm_embed, h)?,
-            norm_hidden: self.norm(spec, &lay.norm_hidden, h)?,
+            norm_hidden: self.norm(spec, &lay.norm_hidden, width)?,
             layer: Layer {
-                ln1: self.norm(spec, &format!("{p}.input_layernorm.weight"), h)?,
-                ln2: self.norm(spec, &format!("{p}.post_attention_layernorm.weight"), h)?,
+                ln1: if gated { vec![0.0; 1] } else { self.norm(spec, &format!("{p}.input_layernorm.weight"), h)? },
+                ln2: if gated { vec![0.0; 1] } else { self.norm(spec, &format!("{p}.post_attention_layernorm.weight"), h)? },
                 ln_pre_mlp: None,
                 ln_post_mlp: None,
                 mixer: Mixer::Attention(attn),
@@ -1951,13 +1960,17 @@ impl Checkpoint {
                 down,
                 moe,
                 hyper: Vec::new(),
-                gated: Vec::new(),
+                gated: self.gated_sites(spec, p)?,
                 prelude: Vec::new(),
                 ple: Vec::new(),
                 residual: Vec::new(),
                 latent: None,
             },
-            norm: self.norm(spec, &lay.norm, h)?,
+            norm: if lay.norm.is_empty() { vec![0.0; 1] } else { self.norm(spec, &lay.norm, h)? },
+            mixer: match lay.mixer.as_deref() {
+                Some(module) => self.gated_weights(spec, module, crate::spec::GatedStage::Collapse)?,
+                None => Vec::new(),
+            },
         })
     }
 

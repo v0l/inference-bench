@@ -520,6 +520,9 @@ pub fn linear_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::line
             out.push(kir::linear::LinearKernel::new(target, f, shape.clone()).map_err(anyhow::Error::msg)?);
         }
     }
+    if spec.streamed_mtp() && spec.speculative().is_some() {
+        out.push(kir::linear::LinearKernel::new(target, kir::linear::Family::DraftStreams, shape).map_err(anyhow::Error::msg)?);
+    }
     Ok(out)
 }
 

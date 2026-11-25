@@ -67,7 +67,7 @@ impl Runtime {
     }
 
     fn mtp_len(&self) -> usize {
-        if self.mtp.is_some() { self.spec.dims.hidden } else { 0 }
+        if self.mtp.is_some() { self.mtp_width() } else { 0 }
     }
 
     fn pending_len(&self) -> usize {

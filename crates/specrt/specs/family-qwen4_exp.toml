@@ -1,6 +1,6 @@
 name = "qwen4_exp"
 kind = "family"
-min_engine = 16
+min_engine = 18
 extends = "qwen3_5"
 
 [match]
@@ -8,10 +8,13 @@ model_types = ["qwen4_exp", "qwen4_exp_text"]
 architectures = ["Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM"]
 gguf = []
 
-[[refuse]]
-when = "mtp_num_hidden_layers > 0"
-part = "mtp"
-message = "the Qwen4Exp MTP layer (four stream input, fc_embedding and fc_hidden, indexed attention) is not supported yet (#1350); text is served without it"
+[mtp_layout]
+layer = "mtp.layers.0"
+fc = "mtp.fc_embedding.weight"
+fc_hidden = "mtp.fc_hidden.weight"
+norm_embed = "mtp.pre_fc_norm_embedding.weight"
+norm_hidden = "mtp.pre_fc_norm_hidden.weight"
+mixer = "mtp.hyper_connection_mixer"
 
 [vision]
 ignore = true
