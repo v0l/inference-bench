@@ -390,6 +390,30 @@ fn the_codec_streaming_state_is_a_fixed_tail_per_layer() {
 }
 
 #[test]
+fn the_codec_graph_plans_every_codec_tensor_of_the_real_checkpoint() {
+    let plan = specrt::codec::graph::plan(&real_config()).unwrap();
+    let rows = header();
+    let codec: BTreeMap<String, Vec<usize>> = rows.into_iter().filter(|(n, _)| n.starts_with("codec.")).collect();
+    let planned: BTreeMap<String, Vec<usize>> = plan.encoder.tensors().into_iter().chain(plan.decoder.tensors()).collect();
+    assert_eq!(planned, codec);
+    assert_eq!(plan.encoder.params(), 343_696_032);
+    assert_eq!(plan.decoder.params(), 343_695_969);
+    assert_eq!((plan.frame_samples, plan.latent_dim), (3200, 64));
+    assert_eq!(plan.encoder.steps(1).last(), Some(&1));
+    assert_eq!(plan.decoder.steps(1).last(), Some(&3200));
+    let (enc, dec) = codec_state_floats(&real_config()["codec"]);
+    assert_eq!((plan.encoder.state_floats(), plan.decoder.reference_state_floats()), (enc, dec));
+    assert_eq!((plan.encoder.state_floats(), plan.decoder.reference_state_floats()), (159_622, 147_904));
+    assert_eq!(plan.decoder.state_floats(), 139_200, "the transposed conv keeps one input column, not an overlap tail");
+    let tiny = specrt::codec::graph::plan(&tiny_config()).unwrap();
+    let meta = json(&dir().join("tiny/reference.json"));
+    assert_eq!(tiny.encoder.state_floats() as u64, meta["codec_state_floats"]["encoder"].as_u64().unwrap());
+    assert_eq!(tiny.decoder.reference_state_floats() as u64, meta["codec_state_floats"]["decoder"].as_u64().unwrap());
+    let w = Weights::load();
+    tiny.check_tensors(&|n| w.tensors.get(n).map(|t| t.0.clone()).ok_or_else(|| anyhow::anyhow!("{n} missing"))).unwrap();
+}
+
+#[test]
 fn the_fixture_stays_under_3_mb() {
     fn size(p: &Path) -> u64 {
         std::fs::read_dir(p).unwrap().flatten().map(|e| if e.path().is_dir() { size(&e.path()) } else { e.metadata().unwrap().len() }).sum()

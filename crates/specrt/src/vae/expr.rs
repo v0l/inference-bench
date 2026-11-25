@@ -216,6 +216,7 @@ fn eval_node(n: &Node, env: &Env) -> Result<Value> {
             },
             ("min", [a, b]) => Value::Num(num(a)?.min(num(b)?)),
             ("max", [a, b]) => Value::Num(num(a)?.max(num(b)?)),
+            ("pow", [a, b]) => Value::Num(num(a)?.powf(num(b)?)),
             _ => bail!("unknown function {f} with {} arguments", args.len()),
         },
     })
