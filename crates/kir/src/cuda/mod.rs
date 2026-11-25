@@ -60,6 +60,14 @@ const SPLIT_BF16: &str = "__device__ __forceinline__ void kir_split_bf16(float v
 
 ";
 
+const STORED: &str = "typedef unsigned short bf16_t;
+
+__device__ __forceinline__ float kir_e4m3(unsigned char b) {
+    return __uint_as_float((((unsigned)b & 0x80u) << 24) | (((unsigned)b & 0x7fu) << 20)) * __uint_as_float(0x7b800000u);
+}
+
+";
+
 fn check(k: &Kernel) -> Result<(), String> {
     k.validate()?;
     if k.target.language != Language::Cuda {
@@ -244,6 +252,9 @@ pub fn emit_module(kernels: &[Kernel]) -> Result<crate::KirSource, String> {
     }
     if kernels.iter().any(|k| matches!(&k.body, Body::Compose(c) if c.splits())) {
         out.push_str(SPLIT_BF16);
+    }
+    if kernels.iter().any(|k| matches!(&k.body, Body::Seq(crate::recur::SeqBody::GroupMap(g)) if !g.scales.is_empty()) && k.params.iter().any(|p| matches!(p.ty, crate::Scalar::U8 | crate::Scalar::Bf16))) {
+        out.push_str(STORED);
     }
     for k in kernels {
         out.push_str(&emit_kernel(k)?);

@@ -44,6 +44,7 @@ pub enum Scalar {
     U32,
     Bf16,
     I32,
+    U8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

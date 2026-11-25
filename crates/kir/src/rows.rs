@@ -245,6 +245,7 @@ impl RowBody {
                     Scalar::U32 => "unsigned",
                     Scalar::Bf16 => "bf16_t",
                     Scalar::I32 => "int",
+                    Scalar::U8 => "unsigned char",
                 };
                 match (p.role, p.access) {
                     (Role::Value, _) => format!("{ty} {}", p.name),

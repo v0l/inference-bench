@@ -16,6 +16,7 @@ pub struct GroupMap {
     pub width: u32,
     pub consts: Vec<Const>,
     pub stages: Vec<GroupStage>,
+    pub scales: Vec<(String, f32)>,
 }
 
 const RESERVED: [&str; 6] = ["i", "row", "grp", "scratch", "WIDTH", "width"];
@@ -40,6 +41,20 @@ impl GroupMap {
         self.stages.iter().any(|s| matches!(s, GroupStage::Sum { .. }))
     }
 
+    fn stored(&self, p: &Param) -> bool {
+        self.scales.iter().any(|(n, _)| n == p.name)
+    }
+
+    fn element(&self, p: &Param, at: &str) -> String {
+        let scale = self.scales.iter().find(|(n, _)| n == p.name).map_or(1.0, |(_, s)| *s);
+        match p.ty {
+            Scalar::Bf16 => format!("__uint_as_float(((unsigned){}[{at}]) << 16)", p.name),
+            Scalar::U8 if scale == 1.0 => format!("kir_e4m3({}[{at}])", p.name),
+            Scalar::U8 => format!("(kir_e4m3({}[{at}]) * {}f)", p.name, crate::lit(scale)),
+            _ => format!("{}[{at}]", p.name),
+        }
+    }
+
     pub fn check(&self, t: &Target, params: &[Param]) -> Result<(), String> {
         if t.language != Language::Cuda {
             return Err("a group_map body has only a CUDA lowering".into());
@@ -54,6 +69,8 @@ impl GroupMap {
                 p.ty == Scalar::I32 && p.role == Role::Activation && p.access == Access::Read
             } else if shift {
                 p.ty == Scalar::I32 && p.role == Role::Value
+            } else if self.stored(p) {
+                matches!(p.ty, Scalar::F32 | Scalar::Bf16 | Scalar::U8) && p.role == Role::Weight
             } else {
                 p.ty == Scalar::F32
             };
@@ -95,10 +112,10 @@ impl GroupMap {
                     if !ok(dst, &defined) {
                         return Err(format!("group_map name {dst:?} is not usable or is defined twice"));
                     }
-                    match params.iter().find(|p| p.name == src) {
-                        Some(p) if p.role != Role::Value && p.access == Access::Read && p.ty == Scalar::F32 => {}
-                        _ => return Err(format!("group_map load from {src:?}, which is not a read f32 buffer param")),
-                    }
+                    let source = match params.iter().find(|p| p.name == src) {
+                        Some(p) if p.role != Role::Value && p.access == Access::Read && (p.ty == Scalar::F32 || self.stored(p)) => p,
+                        _ => return Err(format!("group_map load from {src:?}, which is not a read f32 or stored weight param")),
+                    };
                     let at = match index {
                         None => match shift {
                             None => address(*row, *group, *offset),
@@ -120,7 +137,7 @@ impl GroupMap {
                             }
                         }
                     };
-                    elements.push((dst.clone(), Expr::Raw(format!("{src}[{at}]"))));
+                    elements.push((dst.clone(), Expr::Raw(self.element(source, &at))));
                     defined.push(dst.clone());
                 }
                 GroupStage::Value { dst, expr } => {
