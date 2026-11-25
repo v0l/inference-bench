@@ -16,6 +16,9 @@ norm_embed = "mtp.pre_fc_norm_embedding.weight"
 norm_hidden = "mtp.pre_fc_norm_hidden.weight"
 mixer = "mtp.hyper_connection_mixer"
 
+[attention]
+output_gate = true
+
 [vision]
 ignore = true
 

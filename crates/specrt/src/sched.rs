@@ -503,6 +503,17 @@ impl Executor for PipelineExecutor {
         self.pipe.synchronize()
     }
 
+    fn supports_logprobs(&self) -> bool {
+        true
+    }
+
+    fn logits_of(&mut self, at: LogitsAt) -> Result<Vec<f32>> {
+        match at {
+            LogitsAt::Decode(i) => self.pipe.logits_of(Some(i)),
+            LogitsAt::Prefill => self.pipe.logits_of(None),
+        }
+    }
+
     fn chain_metrics(&self) -> Option<ChainMetrics> {
         let hops = self.pipe.stats();
         let prefill = self.pipe.prefill_stats();

@@ -2585,6 +2585,11 @@ impl Spec {
         if !s.layers.pattern.iter().any(|b| b.is_linear()) {
             s.linear_attention = None;
         }
+        if !s.layers.pattern.iter().any(|b| b.is_attention()) {
+            s.attention.node.clear();
+            s.attention.projection.clear();
+            s.attention.o_cols = None;
+        }
         s.mtp = None;
         if self.runtime.kv_dtype.is_fp8() {
             let attention = |range: std::ops::Range<usize>| range.filter(|&i| self.block(i).is_attention()).count();

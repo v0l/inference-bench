@@ -992,6 +992,10 @@ impl<'a> Raw<'a> {
             (Raw::Fp8 { w, grid, map, .. }, q) if q.is_fp8() => {
                 Matrix::Fp8 { values: w, scales: fp8_scales(&grid, &map) }
             }
+            (Raw::Bf16 { w, cols }, q) if q.is_fp8() => {
+                let (values, grid, map) = quantize_fp8_block128(&w, cols);
+                Matrix::Fp8 { values: Cow::Owned(values), scales: fp8_scales(&grid, &map) }
+            }
             (Raw::Bf16 { .. }, q) => bail!("{what} is bf16 but the spec says {q:?}"),
             (Raw::Ggml(_), _) => unreachable!("ggml rows are handled above"),
             (Raw::Fp8 { .. }, _) => bail!("{what} is FP8; use quant = \"fp8_block128\" or \"fp8_channel\""),
@@ -1064,6 +1068,34 @@ fn par_rows<A: Send, B: Send>(
             });
         }
     });
+}
+
+pub fn quantize_fp8_block128(w: &[u16], cols: usize) -> (Vec<u8>, Vec<f32>, Vec<u32>) {
+    let rows = w.len() / cols;
+    let kb = cols.div_ceil(FP8_BLOCK);
+    let rb = rows.div_ceil(FP8_BLOCK);
+    let mut grid = vec![1f32; rb * kb];
+    for br in 0..rb {
+        for bc in 0..kb {
+            let mut max = 0f32;
+            for r in br * FP8_BLOCK..((br + 1) * FP8_BLOCK).min(rows) {
+                for c in bc * FP8_BLOCK..((bc + 1) * FP8_BLOCK).min(cols) {
+                    max = max.max(bf16_to_f32(w[r * cols + c]).abs());
+                }
+            }
+            if max > 0.0 {
+                grid[br * kb + bc] = max / 448.0;
+            }
+        }
+    }
+    let mut values = vec![0u8; w.len()];
+    for r in 0..rows {
+        for c in 0..cols {
+            values[r * cols + c] = f32_to_e4m3(bf16_to_f32(w[r * cols + c]) / grid[(r / FP8_BLOCK) * kb + c / FP8_BLOCK]);
+        }
+    }
+    let map = (0..rows).map(|r| ((r / FP8_BLOCK) * kb) as u32).collect();
+    (values, grid, map)
 }
 
 pub fn quantize_fp8_channel(w: &[u16], cols: usize) -> (Vec<u8>, Vec<f32>) {
@@ -1640,8 +1672,15 @@ impl Checkpoint {
                 let mut values = Vec::with_capacity(total * rows * cols);
                 let mut grid = Vec::new();
                 for i in 0..total {
-                    let Raw::Fp8 { w, grid: g, .. } = self.raw(&format!("{}.weight", module(i, which)), rows, cols)? else {
-                        bail!("{} is not FP8", module(i, which));
+                    let (w, g) = match self.raw(&format!("{}.weight", module(i, which)), rows, cols)? {
+                        Raw::Fp8 { w, grid: g, .. } => (w, g),
+                        other => match other.dequantized() {
+                            Raw::Bf16 { w, cols } => {
+                                let (values, grid, _) = quantize_fp8_block128(&w, cols);
+                                (Cow::Owned(values), grid)
+                            }
+                            _ => bail!("{} is not FP8", module(i, which)),
+                        },
                     };
                     values.extend_from_slice(&w);
                     grid.extend_from_slice(&g);
@@ -2373,6 +2412,30 @@ mod tests {
         assert_eq!(e4m3_to_f32(0x07), 7.0 * 2f32.powi(-9));
         assert_eq!(e4m3_to_f32(0x08), 2f32.powi(-6));
         assert_eq!(e4m3_to_f32(0x80), -0.0);
+    }
+}
+
+#[cfg(test)]
+mod fp8_block_tests {
+    use super::*;
+
+    #[test]
+    fn bf16_rows_requantise_to_128_blocks_that_decode_close_to_the_source() {
+        let (rows, cols) = (130, 260);
+        let w: Vec<u16> = (0..rows * cols).map(|i| f32_to_bf16(((i % 37) as f32 - 18.0) * if i / cols >= 128 { 0.01 } else { 1.0 })).collect();
+        let (values, grid, map) = quantize_fp8_block128(&w, cols);
+        let kb = cols.div_ceil(FP8_BLOCK);
+        assert_eq!(grid.len(), rows.div_ceil(FP8_BLOCK) * kb);
+        assert_eq!(map.len(), rows);
+        assert_eq!(map[127], 0);
+        assert_eq!(map[128], kb as u32);
+        for r in [0, 127, 128, 129] {
+            for c in [0, 129, 259] {
+                let got = e4m3_to_f32(values[r * cols + c]) * grid[map[r] as usize + c / FP8_BLOCK];
+                let want = bf16_to_f32(w[r * cols + c]);
+                assert!((got - want).abs() <= want.abs() * 0.07 + 1e-6, "{r},{c}: {got} vs {want}");
+            }
+        }
     }
 }
 

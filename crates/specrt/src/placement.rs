@@ -323,12 +323,37 @@ pub struct CostModel {
     pub hop_bytes_per_element: usize,
     head_counts: Vec<(&'static str, usize)>,
     pub max_tp: usize,
+    prelude_layers: Vec<usize>,
 }
 
 const ALLREDUCES_PER_LAYER: f64 = 2.0;
 const ALLREDUCE_BYTES_PER_ELEMENT: usize = 2;
 
 impl CostModel {
+    pub fn stage_fit_error(&self, start: usize, end: usize) -> Option<String> {
+        let device = Device {
+            name: "probe".into(),
+            ordinal: None,
+            memory_bytes: u64::MAX / 4,
+            reserve_bytes: 0,
+            bandwidth: 1e12,
+            flops: 1e15,
+            link_latency: 0.0,
+            link_bandwidth: 1e12,
+            offload_bytes: 0,
+            offload_bandwidth: 1e9,
+            host: None,
+            peer_latency: 0.0,
+            peer_bandwidth: 1e12,
+            tp: 1,
+            ordinals: Vec::new(),
+            allreduce_latency: 0.0,
+            allreduce_bandwidth: 1e12,
+            wgpu: false,
+        };
+        fit_stage(self, 0, &device, start, end).err()
+    }
+
     pub fn new(spec: &Spec, context: usize, slots: usize) -> CostModel {
         let anatomy = ModelAnatomy::new(spec, 0, Some(context));
         let kv_per_token = |attention_index: usize| -> u64 { crate::state::kv_bytes_per_token_at(spec, attention_index) };
@@ -373,6 +398,7 @@ impl CostModel {
             hidden: spec.dims.hidden,
             hop_bytes_per_element: 4,
             max_tp: usize::MAX,
+            prelude_layers: spec.prelude.as_ref().map_or_else(Vec::new, |p| p.layers.clone()),
             head_counts: {
                 let mut counts = vec![("attention heads", spec.attention.heads), ("kv heads", spec.attention.kv_heads)];
                 if let Some(la) = &spec.linear_attention {
@@ -631,6 +657,9 @@ fn fit_stage(model: &CostModel, device_index: usize, device: &Device, start: usi
         return Err(format!("{} runs on the wgpu backend and can't take layers of {}: {why} (#491)", device.name, model.name));
     }
     let slice = &model.layers[start..end];
+    if start != 0 && model.prelude_layers.iter().any(|l| (start..end).contains(l)) {
+        return Err(format!("layers {start}..{end} of {} hold a prelude layer, which needs the token history only the first stage has", model.name));
+    }
     let mut weights: u64 = slice.iter().map(|l| l.weight_bytes).sum();
     if start == 0 {
         weights += model.embedding_bytes;
