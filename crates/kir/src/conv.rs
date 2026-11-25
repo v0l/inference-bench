@@ -123,14 +123,14 @@ impl ConvKernel {
             return bad("an interleaved output splits an even channel count and does not upsample".into());
         }
         if let Prologue::GroupApply { groups, .. } = self.prologue
-            && (groups == 0 || s.cin % groups != 0 || s.kt > 1)
+            && (groups == 0 || groups > MAX_GROUPS || s.cin % groups != 0 || s.kt > 1)
         {
-            return bad(format!("a group norm prologue over {groups} groups needs whole groups and a spatial conv"));
+            return bad(format!("a group norm prologue over {groups} groups needs whole groups, at most {MAX_GROUPS}, and a spatial conv"));
         }
         if let Some(g) = self.epilogue.stats
-            && (g == 0 || s.cout % g != 0 || s.interleave)
+            && (g == 0 || g > MAX_GROUPS || s.cout % g != 0 || s.interleave)
         {
-            return bad(format!("group statistics over {g} groups need whole groups"));
+            return bad(format!("group statistics over {g} groups need whole groups, at most {MAX_GROUPS}"));
         }
         if self.smem_bytes() > self.target.smem_limit {
             return bad(format!("needs {} bytes of shared memory, the target allows {}", self.smem_bytes(), self.target.smem_limit));
@@ -157,7 +157,7 @@ impl ConvKernel {
     }
 
     pub fn smem_bytes(&self) -> u32 {
-        let stats = 4 * (2 * self.epilogue.stats.unwrap_or(0) + 2 * self.groups_in());
+        let stats = 16 * self.epilogue.stats.unwrap_or(0) + 8 * self.groups_in();
         let tiles = match self.family {
             Family::Tile => self.tile.stage_bytes() * self.tile.stages,
             Family::Direct => 0,
@@ -192,14 +192,16 @@ impl ConvKernel {
     }
 }
 
-pub fn attention_rows(t: &Target, head_dim: usize, keys: usize) -> Option<usize> {
-    [16usize, 8, 4, 2, 1].into_iter().find(|&bq| attention_smem(head_dim, bq, keys) <= t.smem_limit as usize)
-}
-
-pub fn attention_smem(head_dim: usize, rows: usize, keys: usize) -> usize {
-    ((2 * rows + keys) * head_dim + rows * keys) * 4
-}
-
-pub const ATTENTION_KEYS: usize = 32;
+pub const MAX_GROUPS: usize = 64;
 pub const ATTENTION_THREADS: u32 = 128;
 pub const ROW_THREADS: u32 = 256;
+
+pub fn attention_smem(keys: usize) -> usize {
+    (keys + 2 * 32) * 4
+}
+
+pub fn attention_fits(t: &Target, keys: usize) -> bool {
+    attention_smem(keys) <= t.smem_limit as usize
+}
+
+pub const ROW_KERNELS: &[&str] = &["vae_zero", "vae_group_stats", "vae_group_apply", "vae_rms", "vae_upsample", "vae_add", "vae_clamp", "vae_attention"];

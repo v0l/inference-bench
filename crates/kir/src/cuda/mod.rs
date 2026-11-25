@@ -5,6 +5,7 @@ mod quant;
 mod linear;
 mod ggml;
 mod vision;
+mod conv;
 mod ops;
 mod moe;
 mod bandwidth;
@@ -22,6 +23,7 @@ pub(crate) use attention::scan_tile::{TileScan, decode as scan_tile_decode, pref
 pub use linear::emit_linear;
 pub use ggml::emit_ggml;
 pub use vision::emit_vision;
+pub use conv::emit_vae;
 pub use ops::emit_ops;
 pub use moe::emit_moe;
 pub use gemm::{fp4_act_source, emit_gemm, emit_gemms, gemm_library, needs_arch_features};

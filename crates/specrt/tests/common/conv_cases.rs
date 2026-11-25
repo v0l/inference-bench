@@ -38,6 +38,7 @@ pub fn case(c: &serde_json::Value) -> Case {
     Case { conv: host::ConvWeights { w: w_, b, cin, cout, k, kt }, input, interleave: c["interleave"].as_bool().unwrap(), upsample: c["upsample"].as_bool().unwrap() }
 }
 
+#[allow(dead_code)]
 pub fn host_output(c: &Case) -> Vec<f32> {
     let x = if c.upsample { host::upsample(&c.input) } else { c.input.clone() };
     let y = host::conv(&x, &c.conv, None);
@@ -49,6 +50,3 @@ pub fn max_abs(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
     a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
 }
-
-#[allow(dead_code)]
-fn main() {}
