@@ -112,14 +112,6 @@ impl CodecOp {
         }
     }
 
-    pub fn state_cols(&self) -> usize {
-        match self {
-            CodecOp::Conv { k, stride, .. } => k - stride,
-            CodecOp::ConvUp { .. } => 1,
-            _ => 0,
-        }
-    }
-
     pub fn input(&self) -> Slot {
         match self {
             CodecOp::Conv { input, .. } | CodecOp::RmsNorm { input, .. } | CodecOp::Linear { input, .. } | CodecOp::ScaleAdd { input, .. } => *input,
@@ -221,10 +213,6 @@ fn graph() -> Result<GraphFile> {
     let g: GraphFile = toml::from_str(GRAPH).context("graphs/codec.toml")?;
     ensure!(g.kind == "graph" && g.name == "codec", "graphs/codec.toml is not the codec graph");
     Ok(g)
-}
-
-pub fn model_types() -> Vec<String> {
-    graph().map(|g| g.codec.iter().flat_map(|d| d.model_types.clone()).collect()).unwrap_or_default()
 }
 
 struct Expander<'a> {
@@ -353,11 +341,6 @@ fn stack(g: &CodecGraph, entry: &str, env: &Env, direction: Direction) -> Result
     };
     ensure!(in_per_frame * up == down * out_per_frame, "the {direction:?} stack does not map whole frames");
     Ok(Stack { direction, ops: x.ops, in_channels, out_channels, in_per_frame, out_per_frame })
-}
-
-pub fn find(config: &serde_json::Value) -> Option<String> {
-    let mt = config["model_type"].as_str()?;
-    graph().ok()?.codec.into_iter().find(|g| g.model_types.iter().any(|m| m == mt)).map(|g| g.section)
 }
 
 pub fn plan(config: &serde_json::Value) -> Result<CodecPlan> {
