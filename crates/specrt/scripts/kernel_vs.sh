@@ -13,7 +13,7 @@ commit=$(git -C "$here" rev-parse --short HEAD)$(git -C "$here" diff --quiet HEA
 cmd="crates/specrt/scripts/kernel_vs.sh $*"
 rm -rf "$out/ours"
 (cd "$here" && systemd-run --user --wait --collect -P -q -p MemoryMax=10G --setenv=CUDA_VISIBLE_DEVICES= --setenv=CARGO_TARGET_DIR="$target" --setenv=CARGO_BUILD_JOBS=4 \
-    --setenv=KERNEL_VS_OUT="$out/ours" --working-directory="$here" \
+    --setenv=KERNEL_VS_OUT="$out/ours" --setenv=KERNEL_VS_JOBS="${KERNEL_VS_JOBS:-}" --working-directory="$here" \
     nice -n 19 cargo test --release -q -p inference-bench-specrt --test kernel_vs -- --ignored dump_vs_kernels)
 env=(--setenv=FLASHINFER_WORKSPACE_BASE="$out/fi" --setenv=FLASHINFER_CUDA_ARCH_LIST=12.0f --setenv=TRITON_CACHE_DIR="$out/triton" --setenv=MAX_JOBS=2 --setenv=FLASHINFER_NVCC_THREADS=2)
 systemd-run --user --wait --collect -P -q -p MemoryMax=14G -p MemorySwapMax=0 "${env[@]}" --working-directory="$here" \
