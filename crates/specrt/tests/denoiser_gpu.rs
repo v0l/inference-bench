@@ -73,9 +73,16 @@ fn the_engine_denoiser_matches_diffusers_on_every_recorded_step() {
         eprintln!("step {step}: velocity max diff {to_f32:e} to the f32 reference, {to_bf16:e} to the bf16 weight reference");
         assert!(to_bf16 < VELOCITY_TOLERANCE, "step {step}: velocity max diff {to_bf16} to the bf16 weight reference");
         assert!(to_f32 < BF16_WEIGHT_BOUND, "step {step}: velocity max diff {to_f32} to the f32 reference");
+        let moved = max_diff(&joint_rows(&trace.blocks[0].1, h), &joint_rows(&trace.blocks[1].1, h));
+        let moved_ref = max_diff(&reference(&format!("bf16.step{step}.double0")), &reference(&format!("bf16.step{step}.single0")));
+        eprintln!("step {step}: the single block moves x by {moved:e} (reference {moved_ref:e})");
+        assert!((moved - moved_ref).abs() < HIDDEN_TOLERANCE, "step {step}: the engine single block moves x by {moved}, the reference by {moved_ref}");
         for (name, x) in &trace.blocks {
-            let d = max_diff(&joint_rows(x, h), &reference(&format!("bf16.step{step}.{name}")));
-            eprintln!("step {step} {name}: hidden max diff {d:e}");
+            let want = reference(&format!("bf16.step{step}.{name}"));
+            let got = joint_rows(x, h);
+            let d = max_diff(&got, &want);
+            let at = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).enumerate().fold((0, 0f32), |m, (i, v)| if v > m.1 { (i, v) } else { m }).0;
+            eprintln!("step {step} {name}: hidden max diff {d:e} at row {} col {}", at / h, at % h);
             assert!(d < HIDDEN_TOLERANCE, "step {step} {name}: hidden max diff {d}");
         }
     }
