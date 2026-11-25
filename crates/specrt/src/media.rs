@@ -472,6 +472,18 @@ impl ImageModel {
         };
         let (plan, mut a) = admit(free, resident, guided, (d.h, d.w), &budget)?;
         a.weights = weights;
+        let o = p.options;
+        let mut plan = plan;
+        if o.sequential_cfg && guided && !plan.sequential_cfg {
+            plan.sequential_cfg = true;
+            a.sequential_cfg = true;
+            a.denoiser_arena = (budget.denoiser_arena)(1)?;
+        }
+        if let Some(t) = o.vae_tile.filter(|t| *t > 0 && plan.vae_tile.is_none_or(|p| p.tile > *t)) {
+            plan.vae_tile = Some(Tiling { tile: t, overlap: ((t as f64 * VAE_TILE_OVERLAP).round() as usize).min(t - 1) });
+            a.vae_tile = Some(t);
+            a.vae_arena = (budget.vae_arena)(t.min(d.h), t.min(d.w))?;
+        }
         Ok((plan, a))
     }
 

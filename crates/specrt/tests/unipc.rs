@@ -24,6 +24,14 @@ fn pipeline() -> Pipeline {
 }
 
 #[test]
+fn the_wan_pipeline_options_are_spec_options_with_defaults_off() {
+    let p = pipeline();
+    assert!(!p.options.sequential_cfg && p.options.vae_tile.is_none() && p.options.offload_text_encoder);
+    let real = Pipeline::from_dir(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wan21-1.3b-configs")).unwrap();
+    assert_eq!((real.values["vae_scale"], real.values["temporal_scale"], real.values["pixel_step"]), (8.0, 4.0, 16.0), "the real VAE config has no scale_factor fields, the scales come from dim_mult and temperal_downsample");
+}
+
+#[test]
 fn the_wan_pipeline_binds_the_unipc_scheduler_as_data() {
     let p = pipeline();
     assert_eq!(p.name, "unipc");

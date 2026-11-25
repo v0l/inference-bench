@@ -80,7 +80,9 @@ guidance = 5
 cfg = "guidance > 1"
 latent = "grid"
 symbols = [
-  ["vae_scale", "spatial_scale"],
+  ["spatial", "select(spatial_scale > 0, spatial_scale, floor(exp((vae_levels - 1) * log(2)) + 0.5))"],
+  ["temporal_scale", "select(temporal_field > 0, temporal_field, floor(exp(time_downs * log(2)) + 0.5))"],
+  ["vae_scale", "spatial"],
   ["pixel_step", "vae_scale * latent_patch"],
   ["token_channels", "latent_channels"],
 ]
@@ -92,7 +94,9 @@ symbols = [
 "scheduler.predict_x0" = "true"
 "scheduler.timestep_spacing" = "linspace"
 "scheduler.final_sigmas_type" = "zero"
-"scheduler.use_dynamic_shifting" = "false"
+
+[pipeline.refuse]
+"scheduler.use_dynamic_shifting" = "true"
 
 [pipeline.fields]
 train_steps = ["scheduler.num_train_timesteps"]
@@ -102,11 +106,17 @@ lower_order_final = ["scheduler.lower_order_final"]
 latent_patch = ["transformer.patch_size.1"]
 latent_channels = ["vae.z_dim"]
 spatial_scale = ["vae.scale_factor_spatial"]
-temporal_scale = ["vae.scale_factor_temporal"]
+temporal_field = ["vae.scale_factor_temporal"]
+vae_levels = ["vae.dim_mult"]
+
+[pipeline.counts]
+time_downs = "vae.temperal_downsample"
 
 [pipeline.defaults]
 lower_order_final = 1
 latent_patch = 2
+spatial_scale = 0
+temporal_field = 0
 
 [pipeline.vectors]
 latents_mean = "vae.latents_mean"
@@ -168,3 +178,4 @@ assign = [
 [pipeline.options]
 offload_text_encoder = true
 offload_vae = false
+sequential_cfg = false

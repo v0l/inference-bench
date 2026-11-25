@@ -106,6 +106,16 @@ fn buffer_bytes(graph: &DenoiserGraph, spec: &DenoiserSpec, d: &crate::denoiser:
     Ok(4 * rows * cols)
 }
 
+pub fn block_peak(graph: &DenoiserGraph, spec: &DenoiserSpec, sh: &Shapes, seqs: usize) -> Result<(usize, usize)> {
+    let mut bytes = 0;
+    let mut blocks = 0;
+    for d in graph.buffer.iter().filter(|d| d.per_block.is_some()) {
+        bytes += buffer_bytes(graph, spec, d, sh, seqs)?;
+        blocks = blocks.max(spec.size(d.per_block.as_deref().unwrap())?);
+    }
+    Ok((blocks, bytes))
+}
+
 pub fn arena_bytes(graph: &DenoiserGraph, spec: &DenoiserSpec, sh: &Shapes, seqs: usize) -> Result<usize> {
     let head_dim = spec.size("head_dim")?;
     let mut bytes = 0usize;

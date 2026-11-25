@@ -70,6 +70,10 @@ pub struct Options {
     pub offload_text_encoder: bool,
     #[serde(default)]
     pub offload_vae: bool,
+    #[serde(default)]
+    pub sequential_cfg: bool,
+    #[serde(default)]
+    pub vae_tile: Option<usize>,
 }
 
 fn yes() -> bool {
@@ -78,7 +82,7 @@ fn yes() -> bool {
 
 impl Default for Options {
     fn default() -> Options {
-        Options { offload_text_encoder: true, offload_vae: false }
+        Options { offload_text_encoder: true, offload_vae: false, sequential_cfg: false, vae_tile: None }
     }
 }
 
@@ -104,6 +108,8 @@ struct PipelineDecl {
     #[serde(default)]
     require: BTreeMap<String, String>,
     #[serde(default)]
+    refuse: BTreeMap<String, String>,
+    #[serde(default)]
     fields: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     defaults: BTreeMap<String, f64>,
@@ -113,6 +119,8 @@ struct PipelineDecl {
     tensors: BTreeMap<String, String>,
     #[serde(default)]
     vectors: BTreeMap<String, String>,
+    #[serde(default)]
+    counts: BTreeMap<String, String>,
     schedule: ScheduleDecl,
     step: StepDecl,
     #[serde(default)]
@@ -246,6 +254,10 @@ impl Pipeline {
             let got = lookup(configs, path).map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string));
             ensure!(got.as_deref() == Some(want.as_str()), "the {} pipeline needs {path} = {want}, the config has {}", d.name, got.as_deref().unwrap_or("nothing"));
         }
+        for (path, bad) in &d.refuse {
+            let got = lookup(configs, path).map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string));
+            ensure!(got.as_deref() != Some(bad.as_str()), "the {} pipeline does not run {path} = {bad}", d.name);
+        }
         let mut vectors = BTreeMap::new();
         for (name, path) in &d.vectors {
             let v = lookup(configs, path).and_then(|v| v.as_array()).with_context(|| format!("{path} is not a list of numbers"))?;
@@ -260,6 +272,10 @@ impl Pipeline {
                 v => v.as_f64().with_context(|| format!("{name} is {v}, not a number"))?,
             };
             values.insert(name.clone(), v);
+        }
+        for (name, path) in &d.counts {
+            let n = lookup(configs, path).and_then(|v| v.as_array()).map_or(0, |a| a.iter().filter(|x| x.as_bool() == Some(true)).count());
+            values.insert(name.clone(), n as f64);
         }
         for (name, text) in &d.symbols {
             let v = eval(&parse(text)?, &values)?;

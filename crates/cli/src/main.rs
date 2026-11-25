@@ -478,19 +478,33 @@ fn kernels_command(data: &Path, spec: &str, target: Option<&str>, plan: Option<(
     Ok(())
 }
 
-fn denoiser_command(path: &Path, size: &str, text: usize, fusion: bool) -> Result<()> {
+fn denoiser_command(path: &Path, size: &str, text: usize, frames: usize, fusion: bool) -> Result<()> {
     use specrt::denoiser::{self, DenoiserGraph, DenoiserSpec};
-    let spec = if path.is_dir() { DenoiserSpec::from_pipeline(path)? } else { DenoiserSpec::from_transformer_config(&std::fs::read_to_string(path)?, 2)? };
+    let (spec, graph) = if path.is_dir() { (DenoiserSpec::from_pipeline(path)?, DenoiserGraph::for_pipeline(path)?) } else { (DenoiserSpec::from_transformer_config(&std::fs::read_to_string(path)?, 2)?, DenoiserGraph::embedded()) };
     let (w, h) = size.split_once('x').context("--size is WIDTHxHEIGHT")?;
     let (w, h): (usize, usize) = (w.parse()?, h.parse()?);
-    let step = 8 * spec.size("latent_patch")?;
+    let p = if path.is_dir() { Some(specrt::sampler::Pipeline::from_dir(path)?) } else { None };
+    let scale = p.as_ref().and_then(|p| p.values.get("vae_scale").copied()).unwrap_or(8.0) as usize;
+    let step = scale * spec.size("latent_patch")?;
     ensure!(w % step == 0 && h % step == 0, "--size must be a multiple of {step} pixels");
-    let image = (w / step) * (h / step);
-    let graph = DenoiserGraph::embedded();
+    let ts = p.as_ref().and_then(|p| p.values.get("temporal_scale").copied()).unwrap_or(1.0) as usize;
+    let video = graph.positions == "frames";
+    ensure!(video || frames <= 1, "--frames is for a video denoiser");
+    let latent_frames = if video { frames.max(1).saturating_sub(1) / ts.max(1) + 1 } else { 1 };
+    let (ph, pw) = (h / step, w / step);
+    let image = latent_frames * ph * pw;
     let plan = graph.plan()?;
     denoiser::validate(graph, &spec, &plan)?;
     let count = denoiser::count(image, text);
     print!("{}", denoiser::report(graph, &spec, &plan, count)?.render());
+    if video {
+        let shapes = denoiser::Shapes { image, text, patch_h: ph, patch_w: pw, frames: latent_frames };
+        let one = specrt::denoiser_cuda::arena_bytes(graph, &spec, &shapes, 1)?;
+        let two = specrt::denoiser_cuda::arena_bytes(graph, &spec, &shapes, 2)?;
+        let (blocks, peak) = specrt::denoiser_cuda::block_peak(graph, &spec, &shapes, 1)?;
+        println!("\nvideo {frames} frames -> {latent_frames} latent frames of {ph}x{pw} patches = {image} tokens, text {text}");
+        println!("denoiser activations: {:.2} GB one sequence, {:.2} GB with guidance batched; largest per block buffers {:.2} GB over {blocks} blocks", one as f64 / 1e9, two as f64 / 1e9, peak as f64 / 1e9);
+    }
     if fusion {
         let costs = specrt::fusion::Costs::for_target(&kir::Target::sm_120()).with_compute(400.0, 1600.0);
         for s in specrt::fusion::denoiser_fusion(graph, &spec, &plan, count, &costs, false)? {
@@ -801,7 +815,7 @@ fn main() -> Result<()> {
             if let Some(g) = graph {
                 ensure!(*plan, "--graph needs --plan");
                 match g.as_str() {
-                    "denoiser" => return denoiser_command(Path::new(spec), size, *text, *fusion),
+                    "denoiser" => return denoiser_command(Path::new(spec), size, *text, *frames, *fusion),
                     "vae" => return vae_kernels_command(Path::new(spec), target.as_deref(), size, *frames, *fusion, *compiled),
                     other => bail!("--graph {other:?} is not denoiser or vae"),
                 }

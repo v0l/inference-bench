@@ -92,6 +92,20 @@ fn three_guided_steps_and_the_causal_vae_give_the_reference_video() {
     let ds = max_diff(&seq.frames.concat(), &got);
     eprintln!("sequential guidance against batched: {ds:e}, arena {} against {}", seq.memory.arena, v.memory.arena);
     assert!(ds < 1e-3 && seq.memory.arena < v.memory.arena);
+    let tiling = specrt::vae::tiled::Tiling { tile: 6, overlap: 4 };
+    let mut tiled_frames = Vec::new();
+    let t0 = std::time::Instant::now();
+    let tiled = run(&mut g, Plan { sequential_cfg: false, vae_tile: Some(tiling) }, &mut Vec::new(), &mut tiled_frames);
+    let tiled_secs = t0.elapsed().as_secs_f64();
+    let t1 = std::time::Instant::now();
+    let whole = run(&mut g, Plan::default(), &mut Vec::new(), &mut Vec::new());
+    let whole_secs = t1.elapsed().as_secs_f64();
+    let db = psnr(&tiled.frames.concat(), &whole.frames.concat());
+    eprintln!("spatial VAE tiles on the video (tile 6, overlap 4 latent pixels): PSNR {db:.1} dB against whole frames, vae arena {} against {}, run {tiled_secs:.3} s against {whole_secs:.3} s", tiled.memory.vae_arena, whole.memory.vae_arena);
+    assert_eq!(tiled.frames.len(), 5);
+    assert!(db > 20.0, "{db}");
+    assert!(tiled.memory.vae_arena < whole.memory.vae_arena);
+    assert_eq!(tiled_frames.last(), Some(&(5, 5)));
 }
 
 fn psnr(a: &[f32], b: &[f32]) -> f64 {
