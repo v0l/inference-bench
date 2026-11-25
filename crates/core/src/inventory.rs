@@ -303,7 +303,7 @@ mod tests {
         assert!(devices.iter().all(|d| d.host.as_deref() == Some(inv.host.as_str())), "{devices:?}");
     }
 
-    fn glm5_on(free_gib: f64) -> anyhow::Result<specrt::placement::Placement> {
+    fn big_moe_on(free_gib: f64) -> anyhow::Result<specrt::placement::Placement> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures/glm5.3-flash.config.json");
         let spec = specrt::spec::Spec::from_hf_config_serving(&std::fs::read_to_string(path).unwrap()).unwrap();
         let free = (free_gib * GB) as u64;
@@ -315,8 +315,8 @@ mod tests {
 
     #[test]
     fn two_cards_give_the_planner_free_memory_less_the_engine_reserve() {
-        let placed = glm5_on(92.7).unwrap_or_else(|e| panic!("{e:#}"));
+        let placed = big_moe_on(92.7).unwrap_or_else(|e| panic!("{e:#}"));
         assert_eq!(placed.stages.len(), 2);
-        assert!(glm5_on(90.0).is_err(), "180 GiB free cannot hold 176.9 GiB plus the two reserves and the KV");
+        assert!(big_moe_on(90.0).is_err(), "180 GiB free cannot hold 176.9 GiB plus the two reserves and the KV");
     }
 }
