@@ -114,6 +114,7 @@ pub enum Buf {
     Branch,
     Logits,
     FcPlanes,
+    DraftPlanes,
     MtpLogits,
     Partial,
     Gdn,
@@ -143,6 +144,7 @@ impl Buf {
             Buf::Branch => "branch",
             Buf::Logits => "logits",
             Buf::FcPlanes => "fc planes",
+            Buf::DraftPlanes => "draft stream planes",
             Buf::MtpLogits => "draft logits",
             Buf::Partial => "rank partial",
             Buf::Gdn => "gdn",
@@ -154,7 +156,7 @@ impl Buf {
     }
 
     pub fn is_planes(self) -> bool {
-        matches!(self, Buf::XnPlanes | Buf::AttnPlanes | Buf::ActPlanes | Buf::GdnPlanes | Buf::MixPlanes | Buf::FcPlanes | Buf::LatentPlanes)
+        matches!(self, Buf::XnPlanes | Buf::AttnPlanes | Buf::ActPlanes | Buf::GdnPlanes | Buf::MixPlanes | Buf::FcPlanes | Buf::LatentPlanes | Buf::DraftPlanes)
     }
 
     pub fn holds_activation(self) -> bool {
@@ -177,6 +179,7 @@ pub enum Weight {
     MixOut,
     LmHead,
     MtpFc,
+    MtpFcHidden,
     MtpQkv,
     MtpO,
     MtpGateUp,
@@ -204,6 +207,7 @@ impl Weight {
             Weight::MixOut => "mix_out",
             Weight::LmHead => "lm_head",
             Weight::MtpFc => "mtp_fc",
+            Weight::MtpFcHidden => "mtp_fc_hidden",
             Weight::MtpQkv => "mtp_qkv",
             Weight::MtpO => "mtp_o",
             Weight::MtpGateUp => "mtp_gate_up",
@@ -223,7 +227,7 @@ impl Weight {
             Weight::GateUp => spec.gate_up_rows(),
             Weight::GateUpWide => spec.gate_up_rows_wide(),
             Weight::MtpGateUp => 2 * spec.dims.intermediate,
-            Weight::O | Weight::Down | Weight::DownWide | Weight::LinOut | Weight::MtpFc | Weight::MtpO | Weight::MtpDown => spec.dims.hidden,
+            Weight::O | Weight::Down | Weight::DownWide | Weight::LinOut | Weight::MtpFc | Weight::MtpFcHidden | Weight::MtpO | Weight::MtpDown => spec.dims.hidden,
             Weight::LinIn => la.map_or(0, |l| l.in_proj_rows()),
             Weight::LinBa => la.map_or(0, |l| l.ba_rows()),
             Weight::MixIn => spec.mix_in_rows(),
@@ -268,7 +272,7 @@ impl Weight {
             Weight::MixOut => spec.mixer.iter().map(|m| format!("{}.{}.weight", m.module, m.out_tensor)).collect(),
             Weight::LmHead if spec.dims.tie_embeddings => vec![w("embed_tokens")],
             Weight::LmHead => vec![w("lm_head")],
-            Weight::MtpFc | Weight::MtpQkv | Weight::MtpO | Weight::MtpGateUp | Weight::MtpDown | Weight::MtpHead => Vec::new(),
+            Weight::MtpFc | Weight::MtpFcHidden | Weight::MtpQkv | Weight::MtpO | Weight::MtpGateUp | Weight::MtpDown | Weight::MtpHead => Vec::new(),
             Weight::LatentDown => spec.latent_tensors(false),
             Weight::LatentUp => spec.latent_tensors(true),
             Weight::SharedGateUp => spec.shared_tensors(false),
@@ -406,6 +410,7 @@ pub const PLE_HEAD: u8 = 0;
 pub const PLE_LAYER: u8 = 1;
 
 pub const GATED_MODULE: u8 = u8::MAX;
+pub const GATED_DRAFT: u8 = u8::MAX - 1;
 
 pub fn weight_kind(q: Quant) -> WeightKind {
     match q {
@@ -445,6 +450,7 @@ impl Op {
             Op::Kernel { .. } => "described kernel".into(),
             Op::MixKernel { .. } => "described mixer kernel".into(),
             Op::Gated { site: GATED_MODULE, .. } => "gated residual mixer".into(),
+            Op::Gated { site: GATED_DRAFT, .. } => "gated residual draft mixer".into(),
             Op::Gated { site, .. } => format!("gated residual site {site}"),
             Op::Prelude { .. } => "described prelude kernel".into(),
             Op::Swiglu => "swiglu".into(),
@@ -670,7 +676,9 @@ impl Op {
             ]),
             Op::GdnDecode => names(&["gdn_conv_step", "gdn_step", "split_rows"]),
             Op::GdnVerify => names(&["gdn_conv_verify", "gdn_verify", "split_rows"]),
+            Op::MtpIn if spec.streamed_mtp() => names(&["mtp_streams_in"]),
             Op::MtpIn => names(&["mtp_fc_in"]),
+            Op::MtpGather if spec.streamed_mtp() => names(&["mtp_copy_w", "mtp_copy_w"]),
             Op::MtpGather => names(&["mtp_copy"]),
             Op::MtpNorm => names(&["rms_split"]),
             Op::MtpDraft => names(&["mtp_draft"]),

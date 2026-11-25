@@ -434,6 +434,117 @@ def ple_reference(model, head):
     print(NAME, "ple layer", layer, "rows", tuple(ple.shape), "calls", len(calls))
 
 
+MTP_FIXTURE = ROOT / "tests/fixtures/tiny-qwen4-exp-mtp"
+MTP_NAME = "tiny-qwen4-exp-mtp"
+MTP_LAYER_LIKE = 3
+
+
+def mtp_layer(cfg):
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextDecoderLayer
+
+    return Qwen4ExpTextDecoderLayer(cfg, MTP_LAYER_LIKE)
+
+
+def mtp_shapes(cfg):
+    h, n = cfg.hidden_size, cfg.hc_count
+    shapes = {}
+    for name, p in sorted(mtp_layer(cfg).state_dict().items()):
+        for real, v in to_real(f"mtp.layers.0.{name}", p).items():
+            shapes[real] = tuple(v.shape)
+    shapes["mtp.fc_embedding.weight"] = (h, h)
+    shapes["mtp.fc_hidden.weight"] = (h, h)
+    shapes["mtp.pre_fc_norm_embedding.weight"] = (h,)
+    shapes["mtp.pre_fc_norm_hidden.weight"] = (n * h,)
+    shapes["mtp.hyper_connection_mixer.hc_norm.weight"] = (n * h,)
+    shapes["mtp.hyper_connection_mixer.input_mix_weight_down.weight"] = (cfg.hc_lowrank, n * h)
+    shapes["mtp.hyper_connection_mixer.input_mix_weight_up.weight"] = (n * h, cfg.hc_lowrank)
+    return shapes
+
+
+class TinyQwen4Mtp(torch.nn.Module):
+    def __init__(self, cfg, state):
+        from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextGatedResidual, Qwen4ExpTextRMSNorm
+
+        super().__init__()
+        h, n = cfg.hidden_size, cfg.hc_count
+        self.cfg = cfg
+        self.layer = mtp_layer(cfg)
+        self.fc_embedding = torch.nn.Linear(h, h, bias=False)
+        self.fc_hidden = torch.nn.Linear(h, h, bias=False)
+        self.pre_fc_norm_embedding = Qwen4ExpTextRMSNorm(h, eps=cfg.rms_norm_eps)
+        self.pre_fc_norm_hidden = Qwen4ExpTextRMSNorm(n * h, eps=cfg.rms_norm_eps)
+        self.hyper_connection_mixer = Qwen4ExpTextGatedResidual(cfg, use_combine=False)
+        own = {k[len("mtp."):].replace("layers.0.", "layer."): v.float() for k, v in to_internal(state).items() if k.startswith("mtp.")}
+        self.load_state_dict(own, strict=True)
+
+    def forward(self, model, head, tokens, streams, positions):
+        from transformers.masking_utils import create_causal_mask
+
+        n, h = self.cfg.hc_count, self.cfg.hidden_size
+        e = self.fc_embedding(self.pre_fc_norm_embedding(model.embed_tokens(tokens)))
+        hs = self.fc_hidden(self.pre_fc_norm_hidden(streams).unflatten(-1, (n, h))).flatten(-2)
+        x = hs + e.repeat(1, 1, n)
+        pos = positions[None]
+        rope = model.rotary_emb(e, pos[None].expand(3, 1, -1))
+        mask = create_causal_mask(config=self.cfg, inputs_embeds=e, attention_mask=None, past_key_values=None, position_ids=pos, allow_is_causal_skip=False)
+        out = self.layer(x, position_embeddings=rope, attention_mask=mask)
+        return head(self.hyper_connection_mixer(out))[0], out[0]
+
+
+def mtp_fixture(cfg):
+    from safetensors.torch import save_file
+
+    g = torch.Generator().manual_seed(SEED + 11)
+    shapes = mtp_shapes(cfg)
+    tensors = {name: random_tensor(name, shapes[name], g).to(stored_dtype(name)).contiguous() for name in sorted(shapes)}
+    MTP_FIXTURE.mkdir(parents=True, exist_ok=True)
+    save_file(tensors, MTP_FIXTURE / "mtp.safetensors", metadata={"format": "pt"})
+    config = fixture_config()
+    config["text_config"] = {**TEXT, "mtp_num_hidden_layers": 1, "mtp_use_dedicated_embeddings": False, "mtp": {"hybrid": True, "layer_types": ["full_attention"], "num_hidden_layers": 1}}
+    (MTP_FIXTURE / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+    from safetensors import safe_open
+
+    with safe_open(FIXTURE / "model.safetensors", "pt") as f:
+        main = list(f.keys())
+    weight_map = {k: "../tiny-qwen4-exp/model.safetensors" for k in main}
+    weight_map.update({k: "mtp.safetensors" for k in tensors})
+    (MTP_FIXTURE / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": dict(sorted(weight_map.items()))}, indent=1) + "\n")
+
+
+def mtp_reference(model, head):
+    from safetensors.torch import load_file
+
+    cfg = model.config
+    mtp = TinyQwen4Mtp(cfg, load_file(MTP_FIXTURE / "mtp.safetensors")).eval()
+    ids = prompt_tokens(cfg.vocab_size)
+    last = cfg.num_hidden_layers - 1
+    trace = {}
+    hook = model.layers[last].register_forward_hook(lambda _m, _a, o: trace.__setitem__("streams", (o[0] if isinstance(o, tuple) else o).detach().clone()))
+    with torch.inference_mode():
+        target, _ = logits_of(model, head, ids)
+        hook.remove()
+        streams = trace["streams"]
+        first = int(target[-1].argmax())
+        nxt = torch.cat([ids[1:], torch.tensor([first])])
+        logits, out = mtp(model, head, nxt[None], streams, torch.arange(PROMPT))
+        draft = int(logits[-1].argmax())
+        chain_tokens = torch.cat([nxt, torch.tensor([draft])])
+        chain_streams = torch.cat([streams, out[None, -1:]], dim=1)
+        chain, chain_out = mtp(model, head, chain_tokens[None], chain_streams, torch.arange(PROMPT + 1))
+        chain_draft = int(chain[-1].argmax())
+        third_tokens = torch.cat([chain_tokens, torch.tensor([chain_draft])])
+        third, _ = mtp(model, head, third_tokens[None], torch.cat([chain_streams, chain_out[None, -1:]], dim=1), torch.arange(PROMPT + 2))
+    stored = json.loads((FIXTURE / "reference" / f"{NAME}.ref.json").read_text())
+    assert first == stored["greedy"][0], (first, stored["greedy"])
+    out_dir = MTP_FIXTURE / "reference"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for key, value in {"logits": logits, "chain": chain[-1], "third": third[-1]}.items():
+        value.float().numpy().astype(np.float32).tofile(out_dir / f"{MTP_NAME}.{key}.bin")
+    meta = {"tokens": ids.tolist(), "first": first, "drafts": [draft, chain_draft, int(third[-1].argmax())], "vocab": cfg.vocab_size, "rows": PROMPT}
+    (out_dir / f"{MTP_NAME}.json").write_text(json.dumps(meta) + "\n")
+    print(MTP_NAME, "first", first, "drafts", meta["drafts"])
+
+
 def fixture_bytes():
     return sum(p.stat().st_size for p in FIXTURE.rglob("*") if p.is_file())
 
@@ -451,6 +562,9 @@ def main():
         indexer_reference(model, head)
     if command in ("all", "reference", "ple"):
         ple_reference(model, head)
+    if command in ("all", "mtp"):
+        mtp_fixture(cfg)
+        mtp_reference(model, head)
     size = fixture_bytes()
     print(NAME, size, "bytes")
     assert size < MAX_BYTES, size

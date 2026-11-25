@@ -119,12 +119,17 @@ fn the_real_qwen3_8_flash_next_config_serves_text_with_offload_sized_pieces() {
     let moe = s.moe.as_ref().unwrap();
     assert_eq!((moe.experts, moe.active, moe.expert_intermediate, moe.shared_intermediate), (512, Some(10), 640, 640));
     assert_eq!(s.gated_residual().map(|h| (h.streams, h.params["hc_lowrank"])), Some((4, 320.0)));
-    assert!(s.mtp.is_none() && s.vision.is_none());
-    let why = s.refused_part("mtp").expect("the MTP layer is refused by name");
-    assert!(why.contains("#1350"), "{why}");
+    assert!(s.vision.is_none());
+    assert!(s.refused_part("mtp").is_none(), "the MTP layer is served (#1350)");
+    let m = s.mtp.as_ref().expect("the real config has one MTP layer");
+    assert_eq!(m.layers, 1);
+    assert!(s.streamed_mtp());
+    assert_eq!(s.draft_width(), 4 * 2560);
+    let lay = s.mtp_layout();
+    assert_eq!((lay.fc.as_str(), lay.fc_hidden.as_deref(), lay.norm_hidden.as_str(), lay.mixer.as_deref()), ("mtp.fc_embedding.weight", Some("mtp.fc_hidden.weight"), "mtp.pre_fc_norm_hidden.weight", Some("mtp.hyper_connection_mixer")));
     let mut on = s.clone();
-    let e = specrt::serve::SpeculativeOptions { enabled: Some(true), ..Default::default() }.apply(&mut on).unwrap_err().to_string();
-    assert!(e.contains("refuses its MTP layer") && e.contains("#1350"), "{e}");
+    specrt::serve::SpeculativeOptions { enabled: Some(true), ..Default::default() }.apply(&mut on).unwrap_or_else(|e| panic!("{e:#}"));
+    assert!(on.speculative().is_some());
     specrt::serve::SpeculativeOptions::default().apply(&mut s.clone()).unwrap();
     for (repo, quant) in [("Qwen__Qwen3.8-Flash-Next-FP8", Quant::Fp8Block128), ("RadixArk__Qwen3.8-Flash-Next-NVFP4", Quant::Nvfp4G16)] {
         let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/popular").join(repo).join("config.json")).unwrap();
