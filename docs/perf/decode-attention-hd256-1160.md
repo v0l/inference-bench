@@ -23,8 +23,8 @@ Occupancy sweep at 8 x 32k, `SPECRT_DECODE_BK` and `SPECRT_DECODE_STAGES` (keys 
 | 16 x 4 | 4.820 | 1.8% |
 | 32 x 2 | 4.966 | -1.2% |
 | 32 x 3 | 4.838 | 1.4% |
-| 8 x 4 | 4.819 | 1.8% |
-| 8 x 6 | 4.961 | -1.0% |
+| 8 x 4 | invalid | see below |
+| 8 x 6 | invalid | see below |
 
 Quadrupling the keys in flight per SM moves the time by under 2%, which is inside the run to run spread. The register count and the spill sit in the compute part of the loop and the loads (cp.async, 2 stages of 16 keys) already cover the memory latency on a 273 GB/s part. The 12 x 128k row (512 GB/s) is an aliased pool that fits in L2 and says nothing about DRAM.
 
@@ -66,10 +66,41 @@ The lever is the split size. `DM_CHUNK` (the smallest keys per split, 256) leave
 | 8 x 8k | 0.199 | 0.204 | 0.204 | 0.205 |
 | 8 x 32k | 0.734 | 0.732 | 0.734 | 0.732 |
 | 16 x 2k | 0.087 | 0.091 | 0.103 | 0.129 |
+
+The Spark's `8 x 4` and `8 x 6` rows in the first table are invalid for the same `SB / 2 == 0` reason, not a 1.8% gain.
 | 32 x 16k | 1.433 | 1.422 | 1.422 | 1.423 |
 
 Up to 4x at short context (8 x 1k: 71 to 25 us, against FlashInfer's 33 us in `kernel-vs.md`), no change at long context, and a loss when the grid is already full (8 x 4k, 16 x 2k). So the floor has to come from the grid fill: pick the chunk so that kv_heads x groups x active splits covers `Target::sm_count` times the blocks per SM (from smem), and no smaller. With chunk 32 the reference tests `decode_attention_matches_the_reference_across_splits_mixed_lengths_and_verify_groups` and `decode_attention_applies_window_and_softcap_like_the_reference` pass (2 passed).
 
-Next step (not done yet): a kir split policy in `crates/kir/src/attention.rs` from `Target` and the group count, used by `batch_decode_attention`, `batch_decode_combine`, the tile decode scan (`scan_tile.rs`) and the host `decode_chunk`, then the A/B above through the runtime.
+## Grid-fill split policy: kernel wins, runtime does not (third pass)
 
-Run it for the stage and key pairs in the table above. Build a tiling pass (warps per KV head, rows per warp, stages from `Target::max_regs`, `smem_limit` and the group size, refusing a spilling tile through `cuobjdump --dump-resource-usage` as `kernel_static.rs` does) only if some pair gains 5% there.
+Built on branch `issue-1160-split-policy` (commit 46dc9649, not merged): `DecodeGrid` in `crates/kir/src/attention.rs` picks the chunk per launch. It starts at one pipeline of keys (`DM_STAGES * DM_BK` = 32) and doubles while the blocks (kv_heads x groups x splits) exceed one wave (`sm_count` x blocks per SM from smem and registers: 564 on the RTX PRO 6000) or the 64 split cap. It stops at the old 256 floor, so a grid that already fills the card keeps the old split. The device `decode_chunk` (decode, combine, tile decode scan) computes the same chunk from `gridDim.y`. A GPU test checks that the splits the device writes match the host chunk on the tiny, 27B and 122B shapes. The CPU policy tests, the five gates, the re-blessed goldens (only `DM_CHUNK_MIN`, `DM_WAVE` and the `decode_chunk` lines changed) and the reference tests all passed.
+
+Kernel A/B with the control in the same binary (`SPECRT_DECODE_WAVE=0` gives the old split), min ms, old / old again / new / new again:
+
+| seqs x ctx | old | old | new | new |
+|---|---|---|---|---|
+| 1 x 1k | 0.069 | 0.069 | 0.018 | 0.018 |
+| 1 x 8k | 0.071 | 0.071 | 0.044 | 0.044 |
+| 8 x 1k | 0.069 | 0.070 | 0.027 | 0.027 |
+| 8 x 2k | 0.070 | 0.071 | 0.042 | 0.042 |
+| 8 x 4k | 0.081 | 0.083 | 0.082 | 0.083 |
+| 8 x 8k | 0.203 | 0.201 | 0.200 | 0.201 |
+| 16 x 1k | 0.070 | 0.070 | 0.042 | 0.042 |
+| 16 x 2k | 0.083 | 0.083 | 0.085 | 0.085 |
+| 8 x 32k | 0.734 | 0.733 | 0.735 | 0.732 |
+
+Through the runtime it gains nothing. Real 27B NVFP4 (`orcarouter/Qwen3.8-27B-Uncensored-NVFP4`), `bench --serve --runs 3 --kv-gb 8 <model> <prompt> 128 <batch>`, base binary (master 3f8584a9) and branch binary alternated A B A B on GPU1, full-batch decode step in ms:
+
+| batch x prompt | A | B | A | B |
+|---|---|---|---|---|
+| 1 x 1k | 25.94 | 25.87 | 26.31 | 26.15 |
+| 1 x 8k | 26.94 | 27.34 | 27.04 | 27.28 |
+| 4 x 1k | 32.73 | 32.49 | 32.69 | 32.57 |
+| 4 x 8k | 34.89 | 34.50 | 34.39 | 34.34 |
+| 8 x 1k | 34.05 | 33.93 | 34.52 | 34.18 |
+| 8 x 4k | 35.72 | 35.50 | 35.74 | 35.51 |
+| 8 x 8k | 37.94 | 37.68 | 37.82 | 37.63 |
+| 16 x 2k | 41.69 | 41.57 | 41.65 | 41.56 |
+
+All within 1.5%, under the 5% bar. The serving layout sets max_ctx near prompt plus new tokens, so at 1k context it launches about 37 splits, not 64, and decode attention is a small share of a 26 to 42 ms step dominated by the weight GEMVs. Saving 40 us on each of the 16 attention layers is at most 0.6 ms, under 2% of the step, which is what the table shows. Decision: the policy is not merged. The branch stays as a reference in case a profile ever shows decode attention as a larger share of the step.
