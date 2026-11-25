@@ -83,4 +83,4 @@ Each is a row where the static data leaves real doubt about the speed gap or abo
 7. `rmsnorm` and `add_rmsnorm` at hidden 2560 and 5120, 1 and 4096 rows: against FlashInfer and vLLM, reporting achieved GB/s on the bytes each side moves (f32 against bf16), so the vector load gap is separated from the dtype gap.
 8. `gate_up_act_f4` and `down_proj_f4` at batch 1: no competitor kernel exists; time against the roofline only.
 
-Phase 2 issue: #1158. Gap issues: #1160 (decode attention, rank 1), #1162 (NVFP4 GEMM pipeline, rank 2), #1159 (`moe_route_logits` smem, rank 3), #1161 (vectorise pass, rank 4), #1163 (sm_75 plan, rank 5), #1164 (split compile, rank 6). Ranks 7 and 8 are small and stay in this list until phase 2 says otherwise.
+Phase 2 issue: #1158, timed results in [kernel-vs.md](kernel-vs.md). Gap issues: #1160 (decode attention, rank 1), #1162 (NVFP4 GEMM pipeline, rank 2), #1159 (`moe_route_logits` smem, rank 3), #1161 (vectorise pass, rank 4), #1163 (sm_75 plan, rank 5), #1164 (split compile, rank 6). Ranks 7 and 8 are small and stay in this list until phase 2 says otherwise.
