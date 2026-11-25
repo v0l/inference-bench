@@ -1,4 +1,4 @@
-use crate::fusion::{self, CaptureSection, Costs, Fit, FusionReport, Part, Section, SectionFusion, Unit};
+use crate::fusion::{self, CaptureSection, Costs, Fit, FusionReport, Part, Probe, Section, SectionFusion, Unit};
 use crate::gemm::{self, GemvLaunch};
 use crate::plan::{Buf, Op, Phase, Plan, QuantSource, Weight, weight_kind};
 use crate::signature::{Count, Signature, Tensor, key, Place, Signer, layers_using, ranked};
@@ -25,19 +25,20 @@ pub struct Options {
     pub family: Family,
     pub context: usize,
     pub capture_groups: bool,
+    pub probe: Option<Probe>,
 }
 
 impl Options {
     pub fn planes(context: usize) -> Options {
-        Options { shards: BTreeMap::new(), fuse: true, family: Family::Planes, context, capture_groups: false }
+        Options { shards: BTreeMap::new(), fuse: true, family: Family::Planes, context, capture_groups: false, probe: None }
     }
 
     pub fn ranked(shards: BTreeMap<String, Shard>, fuse: bool, context: usize) -> Options {
-        Options { shards, fuse, family: Family::Planes, context, capture_groups: false }
+        Options { shards, fuse, family: Family::Planes, context, capture_groups: false, probe: None }
     }
 
     pub fn gemv(context: usize) -> Options {
-        Options { shards: BTreeMap::new(), fuse: true, family: Family::Gemv, context, capture_groups: false }
+        Options { shards: BTreeMap::new(), fuse: true, family: Family::Gemv, context, capture_groups: false, probe: None }
     }
 }
 
@@ -201,7 +202,7 @@ fn fuse(spec: &Spec, signer: &Signer, target: &kir::Target, costs: &Costs, opts:
     let library = |units: &[&Unit]| ctx.fit(units);
     let count = Count::new(phase, 1, opts.context);
     let section = Section { name, repeats: layers.len(), phase, layer, ops };
-    let fused = fusion::fuse_ops(spec, signer, target, count, costs, section, Some(&library))?;
+    let fused = fusion::fuse_ops_probed(spec, signer, target, count, costs, section, Some(&library), opts.probe)?;
     let mut at: BTreeMap<usize, Op> = BTreeMap::new();
     let mut dropped: BTreeSet<usize> = BTreeSet::new();
     for g in fused.groups.iter().filter(|g| g.ops.len() > 1) {
@@ -327,4 +328,8 @@ pub fn single(spec: &Spec, target: &kir::Target, context: usize) -> Result<Plan>
 
 pub fn single_traced(spec: &Spec, target: &kir::Target, context: usize) -> Result<(Plan, FusionReport)> {
     compile_traced(spec, single_plan(spec), target, &Options { capture_groups: true, ..Options::gemv(context) })
+}
+
+pub fn single_probed(spec: &Spec, target: &kir::Target, context: usize, probe: Probe) -> Result<(Plan, FusionReport)> {
+    compile_traced(spec, single_plan(spec), target, &Options { probe: Some(probe), ..Options::gemv(context) })
 }
