@@ -193,6 +193,9 @@ def build(args):
         embeds = model.embed(tokens[None], model_latents[None], user_latents[None], model_mask[None], user_mask[None])
         whole_cache = model.new_cache()
         prompt_hidden, prompt_layers = layer_outputs(model, embeds, whole_cache)
+        no_audio = torch.zeros(n, dtype=torch.bool)
+        text_embeds = model.embed(tokens[None], model_latents[None], user_latents[None], no_audio[None], no_audio[None])
+        text_hidden, text_layers = layer_outputs(model, text_embeds, model.new_cache())
 
         user_audio = tone((STEPS) * FRAME, g, 220.0).reshape(STEPS, FRAME)
         head_noise = torch.randn(STEPS + 1, d, generator=g)
@@ -263,6 +266,8 @@ def build(args):
     ref.put("prompt.layers", prompt_layers[:, 0])
     ref.put("prompt.hidden", prompt_hidden[0])
     ref.put("prompt.logits", stream_logits(model, prompt_hidden[0]))
+    ref.put("text.layers", text_layers[:, 0])
+    ref.put("text.hidden", text_hidden[0])
     ref.put("session.user_audio", user_audio)
     ref.put("session.user_mean", stream_mean)
     ref.put("session.user_noise", user_noise)

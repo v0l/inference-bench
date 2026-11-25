@@ -61,6 +61,21 @@
     512
    ]
   },
+  "text.layers": {
+   "file": "text.layers.bin",
+   "shape": [
+    5,
+    15,
+    64
+   ]
+  },
+  "text.hidden": {
+   "file": "text.hidden.bin",
+   "shape": [
+    15,
+    64
+   ]
+  },
   "session.user_audio": {
    "file": "session.user_audio.bin",
    "shape": [
@@ -203,7 +218,7 @@
    ]
   }
  },
- "haru_commit": "7fe6b7665f8bf035998f401f8cb779fbe53f2751",
+ "haru_commit": "7fe6b766",
  "torch": "2.15.0+cpu",
  "seed": 0,
  "dtype": "float32 on bf16 rounded weights",
