@@ -141,7 +141,7 @@ The real load itself needs both cards and a window (#1353).
 
 ## Real checkpoint
 
-NVFP4 copy (`RadixArk/Qwen3.8-Flash-Next-NVFP4`, 206 shards, all present in the index), loaded across both desktop cards by the planner, text only. Engine commit 18a8755e (branch issue-1353). Numbers were taken on quiet GPUs: nothing else ran on either card, the user's app was stopped.
+NVFP4 copy (`RadixArk/Qwen3.8-Flash-Next-NVFP4`, 206 shards, all present in the index), loaded across both desktop cards by the planner, text only. Engine commit 18a8755e (branch issue-1353). Numbers were taken on quiet GPUs: no other job held a GPU lock during the runs.
 
 ```
 export CARGO_TARGET_DIR=/mnt/data/cargo-target/inference-bench-qwen4exp-real
@@ -168,7 +168,7 @@ Speed, greedy, 64 new tokens with `ignore_eos`, one request at a time (time to f
 | 200 | 0.60 s | 330 | 3.7 |
 | 2000 | 4.24 s | 470 | 3.5 |
 
-Decode is 270 ms a step against the planned 36.5 ms: the pipelined path runs the single stream through both stages one row at a time and the MoE experts are read from the host mmap path, not a tuned decode. That gap is the next speed item, not a correctness problem.
+Decode is 270 ms a step against the planned 36.5 ms: the pipelined path runs one stream through both stages a row at a time. That gap is the next speed item, not a correctness problem.
 
 Text check: "The capital of France is" gives " Paris. Paris is the capital of France. The capital of Germany is Berlin. Berlin is the capital of Germany. The capital of Italy is Rome. Rome is" (32 tokens). The 32 greedy tokens and the top 20 logprobs per step are saved for the vLLM comparison in `docs/qwen4exp-real/nvfp4-france.json` and, for a 200 token plain text prompt (`docs/qwen4exp-real/prompt200.json`), `docs/qwen4exp-real/nvfp4-prompt200.json` (OpenAI `logprobs.tokens` and `logprobs.top_logprobs`). The long one stopped after 20 tokens on a natural end of text. The same request against vLLM `/v1/completions` with `"logprobs":20`, `temperature` 0 gives the files to diff.
 
