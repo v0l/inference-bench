@@ -255,4 +255,4 @@ message = "the kimi_k3 family describes the full rank KDA output gate; this conf
 
 [[refuse]]
 when = "dsa_index_topk > 0"
-message = "Kimi K3.1 sparse attention (dsa_config) on the MLA layers is not supported yet"
+message = "Kimi K3.1 sparse attention (dsa_config) on the MLA layers is not supported yet (#1361)"

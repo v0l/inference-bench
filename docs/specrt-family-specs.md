@@ -137,3 +137,22 @@ Tests: `tests/gemma4.rs` (31B and 12B mapping, the E2B and E4B configs mapping t
 | `[[refuse]] part = "mtp"` | A hit drops only that part (the MTP layer here) and records the message on the spec, so `[speculative] enabled = true` is refused by name while text still serves. |
 
 The gated residual runs prefill and decode as separate steps (no fused prefill plus decode, no single row plan).
+
+## Kimi K3 (#1340)
+
+`family-kimi_k3.toml` extends `kimi_linear` for `kimi_k3` and `kimi_k31`. The reference is the checkpoint's own `modeling_kimi_linear.py` (moonshotai/Kimi-K3 at c7945ea0, sha256 pinned in `scripts/tiny_kimi_k3.py`), run with `fla` stubbed by the torch fallbacks of transformers' `kimi_linear`. The stub reproduces transformers on `tiny-kimi-linear` (prefill 5.3e-5, decode 4.0e-5) before it builds `tests/fixtures/tiny-kimi-k3` (6 layers, all six pieces).
+
+| Piece | Family data | Engine |
+|---|---|---|
+| SiTU | `[activation.map] situ`, `[mlp.gated]` with `act = "situ"` (applies only when `hidden_act` names it) and the two betas from the config | the gated expression reaches the dense GEMM epilogue, the shared expert and every MoE expert kernel |
+| MLA q LoRA | `q_a_proj` as an attention projection, `mla_q_lora_norm_e6`, `dsa_q_b`, `dsa_absorb_q`, `mla_lora_attention` (q rope part from `qr`) | `q_a_layernorm` and `kv_a_layernorm` use KimiRMSNorm's default eps 1e-6, not `rms_norm_eps` (`mla_lora_eps`) |
+| MLA output gate | `g_proj` appended to the qkv GEMM; `mla_expand_v_rows` writes f32, `mla_out_gate` (`group_map`, new `planes` stage) stores `v * sigmoid(g)` to the attention planes | none |
+| Full rank KDA gate | `g_proj` as a mixer projection, `kda_gated_norm_mix` reads the gate from the mixer input; `kda_recurrence` with `gate_lower_bound` | none |
+| Latent experts | `[moe.latent]` names width, down, up, norm and the config key that turns the norm on | `Moe::latent`, `MoeShape.width` (expert kernels run at `MOE_WIDTH`, the router stays at `HIDDEN`) and `assign` combine; graph linears `latent_down`, `latent_up`, `shared_gate_up`, `shared_down` and op `latent_norm`; the shared expert runs at full width as a dense GEMM pair |
+| Block attention residuals | `[block_residual]` names the block size key, the two sites and the output module | op `block_res` with stages enter, mixed, done, tail; kir row family `block_res` (mix, push, add, set, out); the score vector is `norm.weight * proj.weight` folded at load; the block stack is per row in the prefill scratch (at most 16 blocks) |
+
+The `blockres_*` graph blocks clear `x` before each branch so `x` holds the branch output; the prefix sum lives beside it, and `done` writes the layer output back to `x`, which is what the hidden trace reads. Variants the family does not describe are refused by name: MLA without the output gate, KDA without the full rank gate, and K3.1's `dsa_config` (#1361).
+
+Tests: `tests/kimi_k3.rs`. CPU: spec, plan validation and module build for the fixture and the real 93 layer K3 config, the K3.1 refusal. GPU1: all 6 layer outputs within 3.4e-4, prefill logits within 6.3e-5 and decode within 1.8e-5 of the largest logit, greedy tokens equal, and four red checks (silu for SiTU, the softplus gate, latent experts without their norm, MLA without the output gate) that each miss by more than 0.19.
+
+The logit checks are relative to the largest logit (bound 1e-4, about 5e-3 absolute) rather than kimi_linear's absolute 7e-4, because the K3 fixture's logits reach about 50 and an f32 host head on the engine's own last layer output already misses the reference by about the same 3e-3, so the gap is head arithmetic on large logits; the layer-wise 3.8e-4 bound on every hidden state is the real check.

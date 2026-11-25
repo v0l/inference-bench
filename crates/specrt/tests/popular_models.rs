@@ -1046,13 +1046,14 @@ fn the_offload_numbers_follow_the_machine_block() {
 }
 
 #[test]
-fn kimi_k3_reads_needs_family_then_offload() {
+fn kimi_k3_passes_and_k3_1_names_its_sparse_attention() {
     let doc = report().doc;
     let kimi = section(&doc, "Main labs");
     let line = kimi.lines().find(|l| l.starts_with("| moonshotai/Kimi-K3 |")).expect("Kimi-K3 row");
-    assert!(line.contains("needs family #1340, then offload:"), "{line}");
-    assert!(line.contains(" cards plus ") && line.contains(" GB host plus ") && line.contains(" GB NVMe"), "{line}");
-    assert!(!line.contains("refused for size"));
+    assert!((line.contains("SUPPORTED-WITH-OFFLOAD: ") || line.contains("DOES-NOT-FIT: ")) && line.contains(" cards plus ") && line.contains(" GB NVMe"), "{line}");
+    assert!(!line.contains("refused for size") && !line.contains("needs family") && !line.contains("not supported"), "{line}");
+    let pro = kimi.lines().find(|l| l.starts_with("| moonshotai/Kimi-K3.1-Pro |")).expect("Kimi-K3.1-Pro row");
+    assert!(pro.contains("needs family #1361, then offload:") && pro.contains("dsa_config"), "{pro}");
 }
 
 #[test]

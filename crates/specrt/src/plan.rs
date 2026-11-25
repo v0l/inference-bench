@@ -229,9 +229,9 @@ impl Weight {
             Weight::MixIn => spec.mix_in_rows(),
             Weight::MixOut => spec.dims.hidden,
             Weight::LmHead | Weight::MtpHead => spec.head_rows().len(),
-            Weight::LatentDown => spec.moe.as_ref().map_or(0, |m| m.width(spec.dims.hidden)),
+            Weight::LatentDown => spec.expert_width(),
             Weight::LatentUp | Weight::SharedDown => spec.dims.hidden,
-            Weight::SharedGateUp => 2 * spec.moe.as_ref().map_or(0, |m| m.shared_intermediate),
+            Weight::SharedGateUp => 2 * spec.shared_expert_rows(),
         }
     }
 
@@ -269,9 +269,10 @@ impl Weight {
             Weight::LmHead if spec.dims.tie_embeddings => vec![w("embed_tokens")],
             Weight::LmHead => vec![w("lm_head")],
             Weight::MtpFc | Weight::MtpQkv | Weight::MtpO | Weight::MtpGateUp | Weight::MtpDown | Weight::MtpHead => Vec::new(),
-            Weight::LatentDown | Weight::LatentUp => spec.moe.iter().flat_map(|m| m.latent.as_ref()).map(|l| format!("mlp.{}.weight", if self == Weight::LatentDown { &l.down } else { &l.up })).collect(),
-            Weight::SharedGateUp => spec.moe.iter().flat_map(|m| ["gate_proj", "up_proj"].map(|p| format!("mlp.{}.{p}.weight", m.shared_module))).collect(),
-            Weight::SharedDown => spec.moe.iter().map(|m| format!("mlp.{}.down_proj.weight", m.shared_module)).collect(),
+            Weight::LatentDown => spec.latent_tensors(false),
+            Weight::LatentUp => spec.latent_tensors(true),
+            Weight::SharedGateUp => spec.shared_tensors(false),
+            Weight::SharedDown => spec.shared_tensors(true),
         }
     }
 }
@@ -588,7 +589,7 @@ impl Op {
             Op::BlockRes { stage: ResStage::Enter } => spec.block_residual.iter().flat_map(|r| ["norm", "proj"].map(|t| format!("{}_{t}.weight", r.sites[0]))).collect(),
             Op::BlockRes { stage: ResStage::Mixed } => spec.block_residual.iter().flat_map(|r| ["norm", "proj"].map(|t| format!("{}_{t}.weight", r.sites[1]))).collect(),
             Op::BlockRes { stage: ResStage::Tail } => spec.block_residual.iter().flat_map(|r| ["norm", "proj"].map(|t| format!("{}_{t}.weight", r.output))).collect(),
-            Op::LatentNorm => spec.moe.iter().flat_map(|m| m.latent.as_ref()).flat_map(|l| l.norm.as_ref()).map(|n| format!("mlp.{n}.weight")).collect(),
+            Op::LatentNorm => spec.latent_norm_tensors(),
             _ => Vec::new(),
         }
     }

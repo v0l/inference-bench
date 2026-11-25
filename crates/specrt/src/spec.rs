@@ -982,6 +982,29 @@ impl Moe {
     }
 }
 
+impl Spec {
+    pub fn expert_width(&self) -> usize {
+        self.moe.as_ref().map_or(0, |m| m.width(self.dims.hidden))
+    }
+
+    pub fn shared_expert_rows(&self) -> usize {
+        self.moe.as_ref().map_or(0, |m| m.shared_intermediate)
+    }
+
+    pub fn latent_tensors(&self, up: bool) -> Vec<String> {
+        self.moe.iter().flat_map(|m| m.latent.as_ref()).map(|l| format!("mlp.{}.weight", if up { &l.up } else { &l.down })).collect()
+    }
+
+    pub fn latent_norm_tensors(&self) -> Vec<String> {
+        self.moe.iter().flat_map(|m| m.latent.as_ref()).flat_map(|l| l.norm.as_ref()).map(|n| format!("mlp.{n}.weight")).collect()
+    }
+
+    pub fn shared_tensors(&self, down: bool) -> Vec<String> {
+        let parts: &[&str] = if down { &["down_proj"] } else { &["gate_proj", "up_proj"] };
+        self.moe.iter().flat_map(|m| parts.iter().map(move |p| format!("mlp.{}.{p}.weight", m.shared_module))).collect()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Layers {
