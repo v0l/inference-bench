@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 const NAME: &str = "tiny-qwen4-exp";
 const LAYER: usize = 3;
 const MAX_CTX: usize = 64;
+const SCRATCH_CTX: usize = 65536;
 const PAGE: usize = 16;
 const TOLERANCE: f32 = 1e-3;
 
@@ -281,6 +282,7 @@ struct Gpu {
     table: CudaSlice<i32>,
     dummy: CudaSlice<i32>,
     pages: i32,
+    max_ctx: usize,
 }
 
 struct Step {
@@ -297,10 +299,11 @@ impl Gpu {
         let pos = stream.clone_htod(&[start as i32]).unwrap();
         let slots: CudaSlice<i32> = stream.alloc_zeros(rows).unwrap();
         let idx: CudaSlice<i32> = stream.alloc_zeros(rows * ix.out).unwrap();
+        let scores: CudaSlice<f32> = stream.alloc_zeros(rows * (self.max_ctx / ix.ratio)).unwrap();
         let out_hi: CudaSlice<u16> = stream.alloc_zeros(rows * spec.q_dim()).unwrap();
         let out_lo: CudaSlice<u16> = stream.alloc_zeros(rows * spec.q_dim()).unwrap();
         let (pos_step, row_step) = if decode { (1i32, 0i32) } else { (0, 1) };
-        let (layer, per_row, slot_base, mm_stride) = (0i32, i32::from(decode), 0i32, MAX_CTX as i32);
+        let (layer, per_row, slot_base, mm_stride) = (0i32, i32::from(decode), 0i32, self.max_ctx as i32);
         let f = self.loaded.function("qk_norm_rope").unwrap();
         let mut b = stream.launch_builder(&f);
         b.arg(&qkv_d).arg(&self.q_norm).arg(&self.k_norm).arg(&self.k_cache).arg(&self.v_cache).arg(&self.table).arg(&pos).arg(&slots).arg(&layer).arg(&per_row).arg(&self.pages).arg(&mm_stride).arg(&self.dummy).arg(&self.dummy).arg(&slot_base);
@@ -336,6 +339,7 @@ impl Gpu {
                     },
                     (kir::Role::Weight, _, Some(Bind::Weight { weight, .. })) => b.arg(&self.weights.iter().find(|(n, _)| n == weight).unwrap().1),
                     (_, _, Some(Bind::Buffer { buffer })) if buffer == "qkv" => b.arg(&qkv_d),
+                    (_, _, Some(Bind::Buffer { buffer })) if buffer == "index_scores" => b.arg(&scores),
                     (_, _, Some(Bind::Buffer { .. })) => b.arg(&idx),
                     (_, _, Some(Bind::State { state })) => b.arg(state_of(state)),
                     (_, "qkv", None) => b.arg(&qkv_d),
@@ -367,17 +371,28 @@ impl Gpu {
 #[test]
 #[ignore = "needs a CUDA GPU with NVRTC"]
 fn the_indexed_layer_matches_the_fixture_at_prefill_and_across_decode_group_boundaries() {
+    indexed_layer(MAX_CTX, "__shared__ float score[MAX_GROUPS];");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU with NVRTC"]
+fn the_indexed_layer_scores_groups_in_global_scratch_past_the_shared_budget() {
+    indexed_layer(SCRATCH_CTX, "float* score = scores + (size_t)row * MAX_GROUPS;");
+}
+
+fn indexed_layer(max_ctx: usize, scoring: &str) {
     let spec = qsa_spec();
     let ix = Index::of(&spec);
     let ctx = CudaContext::new(0).unwrap();
     let target = specrt::codegen::cuda_target(&ctx).unwrap();
-    let module = Module::generate_kv(&spec, MAX_CTX, 2, &target).unwrap();
+    let module = Module::generate_kv(&spec, max_ctx, 2, &target).unwrap();
+    assert!(module.source.contains(scoring), "max_context {max_ctx} picks the score storage");
     let jit = Jit::new(ctx.clone(), std::env::temp_dir().join(format!("specrt-qsa-{}", std::process::id()))).unwrap();
     let loaded = jit.load(&module).unwrap();
-    let described = specrt::codegen::described_kernels(&spec, 2, MAX_CTX, &target).unwrap();
+    let described = specrt::codegen::described_kernels(&spec, 2, max_ctx, &target).unwrap();
     let stream = ctx.default_stream();
     let attn = attention(&spec);
-    let pages = MAX_CTX / PAGE;
+    let pages = max_ctx / PAGE;
     let kv = pages * spec.kv_layers().max(1) * spec.attention.kv_heads * PAGE * spec.attention.head_dim * 2;
     let state = pages * spec.kv_layers().max(1) * PAGE * ix.dim * 2;
     let table: Vec<i32> = (0..pages as i32).rev().collect();
@@ -392,8 +407,9 @@ fn the_indexed_layer_matches_the_fixture_at_prefill_and_across_decode_group_boun
         v_cache: stream.alloc_zeros(kv).unwrap(),
         states: ["index_raw", "index_pool"].iter().map(|n| (n.to_string(), stream.alloc_zeros(state).unwrap())).collect(),
         table: stream.clone_htod(&table).unwrap(),
-        dummy: stream.alloc_zeros(2 * MAX_CTX).unwrap(),
+        dummy: stream.alloc_zeros(2 * max_ctx).unwrap(),
         pages: pages as i32,
+        max_ctx,
     };
     let qkv = attn.project(&spec, &floats(&format!("{NAME}.indexer.input.bin")));
     let row = spec.qkv_rows();
@@ -423,5 +439,5 @@ fn the_indexed_layer_matches_the_fixture_at_prefill_and_across_decode_group_boun
             assert!(diff <= TOLERANCE, "row {p} attention output differs by {diff}");
         }
     }
-    eprintln!("qsa indexed layer: {total} rows ({prompt} prefill, {} decode), selection exact, attention max abs {worst:e}", total - prompt);
+    eprintln!("qsa indexed layer at max_context {max_ctx}: {total} rows ({prompt} prefill, {} decode), selection exact, attention max abs {worst:e}", total - prompt);
 }

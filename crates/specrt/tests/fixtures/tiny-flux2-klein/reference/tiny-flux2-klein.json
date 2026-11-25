@@ -168,10 +168,77 @@
     64,
     16
    ]
+  },
+  "bf16.image": {
+   "file": "tiny-flux2-klein.bf16.image.bin",
+   "shape": [
+    1,
+    3,
+    32,
+    32
+   ]
+  },
+  "bf16.cfg.image": {
+   "file": "tiny-flux2-klein.bf16.cfg.image.bin",
+   "shape": [
+    1,
+    3,
+    32,
+    32
+   ]
+  },
+  "bf16.step0.latent": {
+   "file": "tiny-flux2-klein.bf16.step0.latent.bin",
+   "shape": [
+    1,
+    64,
+    16
+   ]
+  },
+  "bf16.cfg.step0.latent": {
+   "file": "tiny-flux2-klein.bf16.cfg.step0.latent.bin",
+   "shape": [
+    1,
+    64,
+    16
+   ]
+  },
+  "bf16.step1.latent": {
+   "file": "tiny-flux2-klein.bf16.step1.latent.bin",
+   "shape": [
+    1,
+    64,
+    16
+   ]
+  },
+  "bf16.cfg.step1.latent": {
+   "file": "tiny-flux2-klein.bf16.cfg.step1.latent.bin",
+   "shape": [
+    1,
+    64,
+    16
+   ]
+  },
+  "bf16.step2.latent": {
+   "file": "tiny-flux2-klein.bf16.step2.latent.bin",
+   "shape": [
+    1,
+    64,
+    16
+   ]
+  },
+  "bf16.cfg.step2.latent": {
+   "file": "tiny-flux2-klein.bf16.cfg.step2.latent.bin",
+   "shape": [
+    1,
+    64,
+    16
+   ]
   }
  },
  "pipeline": "Flux2KleinPipeline",
  "seed": 0,
+ "noise": "splitmix64 counter, Box-Muller pairs",
  "steps": 3,
  "height": 32,
  "width": 32,

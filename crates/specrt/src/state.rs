@@ -15,6 +15,7 @@ pub enum Per {
 pub enum Layers {
     Attention,
     Linear,
+    Prelude,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +99,7 @@ fn symbol(spec: &Spec, name: &str) -> Option<usize> {
                     .and_then(|m| m.params.get(other))
                     .or_else(|| spec.gated_residual().and_then(|h| h.params.get(other)))
                     .or_else(|| spec.per_layer().and_then(|p| p.params.get(other)))
+                    .or_else(|| spec.prelude.as_ref().and_then(|p| p.params.get(other)))
                 {
                     return (*v >= 0.0 && v.fract() == 0.0).then_some(*v as usize);
                 }
@@ -109,15 +111,24 @@ fn symbol(spec: &Spec, name: &str) -> Option<usize> {
 }
 
 pub fn dim(spec: &Spec, text: &str) -> Result<usize> {
+    sized(spec, text, None)
+}
+
+pub fn dim_at(spec: &Spec, text: &str, max_context: usize) -> Result<usize> {
+    sized(spec, text, Some(max_context))
+}
+
+fn sized(spec: &Spec, text: &str, max_context: Option<usize>) -> Result<usize> {
     let e = kir::expr::Expr::parse(text).map_err(anyhow::Error::msg).with_context(|| format!("size {text:?}"))?;
-    let env = |n: &str| symbol(spec, n).map(|v| v as f64);
+    let lookup = |n: &str| if n == "max_context" { max_context } else { symbol(spec, n) };
+    let env = |n: &str| lookup(n).map(|v| v as f64);
     match e.eval(&env) {
         Some(v) if v >= 0.0 && v.fract() == 0.0 => Ok(v as usize),
         Some(v) => bail!("size {text:?} is {v}, not a whole number"),
         None => {
             let mut names = Vec::new();
             e.names(&mut names);
-            let missing: Vec<String> = names.into_iter().filter(|n| symbol(spec, n).is_none()).collect();
+            let missing: Vec<String> = names.into_iter().filter(|n| lookup(n).is_none()).collect();
             bail!("size {text:?} names {missing:?}, which this model does not provide")
         }
     }
@@ -129,6 +140,7 @@ impl State {
             Layers::Attention if !self.blocks.is_empty() => (0..spec.layers.count).filter(|&i| spec.owns_kv(i) && self.blocks.iter().any(|b| b == spec.block(i).name())).count(),
             Layers::Attention => spec.kv_layers(),
             Layers::Linear => spec.linear_layers(),
+            Layers::Prelude => spec.prelude.as_ref().map_or(0, |p| p.layers.len()),
         }
     }
 

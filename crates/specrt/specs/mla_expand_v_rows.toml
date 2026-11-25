@@ -1,0 +1,36 @@
+kind = "kir-kernel"
+family = "head_matvec"
+name = "mla_expand_v_rows"
+threads = 128
+
+[args]
+x_row = "heads * kv_lora_rank"
+x_head = "kv_lora_rank"
+x_offset = 0
+inner = "kv_lora_rank"
+w_head = "(qk_nope_head_dim + v_head_dim) * kv_lora_rank"
+w_inner = 1
+w_out = "kv_lora_rank"
+w_offset = "qk_nope_head_dim * kv_lora_rank"
+out = "v_head_dim"
+y_row = "heads * v_head_dim"
+y_head = "v_head_dim"
+y_offset = 0
+
+[[param]]
+name = "x"
+type = "f32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "w"
+type = "f32"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "y"
+type = "f32"
+role = "activation"
+access = "write"

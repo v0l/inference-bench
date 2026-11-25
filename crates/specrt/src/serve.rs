@@ -48,6 +48,9 @@ pub struct SpeculativeOptions {
 impl SpeculativeOptions {
     pub fn apply(&self, spec: &mut Spec) -> Result<()> {
         let Some(m) = spec.mtp.as_mut() else {
+            if let Some(why) = spec.refused_part("mtp").filter(|_| self.enabled == Some(true)) {
+                anyhow::bail!("[speculative] enabled = true but {} refuses its MTP layer: {why}", spec.name);
+            }
             anyhow::ensure!(self.enabled != Some(true), "[speculative] enabled = true but {} has no [mtp] layer", spec.name);
             return Ok(());
         };

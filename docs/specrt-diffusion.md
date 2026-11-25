@@ -267,6 +267,31 @@ The arena of a denoiser forward or a VAE tile is a plan query, not a constant. L
 5. Vision attention family: separate key and value source, head_dim 384 and 512 shape. Done by identity against the diffusers attention outputs.
 6. `arena` plan query and `memory_plan` offsets. Done when the arena reported for the tiny fixtures equals the runtime's allocation and a request over the budget is refused or tiled before launch.
 
+### Denoiser on the engine (#1282)
+
+What landed, in the order the compiler sees it:
+
+- `graphs/denoiser.toml`: the generic denoiser graph. `[fields]` bind the diffusers `transformer`, `vae` and `pipeline` configs, `[symbols]` derive the widths (`hidden`, `mlp`, `fused`, `cat`, the modulation set widths), `[[buffer]]` declares every activation with its rows (`image`, `text`, `joint`, `seqs`) and form. `[[head]]`, `[[block]]` (`double`, `single`, with their `count` field and tensor `prefix`) and `[[tail]]` lower to a `Plan` with `Phase::Forward` and one `Op::Dit(DitOp)` per node. Nothing in Rust names the architecture; `DenoiserSpec::from_pipeline` reads a diffusers folder.
+- Ops: `Patchify`, `Unpatchify`, `TimestepEmbed`, `Split` (with SiLU), `Copy`, `Linear` (rows per stream, `+` joins weights, `[a:b]` slices weight columns, `add` accumulates), `Modulate { set, shift, scale }`, `GatedAdd { set, gate }`, `Glu { offset }`, `AxisRope`, `JointAttention`. `denoiser::Signer` signs them over `Rows::Image | Text | Joint` and `Count { image, text }` (zero for every decoder count). `denoiser::validate` walks the plan and checks every read against what was written, per row stream.
+- Kernels: compose descriptions in `specs/` (`dit_modulate` is LayerNorm plus `(1 + scale) x + shift` plus the plane split in one kernel with two block sums; `dit_gated_add`, `dit_glu`, `dit_split`, `dit_silu_split`, `dit_copy`, `dit_timestep`, `dit_patchify`, `dit_unpatchify`). Compose gained several block sums, an `index` stage, a bf16 `split_store`, row strides and offsets, nested layouts with symbol sizes, and `sin`/`cos`. The tile GEMM is `vis_mma`, attention is `vis_flash` with one segment `[0, S)`, and qk norm plus the 4 axis table rope is `vis_axis_rope` in the vision family (`VisionKernel::joint`).
+- Runtime: `denoiser_cuda::Denoiser` with `load`, `arena` (its own buffers, no KV state), `prepare` (runs the step invariant head ops once) and `forward(latent, sigma)`. `denoiser_host::HostDenoiser` runs the same plan on the CPU in f32, which is how the graph, the spec binding, the modulation order and the rope were proven before any kernel ran.
+- H1: `denoiser::hoisted` marks head ops whose reads do not depend on the latent or the timestep and whose writes no later section rewrites: `split text` and `context_embedder`. The copy of the context into `x` stays in the step because the blocks rewrite `x`.
+- Cost model: `Costs::with_compute(tflops, gbs)` adds the ridge; `compute_bound` is false for every decoder unit (their flops are 0), so `fusion_plan.rs` and `compile_plan.rs` are unchanged. A prologue onto a compute bound GEMM is refused with `Reason::ComputeBound` unless `compute_prologue`.
+
+Tolerances, from `scripts/denoiser_reference.py` (diffusers CPU f32, and the same model with its weights rounded to bf16): the host plan matches the f32 velocity to 5e-7 and every block output to 1e-4. With bf16 weights the reference itself moves 3e-3 from f32, so the engine (bf16 weights, f32 accumulation, split bf16 activations) is held to 1e-4 against the bf16 weight reference and 5e-3 against f32.
+
+Counts for FLUX.2 klein 4B at 1024 x 1024 (4096 image tokens, 512 text), from `inference-bench kernels --spec crates/specrt/tests/fixtures/tiny-flux2-klein/klein-4b-transformer.json --plan --graph denoiser --fusion`:
+
+| Section | Launches before | After fusion | What fused |
+|---|---|---|---|
+| head (x1) | 14 | 14 (12 per step after the hoist) | none |
+| double (x5) | 20 | 14 | gated residual into `to_out.0`, `to_add_out`, `linear_out` (both streams); SwiGLU into `linear_in` (both streams) |
+| single (x20) | 8 | 7 | both halves of `to_out` and the gated residual into one epilogue |
+| tail (x1) | 3 | 3 | none |
+| step | 277 | 227 | |
+
+34.8 TFLOP and 48.7 GB read per step. Every modulate prologue (11 per step) is refused as compute bound. The fused groups are the dry run of the fusion engine; the runtime still launches the unfused plan, so the identity of each fused kernel against the unfused plan is the next step (queue item 3).
+
 ## 7. Slices
 
 Filed as #1282 to #1286 by the supervisor; the order and the done test of each:
@@ -277,6 +302,34 @@ Filed as #1282 to #1286 by the supervisor; the order and the done test of each:
 4. **#1284 text encoder and sampler loop**: Qwen3 hidden states of selected layers with masked pad keys, `[pipeline]` with flow Euler, CFG batched, host noise from a documented generator. Pass H1 and the Euler update epilogue. Done: `text.hidden` and `text.embeds` within 1e-4, then the whole 3 step run from the recorded noise to `image` within 1e-3, guided and unguided.
 5. **#1285 serving**: family file for FLUX.2 klein, the routes below, the load and Generate pages, `arena` driving admission. Done: the tiny fixture served end to end through `POST /v1/images/generations` (byte compare of the PNG decoded pixels against `image` within one 8 bit level), the real klein 4B loaded through the load dialog in headless sway with `nvidia-smi` showing it on the chosen GPU and the screenshots at 1280 x 800 and 390 x 844 read.
 6. **#1286 video**: UMT5 family, Wan DiT (cross attention, table modulation, 3 axis rope), UniPC as `[pipeline]` state, 3D causal VAE with the frame cache and temporal chunks, the video route. Done: `tiny-wan21` velocities, latents and `video` within the same tolerances, then Wan 2.1 1.3B at 480p on GPU1.
+
+## 7a. VAE decoder (#1283, landed)
+
+The VAE decoder is a plan, compiled by the same fusion engine as the decoder graph:
+
+- `graphs/vae.toml` holds one decoder graph per family (`kl` for `AutoencoderKL` and `AutoencoderKLFlux2`, `causal3d` for `AutoencoderKLWan` and `AutoencoderKLQwenImage`), written as macros over the diffusers config fields (`block_out_channels`, `layers_per_block`, `dim_mult`, `temperal_downsample`). `specrt::vae::graph::plan` expands it into `VaeOp`s (`conv`, `group_norm`, `rms_norm`, `upsample`, `time_up`, `attention`, `add`, `clamp`) and checks every tensor shape against the checkpoint. A new VAE family is a graph entry, no Rust.
+- Plan IR: `Rows::Grid(level)` and `Count::grids` size each resolution level; group norm lowers to a `GridReduce` stats unit and an elementwise apply unit; the fusion engine refuses to fuse a grid reduction with its reader (`Reason::GridBarrier`) and folds the nearest upsample only into an implicit GEMM load (`Reason::Layout`).
+- Rediscovered by the pass on the plain plan, no hand arrangement: group norm apply (with SiLU) as the next conv's prologue, the next group norm's statistics in the conv epilogue, residual adds into `conv2` and `to_out`, the upsample into the next conv's load, the clamp into `conv_out`. Tiny KL VAE: 56 launches to 21. Tiny Wan VAE: 56 to 44 (its channel RMS norm is a row reduction over channels that a conv tile does not own).
+- kir `conv`: `ConvKernel` is an implicit GEMM over NHWC (M output pixels, N Cout, K taps x Cin) with the tile from a formula: an 8 x 16 output patch (1 x 128 for 1x1), `bn = min(128, round_up(Cout, 32))`, `bk = min(32, Cin)` per tap, stages from shared memory (at most 2). Convs with under 8 input or output channels go to the direct family. The causal 3D variant reads the earlier frames from a per conv frame cache; `time_up` is the (3, 1, 1) causal conv to 2C with the interleave in the store.
+- Mid attention is one head over the pixels of a frame, any head dim (384 and 512 included): one block per query row with the scores in shared memory, so the key count is bounded by shared memory, not the head dim.
+- Memory: `vae::compile::arena` walks the fused schedule, takes the peak of live bytes and assigns offsets by interval colouring; `vae::tiled::choose` picks the largest tile (steps of 8 latent pixels) whose arena fits the budget, and `decode_tiled` blends overlapping tiles with linear ramps. Tiled against untiled on the tiny fixture (tile 12, overlap 8): 25.1 dB PSNR, against 18.1 dB for diffusers' own tiled decode at its tile 24.
+- Proof: host decode against `vae.decoded` 2.8e-6 (KL) and 2.2e-7 (Wan) max abs; fused and unfused schedules bit identical on the host; every conv shape against numpy (`fixtures/conv-cases`). GPU tests in `tests/vae_gpu.rs`.
+- Counts: `inference-bench kernels --plan --graph vae --spec <diffusers folder> --size 1024x1024 [--compiled] [--fusion]`.
+
+## 7b. Text encoder and sampler loop (#1284, landed)
+
+From a prompt to an image on the engine, with no per-architecture Rust:
+
+- Pipeline as data: `graphs/pipeline.toml` has one entry per pipeline class (`flow-euler` for `Flux2KleinPipeline` with `FlowMatchEulerDiscreteScheduler`). `[fields]` bind the scheduler, VAE, text encoder and `model_index.json` configs; `text_layers` (`layers / 4, layers / 2, 3 layers / 4`, which is 9, 18, 27 for Qwen3-4B and 1, 2, 3 for the tiny copy), `max_length` 512, the default steps and guidance (distilled 4 and 1, base 50 and 4), the `cfg` condition, and the schedule as expressions: `mu` (the empirical fit from the pipeline code), the per step `sigma` (linspace with the exponential or static shift), the model timestep, and the step itself as kir `Expr`s: `update = x + (s1 - s0) * v`, `combine = u + g * (c - u)`, `latent_in` (BatchNorm denormalise) and `output` (`(x / 2 + 0.5)` clamped). `sampler::Pipeline` reads it; adding DDIM or UniPC is a new entry plus, for multistep rules, state inputs.
+- Runtime options: `[pipeline.options] offload_text_encoder` (default on: the encoder runtime is dropped after the prompt is encoded, before the denoiser loads) and `offload_vae` (default off: the VAE stays loaded between requests). The denoiser is resident for every step. Both change no pixel (`sampler_gpu.rs`).
+- Prompt: `sampler::PromptEncoder` renders the tokenizer's chat template (`enable_thinking` false), tokenises, truncates to `max_length` and pads with the config's `pad_token`, with the mask. Checked against transformers on the Qwen3 tokenizer.
+- Text encoder: the existing Qwen3 family on the engine. `Runtime::hidden_states(ids, real, layers)` runs the decoder graph's prefill plan (today's compile, no lm_head, no final norm, KV not kept), copies `x` after each chosen layer and stops after the last one. Pad keys are masked with a per run key limit in `flash_mma` (`key_limit`, every other caller passes no limit), so padded rows are computed as diffusers computes them. `sampler::stack_layers` gives the `[tokens, layers x hidden]` embedding. The tiny fixture's encoder is 2 heads of 32 (the engine's flash kernel takes head dims that are multiples of 16), with bf16-exact weights.
+- Step in the plan: `graphs/denoiser.toml` now runs on the pipeline's packed latent tokens (`latent` rows: one copy shared by both CFG sequences) and ends with a `[[step]]` node. `DenoiserGraph::sampling_plan(rule, guided)` lowers it to `DitOp::Step` with the rule, and its kernel is a compose description generated from the rule (`denoiser::step_description`). Without CFG the fusion pass attaches the step to `proj_out`'s epilogue (`tail`: 3 launches to 2); with CFG it refuses (`Reason::Rows`: the step reads both sequences' rows). The CUDA denoiser runs the fused form as `vis_mma_step`, the tile GEMM with the rule lowered into its store (`kir::cuda::emit_vision_step`); it is bit identical to the unfused step.
+- CFG: two sequences of one forward. `Count::seqs` scales the image, text and joint rows; the arena holds both sequences, the attention is two segments, the axis rope tables repeat per sequence, and the shared latent is split once and copied. The guided step reads the conditional rows then the unconditional rows. Batched velocities equal single forwards (0 and 7e-7).
+- Noise: the engine cannot reproduce torch's CPU generator, so the initial latent comes from `sampler::noise(seed, n)`: a splitmix64 counter (the VAE tests' generator) giving uniform pairs, then Box-Muller in f64, in channels first order. `scripts/tiny_diffusion.py` (`engine_noise`) generates the same numbers and feeds them to diffusers as `latents`; `sampler.rs` checks they match to 1e-6.
+- H1: `context_embedder` and the text split stay hoisted out of the step loop; the rope tables are built once per arena.
+
+Tolerances (tiny fixture, GPU1): text hidden states 7e-6, embeddings 9e-6 (bound 1e-4). Against a diffusers run with the transformer weights rounded to bf16 (the engine's weights): latents 6e-6 unguided and 1.7e-5 guided after 3 steps (bound 1e-4), decoded image 3e-6 and 1e-5 (bound 1e-3), PSNR 124 and 114 dB (bound 60). Against the f32 diffusers run the bf16 weights alone move the image 2e-3 (bound 2e-2). Arena: 327 KB unguided, 650 KB guided (bound 1 MB), VAE arena 263 KB.
 
 ## 8. API shape
 

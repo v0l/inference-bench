@@ -186,8 +186,8 @@ pub fn spelled_prologue(stages: &[Stage]) -> Result<bool, String> {
 
 fn defined(s: &Stage) -> Option<&str> {
     match s {
-        Stage::TileLoad { dst, .. } | Stage::Epilogue { dst, .. } | Stage::BlockSum { dst, .. } | Stage::Gather { dst, .. } | Stage::Lookup { dst, .. } => Some(dst),
-        Stage::TileStore { .. } | Stage::Scatter { .. } => None,
+        Stage::TileLoad { dst, .. } | Stage::Epilogue { dst, .. } | Stage::BlockSum { dst, .. } | Stage::Gather { dst, .. } | Stage::Lookup { dst, .. } | Stage::Index { dst } => Some(dst),
+        Stage::TileStore { .. } | Stage::Scatter { .. } | Stage::SplitStore { .. } => None,
     }
 }
 
@@ -202,6 +202,8 @@ fn rename(s: Stage, from: &str, to: &str) -> Result<Stage, String> {
         Stage::Gather { dst, src, index } => Stage::Gather { dst, src: name(src), index },
         Stage::Lookup { dst, src, index } => Stage::Lookup { dst, src: name(src), index },
         Stage::Scatter { dst, value, index } => Stage::Scatter { dst, value: name(value), index },
+        Stage::SplitStore { hi, lo, value, tile } => Stage::SplitStore { hi, lo, value: name(value), tile },
+        Stage::Index { dst } => Stage::Index { dst },
     })
 }
 

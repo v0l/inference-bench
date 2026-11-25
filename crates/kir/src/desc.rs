@@ -10,7 +10,7 @@ use toml::Value;
 
 pub const KIND: &str = "kir-kernel";
 
-pub const ROW_FAMILIES: [&str; 14] = ["span_rope", "state_write", "head_matvec", "index_topk", "layernorm_segment", "head_rms", "block_pool", "hyper_pre", "hyper_post", "hyper_expand", "hyper_mean", "pool_topk", "group_pool", "group_topk"];
+pub const ROW_FAMILIES: [&str; 15] = ["span_rope", "state_write", "head_matvec", "index_topk", "layernorm_segment", "head_rms", "block_pool", "hyper_pre", "hyper_post", "hyper_expand", "hyper_mean", "pool_topk", "group_pool", "group_topk", "block_res"];
 
 pub const SEQ_FAMILIES: [&str; 7] = ["recurrence", "seq_conv", "group_norm", "token_hash", "group_map", "group_sum", "group_update"];
 
@@ -294,6 +294,10 @@ pub struct RowsDesc {
     pub iter: String,
     pub address: String,
     pub per_row: Vec<String>,
+    #[serde(default)]
+    pub stride: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub offset: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
@@ -304,6 +308,8 @@ pub struct ParamDesc {
     pub access: String,
     #[serde(default, rename = "type")]
     pub ty: Option<String>,
+    #[serde(default)]
+    pub stored: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
@@ -356,7 +362,7 @@ pub struct StageDesc {
     #[serde(default)]
     pub limit: Option<Value>,
     #[serde(default)]
-    pub planes: bool,
+    pub lo: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -395,6 +401,10 @@ impl Shape {
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.0.get(name)
     }
+}
+
+pub fn intern_public(name: &str) -> &'static str {
+    intern(name)
 }
 
 pub(crate) fn intern(name: &str) -> &'static str {
@@ -525,23 +535,22 @@ impl Description {
         out
     }
 
-    fn tile(&self, width: u32, layout: &Option<String>, at: &[String]) -> Result<Option<Tile>, String> {
+    fn tile(&self, shape: &Shape, width: u32, layout: &Option<String>, at: &[String]) -> Result<Option<Tile>, String> {
         let Some(text) = layout else {
             return if at.is_empty() { Ok(None) } else { Err(format!("{}: stage has `at` without a layout", self.name)) };
         };
         let bad = || format!("{}: layout {text:?} is not (shape):(stride)", self.name);
-        let (shape, stride) = text.split_once(':').ok_or_else(bad)?;
-        let list = |part: &str| -> Result<Vec<u64>, String> {
-            let inner = part.trim().strip_prefix('(').and_then(|p| p.strip_suffix(')')).ok_or_else(bad)?;
-            inner
-                .split(',')
-                .map(|x| match x.trim() {
-                    "width" => Ok(width as u64),
-                    n => n.parse::<u64>().map_err(|_| bad()),
-                })
-                .collect()
+        let (shape_text, stride_text) = split_top(text, ':').ok_or_else(bad)?;
+        let leaf = |tok: &str| -> Result<u64, String> {
+            match tok.trim() {
+                "width" => Ok(width as u64),
+                t => match t.parse::<u64>() {
+                    Ok(n) => Ok(n),
+                    Err(_) => self.size(shape, &Value::String(t.to_string()), "layout").map(u64::from),
+                },
+            }
         };
-        let layout = Layout::flat(&list(shape)?, &list(stride)?)?;
+        let layout = Layout::new(nest(shape_text, &leaf).map_err(|e| format!("{}: {e}", bad()))?, nest(stride_text, &leaf).map_err(|e| format!("{}: {e}", bad()))?)?;
         Ok(Some(Tile { layout, at: at.to_vec() }))
     }
 
@@ -553,6 +562,38 @@ impl Description {
             Some("wgsl") => Mat { cuda: false, wgsl: true },
             Some(o) => return Err(format!("{}: materialize {o:?} is not none, cuda, wgsl or both", self.name)),
         })
+    }
+
+    fn stored(&self, shape: &Shape, params: &mut [Param]) -> Result<Vec<(String, f32)>, String> {
+        let mut scales = Vec::new();
+        for (p, q) in self.param.iter().zip(params.iter_mut()) {
+            let Some(prefix) = &p.stored else { continue };
+            if p.ty.as_deref().is_some_and(|t| t != "f32") || p.role != "weight" || p.access != "read" {
+                return Err(format!("{}: stored param {:?} must be a read f32 weight in the description", self.name, p.name));
+            }
+            let dtype = match shape.get(&format!("{prefix}_dtype")) {
+                None => "f32".to_string(),
+                Some(Value::String(s)) => s.clone(),
+                Some(v) => return Err(format!("{}: {prefix}_dtype is {v}, not a dtype word", self.name)),
+            };
+            q.ty = match dtype.as_str() {
+                "f32" => Scalar::F32,
+                "bf16" => Scalar::Bf16,
+                "fp8" => Scalar::U8,
+                o => return Err(format!("{}: {prefix}_dtype {o:?} is not f32, bf16 or fp8", self.name)),
+            };
+            let scale = match shape.get(&format!("{prefix}_scale")) {
+                None => 1.0,
+                Some(Value::Float(f)) => *f as f32,
+                Some(Value::Integer(i)) => *i as f32,
+                Some(v) => return Err(format!("{}: {prefix}_scale is {v}, not a number", self.name)),
+            };
+            if !scale.is_finite() || scale <= 0.0 || (q.ty != Scalar::U8 && scale != 1.0) {
+                return Err(format!("{}: {prefix}_scale {scale} needs a positive scale, and only fp8 takes one other than 1", self.name));
+            }
+            scales.push((p.name.clone(), scale));
+        }
+        Ok(scales)
     }
 
     fn scalar(&self, p: &ParamDesc) -> Result<Scalar, String> {
@@ -764,8 +805,9 @@ impl Description {
         Ok(crate::hash::TokenHash { context: n["context"], heads: n["heads"], out_row: n["out_row"], layers: n["layers"], blank: n["blank"] as u64, per_head, lets, index: index.fold().map_err(|e| format!("{}: index: {e}", self.name))? })
     }
 
-    fn group_map(&self, shape: &Shape, words: &[(String, String)]) -> Result<crate::group::GroupMap, String> {
+    fn group_map(&self, shape: &Shape, words: &[(String, String)], params: &mut [Param]) -> Result<crate::group::GroupMap, String> {
         use crate::group::GroupStage;
+        let scales = self.stored(shape, params)?;
         let n = self.sizes(shape, &self.args, &["width"], "[args]")?;
         let mut consts = Vec::new();
         for c in &self.consts {
@@ -799,16 +841,20 @@ impl Description {
                 "scalar" => GroupStage::Scalar { dst: dst()?, expr: e()? },
                 "store" => {
                     let (row, group, offset) = at()?;
-                    GroupStage::Store { dst: need(&s.dst, "dst", &s.op)?, value: parse(need(&s.value, "value", &s.op)?)?, row, group, offset, planes: s.planes }
+                    GroupStage::Store { dst: need(&s.dst, "dst", &s.op)?, value: parse(need(&s.value, "value", &s.op)?)?, row, group, offset }
                 }
                 "put" => {
                     let (row, group, offset) = at()?;
                     GroupStage::Put { dst: need(&s.dst, "dst", &s.op)?, value: parse(need(&s.value, "value", &s.op)?)?, row, group, offset }
                 }
-                o => return Err(format!("{}: group_map stage op {o:?} is not load, gather, gather_row, pick, value, sum, scalar, store or put", self.name)),
+                "planes" => {
+                    let (row, group, offset) = at()?;
+                    GroupStage::Planes { value: parse(need(&s.value, "value", &s.op)?)?, row, group, offset }
+                }
+                o => return Err(format!("{}: group_map stage op {o:?} is not load, gather, gather_row, pick, value, sum, scalar, store, put or planes", self.name)),
             });
         }
-        Ok(crate::group::GroupMap { width: n["width"], consts, stages })
+        Ok(crate::group::GroupMap { width: n["width"], consts, stages, scales })
     }
 
     fn seq_kernel(&self, t: &Target, shape: &Shape) -> Result<Kernel, String> {
@@ -830,7 +876,8 @@ impl Description {
                 Kernel::seq(t, intern(&self.name), self.threads(shape)?, params, body).map_err(fail)
             }
             "group_map" => {
-                let body = SeqBody::GroupMap(self.group_map(shape, &words)?);
+                let mut params = params;
+                let body = SeqBody::GroupMap(self.group_map(shape, &words, &mut params)?);
                 Kernel::seq(t, intern(&self.name), self.threads(shape)?, params, body).map_err(fail)
             }
             "group_norm" => {
@@ -965,6 +1012,13 @@ impl Description {
                 let n = self.sizes(shape, &self.args, &["row", "head", "offset", "width"], "[args]")?;
                 RowBody::HeadRms { row: n["row"], head: n["head"], offset: n["offset"], width: n["width"], eps: self.number(shape, "eps")? as f32 }
             }
+            "block_res" => {
+                let n = self.sizes_except(shape, &self.args, &["hidden", "blocks"], &["eps", "mode"], "[args]")?;
+                let word = self.args.get("mode").and_then(|v| v.as_str()).ok_or_else(|| format!("{}: block_res needs a mode", self.name))?;
+                let mode = crate::rows::ResMode::parse(word).ok_or_else(|| format!("{}: block_res mode {word:?} is not mix, push, add or set", self.name))?;
+                let eps = if self.args.contains_key("eps") { self.number(shape, "eps")? as f32 } else { 0.0 };
+                RowBody::BlockRes { hidden: n["hidden"], blocks: n["blocks"], eps, mode }
+            }
             "block_pool" => {
                 let n = self.sizes(shape, &self.args, &["dim", "rot", "layers", "raw_width", "gate_offset"], "[args]")?;
                 RowBody::BlockPool { dim: n["dim"], rot: n["rot"], layers: n["layers"], raw_width: n["raw_width"], gate_offset: n["gate_offset"], eps: self.number(shape, "eps")? as f32 }
@@ -1093,18 +1147,28 @@ impl Description {
         for s in &self.stage {
             let expr = |s: &StageDesc| -> Result<Expr, String> { Expr::parse(&self.text(&words, &need(&s.expr, "expr", &s.op)?)).map_err(|e| format!("{}: {e}", self.name)) };
             stages.push(match s.op.as_str() {
-                "tile_load" => Stage::TileLoad { dst: need(&s.name, "name", &s.op)?, src: need(&s.src, "src", &s.op)?, tile: self.tile(width, &s.layout, &s.at)?, mat: self.mat(&s.materialize)? },
+                "tile_load" => Stage::TileLoad { dst: need(&s.name, "name", &s.op)?, src: need(&s.src, "src", &s.op)?, tile: self.tile(shape, width, &s.layout, &s.at)?, mat: self.mat(&s.materialize)? },
                 "epilogue" => Stage::Epilogue { dst: need(&s.name, "name", &s.op)?, expr: expr(s)?, mat: self.mat(&s.materialize)? },
                 "block_sum" => Stage::BlockSum { dst: need(&s.name, "name", &s.op)?, expr: expr(s)? },
                 "gather" => Stage::Gather { dst: need(&s.name, "name", &s.op)?, src: need(&s.src, "src", &s.op)?, index: need(&s.index, "index", &s.op)? },
                 "lookup" => Stage::Lookup { dst: need(&s.name, "name", &s.op)?, src: need(&s.src, "src", &s.op)?, index: need(&s.index, "index", &s.op)? },
                 "scatter" => Stage::Scatter { dst: need(&s.dst, "dst", &s.op)?, value: need(&s.value, "value", &s.op)?, index: need(&s.index, "index", &s.op)? },
-                "tile_store" => Stage::TileStore { dst: need(&s.dst, "dst", &s.op)?, value: need(&s.value, "value", &s.op)?, tile: self.tile(width, &s.layout, &s.at)? },
+                "tile_store" => Stage::TileStore { dst: need(&s.dst, "dst", &s.op)?, value: need(&s.value, "value", &s.op)?, tile: self.tile(shape, width, &s.layout, &s.at)? },
+                "split_store" => Stage::SplitStore { hi: need(&s.dst, "dst", &s.op)?, lo: need(&s.lo, "lo", &s.op)?, value: need(&s.value, "value", &s.op)?, tile: self.tile(shape, width, &s.layout, &s.at)? },
+                "index" => Stage::Index { dst: need(&s.name, "name", &s.op)? },
                 o => return Err(format!("{}: unknown stage op {o:?}", self.name)),
             });
         }
+        let mut stride = Vec::new();
+        for (n, v) in &rows.stride {
+            stride.push((n.clone(), self.size(shape, v, n)?));
+        }
+        let mut offset = Vec::new();
+        for (n, v) in &rows.offset {
+            offset.push((n.clone(), self.size(shape, v, n)?));
+        }
         let sum = stages.iter().any(|s| matches!(s, Stage::BlockSum { .. })).then(|| BlockSum::for_target(t));
-        Kernel::compose(t, intern(&self.name), self.threads(shape)?, params, Compose { width, rows: Rows { iter, address, per_row }, consts, sum, stages }).map_err(|e| format!("{}: {e}", self.name))
+        Kernel::compose(t, intern(&self.name), self.threads(shape)?, params, Compose { width, rows: Rows { iter, address, per_row, stride, offset }, consts, sum, stages }).map_err(|e| format!("{}: {e}", self.name))
     }
 
     fn threads(&self, shape: &Shape) -> Result<u32, String> {
@@ -1135,6 +1199,9 @@ impl Description {
         }
         if self.family != "token_hash" && !self.int.is_empty() {
             return Err(format!("{}: only family token_hash takes [[int]]", self.name));
+        }
+        if self.family != "group_map" && self.param.iter().any(|p| p.stored.is_some()) {
+            return Err(format!("{}: only family group_map takes a stored param", self.name));
         }
         match self.family.as_str() {
             "compose" => self.compose(t, shape),
@@ -1209,6 +1276,34 @@ impl Description {
         };
         AttentionKernel::new(t, family, resolved).map_err(|e| format!("{}: {e}", self.name))
     }
+}
+
+fn split_top(text: &str, sep: char) -> Option<(&str, &str)> {
+    let mut depth = 0i32;
+    for (i, c) in text.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            c if c == sep && depth == 0 => return Some((&text[..i], &text[i + 1..])),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn nest(text: &str, leaf: &dyn Fn(&str) -> Result<u64, String>) -> Result<crate::layout::Nest, String> {
+    let t = text.trim();
+    let Some(inner) = t.strip_prefix('(').and_then(|p| p.strip_suffix(')')) else {
+        return leaf(t).map(crate::layout::leaf);
+    };
+    let mut parts = Vec::new();
+    let mut rest = inner;
+    while let Some((head, tail)) = split_top(rest, ',') {
+        parts.push(nest(head, leaf)?);
+        rest = tail;
+    }
+    parts.push(nest(rest, leaf)?);
+    Ok(crate::layout::tuple(parts))
 }
 
 pub fn build_builtin(name: &str, t: &Target, shape: &Shape) -> Result<Kernel, String> {

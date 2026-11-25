@@ -176,9 +176,9 @@ pub fn grouped() -> String {
     out.push_str(&crate::cuda::quant::quant_fp8_f32_groups("moe_quant_f8", 128));
     out.push_str(&mma::tiles("moe_tiles_f8"));
     out.push_str(&gemm());
-    out.push_str(&variant("moe_mma_up_f8", "MOE_INTER, HIDDEN, 2, 64, 64, 2, 2, 3, false"));
-    out.push_str(&variant("moe_mma_up_f8_s", "MOE_INTER, HIDDEN, 2, 16, 64, 1, 4, 3, false"));
-    out.push_str(&variant("moe_mma_down_f8", "HIDDEN, MOE_INTER, 1, 64, 64, 2, 2, 3, true"));
-    out.push_str(&variant("moe_mma_down_f8_s", "HIDDEN, MOE_INTER, 1, 16, 64, 1, 4, 3, true"));
+    out.push_str(&variant("moe_mma_up_f8", "MOE_INTER, MOE_WIDTH, 2, 64, 64, 2, 2, 3, false"));
+    out.push_str(&variant("moe_mma_up_f8_s", "MOE_INTER, MOE_WIDTH, 2, 16, 64, 1, 4, 3, false"));
+    out.push_str(&variant("moe_mma_down_f8", "MOE_WIDTH, MOE_INTER, 1, 64, 64, 2, 2, 3, true"));
+    out.push_str(&variant("moe_mma_down_f8_s", "MOE_WIDTH, MOE_INTER, 1, 16, 64, 1, 4, 3, true"));
     out
 }

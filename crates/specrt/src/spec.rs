@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use kir as kir;
 
-pub const SPEC_FORMAT: u32 = 16;
+pub const SPEC_FORMAT: u32 = 19;
 
 pub fn modelopt_verified() -> bool {
     include_str!("../modelopt-verified.txt").trim() == "pass"
@@ -529,6 +529,82 @@ pub struct GatedResidual {
     pub node: Vec<crate::graph::Node>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Prelude {
+    pub module: String,
+    pub layers: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub params: std::collections::BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub scratch: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub int_scratch: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub stored: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub words: std::collections::BTreeMap<String, String>,
+    pub node: Vec<crate::graph::Node>,
+}
+
+impl Prelude {
+    pub const BUFFERS: [&'static str; 3] = ["x", "streams", "tokens"];
+
+    pub fn stored_as(&self, weight: &str) -> Option<(&str, &str)> {
+        let (prefix, _) = self.stored.iter().find(|(_, w)| *w == weight)?;
+        Some((prefix.as_str(), self.words.get(&format!("{prefix}_dtype")).map_or("f32", String::as_str)))
+    }
+
+    pub fn slot(&self, layer: usize) -> Option<usize> {
+        self.layers.iter().position(|&l| l == layer)
+    }
+
+    pub fn weights(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for n in &self.node {
+            for b in n.bind.values() {
+                if let crate::graph::Bind::Weight { weight, len } = b
+                    && !out.iter().any(|(w, _)| w == weight)
+                {
+                    out.push((weight.clone(), len.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    pub fn symbols(&self, slot: usize) -> Vec<(String, f64)> {
+        let mut out: Vec<(String, f64)> = self.params.iter().map(|(n, v)| (n.clone(), *v)).collect();
+        out.extend(self.index.iter().map(|n| (n.clone(), slot as f64)));
+        out.extend(self.count.iter().map(|n| (n.clone(), self.layers.len() as f64)));
+        out
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockResidual {
+    pub size: usize,
+    pub sites: Vec<String>,
+    pub output: String,
+}
+
+pub const MAX_RESIDUAL_BLOCKS: usize = 16;
+
+impl BlockResidual {
+    pub fn blocks(&self, layers: usize) -> usize {
+        layers.div_ceil(self.size)
+    }
+
+    pub fn opens(&self, layer: usize) -> bool {
+        layer.is_multiple_of(self.size)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatedStage {
     Expand,
@@ -833,8 +909,20 @@ pub struct Moe {
     pub input_norm: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expert_scale: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latent: Option<LatentExperts>,
     #[serde(skip)]
     pub local: Option<ExpertRange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LatentExperts {
+    pub width: usize,
+    pub down: String,
+    pub up: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub norm: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -936,11 +1024,38 @@ impl Moe {
     }
 
     pub fn shared_slots(&self) -> usize {
-        if self.shared_intermediate == 0 { 0 } else { (self.shared_intermediate / self.expert_intermediate.max(1)).max(1) }
+        if self.shared_intermediate == 0 || self.latent.is_some() { 0 } else { (self.shared_intermediate / self.expert_intermediate.max(1)).max(1) }
     }
 
     pub fn pairs(&self) -> usize {
         self.top_k() + self.shared_slots()
+    }
+
+    pub fn width(&self, hidden: usize) -> usize {
+        self.latent.as_ref().map_or(hidden, |l| l.width)
+    }
+}
+
+impl Spec {
+    pub fn expert_width(&self) -> usize {
+        self.moe.as_ref().map_or(0, |m| m.width(self.dims.hidden))
+    }
+
+    pub fn shared_expert_rows(&self) -> usize {
+        self.moe.as_ref().map_or(0, |m| m.shared_intermediate)
+    }
+
+    pub fn latent_tensors(&self, up: bool) -> Vec<String> {
+        self.moe.iter().flat_map(|m| m.latent.as_ref()).map(|l| format!("mlp.{}.weight", if up { &l.up } else { &l.down })).collect()
+    }
+
+    pub fn latent_norm_tensors(&self) -> Vec<String> {
+        self.moe.iter().flat_map(|m| m.latent.as_ref()).flat_map(|l| l.norm.as_ref()).map(|n| format!("mlp.{n}.weight")).collect()
+    }
+
+    pub fn shared_tensors(&self, down: bool) -> Vec<String> {
+        let parts: &[&str] = if down { &["down_proj"] } else { &["gate_proj", "up_proj"] };
+        self.moe.iter().flat_map(|m| parts.iter().map(move |p| format!("mlp.{}.{p}.weight", m.shared_module))).collect()
     }
 }
 
@@ -1159,7 +1274,11 @@ pub struct Spec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gated_residual: Option<GatedResidual>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prelude: Option<Prelude>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_layer: Option<PerLayer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_residual: Option<BlockResidual>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtp: Option<Mtp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1176,6 +1295,21 @@ pub struct Spec {
     pub iq_quants: bool,
     #[serde(default, skip_serializing_if = "crate::quant_map::QuantMap::is_empty")]
     pub quant_map: crate::quant_map::QuantMap,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<Refusal>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Refusal {
+    pub part: String,
+    pub message: String,
+}
+
+impl Spec {
+    pub fn refused_part(&self, part: &str) -> Option<&str> {
+        self.refused.iter().find(|r| r.part == part).map(|r| r.message.as_str())
+    }
 }
 
 pub const MAX_DRAFT_TOKENS: usize = 3;
@@ -1205,9 +1339,14 @@ pub struct MtpLayout {
     pub fc: String,
     pub norm_embed: String,
     pub norm_hidden: String,
+    #[serde(default)]
     pub norm: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fc_hidden: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixer: Option<String>,
 }
 
 impl MtpLayout {
@@ -1219,21 +1358,38 @@ impl MtpLayout {
             norm_hidden: "mtp.pre_fc_norm_hidden.weight".into(),
             norm: "mtp.norm.weight".into(),
             head: None,
+            fc_hidden: None,
+            mixer: None,
         }
     }
 
     fn at(&self, layers: usize) -> MtpLayout {
         let sub = |t: &str| t.replace("{n}", &layers.to_string());
-        MtpLayout { layer: sub(&self.layer), fc: sub(&self.fc), norm_embed: sub(&self.norm_embed), norm_hidden: sub(&self.norm_hidden), norm: sub(&self.norm), head: self.head.as_deref().map(sub) }
+        MtpLayout {
+            layer: sub(&self.layer),
+            fc: sub(&self.fc),
+            norm_embed: sub(&self.norm_embed),
+            norm_hidden: sub(&self.norm_hidden),
+            norm: sub(&self.norm),
+            head: self.head.as_deref().map(sub),
+            fc_hidden: self.fc_hidden.as_deref().map(sub),
+            mixer: self.mixer.as_deref().map(sub),
+        }
     }
 
     fn validate(&self) -> Result<()> {
-        for (name, v) in [("layer", &self.layer), ("fc", &self.fc), ("norm_embed", &self.norm_embed), ("norm_hidden", &self.norm_hidden), ("norm", &self.norm)] {
+        for (name, v) in [("layer", &self.layer), ("fc", &self.fc), ("norm_embed", &self.norm_embed), ("norm_hidden", &self.norm_hidden)] {
             ensure!(!v.is_empty(), "[mtp.layout] {name} is empty");
         }
-        for (name, v) in [("fc", &self.fc), ("norm_embed", &self.norm_embed), ("norm_hidden", &self.norm_hidden), ("norm", &self.norm)] {
+        ensure!(!self.norm.is_empty() || self.mixer.is_some(), "[mtp.layout] norm is empty; only a layout with a mixer collapses its streams instead of a norm");
+        for (name, v) in [("fc", &self.fc), ("norm_embed", &self.norm_embed), ("norm_hidden", &self.norm_hidden)] {
             ensure!(v.ends_with(".weight"), "[mtp.layout] {name} must name a .weight tensor, not {v:?}");
         }
+        ensure!(self.norm.is_empty() || self.norm.ends_with(".weight"), "[mtp.layout] norm must name a .weight tensor, not {:?}", self.norm);
+        if let Some(v) = &self.fc_hidden {
+            ensure!(v.ends_with(".weight"), "[mtp.layout] fc_hidden must name a .weight tensor, not {v:?}");
+        }
+        ensure!(self.mixer.as_deref().is_none_or(|m| !m.is_empty() && !m.ends_with(".weight")), "[mtp.layout] mixer names a module, not a tensor");
         Ok(())
     }
 }
@@ -1776,7 +1932,7 @@ impl Spec {
         );
         ensure!(m.active.is_some_and(|k| k >= 1 && k <= m.experts), "mixture-of-experts needs num_experts_per_tok between 1 and the expert count");
         ensure!(!m.quantized_experts || matches!(experts_quant, Quant::Gguf | Quant::Q8), "[moe] quantized_experts keeps GGUF expert blocks and needs GGUF weights, not {experts_quant:?}");
-        ensure!(m.expert_intermediate.is_multiple_of(256) || experts_quant == Quant::Bf16, "nvfp4 experts need an intermediate size that is a multiple of 256");
+        ensure!(m.expert_intermediate.is_multiple_of(128) || experts_quant == Quant::Bf16, "quantised experts need an intermediate size that is a multiple of 128");
         ensure!(m.expert_intermediate.is_multiple_of(16) && m.shared_intermediate.is_multiple_of(16), "expert intermediate sizes must be multiples of 16");
         ensure!(
             m.parallel_dense || (m.router_norm.is_none() && m.input_norm.is_none() && m.expert_scale.is_none() && m.router_norm_scale == 1.0),
@@ -1854,9 +2010,18 @@ impl Spec {
             family.attention.output_gate.read(&value),
         );
         family.normalise(&mut value);
+        let mut refused = Vec::new();
         if strict {
             for r in &family.refuse {
-                ensure!(!r.hits(&value)?, "{}", r.message);
+                match r.part.as_deref() {
+                    None => ensure!(!r.hits(&value)?, "{}", r.message),
+                    Some("mtp") => {
+                        if r.hits(&value)? {
+                            refused.push(Refusal { part: "mtp".into(), message: r.message.clone() });
+                        }
+                    }
+                    Some(other) => bail!("[[refuse]] part {other:?} is not mtp"),
+                }
             }
         }
         let dtype_values: std::collections::HashMap<&str, String> = family
@@ -2062,6 +2227,7 @@ impl Spec {
                     },
                     input_norm: family.moe.input_norm.clone(),
                     expert_scale: family.moe.expert_scale.clone(),
+                    latent: family.moe.latent.as_ref().and_then(|l| l.read(&value)),
                     local: None,
                 })
             }
@@ -2137,8 +2303,8 @@ impl Spec {
                 down_act_planes: if block_act { family.moe.act_planes.unwrap_or(1) } else { 1 },
                 fused_gate_up: family.mlp.fused_gate_up,
                 gated: match &family.mlp.gated {
-                    Some(g) => Some(GatedAct { expr: g.expr.clone(), params: crate::family::read_params(&g.params, &value)? }),
-                    None => None,
+                    Some(g) if g.applies(hf.hidden_act.as_deref()) => Some(GatedAct { expr: g.expr.clone(), params: crate::family::read_params(&g.params, &value)? }),
+                    _ => None,
                 },
                 mapped: match &family.mlp.mapped {
                     Some(g) if activation == Activation::Mapped => Some(GatedAct { expr: g.expr.clone(), params: crate::family::read_params(&g.params, &value)? }),
@@ -2148,13 +2314,15 @@ impl Spec {
                 stored_gate_up: family.mlp.stored_gate_up,
             },
             moe,
-            mtp: (family.mtp && (hybrid || family.mtp_layout.is_some()) && hf.mtp_num_hidden_layers > 0)
+            mtp: (family.mtp && (hybrid || family.mtp_layout.is_some()) && hf.mtp_num_hidden_layers > 0 && !refused.iter().any(|r| r.part == "mtp"))
                 .then(|| Mtp { layout: family.mtp_layout.clone(), ..Mtp::new(hf.mtp_num_hidden_layers) }),
             linear_attention,
             mixer,
             hyper: family.hyper.read(&value),
             gated_residual: family.gated_residual.read(&value)?,
+            prelude: family.prelude.read(&value)?,
             per_layer: family.per_layer.read(&value)?,
+            block_residual: family.block_residual.read(&value),
             tensors: family.tensors.clone(),
             vision: if strict { crate::vision::Vision::from_hf_config(json)? } else { None },
             state: if family.state.is_empty() { crate::state::stock() } else { family.state.clone() },
@@ -2162,6 +2330,7 @@ impl Spec {
             plain_activations: !family.runtime.split_activations,
             iq_quants: false,
             quant_map,
+            refused,
         };
         Ok(spec)
     }
@@ -2181,7 +2350,9 @@ impl Spec {
         self.validate_attention_nodes()?;
         self.validate_mixer()?;
         self.validate_hyper()?;
+        self.validate_prelude()?;
         self.validate_per_layer()?;
+        self.validate_block_residual()?;
         crate::state::validate(self)?;
         match self.head_quant {
             None | Some(Quant::Bf16) => {}
@@ -2213,6 +2384,18 @@ impl Spec {
             }
             if let Some(l) = &m.layout {
                 l.validate()?;
+            }
+            if let Some(h) = self.gated_residual() {
+                let l = self.mtp_layout();
+                ensure!(
+                    l.fc_hidden.is_some() && l.mixer.is_some(),
+                    "[mtp] on a [gated_residual] spec takes the {} stream hidden: its [mtp.layout] needs fc_hidden and mixer",
+                    h.streams
+                );
+                ensure!(self.moe.is_some(), "[mtp] on a [gated_residual] spec runs the gated MoE block, so it needs [moe]");
+            } else {
+                let l = self.mtp_layout();
+                ensure!(l.fc_hidden.is_none() && l.mixer.is_none(), "[mtp.layout] fc_hidden and mixer take the streams of a [gated_residual] spec");
             }
             ensure!(
                 self.linear_attention.is_some() || m.layout.is_some(),
@@ -2285,9 +2468,10 @@ impl Spec {
                 let experts = self.quant == Quant::Bf16 && self.moe.is_some();
                 ensure!(m == Quant::Nvfp4G16 && (beside_fp8 || experts), "[mlp] quant {m:?} beside {:?} is not supported (nvfp4_g16 beside fp8_channel is, and beside bf16 for mixture-of-experts)", self.quant);
                 ensure!(until.is_none_or(|u| u > 0 && u < self.layers.count), "[mlp] quant_until must be inside the layer count");
+                let width = if self.moe.is_some() { 128 } else { 256 };
                 ensure!(
-                    self.dims.hidden.is_multiple_of(256) && self.dims.intermediate.is_multiple_of(256),
-                    "nvfp4_g16 needs hidden and intermediate to be multiples of 256"
+                    self.dims.hidden.is_multiple_of(256) && self.dims.intermediate.is_multiple_of(width),
+                    "nvfp4_g16 needs hidden to be a multiple of 256 and intermediate a multiple of {width}"
                 );
             }
             (None, None) => {}
@@ -2392,6 +2576,12 @@ impl Spec {
         s.layers.count = end - start;
         s.mlp.quant_until = self.mlp.quant_until.map(|u| u.saturating_sub(start));
         s.quant_map = self.quant_map.stage(start, end);
+        if let Some(p) = s.prelude.as_mut() {
+            p.layers = p.layers.iter().filter(|&&l| (start..end).contains(&l)).map(|l| l - start).collect();
+        }
+        if s.prelude.as_ref().is_some_and(|p| p.layers.is_empty()) {
+            s.prelude = None;
+        }
         if !s.layers.pattern.iter().any(|b| b.is_linear()) {
             s.linear_attention = None;
         }
@@ -2472,7 +2662,8 @@ impl Spec {
             ensure!(h.collapses(), "a [gated_residual] with tagged nodes needs its own collapse nodes");
         }
         ensure!(!self.mlp.stored_gate_up || tags.contains(&"act"), "[mlp] stored_gate_up needs a [[gated_residual.node]] tagged act that turns gate_up into the activation planes");
-        ensure!(self.speculative().is_none() && self.mixer.is_none(), "[gated_residual] cannot be combined with [mtp] or [mixer] yet");
+        ensure!(tags.is_empty() || self.speculative().is_none(), "a [gated_residual] with tagged nodes cannot be combined with [mtp] yet");
+        ensure!(self.mixer.is_none(), "[gated_residual] cannot be combined with [mixer] yet");
         ensure!(h.node.len() <= 64, "[[gated_residual.node]] has more than 64 nodes");
         let stages: &[GatedStage] = if tags.is_empty() { &[GatedStage::Expand, GatedStage::Pre, GatedStage::Post, GatedStage::Collapse] } else { &[GatedStage::Expand, GatedStage::Collapse] };
         for &stage in stages {
@@ -2512,6 +2703,66 @@ impl Spec {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn validate_prelude(&self) -> Result<()> {
+        let Some(p) = &self.prelude else { return Ok(()) };
+        ensure!(self.gated_residual().is_some() && self.mixer.is_none(), "[prelude] runs inside the [gated_residual] blocks and cannot be combined with [mixer] yet");
+        ensure!(!p.module.is_empty() && !p.node.is_empty() && p.node.len() <= 64, "[prelude] needs a module and one to 64 nodes");
+        ensure!(p.layers.len() == 1, "[prelude] runs on {} layers; its kernels fold the layer index in, so more than one layer needs one build per layer, which is not supported yet", p.layers.len());
+        ensure!(p.layers.iter().all(|&l| l < self.layers.count), "[prelude] layers {:?} are not inside the model's {} layers", p.layers, self.layers.count);
+        for (n, w) in p.scratch.iter().chain(&p.int_scratch) {
+            ensure!(!Prelude::BUFFERS.contains(&n.as_str()), "[prelude] scratch {n} shadows a built in buffer");
+            crate::state::dim(self, w).with_context(|| format!("[prelude] scratch {n}"))?;
+        }
+        ensure!(p.int_scratch.keys().all(|n| !p.scratch.contains_key(n)), "[prelude.int_scratch] repeats a [prelude.scratch] name");
+        let weights = p.weights();
+        for (prefix, w) in &p.stored {
+            ensure!(weights.iter().any(|(n, _)| n == w), "[prelude.stored] {prefix} names {w:?}, which no [[prelude.node]] binds as a weight");
+        }
+        for (k, v) in &p.words {
+            let prefix = k.strip_suffix("_dtype").filter(|pre| p.stored.contains_key(*pre));
+            ensure!(prefix.is_some() && matches!(v.as_str(), "f32" | "bf16" | "fp8"), "[prelude.words] {k} = {v:?} is not the f32, bf16 or fp8 dtype of a [prelude.stored] weight");
+        }
+        for (i, n) in p.node.iter().enumerate() {
+            ensure!(n.op == "kernel" && n.kernel.is_some(), "[[prelude.node]] {i} must be a kernel node with `kernel`");
+            ensure!(!n.grid.is_empty() && n.grid.len() <= 3, "[[prelude.node]] {i} needs a grid of one to three symbols");
+            for g in n.grid.iter().filter(|g| !matches!(g.as_str(), "rows" | "seqs")) {
+                crate::state::dim(self, g).with_context(|| format!("[[prelude.node]] {i} grid symbol {g:?}"))?;
+            }
+            for b in n.bind.values() {
+                match b {
+                    crate::graph::Bind::Weight { len, .. } => {
+                        self.weight_len(len)?;
+                    }
+                    crate::graph::Bind::Buffer { buffer } => ensure!(
+                        Prelude::BUFFERS.contains(&buffer.as_str()) || p.scratch.contains_key(buffer) || p.int_scratch.contains_key(buffer),
+                        "[[prelude.node]] {i} binds buffer {buffer:?}, which is not x, streams, tokens or a [prelude] scratch entry"
+                    ),
+                    crate::graph::Bind::State { state } => ensure!(
+                        crate::state::named(self, state).is_some_and(|s| s.per == crate::state::Per::Sequence && s.layers == crate::state::Layers::Prelude && s.dtype == crate::state::Dtype::F32),
+                        "[[prelude.node]] {i} binds state {state:?}, which is not a per sequence f32 [[state]] on the prelude layers"
+                    ),
+                    crate::graph::Bind::Number(_) => {}
+                    crate::graph::Bind::Name(name) => ensure!(p.params.contains_key(name), "[[prelude.node]] {i} binds {name:?}, which is not a [prelude.params] entry"),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn prelude_slot(&self, layer: usize) -> Option<usize> {
+        self.prelude.as_ref().and_then(|p| p.slot(layer))
+    }
+
+    fn validate_block_residual(&self) -> Result<()> {
+        let Some(r) = &self.block_residual else { return Ok(()) };
+        ensure!(r.size > 0 && r.sites.len() == 2 && !r.output.is_empty(), "[block_residual] needs a block size, two sites (before the mixer, before the mlp) and an output module");
+        ensure!(r.blocks(self.layers.count) <= MAX_RESIDUAL_BLOCKS, "[block_residual] keeps {} blocks, more than the {MAX_RESIDUAL_BLOCKS} the kernel holds", r.blocks(self.layers.count));
+        ensure!(self.hyper.is_none() && self.gated_residual.is_none() && !self.uses_branch() && !self.layers.split && self.norm.pre, "[block_residual] replaces the plain pre-norm residual and takes no hyper, gated, sandwich, scaled or split layers");
+        ensure!(self.speculative().is_none(), "[block_residual] cannot be combined with [mtp] yet");
+        ensure!(self.moe.as_ref().is_none_or(|m| m.latent.is_some() && !m.parallel_dense && !m.input_scaled && m.shared_gate == false), "[block_residual] runs mixture-of-experts layers with [moe] latent experts and an ungated shared expert only");
         Ok(())
     }
 
@@ -2596,7 +2847,7 @@ impl Spec {
             crate::state::dim(self, c).context("[attention] o_cols")?;
         }
         for (n, w) in self.attention.scratch.iter().chain(&self.attention.int_scratch) {
-            crate::state::dim(self, w).with_context(|| format!("[attention.scratch] {n}"))?;
+            crate::state::dim_at(self, w, crate::engine::DEFAULT_CTX).with_context(|| format!("[attention.scratch] {n}"))?;
         }
         ensure!(self.attention.int_scratch.keys().all(|n| !self.attention.scratch.contains_key(n)), "[attention.int_scratch] repeats an [attention.scratch] name");
         if nodes.is_empty() {
@@ -2735,6 +2986,17 @@ impl Spec {
 
     pub fn speculative(&self) -> Option<&Mtp> {
         self.mtp.as_ref().filter(|m| m.speculate)
+    }
+
+    pub fn streamed_mtp(&self) -> bool {
+        self.gated_residual().is_some() && self.mtp.as_ref().is_some_and(|m| m.layout.as_ref().is_some_and(|l| l.fc_hidden.is_some()))
+    }
+
+    pub fn draft_width(&self) -> usize {
+        match self.gated_residual() {
+            Some(h) if self.streamed_mtp() => h.width(self.dims.hidden),
+            _ => self.dims.hidden,
+        }
     }
 
     pub fn kv_f16_layers(&self) -> usize {

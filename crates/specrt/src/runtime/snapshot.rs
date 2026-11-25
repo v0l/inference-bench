@@ -66,8 +66,26 @@ impl Runtime {
         Ok((layers * gb.la.conv_dim() * (gb.la.conv_kernel - 1), layers * gb.la.value_heads * gb.la.key_head_dim * gb.la.key_head_dim))
     }
 
+    fn mtp_len(&self) -> usize {
+        if self.mtp.is_some() { self.mtp_width() } else { 0 }
+    }
+
     fn pending_len(&self) -> usize {
-        if self.mtp.is_some() { self.spec.dims.hidden } else { 0 }
+        self.mtp_len() + self.prelude_floats()
+    }
+
+    fn pending_host(&self, slot: usize) -> Result<Vec<f32>> {
+        let mut out = if self.mtp.is_some() { self.mtp_pending_host(slot)? } else { Vec::new() };
+        out.extend(self.prelude_host(slot)?);
+        Ok(out)
+    }
+
+    fn pending_from(&mut self, slot: usize, host: &[f32]) -> Result<()> {
+        let m = self.mtp_len();
+        if m > 0 {
+            self.mtp_pending_from(slot, &host[..m])?;
+        }
+        self.prelude_from(slot, &host[m..])
     }
 
     fn ensure_snapshot_slot(&self, slot: usize) -> Result<()> {
@@ -140,7 +158,7 @@ impl Runtime {
         let (conv, ssm) = self.state_lens()?;
         let gb = self.gdn.as_ref().context("no linear layers")?;
         self.stream.synchronize()?;
-        let pending = if self.mtp.is_some() { self.mtp_pending_host(slot)? } else { Vec::new() };
+        let pending = self.pending_host(slot)?;
         Ok(StateSnapshot::new(
             self.stream.clone_dtoh(&gb.conv_state.slice(slot * conv..(slot + 1) * conv))?,
             self.stream.clone_dtoh(&gb.ssm_state.slice(slot * ssm..(slot + 1) * ssm))?,
@@ -174,9 +192,14 @@ impl Runtime {
         let gb = self.gdn.as_ref().context("no linear layers")?;
         self.stream.memcpy_dtod(&gb.conv_state.slice(slot * conv..(slot + 1) * conv), &mut staging.slice_mut(..conv))?;
         self.stream.memcpy_dtod(&gb.ssm_state.slice(slot * ssm..(slot + 1) * ssm), &mut staging.slice_mut(conv..conv + ssm))?;
-        if pending > 0 {
-            let mut dst = staging.slice_mut(conv + ssm..total);
+        let mtp = self.mtp_len();
+        if mtp > 0 {
+            let mut dst = staging.slice_mut(conv + ssm..conv + ssm + mtp);
             self.mtp_pending_to(slot, &mut dst)?;
+        }
+        if pending > mtp {
+            let mut dst = staging.slice_mut(conv + ssm + mtp..total);
+            self.prelude_to(slot, &mut dst)?;
         }
         let ready = self.stream.record_event(None)?;
         let side = self.snap.side.clone().expect("side stream");
@@ -208,7 +231,7 @@ impl Runtime {
         self.stream.memcpy_htod(snap.conv(), &mut gb.conv_state.slice_mut(slot * conv..(slot + 1) * conv))?;
         self.stream.memcpy_htod(snap.ssm(), &mut gb.ssm_state.slice_mut(slot * ssm..(slot + 1) * ssm))?;
         if pending > 0 {
-            self.mtp_pending_from(slot, snap.pending())?;
+            self.pending_from(slot, snap.pending())?;
         }
         self.stream.synchronize()?;
         Ok(())

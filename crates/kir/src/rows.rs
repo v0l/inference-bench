@@ -22,9 +22,34 @@ pub enum RowBody {
     HyperExpand { streams: u32, hidden: u32 },
     HyperMean { streams: u32, hidden: u32 },
     PoolTopk { heads: u32, dim: u32, pool: u32, pick: u32, max_pools: u32, q_row: u32, q_offset: u32, w_row: u32, w_offset: u32, out_row: u32, layers: u32, tail: bool },
+    BlockRes { hidden: u32, blocks: u32, eps: f32, mode: ResMode },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResMode {
+    Mix,
+    Push,
+    Add,
+    Set,
+    Out,
+}
+
+impl ResMode {
+    pub fn parse(word: &str) -> Option<ResMode> {
+        Some(match word {
+            "mix" => ResMode::Mix,
+            "push" => ResMode::Push,
+            "add" => ResMode::Add,
+            "set" => ResMode::Set,
+            "out" => ResMode::Out,
+            _ => return None,
+        })
+    }
 }
 
 const MAX_STREAMS: u32 = 8;
+
+const GROUP_TOPK_SHARED: u32 = 12288;
 
 const POSITION: [(&str, Scalar, Role, Access); 4] = [
     ("pos", Scalar::I32, Role::Activation, Access::Read),
@@ -56,11 +81,16 @@ impl RowBody {
             RowBody::PoolTopk { .. } => "pool_topk",
             RowBody::GroupPool { .. } => "group_pool",
             RowBody::GroupTopk { .. } => "group_topk",
+            RowBody::BlockRes { .. } => "block_res",
         }
     }
 
     pub fn describe(&self) -> String {
         format!("{self:?}")
+    }
+
+    fn shared_scores(heads: u32, dim: u32, max_groups: u32) -> bool {
+        heads * dim + max_groups <= GROUP_TOPK_SHARED
     }
 
     fn planes(params: &[Param]) -> bool {
@@ -124,6 +154,9 @@ impl RowBody {
                 out.extend(POSITION);
                 out.extend(PAGED);
                 out.push(("scale", Scalar::F32, Role::Value, Access::Read));
+                if params.iter().any(|p| p.name == "scores") {
+                    out.push(("scores", Scalar::F32, Role::Activation, Access::Write));
+                }
             }
             RowBody::LayerNorm { .. } => {
                 out.push(("x", Scalar::F32, Role::Activation, Access::Write));
@@ -172,6 +205,26 @@ impl RowBody {
                     out.push(("y", Scalar::F32, Role::Activation, Access::Write));
                 }
             }
+            RowBody::BlockRes { mode: ResMode::Push, .. } => {
+                out.push(("stack", Scalar::F32, Role::Activation, Access::Write));
+                out.push(("prefix", Scalar::F32, Role::Activation, Access::Read));
+                out.push(("slot", Scalar::I32, Role::Value, Access::Read));
+            }
+            RowBody::BlockRes { mode: ResMode::Mix, .. } => {
+                out.push(("stack", Scalar::F32, Role::Activation, Access::Read));
+                out.push(("prefix", Scalar::F32, Role::Activation, Access::Read));
+                out.push(("w", Scalar::F32, Role::Weight, Access::Read));
+                out.push(("y", Scalar::F32, Role::Activation, Access::Write));
+                out.push(("count", Scalar::I32, Role::Value, Access::Read));
+            }
+            RowBody::BlockRes { mode: ResMode::Add | ResMode::Set, .. } => {
+                out.push(("x", Scalar::F32, Role::Activation, Access::Read));
+                out.push(("prefix", Scalar::F32, Role::Activation, Access::Write));
+            }
+            RowBody::BlockRes { mode: ResMode::Out, .. } => {
+                out.push(("x", Scalar::F32, Role::Activation, Access::Write));
+                out.push(("prefix", Scalar::F32, Role::Activation, Access::Write));
+            }
         }
         out
     }
@@ -212,7 +265,10 @@ impl RowBody {
             RowBody::GroupPool { dim, .. } if *dim > 1024 => Err("group_pool rows live in shared memory, at most 1024 wide".into()),
             RowBody::GroupTopk { heads, topk, max_groups, .. } if *heads == 0 || *topk == 0 || *max_groups == 0 => Err("group_topk needs positive heads, topk and max_groups".into()),
             RowBody::GroupTopk { topk, max_groups, .. } if topk > max_groups => Err("group_topk cannot select more groups than it scores".into()),
-            RowBody::GroupTopk { heads, dim, max_groups, .. } if heads * dim + max_groups > 12288 => Err("group_topk keeps the query and the group scores in shared memory, at most 12288 values".into()),
+            RowBody::GroupTopk { heads, dim, .. } if heads * dim > GROUP_TOPK_SHARED => Err(format!("group_topk keeps the query in shared memory, at most {GROUP_TOPK_SHARED} values")),
+            RowBody::GroupTopk { heads, dim, max_groups, .. } if !Self::shared_scores(*heads, *dim, *max_groups) && !params.iter().any(|p| p.name == "scores") => Err(format!(
+                "group_topk keeps the query and the group scores in shared memory, at most {GROUP_TOPK_SHARED} values; bind a scores scratch of max_groups floats per row for more"
+            )),
             RowBody::IndexTopk { heads, dim, topk, max_keys, .. } if *heads == 0 || *dim == 0 || *topk == 0 || *max_keys == 0 => Err("index_topk needs positive heads, dim, topk and max_keys".into()),
             RowBody::IndexTopk { topk, max_keys, .. } if topk > max_keys => Err("index_topk cannot select more keys than it scores".into()),
             RowBody::IndexTopk { max_keys, .. } if *max_keys > 12288 => Err("index_topk scores live in shared memory, at most 12288 keys".into()),
@@ -231,6 +287,7 @@ impl RowBody {
             }
             RowBody::PoolTopk { max_pools, .. } if *max_pools > 12288 => Err("pool_topk scores live in shared memory, at most 12288 pools".into()),
             RowBody::PoolTopk { pick, pool, out_row, .. } if *out_row < pick * pool + pool - 1 => Err("pool_topk out_row must hold the picked pools and the open tail".into()),
+            RowBody::BlockRes { hidden, blocks, eps, .. } if *hidden == 0 || *blocks == 0 || *blocks > 64 || !eps.is_finite() || *eps < 0.0 => Err("block_res needs a positive hidden size, 1 to 64 blocks and a finite eps".into()),
             _ => Ok(()),
         }
     }
@@ -245,6 +302,7 @@ impl RowBody {
                     Scalar::U32 => "unsigned",
                     Scalar::Bf16 => "bf16_t",
                     Scalar::I32 => "int",
+                    Scalar::U8 => "unsigned char",
                 };
                 match (p.role, p.access) {
                     (Role::Value, _) => format!("{ty} {}", p.name),
@@ -739,10 +797,10 @@ impl RowBody {
     constexpr int MAX_GROUPS = {max_groups};
     constexpr int OUT = TOPK * RATIO + RATIO - 1;
     __shared__ float qs[HEADS * DIM];
-    __shared__ float score[MAX_GROUPS];
-    __shared__ float best_v[32];
+{score_decl}    __shared__ float best_v[32];
     __shared__ int best_i[32];
     const int row = blockIdx.y;
+{score_row}
     const int p = pos[row * pos_step] + row * row_step;
     const int n = min((p + 1) / RATIO, MAX_GROUPS);
     const int cnt = min(TOPK, n);
@@ -769,20 +827,16 @@ impl RowBody {
         }}
     }}
     __syncthreads();
-    for (int g = threadIdx.x; g < MAX_GROUPS; g += blockDim.x) {{
-        if (g < n) {{
-            const int tp = g * RATIO + RATIO - 1;
-            const bf16_t* kr = keys + (((size_t)table[tp / PAGE] * {layers} + layer) * PAGE + tp % PAGE) * DIM * KV_PLANES;
-            float s = 0.0f;
-            for (int h = 0; h < HEADS; h++) {{
-                float d = 0.0f;
-                for (int j = 0; j < DIM; j++) d += qs[h * DIM + j] * (attn_float(kr[j]) + (KV_PLANES == 2 ? attn_float(kr[DIM + j]) : 0.0f));
-                s += fmaxf(d, 0.0f);
-            }}
-            score[g] = s * scale;
-        }} else {{
-            score[g] = -3.0e30f;
+    for (int g = threadIdx.x; g < n; g += blockDim.x) {{
+        const int tp = g * RATIO + RATIO - 1;
+        const bf16_t* kr = keys + (((size_t)table[tp / PAGE] * {layers} + layer) * PAGE + tp % PAGE) * DIM * KV_PLANES;
+        float s = 0.0f;
+        for (int h = 0; h < HEADS; h++) {{
+            float d = 0.0f;
+            for (int j = 0; j < DIM; j++) d += qs[h * DIM + j] * (attn_float(kr[j]) + (KV_PLANES == 2 ? attn_float(kr[DIM + j]) : 0.0f));
+            s += fmaxf(d, 0.0f);
         }}
+        score[g] = s * scale;
     }}
     __syncthreads();
     for (int r = 0; r < cnt; r++) {{
@@ -816,6 +870,8 @@ impl RowBody {
 ",
                 eps = crate::lit(*eps),
                 weight = if *unit { "(1.0f + norm[d])" } else { "norm[d]" },
+                score_decl = if Self::shared_scores(*heads, *dim, *max_groups) { "    __shared__ float score[MAX_GROUPS];\n" } else { "" },
+                score_row = if Self::shared_scores(*heads, *dim, *max_groups) { "" } else { "    float* score = scores + (size_t)row * MAX_GROUPS;\n" },
             ),
             RowBody::HeadMatvec { x_row, x_head, x_offset, inner, w_head, w_inner, w_out, w_offset, out, y_row, y_head, y_offset } => {
                 let store = if Self::planes(&k.params) {
@@ -842,6 +898,48 @@ impl RowBody {
 "
                 )
             }
+            RowBody::BlockRes { hidden, blocks, eps, mode } => match mode {
+                ResMode::Mix => format!(
+                    "    constexpr int H = {hidden};
+    constexpr int BLOCKS = {blocks};
+    __shared__ float scratch[32];
+    __shared__ float score[BLOCKS + 1];
+    const int row = blockIdx.y;
+    const float* st = stack + (size_t)row * BLOCKS * H;
+    const float* pf = prefix + (size_t)row * H;
+    for (int j = 0; j <= count; j++) {{
+        const float* v = j < count ? st + (size_t)j * H : pf;
+        float ss = 0.0f, dot = 0.0f;
+        for (int i = threadIdx.x; i < H; i += blockDim.x) {{
+            ss += v[i] * v[i];
+            dot += v[i] * w[i];
+        }}
+        const float total = kir_block_sum(ss, scratch);
+        const float d = kir_block_sum(dot, scratch);
+        if (threadIdx.x == 0) score[j] = d * rsqrtf(total / H + {eps}f);
+    }}
+    __syncthreads();
+    float m = score[0];
+    for (int j = 1; j <= count; j++) m = fmaxf(m, score[j]);
+    float z = 0.0f;
+    for (int j = 0; j <= count; j++) z += expf(score[j] - m);
+    for (int i = threadIdx.x; i < H; i += blockDim.x) {{
+        float acc = 0.0f;
+        for (int j = 0; j <= count; j++) acc += expf(score[j] - m) / z * (j < count ? st[(size_t)j * H + i] : pf[i]);
+        y[(size_t)row * H + i] = acc;
+    }}
+",
+                    eps = crate::lit(*eps),
+                ),
+                ResMode::Push => format!(
+                    "    const int row = blockIdx.y;
+    for (int i = threadIdx.x; i < {hidden}; i += blockDim.x) stack[((size_t)row * {blocks} + slot) * {hidden} + i] = prefix[(size_t)row * {hidden} + i];
+"
+                ),
+                ResMode::Add => format!("    const int row = blockIdx.y;\n    for (int i = threadIdx.x; i < {hidden}; i += blockDim.x) prefix[(size_t)row * {hidden} + i] += x[(size_t)row * {hidden} + i];\n"),
+                ResMode::Set => format!("    const int row = blockIdx.y;\n    for (int i = threadIdx.x; i < {hidden}; i += blockDim.x) prefix[(size_t)row * {hidden} + i] = x[(size_t)row * {hidden} + i];\n"),
+                ResMode::Out => format!("    const int row = blockIdx.y;\n    for (int i = threadIdx.x; i < {hidden}; i += blockDim.x) {{\n        const size_t at = (size_t)row * {hidden} + i;\n        prefix[at] += x[at];\n        x[at] = prefix[at];\n    }}\n"),
+            },
         };
         Ok(format!("{head}{body}}}\n\n"))
     }

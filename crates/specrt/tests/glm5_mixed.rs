@@ -247,7 +247,7 @@ fn nvfp4_routed_experts_stack_as_fp4_and_take_a_requantised_fp8_shared_expert() 
     quantised(&glm5_layout(Some(Format::Nvfp4)), &mixed, &twin);
     let config = std::fs::read_to_string(mixed.join("config.json")).unwrap();
     let refusal = Spec::from_hf_config_serving(&config).unwrap_err().to_string();
-    assert!(refusal.contains("multiples of 256"), "the tiny expert width is too narrow for the fp4 expert kernels: {refusal}");
+    assert!(refusal.contains("nvfp4_g16 needs hidden to be a multiple of 256"), "the tiny expert width is too narrow for the fp4 expert kernels: {refusal}");
     let twin_spec = spec_for(&twin);
     let mut spec = twin_spec.clone();
     spec.repo = mixed.display().to_string();

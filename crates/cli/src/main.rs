@@ -1,6 +1,6 @@
 #![allow(clippy::large_enum_variant)]
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use inference_bench_core::target::{NATIVE, Request, TargetConfig};
 use inference_bench_core::logging::{self, LogArgs};
@@ -292,6 +292,14 @@ enum Cmd {
         context: Option<usize>,
         #[arg(long, default_value = "decode", help = "prefill, decode or verify")]
         phase: String,
+        #[arg(long, help = "With --plan: count a non decoder graph instead; denoiser reads --spec as a diffusers pipeline folder or a transformer config.json, vae as a diffusers pipeline or vae folder")]
+        graph: Option<String>,
+        #[arg(long, default_value = "1024x1024", help = "With --graph denoiser or vae: image size in pixels, WIDTHxHEIGHT")]
+        size: String,
+        #[arg(long, default_value_t = 512, help = "With --graph denoiser: text tokens")]
+        text: usize,
+        #[arg(long, default_value_t = 1, help = "With --graph vae: latent frames of a video vae")]
+        frames: usize,
     },
     #[command(about = "Compile and cache the kernels of a spec without loading weights")]
     Warmup {
@@ -467,6 +475,66 @@ fn kernels_command(data: &Path, spec: &str, target: Option<&str>, plan: Option<(
         return Ok(());
     }
     print!("{}", specrt::codegen::kernels_report(&spec, &target)?);
+    Ok(())
+}
+
+fn denoiser_command(path: &Path, size: &str, text: usize, fusion: bool) -> Result<()> {
+    use specrt::denoiser::{self, DenoiserGraph, DenoiserSpec};
+    let spec = if path.is_dir() { DenoiserSpec::from_pipeline(path)? } else { DenoiserSpec::from_transformer_config(&std::fs::read_to_string(path)?, 2)? };
+    let (w, h) = size.split_once('x').context("--size is WIDTHxHEIGHT")?;
+    let (w, h): (usize, usize) = (w.parse()?, h.parse()?);
+    let step = 8 * spec.size("latent_patch")?;
+    ensure!(w % step == 0 && h % step == 0, "--size must be a multiple of {step} pixels");
+    let image = (w / step) * (h / step);
+    let graph = DenoiserGraph::embedded();
+    let plan = graph.plan()?;
+    denoiser::validate(graph, &spec, &plan)?;
+    let count = denoiser::count(image, text);
+    print!("{}", denoiser::report(graph, &spec, &plan, count)?.render());
+    if fusion {
+        let costs = specrt::fusion::Costs::for_target(&kir::Target::sm_120()).with_compute(400.0, 1600.0);
+        for s in specrt::fusion::denoiser_fusion(graph, &spec, &plan, count, &costs, false)? {
+            println!("\n== {} (x{}) launches {} -> {}", s.name, s.repeats, s.launches_before, s.launches_after);
+            for g in &s.groups {
+                println!("  group [{}] launches {}", g.units.join(" + "), g.launches);
+            }
+            for d in s.rejected.iter().filter(|d| d.rule == specrt::fusion::Rule::Prologue) {
+                println!("  kept apart {}", d.describe());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn vae_kernels_command(dir: &Path, target: Option<&str>, size: &str, frames: usize, fusion: bool, compiled: bool) -> Result<()> {
+    use specrt::vae::compile::{Dims, compile, fusion_report, plan_report};
+    let dir = if dir.join("vae").join("config.json").exists() { dir.join("vae") } else { dir.to_path_buf() };
+    let plan = specrt::vae::graph::load_plan(&dir)?;
+    let target = match target {
+        Some(name) => kir::Target::named(name).with_context(|| format!("target {name:?} is not sm_120, sm_80, wgpu or wgpu-nosubgroups"))?,
+        None => specrt::codegen::default_target(),
+    };
+    let (w, h) = size.split_once('x').with_context(|| format!("size {size:?} is not WIDTHxHEIGHT"))?;
+    let (w, h): (usize, usize) = (w.parse()?, h.parse()?);
+    let scale = plan.spatial_scale();
+    ensure!(w % scale == 0 && h % scale == 0, "the vae scales by {scale}, {w}x{h} does not divide");
+    let latent = Dims { t: 1, h: h / scale, w: w / scale };
+    for first in if plan.temporal { vec![true, false] } else { vec![true] } {
+        let c = compile(&plan, latent, &target, compiled, first)?;
+        if plan.temporal {
+            println!("== {} latent frame", if first { "first" } else { "steady" });
+        }
+        if fusion {
+            let fused = compile(&plan, latent, &target, true, first)?;
+            print!("{}", fusion_report(&fused.fusion, fused.lowered.count, &target).render());
+        } else {
+            print!("{}", plan_report(&c.lowered, &c.shapes));
+        }
+        println!("arena peak {} bytes at step {}, allocated {} bytes, {} launches", c.arena.peak, c.arena.at, c.arena.size, c.fusion.launches_after);
+    }
+    if plan.temporal {
+        println!("latent frames {frames} decode to {} frames", plan.output_frames(frames));
+    }
     Ok(())
 }
 
@@ -726,9 +794,17 @@ fn main() -> Result<()> {
         }
         Cmd::Spec { model, out, expect_act_quant } => spec_command(model, out.as_deref(), expect_act_quant.as_deref())?,
         Cmd::Warmup { spec, max_ctx, slots } => warmup_command(&data, spec, *max_ctx, *slots)?,
-        Cmd::Kernels { spec, target, plan, fusion, compiled, tokens, context, phase } => {
+        Cmd::Kernels { spec, target, plan, fusion, compiled, tokens, context, phase, graph, size, text, frames } => {
             if (*fusion || *compiled) && !*plan {
                 bail!("--fusion and --compiled need --plan");
+            }
+            if let Some(g) = graph {
+                ensure!(*plan, "--graph needs --plan");
+                match g.as_str() {
+                    "denoiser" => return denoiser_command(Path::new(spec), size, *text, *fusion),
+                    "vae" => return vae_kernels_command(Path::new(spec), target.as_deref(), size, *frames, *fusion, *compiled),
+                    other => bail!("--graph {other:?} is not denoiser or vae"),
+                }
             }
             kernels_command(&data, spec, target.as_deref(), plan.then_some((phase.as_str(), *tokens, *context)), *fusion, *compiled)?
         }

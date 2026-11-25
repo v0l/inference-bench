@@ -1,0 +1,43 @@
+kind = "kir-kernel"
+family = "group_norm"
+name = "latent_norm"
+threads = 256
+
+[args]
+x_row = "moe_width"
+x_offset = 0
+g_row = "moe_width"
+g_offset = 0
+width = "moe_width"
+w_group = 0
+out_row = "moe_width"
+eps = "norm_eps"
+input = "x"
+output = "w * n"
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "g"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "w"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "out_hi"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "out_lo"
+type = "bf16"
+role = "activation"
+access = "write"

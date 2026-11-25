@@ -91,6 +91,18 @@ fn pool(dim: &str, rot: &str, unit: bool) -> Result<Kernel, String> {
 }
 
 fn topk(topk: &str, max_groups: &str) -> Result<Kernel, String> {
+    topk_with(topk, max_groups, "")
+}
+
+const SCORES: &str = r#"
+[[param]]
+name = "scores"
+type = "f32"
+role = "activation"
+access = "write"
+"#;
+
+fn topk_with(topk: &str, max_groups: &str, extra: &str) -> Result<Kernel, String> {
     let text = format!(
         r#"kind = "kir-kernel"
 family = "group_topk"
@@ -139,7 +151,7 @@ name = "scale"
 type = "f32"
 role = "value"
 access = "read"
-"#
+{extra}"#
     );
     Description::parse(&text)?.build(&Target::sm_120(), &shape())
 }
@@ -163,9 +175,23 @@ fn the_group_topk_scores_relu_dots_summed_over_heads_and_expands_groups_to_token
     assert!(src.contains("const int n = min((p + 1) / RATIO, MAX_GROUPS);"), "{src}");
     assert!(src.contains("s += fmaxf(d, 0.0f);") && src.contains("score[g] = s * scale;"), "{src}");
     assert!(src.contains("(float)p * rope_inv_freq(j, layer)"), "the query is roped at its own position: {src}");
+    assert!(src.contains("__shared__ float score[MAX_GROUPS];") && !src.contains("float* score"), "{src}");
+    assert!(src.contains("for (int g = threadIdx.x; g < n; g += blockDim.x)"), "only scored groups are written: {src}");
     assert!(src.contains("const int tp = g * RATIO + RATIO - 1;"), "a pooled group lives at its last token: {src}");
     assert!(src.contains("idx[(size_t)row * OUT + r * RATIO + k] = at * RATIO + k;"), "{src}");
     assert!(src.contains("const int t = n * RATIO + (j - cnt * RATIO);") && src.contains("idx[(size_t)row * OUT + j] = t <= p ? t : -1;"), "{src}");
+}
+
+#[test]
+fn the_group_topk_scores_in_a_per_row_global_scratch_past_the_shared_budget() {
+    let shared = kir::cuda::emit_module(&[topk_with("4", "max_context / 4", SCORES).unwrap()]).unwrap();
+    assert!(shared.contains("__shared__ float score[MAX_GROUPS];"), "a bound scratch is unused while the scores fit: {shared}");
+    let k = topk_with("512", "262144 / 4", SCORES).unwrap();
+    let src = kir::cuda::emit_module(&[k]).unwrap();
+    assert!(src.contains("constexpr int MAX_GROUPS = 65536;"), "{src}");
+    assert!(!src.contains("__shared__ float score[") && src.contains("float* score = scores + (size_t)row * MAX_GROUPS;"), "{src}");
+    assert!(src.contains("score[g] = s * scale;") && src.contains("score[at] = -3.0e30f;"), "the same top-k runs over the scratch: {src}");
+    assert!(topk_with("4", "262144 / 4", "").unwrap_err().contains("scores scratch"));
 }
 
 #[test]

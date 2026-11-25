@@ -45,13 +45,11 @@ fn a_limited_gather_reads_row_zero_for_ids_past_the_table() {
 }
 
 #[test]
-fn a_plane_store_splits_into_bf16_hi_and_lo() {
-    let text = format!("{HEAD}{}{}{}\n[[stage]]\nop = \"load\"\nname = \"v\"\nsrc = \"x\"\nrow = 8\n\n[[stage]]\nop = \"store\"\ndst = \"out\"\nvalue = \"v + 1.0\"\nrow = 8\nplanes = true\n", param("x", "f32", "activation", "read"), param("out_hi", "bf16", "activation", "write"), param("out_lo", "bf16", "activation", "write"));
+fn a_stepped_load_feeds_the_planes_stage() {
+    let text = format!("{HEAD}{}{}{}\n[[stage]]\nop = \"load\"\nname = \"v\"\nsrc = \"x\"\nrow = 16\nstep = 2\n\n[[stage]]\nop = \"planes\"\nvalue = \"v + 1.0\"\nrow = 8\n", param("x", "f32", "activation", "read"), param("out_hi", "bf16", "activation", "write"), param("out_lo", "bf16", "activation", "write"));
     let src = build(&text, &Shape::new()).unwrap();
-    assert!(src.contains("split_hi_lo(x[(size_t)row * 8 + i] + 1.0f, hi, lo);"), "{src}");
+    assert!(src.contains("split_hi_lo(x[(size_t)row * 16 + (size_t)i * 2] + 1.0f, hi, lo);"), "{src}");
     assert!(src.contains("out_hi[(size_t)row * 8 + i] = (bf16_t)hi;"), "{src}");
-    let missing = text.replace(&param("out_lo", "bf16", "activation", "write"), "");
-    assert!(build(&missing, &Shape::new()).is_err());
 }
 
 #[test]

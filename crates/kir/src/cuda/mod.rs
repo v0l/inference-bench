@@ -5,6 +5,7 @@ mod quant;
 mod linear;
 mod ggml;
 mod vision;
+mod conv;
 mod ops;
 mod moe;
 mod bandwidth;
@@ -21,7 +22,8 @@ pub use attention::emit_attention;
 pub(crate) use attention::scan_tile::{TileScan, decode as scan_tile_decode, prefill as scan_tile_prefill};
 pub use linear::emit_linear;
 pub use ggml::emit_ggml;
-pub use vision::emit_vision;
+pub use vision::{emit_vision, emit_vision_step};
+pub use conv::emit_vae;
 pub use ops::emit_ops;
 pub use moe::emit_moe;
 pub use gemm::{fp4_act_source, emit_gemm, emit_gemms, gemm_library, needs_arch_features};
@@ -45,6 +47,25 @@ __device__ float kir_block_sum(float v, float* scratch) {
     float r = 0.0f;
     for (int i = 0; i < warps; i++) r += scratch[i];
     return r;
+}
+
+";
+
+const SPLIT_BF16: &str = "__device__ __forceinline__ void kir_split_bf16(float v, unsigned short& hi, unsigned short& lo) {
+    unsigned u = __float_as_uint(v);
+    unsigned h = (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
+    float r = v - __uint_as_float(h << 16);
+    unsigned w = __float_as_uint(r);
+    hi = (unsigned short)h;
+    lo = (unsigned short)((w + 0x7fffu + ((w >> 16) & 1u)) >> 16);
+}
+
+";
+
+const STORED: &str = "typedef unsigned short bf16_t;
+
+__device__ __forceinline__ float kir_e4m3(unsigned char b) {
+    return __uint_as_float((((unsigned)b & 0x80u) << 24) | (((unsigned)b & 0x7fu) << 20)) * __uint_as_float(0x7b800000u);
 }
 
 ";
@@ -228,8 +249,14 @@ pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
 
 pub fn emit_module(kernels: &[Kernel]) -> Result<crate::KirSource, String> {
     let mut out = String::new();
-    if kernels.iter().any(|k| matches!(k.body, Body::RmsNorm { .. } | Body::RmsNormSegment { .. } | Body::AddRmsNorm { .. } | Body::NormAdd { .. }) || matches!(&k.body, Body::Compose(c) if c.has_sum()) || matches!(&k.body, Body::Rows(crate::rows::RowBody::LayerNorm { .. })) || matches!(&k.body, Body::Seq(s) if s.has_sum())) {
+    if kernels.iter().any(|k| matches!(k.body, Body::RmsNorm { .. } | Body::RmsNormSegment { .. } | Body::AddRmsNorm { .. } | Body::NormAdd { .. }) || matches!(&k.body, Body::Compose(c) if c.has_sum()) || matches!(&k.body, Body::Rows(crate::rows::RowBody::LayerNorm { .. } | crate::rows::RowBody::BlockRes { mode: crate::rows::ResMode::Mix, .. })) || matches!(&k.body, Body::Seq(s) if s.has_sum())) {
         out.push_str(WARP_SUM);
+    }
+    if kernels.iter().any(|k| matches!(&k.body, Body::Compose(c) if c.splits())) {
+        out.push_str(SPLIT_BF16);
+    }
+    if kernels.iter().any(|k| matches!(&k.body, Body::Seq(crate::recur::SeqBody::GroupMap(g)) if !g.scales.is_empty()) && k.params.iter().any(|p| matches!(p.ty, crate::Scalar::U8 | crate::Scalar::Bf16))) {
+        out.push_str(STORED);
     }
     for k in kernels {
         out.push_str(&emit_kernel(k)?);

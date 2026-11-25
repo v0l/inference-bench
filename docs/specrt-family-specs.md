@@ -122,3 +122,37 @@ Gemma 4 sliding layers use `head_dim` and `num_key_value_heads`, full layers use
 The kernels are kir descriptions (`specs/g4_*.toml`): `head_rms` with an optional weight (q, k norms; v norm without), `span_rope` with an explicit `theta` and `angles` (proportional rope rotates `partial_rotary_factor * head_dim / 2` angles over the full head), `state_write`, and a geometry `scan_attention` writing the split attention planes. The vision and audio towers are ignored (`[vision] ignore`); image input gets a text-only refusal (#1237).
 
 Tests: `tests/gemma4.rs` (31B and 12B mapping, the E2B and E4B configs mapping their shared tail, wide MLP and per-layer inputs, per kind KV bytes, every kernel builds, and on GPU1 tiny-gemma4 and tiny-gemma4-e logits, greedy and per-layer states against transformers from `scripts/tiny_gemma4.py <dir>` with `G4_FIXTURE` and `G4_STYLE=e`: max abs 4.6e-4 and 2.0e-4 on logits). The E fixture is 6 layers with per layer input 16, 2 shared KV layers and the double wide MLP; its KV bytes are smaller than a spec with no sharing.
+
+## A prelude before chosen layers, partial refusals (#1280, Qwen3.8-Flash-Next)
+
+`family-qwen4_exp.toml` extends `qwen3_5` and adds three tables, all data: `[gated_residual]` (four streams with a low rank gate, #1277), the QSA indexer as `[[attention.node]]` (#1278) and the PLE as a `[prelude]` (#1279). Details in [specrt-qwen4exp.md](specrt-qwen4exp.md).
+
+| Field | What it does |
+|---|---|
+| `[prelude] module`, `layers_key`, `layers_base` | Described kernel nodes that run at the start of each layer the config list names (`ple_layer_ids`, 1 based), before the block's own nodes. Weights load from `layers.N.<module>.*`. |
+| `[prelude] index`, `count` | Symbols the descriptions read: the layer's position in the list and the list length. One layer for now (kernels fold the index in). |
+| `[prelude.params]`, `[prelude.scratch]`, `[prelude.int_scratch]` | Params from the config; f32 and i32 buffers of the given row width. Nodes bind `x`, `streams`, `tokens`, a scratch buffer, a weight or a state. |
+| `{ int = "..." }` param | A 64 bit integer expression (`kir::int`: `prime_sum`, `splitmix64`, wrapping ops) over config keys and earlier params, for sizes like the n-gram table rows. |
+| `[[state]] layers = "prelude"` | A per sequence f32 state with one slice per prelude layer; zeroed on reset, carried in snapshots, swap and session restore. |
+| `[[refuse]] part = "mtp"` | A hit drops only that part (the MTP layer here) and records the message on the spec, so `[speculative] enabled = true` is refused by name while text still serves. |
+
+The gated residual runs prefill and decode as separate steps (no fused prefill plus decode, no single row plan).
+
+## Kimi K3 (#1340)
+
+`family-kimi_k3.toml` extends `kimi_linear` for `kimi_k3` and `kimi_k31`. The reference is the checkpoint's own `modeling_kimi_linear.py` (moonshotai/Kimi-K3 at c7945ea0, sha256 pinned in `scripts/tiny_kimi_k3.py`), run with `fla` stubbed by the torch fallbacks of transformers' `kimi_linear`. The stub reproduces transformers on `tiny-kimi-linear` (prefill 5.3e-5, decode 4.0e-5) before it builds `tests/fixtures/tiny-kimi-k3` (6 layers, all six pieces).
+
+| Piece | Family data | Engine |
+|---|---|---|
+| SiTU | `[activation.map] situ`, `[mlp.gated]` with `act = "situ"` (applies only when `hidden_act` names it) and the two betas from the config | the gated expression reaches the dense GEMM epilogue, the shared expert and every MoE expert kernel |
+| MLA q LoRA | `q_a_proj` as an attention projection, `mla_q_lora_norm_e6`, `dsa_q_b`, `dsa_absorb_q`, `mla_lora_attention` (q rope part from `qr`) | `q_a_layernorm` and `kv_a_layernorm` use KimiRMSNorm's default eps 1e-6, not `rms_norm_eps` (`mla_lora_eps`) |
+| MLA output gate | `g_proj` appended to the qkv GEMM; `mla_expand_v_rows` writes f32, `mla_out_gate` (`group_map`, new `planes` stage) stores `v * sigmoid(g)` to the attention planes | none |
+| Full rank KDA gate | `g_proj` as a mixer projection, `kda_gated_norm_mix` reads the gate from the mixer input; `kda_recurrence` with `gate_lower_bound` | none |
+| Latent experts | `[moe.latent]` names width, down, up, norm and the config key that turns the norm on | `Moe::latent`, `MoeShape.width` (expert kernels run at `MOE_WIDTH`, the router stays at `HIDDEN`) and `assign` combine; graph linears `latent_down`, `latent_up`, `shared_gate_up`, `shared_down` and op `latent_norm`; the shared expert runs at full width as a dense GEMM pair |
+| Block attention residuals | `[block_residual]` names the block size key, the two sites and the output module | op `block_res` with stages enter, mixed, done, tail; kir row family `block_res` (mix, push, add, set, out); the score vector is `norm.weight * proj.weight` folded at load; the block stack is per row in the prefill scratch (at most 16 blocks) |
+
+The `blockres_*` graph blocks clear `x` before each branch so `x` holds the branch output; the prefix sum lives beside it, and `done` writes the layer output back to `x`, which is what the hidden trace reads. Variants the family does not describe are refused by name: MLA without the output gate, KDA without the full rank gate, and K3.1's `dsa_config` (#1361).
+
+Tests: `tests/kimi_k3.rs`. CPU: spec, plan validation and module build for the fixture and the real 93 layer K3 config, the K3.1 refusal. GPU1: all 6 layer outputs within 3.4e-4, prefill logits within 6.3e-5 and decode within 1.8e-5 of the largest logit, greedy tokens equal, and four red checks (silu for SiTU, the softplus gate, latent experts without their norm, MLA without the output gate) that each miss by more than 0.19.
+
+The logit checks are relative to the largest logit (bound 1e-4, about 5e-3 absolute) rather than kimi_linear's absolute 7e-4, because the K3 fixture's logits reach about 50 and an f32 host head on the engine's own last layer output already misses the reference by about the same 3e-3, so the gap is head arithmetic on large logits; the layer-wise 3.8e-4 bound on every hidden state is the real check.

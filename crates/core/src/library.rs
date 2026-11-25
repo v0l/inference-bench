@@ -971,7 +971,7 @@ mod tests {
 
     #[test]
     fn every_config_the_engine_tests_load_is_supported_by_the_library() {
-        let engine_refuses = ["tiny-qwen4-exp"];
+        let engine_refuses: [&str; 0] = [];
         let fixtures = engine_config_fixtures();
         assert!(fixtures.len() >= 12, "{} fixtures", fixtures.len());
         for (name, config) in &fixtures {

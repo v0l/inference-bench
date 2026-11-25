@@ -201,12 +201,12 @@ impl MoeBuffers {
             coef: stream.alloc_zeros(pairs)?,
             logits: stream.alloc_zeros(rows * (m.experts + 1))?,
             act: stream.alloc_zeros(pairs * m.expert_intermediate)?,
-            out: stream.alloc_zeros(pairs * spec.dims.hidden)?,
+            out: stream.alloc_zeros(pairs * m.width(spec.dims.hidden))?,
             offsets: stream.alloc_zeros(m.experts + 2)?,
             sorted: stream.alloc_zeros(pairs)?,
             mma: if mma {
                 let pad = crate::dequant::DEVICE_TILE;
-                let (h, i) = (spec.dims.hidden.next_multiple_of(pad), m.expert_intermediate.next_multiple_of(pad));
+                let (h, i) = (m.width(spec.dims.hidden).next_multiple_of(pad), m.expert_intermediate.next_multiple_of(pad));
                 let tiles = m.experts + 1 + pairs / crate::codegen::MOE_MMA_BM_SMALL;
                 Some(MmaBuffers {
                     xq: stream.alloc_zeros(inputs * h / 2)?,
@@ -223,7 +223,7 @@ impl MoeBuffers {
                 None
             },
             mmb: if mmb {
-                let (h, i) = (spec.dims.hidden, m.expert_intermediate);
+                let (h, i) = (m.width(spec.dims.hidden), m.expert_intermediate);
                 let tiles = m.experts + 1 + pairs / crate::codegen::MOE_MMA_BM_SMALL;
                 Some(MmbBuffers {
                     xh: stream.alloc_zeros(inputs * h)?,
@@ -236,7 +236,7 @@ impl MoeBuffers {
                 None
             },
             mma8: if mma8 {
-                let (h, i) = (spec.dims.hidden, m.expert_intermediate);
+                let (h, i) = (m.width(spec.dims.hidden), m.expert_intermediate);
                 let tiles = m.experts + 1 + pairs / crate::codegen::MOE_MMA_BM_SMALL;
                 Some(Mma8Buffers {
                     xq: stream.alloc_zeros(inputs * h)?,
@@ -292,9 +292,16 @@ impl Runtime {
         Ok(())
     }
 
-    fn expert_inputs<'a>(&self, mb: &'a MoeBuffers, n: usize) -> (&'a CudaSlice<f32>, usize) {
+    fn expert_inputs<'a>(&'a self, mb: &'a MoeBuffers, n: usize) -> (&'a CudaSlice<f32>, usize) {
         let m = self.spec.moe.as_ref().expect("moe spec");
+        if m.latent.is_some() {
+            return (&self.residual.as_ref().expect("latent experts keep their input in the residual buffers").latent, n);
+        }
         if m.input_scaled { (&mb.xp, n * m.pairs()) } else { (&mb.xn, n) }
+    }
+
+    fn width(&self) -> usize {
+        self.spec.moe.as_ref().map_or(self.spec.dims.hidden, |m| m.width(self.spec.dims.hidden))
     }
 
     fn stack_args<'a>(&'a self, b: &mut crate::launch::Launch<'a>, s: &'a StackWeights) {
@@ -363,7 +370,7 @@ impl Runtime {
                 cache.prefetch(&self.stream, next.0, next.1, &predicted)?;
             }
             if let Some((gate_up, down)) = &cache.bias {
-                let (inter, hidden) = (m.expert_intermediate, self.spec.dims.hidden);
+                let (inter, hidden) = (m.expert_intermediate, self.width());
                 let copy = |from: &CudaSlice<f32>, to: &CudaSlice<f32>, per: usize, e: usize, slot: usize| -> Result<()> {
                     let (src, _a) = from.device_ptr(&self.stream);
                     let (dst, _b) = to.device_ptr(&self.stream);
@@ -471,7 +478,7 @@ impl Runtime {
         if let Some(t) = table {
             b.arg(t);
         }
-        let config = launch(kir::moe::expert_rows_launch(pairs, self.spec.dims.hidden));
+        let config = launch(kir::moe::expert_rows_launch(pairs, self.width()));
         unsafe { b.launch(config) }?;
         Ok(())
     }
@@ -506,7 +513,7 @@ impl Runtime {
         };
         let stem = if block { "moe_mma_mx" } else { "moe_mma" };
         let quant_kernel = if block { "moe_quant_mx" } else { "moe_quant_f32" };
-        let (h, inter) = (self.spec.dims.hidden, m.expert_intermediate);
+        let (h, inter) = (self.width(), m.expert_intermediate);
         let slots = m.local_experts() + m.shared_slots();
         let pairs = n * m.pairs();
         let small = pairs / slots < MOE_MMA_BM / 2;
@@ -572,7 +579,7 @@ impl Runtime {
         let (StackWeights::Bf16(gw), StackWeights::Bf16(uw), StackWeights::Bf16(dw)) = (&st.gate, &st.up, &st.down) else {
             unreachable!("the bf16 mma path needs bf16 experts")
         };
-        let (h, inter) = (self.spec.dims.hidden, m.expert_intermediate);
+        let (h, inter) = (self.width(), m.expert_intermediate);
         let mapped = self.spec.mlp.mapped.is_some();
         let up_weights = if mapped { 1 } else { 2 };
         let (gw, uw) = if mapped { (uw, uw) } else { (gw, uw) };
@@ -615,7 +622,7 @@ impl Runtime {
         let (StackWeights::Fp8 { values: gw, grid: gg }, StackWeights::Fp8 { values: uw, grid: ug }, StackWeights::Fp8 { values: dw, grid: dg }) = (&st.gate, &st.up, &st.down) else {
             unreachable!("the fp8 mma path needs FP8 experts")
         };
-        let (h, inter) = (self.spec.dims.hidden, m.expert_intermediate);
+        let (h, inter) = (self.width(), m.expert_intermediate);
         let slots = m.local_experts() + m.shared_slots();
         let pairs = n * m.pairs();
         let small = pairs / slots < MOE_MMA_BM / 2;
@@ -668,7 +675,7 @@ impl Runtime {
         let mut b = self.launcher(self.kernel(&down));
         self.stack_args(&mut b, &st.down);
         b.arg(bias.1).arg(&mb.act).arg(&mb.offsets).arg(&mb.sorted).arg(&mb.out);
-        let config = launch(kir::moe::expert_rows_launch(slots, self.spec.dims.hidden));
+        let config = launch(kir::moe::expert_rows_launch(slots, self.width()));
         unsafe { b.launch(config) }?;
         Ok(())
     }
@@ -677,7 +684,7 @@ impl Runtime {
         let mb = self.moe.as_ref().expect("moe buffers");
         let mut b = self.launcher(self.kernel("moe_combine"));
         b.arg(x).arg(&mb.out).arg(&mb.coef);
-        let config = launch(kir::moe::rows_launch(self.spec.dims.hidden, n));
+        let config = launch(kir::moe::rows_launch(self.width(), n));
         unsafe { b.launch(config) }?;
         Ok(())
     }

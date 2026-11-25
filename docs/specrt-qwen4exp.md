@@ -15,7 +15,7 @@ The config adds four things to `family-qwen3_5.toml`. Two of them are not the me
 | 5 | Gated attention output | `q_proj` is 2 x heads x head_dim, sigmoid gate on the attention output | `attn_output_gate` read, qwen3_5 path | exists |
 | 6 | Gated delta-net | same math as qwen3_5 (`linear_*` keys, 16 key and 48 value heads in the real model) | qwen3_5 | exists |
 | 7 | MoE | softmax router, top k, optional renorm, shared expert with sigmoid gate, `silu` | qwen3_5_moe | exists |
-| 8 | MTP | `mtp` object with `hybrid` true and `layer_types ["full_attention"]`, one layer, weights excluded from the NVFP4 quantisation | `[mtp]` on qwen3_5. The MTP layer also carries an indexer and hyper-connection weights are not listed for it | needs a check against a real shard (the HF model ignores `mtp.*`) |
+| 8 | MTP | `mtp` object with `hybrid` true and `layer_types ["full_attention"]`, one layer, weights excluded from the NVFP4 quantisation | `[mtp_layout]` in `family-qwen4_exp.toml` with `fc_hidden` and `mixer` | **done (#1350)**, see below |
 | 9 | Vision tower | `Qwen4ExpVisionModel` | qwen3_5 vision | out of scope for this issue (text first) |
 
 Layer I/O names for the family spec: attention `self_attn.{q,k,v,o}_proj`, `q_norm`, `k_norm`, `self_attn.indexer.{index_qk_proj,q_layernorm,k_layernorm}`, delta-net `linear_attn.*` as qwen3_5, `mlp.gate`, `mlp.experts.N.{gate,up,down}_proj`, `mlp.shared_expert*`, `{attn,mlp}_hyper_connection.{hc_norm,input_mix_weight_down,input_mix_weight_up,block_inject_weight}`, `ple.{ple_embedding.ngram_embedding,key_proj,value_proj,norm_key,norm_query,norm_conv,conv1d}`, model level `hyper_connection_mixer.*`. The NVFP4 copy excludes attention, delta-net, router, shared expert, hyper-connections, `ple` and embeddings, so only routed experts are 4 bit.
@@ -71,12 +71,80 @@ Spec side for #1280: the params the descriptions read are in `tests/qwen4_exp_pl
 
 Tests: `crates/kir/tests/ple.rs` (CPU: integer semantics, the hash description against `reference/tiny-qwen4-exp.ngram.json`, five cases checked against transformers when written, red when a multiplier changes), `crates/specrt/tests/qwen4_exp_ple.rs` (CPU: params from the tiny and real configs, every description builds, the state table sizes, the host reference against the transformers PLE capture at 2e-6; GPU: prefill and decode steps 1 to 4, chunked prefill plus slot reuse, two sequences side by side). Regenerate the references with `~/.venv-vllm/bin/python crates/specrt/scripts/tiny_qwen4_exp.py ple`.
 
-## Not done, and why `family-qwen4_exp.toml` is not added
+## Not done before #1280, and why `family-qwen4_exp.toml` waited
+
+## The family (#1280)
+
+`crates/specrt/specs/family-qwen4_exp.toml` matches `qwen4_exp` and `qwen4_exp_text` and extends `qwen3_5` (delta-net, MoE with a sigmoid gated shared expert, gated attention output). It adds, as data only:
+
+- `[gated_residual]` from #1277 (copied from the old test harness, now removed).
+- The QSA indexer from #1278: `[attention.params]` read from the config (`index_groups = indexer_budget / indexer_compress_ratio`, `index_out = indexer_budget + indexer_compress_ratio - 1`, `index_scale = rsqrt(indexer_head_dim)`), the appended `index_qk_proj` projection, the `index_raw` and `index_pool` per token states and the four kernel nodes. No `layers = ["full"]` is needed: attention nodes only run on attention layers.
+- The PLE from #1279 as a `[prelude]`: a new spec table of described kernel nodes that run at the start of each layer named by `ple_layer_ids` (1 based), before the attn gated residual. Its seven nodes are the `specs/ple_*` descriptions in the order of `Qwen4ExpTextPLELayer.forward`: hash, gather, key and value projections, gate, dilated conv, add into the streams. `ngram_history` and `ple_conv` are `layers = "prelude"` per sequence states, zeroed on reset and carried in state snapshots (the slot pending section), swap and sessions. The table row count is an `{ int = ... }` param: `ceil(prime_sum(ngram_vocab_size_base - 1, 1, ngram_heads) / 128) * 128`, 4096 on the tiny config and 320001536 on the real one (128 shards of 2500012).
+- The vision tower is ignored (text only, #1237). The MTP layer is served since #1350 (below).
+
+## MTP layer (#1350)
+
+`transformers` ignores `mtp.*`, so the formulation comes from vLLM `vllm/models/qwen4_exp/nvidia/mtp.py`, the shard headers of Qwen/Qwen3.8-Flash-Next and RadixArk/Qwen3.8-Flash-Next-NVFP4 (both list the same 31 `mtp.*` tensors, bf16 in both) and `fused_pre_fc_norms_split`:
+
+```
+e      = fc_embedding(norm_embed(embed(token)))                 [hidden]
+streams = fc_hidden(norm_hidden(previous streams) per stream)  [4, hidden], norm over all 4 x hidden
+x      = streams + e on every stream
+out    = one Qwen4Exp decoder layer (gated residual sites, indexed attention, MoE), no PLE
+logits = lm_head(hyper_connection_mixer(out))                   the mixer has no inject weights
+```
+
+The previous streams are the target's streams after its last layer and before its final mixer on the first draft step, then the draft layer's own output streams on later steps. Norms use `(1 + w)`.
+
+Spec side, as data: `[mtp_layout]` names `fc` (fc_embedding), `fc_hidden`, `norm_embed`, `norm_hidden` and `mixer`, and has no `norm`. `Spec::streamed_mtp` and `draft_width` (4 x hidden) follow from it. The `[[refuse]] part = "mtp"` rule is gone, so `[speculative] enabled = true` works.
+
+Plan: `decoder.toml` has a `gated` copy of the `[[mtp]]` and `[[mtp_head]]` sections (the flat ones are now `+flat` and unchanged for qwen3_5): `mtp_in` (kir `mtp_streams_in`: both norms, embedding planes and the 4 x hidden planes), `mtp_fc` into `x`, `gated_expand` into the streams, `mtp_fc_hidden` added into the streams (residual epilogue over 4 x rows), then the same gated attention plus MoE body as the target layers, using the MTP layer's `attn_hyper_connection` and `mlp_hyper_connection`. The head gathers the wide rows, runs `gated_collapse` with `weight = "draft"` (site `GATED_DRAFT`, the `mtp.hyper_connection_mixer` weights), `split` and the draft head.
+
+Speculation: verify rows run the PLE prelude, whose n-gram history and dilated conv window are per sequence state with no per row log. A round saves those states per sequence before verify, and after acceptance restores them and replays the stateful prelude nodes (hash and conv) one position at a time on the accepted tokens; rejected rows go to the pad slot. Without the replay, greedy diverges at the second token (checked red once).
+
+Tests (`tests/qwen4_exp_mtp.rs`, GPU1 shared with the user's app): draft logits against the reference at 1.4e-4 (k = 2) and 1.2e-4 (k = 3) with equal drafts `[74, 354, 501]`; speculative greedy equals plain greedy over 6 prompts x 40 tokens for k = 1 to 3, batch 1 and 2, with MTP drafts, oracle drafts and rotating wrong drafts. The random tiny MTP weights accept no MTP drafts, which is expected; acceptance on the real model needs its weights. Regenerate the fixture and reference with `~/.venv-vllm/bin/python crates/specrt/scripts/tiny_qwen4_exp.py mtp`.
+
+The real 360 GB model still waits on the loader work in #1349 and a both-card window.
+
+The gated residual has no fused prefill plus decode step and no single row plan, so the scheduler runs prefill and decode as separate steps.
+
+GPU1 (`gpu-run 1 --min-free 2000`, the user's app on the card), `tests/qwen4_exp.rs`, bar 1e-3 as the qwen3.5 tiny fixtures:
+
+| Check | Max abs |
+|---|---|
+| layer 0 streams, 30 rows | 9.5e-5 |
+| layer 1 streams, 30 rows, PLE computed in the engine | 2.6e-4 |
+| layer 3 streams, all 30 rows (the indexer selects from row 19) | 2.5e-4 |
+| prefill logits, 30 rows, every row's argmax equal | 2.5e-4 |
+| decode steps 1 to 4, greedy equal | 1.4e-4, 1.4e-4, 2.0e-4, 1.7e-4 |
+| in engine PLE against the injected #1279 capture, layer 1 | 2.4e-5 |
+
+Two served slots (prefill in chunks of 7, then 4 decode steps side by side) give the transformers greedy for slot 0 and the same tokens for slot 1 as its prompt served alone, also with the slots swapped after reuse. A state snapshot of slot 0 restored into slot 1 decodes the same greedy tokens; with the prelude restore disabled it does not (checked red once).
+
+The expert GEMMs were refused at an expert width of 640 by an old `% 256` rule; the grouped NVFP4 and FP8 MMA kernels only need `N % 64` and `K % 128`, and both match the CPU at hidden 512, intermediate 640 on GPU1 (`moe_mma.rs`, `moe_mma_fp8.rs`), so the rule is now `% 128` for quantised experts.
+
+Coverage (`model_coverage.sh`): Qwen/Qwen3.8-Flash-Next (360 GB bf16) 2 cards plus 21 GB host plus 166 GB NVMe, the planner models cards and host only; Qwen/Qwen3.8-Flash-Next-FP8 (185.5 GB) 2 cards plus 13 GB host, planner accepts; RadixArk/Qwen3.8-Flash-Next-NVFP4 (135.2 GB) 2 cards, planner accepts. All three SUPPORTED-WITH-OFFLOAD. The GGUF copy waits on #1204 (the GGUF spec is built in Rust and has none of these tables); the MXFP4 GPTQ copy on its quant format.
+
+## Real checkpoint tensors (#1349)
+
+Read from the three repos' shard headers (no download); names, dtypes, shapes, the fp8 scale and the three I64 buffers are in `tests/fixtures/qwen4-exp-real/headers.json`.
+
+- The n-gram table is 128 `ple_embedding.ngram_embedding.shard_N.weight` tensors of [2500012, 160]: bf16 in the base repo, F8_E4M3 in the FP8 and NVFP4 repos with one bf16 `ngram_embedding.weight_scale` (1.99e-4). `Checkpoint` joins any complete `X.shard_0..N.leaf` run into `X.leaf` along rows (`has`, `shape_of`, `dtype_of`, `parts`), so the family still binds `ple_embedding.ngram_embedding.weight`.
+- `[prelude.stored]` names prelude weights that stay in their stored dtype: `ple_table = "ple_embedding.ngram_embedding.weight"`. At load `complete_prelude` reads the dtype from the checkpoint into `[prelude.words]` (`ple_table_dtype` = f32, bf16 or fp8) and the fp8 scale into `ple_table_scale`. The gather's `table` param carries `stored = "ple_table"`, so kir types it `bf16_t` or `unsigned char` and decodes each element (bf16 by shift, e4m3 times the scale) in the `group_map` load. The table is copied part by part from the mmap into one device buffer (fp8 51 GB, bf16 102 GB) and kept out of the staged prefetch groups. The bf16 copy needs the host tier (#1355).
+- The bf16 repo fuses experts as `mlp.experts.gate_up_proj` [512, 1280, 2560] (gate rows first) and `mlp.experts.down_proj` [512, 2560, 640] with no `.weight` suffix; `[moe] fused_experts = true` loads both spellings, with the per matrix `shared_expert` appended. The FP8 and NVFP4 repos use per expert names.
+- `layer_multipliers`, `ngram_heads_offsets` and `ngram_heads_vocab_sizes` are not loaded: the folded `ple_ngram_hash` constants equal them (checked on CPU against the real values).
+- The QSA select keeps group scores in shared memory while `index_heads * index_head_dim + max_context / index_ratio` fits 12288 floats (47104 tokens on the real model). Past that the kernel scores into `[attention.scratch] index_scores = "floor(max_context / index_ratio)"`, one float per group per row, and runs the same top-k over it (256 K on the real model: 256 KB per row, about 0.5 GB over a 2048 row prefill chunk). Scratch sizes may name `max_context`, which the runtime fills with the loaded context (#1356).
+
+Tests (`tests/qwen4_exp_checkpoint.rs`): CPU, the real header names join into the table the family reads with the folded `ngram_rows`; the hash constants equal the real buffers; an fp8 sharded copy of the tiny table loads through the name map in its stored bytes; bad `[prelude.stored]` or dtype words are refused; fused bf16 experts load identical stacks to the per expert copy. GPU1: the fp8 gather equals the f32 gather of the decoded table, and the bf16 gather reads the table bit for bit; the engine on bf16 shards and on fused experts gives logits identical to the original fixture, and on fp8 shards identical to the decoded f32 table.
+
+The real load itself needs both cards and a window (#1353).
+
+## History: why the family came last
 
 A family file makes `from_hf_config_serving` accept the model, so the coverage script would call the real config TOO-BIG while the engine cannot run it. The family file goes in last, after these engine pieces each have a kir description and a test against `tiny-qwen4-exp`:
 
 1. 4 stream residual with the low rank gate, collapse and inject kernels: done in #1277 (above).
-2. QSA block pool, score and block top-k stage over a GQA layer, producing a mask or a selected index list for `flash_attention`.
-3. n-gram hash and gather stage plus token history state.
-4. PLE gate and dilated conv stage.
-5. `family-qwen4_exp.toml`, `unsupported` entries removed, `model_coverage.sh` rerun (expected: Qwen/Qwen3.8-Flash-Next TOO-BIG, NVFP4 copy TOO-BIG with 2 cards), GPU1 logits check through `gpu-run 1 --`.
+2. QSA block pool, score and block top-k stage over a GQA layer: done in #1278.
+3. n-gram hash and gather stage plus token history state: done in #1279.
+4. PLE gate and dilated conv stage: done in #1279.
+5. `family-qwen4_exp.toml`: done in #1280 (above).

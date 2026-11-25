@@ -106,6 +106,26 @@ pub fn tap_rotate(half: &str, quarter: &str, tap_true: &str, tap_false: &str) ->
     )
 }
 
+pub fn head_rms_inv(var: &str, src: &str, width: &str, red: &str, out: &str, eps: &str) -> String {
+    format!(
+        "        float {var} = 0.0f;
+        for (int d = threadIdx.x; d < {width}; d += blockDim.x) {var} += {src}[d] * {src}[d];
+        float {out} = part < 2 ? rsqrtf(block_sum({var}, {red}) / {width} + {eps}) : 1.0f;
+"
+    )
+}
+
+pub fn table_rotate(src: &str, inv: &str, w: &str, cos: &str, sin: &str, row: &str, width: &str) -> String {
+    format!(
+        "                    float other = {src}[d ^ 1] * {inv} * {w}[d ^ 1];
+                    v = v * {inv} * {w}[d];
+                    float c = {cos}[(size_t){row} * {width} + d];
+                    float s = {sin}[(size_t){row} * {width} + d];
+                    v = (d & 1) ? v * c + other * s : v * c - other * s;
+"
+    )
+}
+
 pub fn layernorm_apply(row: &str, width: &str, threads: &str, mean: &str, inv: &str) -> String {
     format!(
         "    for (int i = threadIdx.x * 2; i < {width}; i += {threads} * 2) {{

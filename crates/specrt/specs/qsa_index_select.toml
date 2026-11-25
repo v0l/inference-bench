@@ -87,3 +87,9 @@ name = "scale"
 type = "f32"
 role = "value"
 access = "read"
+
+[[param]]
+name = "scores"
+type = "f32"
+role = "activation"
+access = "write"

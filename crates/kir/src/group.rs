@@ -9,7 +9,8 @@ pub enum GroupStage {
     Value { dst: String, expr: Expr },
     Sum { dst: String, expr: Expr },
     Scalar { dst: String, expr: Expr },
-    Store { dst: String, value: Expr, row: u32, group: u32, offset: u32, planes: bool },
+    Store { dst: String, value: Expr, row: u32, group: u32, offset: u32 },
+    Planes { value: Expr, row: u32, group: u32, offset: u32 },
     Put { dst: String, value: Expr, row: u32, group: u32, offset: u32 },
 }
 
@@ -18,9 +19,12 @@ pub struct GroupMap {
     pub width: u32,
     pub consts: Vec<Const>,
     pub stages: Vec<GroupStage>,
+    pub scales: Vec<(String, f32)>,
 }
 
-const RESERVED: [&str; 6] = ["i", "row", "grp", "scratch", "WIDTH", "width"];
+const RESERVED: [&str; 8] = ["i", "row", "grp", "scratch", "WIDTH", "width", "hi", "lo"];
+
+const PLANES: [&str; 2] = ["out_hi", "out_lo"];
 
 fn address(row: u32, group: u32, offset: u32) -> String {
     stepped(row, group, offset, 1)
@@ -54,8 +58,18 @@ impl GroupMap {
         self.stages.iter().any(|s| matches!(s, GroupStage::Sum { .. }))
     }
 
-    fn plane_store(&self, name: &str) -> bool {
-        self.stages.iter().any(|s| matches!(s, GroupStage::Store { dst, planes: true, .. } if name.strip_suffix("_hi").or_else(|| name.strip_suffix("_lo")) == Some(dst.as_str())))
+    fn stored(&self, p: &Param) -> bool {
+        self.scales.iter().any(|(n, _)| n == p.name)
+    }
+
+    fn element(&self, p: &Param, at: &str) -> String {
+        let scale = self.scales.iter().find(|(n, _)| n == p.name).map_or(1.0, |(_, s)| *s);
+        match p.ty {
+            Scalar::Bf16 => format!("__uint_as_float(((unsigned){}[{at}]) << 16)", p.name),
+            Scalar::U8 if scale == 1.0 => format!("kir_e4m3({}[{at}])", p.name),
+            Scalar::U8 => format!("(kir_e4m3({}[{at}]) * {}f)", p.name, crate::lit(scale)),
+            _ => format!("{}[{at}]", p.name),
+        }
     }
 
     pub fn check(&self, t: &Target, params: &[Param]) -> Result<(), String> {
@@ -68,12 +82,15 @@ impl GroupMap {
         for (i, p) in params.iter().enumerate() {
             let index = self.stages.iter().any(|s| matches!(s, GroupStage::Load { index: Some(n), .. } if n == p.name));
             let shift = self.stages.iter().any(|s| matches!(s, GroupStage::Load { shift: Some(n), .. } if n == p.name));
+            let plane = PLANES.contains(&p.name);
             let ty_ok = if index {
                 p.ty == Scalar::I32 && p.role == Role::Activation && p.access == Access::Read
+            } else if plane {
+                p.ty == Scalar::Bf16 && p.role == Role::Activation && p.access == Access::Write
             } else if shift {
                 p.ty == Scalar::I32 && p.role == Role::Value
-            } else if self.plane_store(p.name) {
-                p.ty == Scalar::Bf16 && p.role == Role::Activation && p.access == Access::Write
+            } else if self.stored(p) {
+                matches!(p.ty, Scalar::F32 | Scalar::Bf16 | Scalar::U8) && p.role == Role::Weight
             } else {
                 p.ty == Scalar::F32
             };
@@ -81,7 +98,11 @@ impl GroupMap {
                 return Err(format!("group_map param {:?} is not usable", p.name));
             }
         }
-        if !self.stages.iter().any(|s| matches!(s, GroupStage::Store { .. } | GroupStage::Put { .. })) {
+        let planes = self.stages.iter().any(|s| matches!(s, GroupStage::Planes { .. }));
+        if planes != PLANES.iter().all(|n| params.iter().any(|p| p.name == *n)) || PLANES.iter().filter(|n| params.iter().any(|p| p.name == **n)).count() == 1 {
+            return Err("group_map stores to planes through a planes stage with both out_hi and out_lo params".into());
+        }
+        if !self.stages.iter().any(|s| matches!(s, GroupStage::Store { .. } | GroupStage::Planes { .. } | GroupStage::Put { .. })) {
             return Err("group_map has no store".into());
         }
         self.body(params)?;
@@ -116,9 +137,10 @@ impl GroupMap {
                     if !ok(dst, &defined) {
                         return Err(format!("group_map name {dst:?} is not usable or is defined twice"));
                     }
-                    if !readable(src) {
-                        return Err(format!("group_map load from {src:?}, which is not a read f32 buffer param"));
-                    }
+                    let source = match params.iter().find(|p| p.name == src) {
+                        Some(p) if p.role != Role::Value && p.access == Access::Read && (p.ty == Scalar::F32 || self.stored(p)) => p,
+                        _ => return Err(format!("group_map load from {src:?}, which is not a read f32 or stored weight param")),
+                    };
                     if *step == 0 || (*step != 1 && index.is_some()) || (limit.is_some() && index.is_none()) {
                         return Err(format!("group_map load {dst:?}: a step is positive and only on plain loads, a limit only on gathers"));
                     }
@@ -148,7 +170,7 @@ impl GroupMap {
                             }
                         }
                     };
-                    elements.push((dst.clone(), Expr::Raw(format!("{src}[{at}]"))));
+                    elements.push((dst.clone(), Expr::Raw(self.element(source, &at))));
                     defined.push(dst.clone());
                 }
                 GroupStage::Pick { dst, src, row, group, offset } => {
@@ -196,25 +218,18 @@ impl GroupMap {
                     let text = element(value, &[], &scalars).map_err(|e| format!("group_map put {dst:?}: {e}"))?;
                     out.push_str(&format!("    if (threadIdx.x == 0) {dst}[{}] = {text};\n", fixed(*row, *group, *offset)));
                 }
-                GroupStage::Store { dst, value, row, group, offset, planes } => {
+                GroupStage::Store { dst, value, row, group, offset } => {
+                    match params.iter().find(|p| p.name == dst) {
+                        Some(p) if p.role == Role::Activation && p.access == Access::Write => {}
+                        _ => return Err(format!("group_map store to {dst:?}, which is not a written activation param")),
+                    }
+                    let text = element(value, &elements, &scalars)?;
+                    out.push_str(&format!("{loop_head} {dst}[{}] = {text};\n", address(*row, *group, *offset)));
+                }
+                GroupStage::Planes { value, row, group, offset } => {
                     let text = element(value, &elements, &scalars)?;
                     let at = address(*row, *group, *offset);
-                    if *planes {
-                        let (hi, lo) = (format!("{dst}_hi"), format!("{dst}_lo"));
-                        for n in [&hi, &lo] {
-                            match params.iter().find(|p| p.name == n.as_str()) {
-                                Some(p) if p.role == Role::Activation && p.access == Access::Write && p.ty == Scalar::Bf16 => {}
-                                _ => return Err(format!("group_map plane store to {dst:?} needs written bf16 params {hi:?} and {lo:?}")),
-                            }
-                        }
-                        out.push_str(&format!("{loop_head} {{\n        unsigned hi, lo;\n        split_hi_lo({text}, hi, lo);\n        {hi}[{at}] = (bf16_t)hi;\n        {lo}[{at}] = (bf16_t)lo;\n    }}\n"));
-                    } else {
-                        match params.iter().find(|p| p.name == dst) {
-                            Some(p) if p.role == Role::Activation && p.access == Access::Write => {}
-                            _ => return Err(format!("group_map store to {dst:?}, which is not a written activation param")),
-                        }
-                        out.push_str(&format!("{loop_head} {dst}[{at}] = {text};\n"));
-                    }
+                    out.push_str(&format!("{loop_head} {{\n        unsigned hi, lo;\n        split_hi_lo({text}, hi, lo);\n        out_hi[{at}] = (bf16_t)hi;\n        out_lo[{at}] = (bf16_t)lo;\n    }}\n"));
                 }
             }
         }

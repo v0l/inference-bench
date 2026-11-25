@@ -87,17 +87,17 @@ fn up_impl(name: &str, dot: &str, table: bool) -> String {
             name,
             &format!("{UP_ARGS}, const float* xn, const int* idx, float* act{extra}"),
             &by_id(format!(
-                r##"    __shared__ __align__(16) float xs[HIDDEN];
+                r##"    __shared__ __align__(16) float xs[MOE_WIDTH];
     int pair = blockIdx.x;
     int t = MOE_INPUT_SCALED ? pair : pair / MOE_PAIRS;
     int expert = idx[pair];
     if (expert < 0) return;
-{}    for (int i = threadIdx.x; i < HIDDEN; i += 256) xs[i] = xn[(size_t)t * HIDDEN + i];
+{}    for (int i = threadIdx.x; i < MOE_WIDTH; i += 256) xs[i] = xn[(size_t)t * MOE_WIDTH + i];
     __syncthreads();
 {}    int row = blockIdx.y * MOE_WARPS + warp;
     if (row >= MOE_INTER) return;
-    float g = MOE_MAPPED ? 0.0f : {dot}<Q, HIDDEN, MOE_INTER>(gw, gs, gg, expert, row, xs, lane);
-    float u = {dot}<Q, HIDDEN, MOE_INTER>(uw, us, ug, expert, row, xs, lane);
+    float g = MOE_MAPPED ? 0.0f : {dot}<Q, MOE_WIDTH, MOE_INTER>(gw, gs, gg, expert, row, xs, lane);
+    float u = {dot}<Q, MOE_WIDTH, MOE_INTER>(uw, us, ug, expert, row, xs, lane);
     if (MOE_EBIAS) {{
         g += eb[(size_t)expert * 2 * MOE_INTER + row];
         u += eb[((size_t)expert * 2 + 1) * MOE_INTER + row];
@@ -129,10 +129,10 @@ fn down_impl(name: &str, dot: &str, table: bool) -> String {
 {}    for (int i = threadIdx.x; i < MOE_INTER; i += 256) xs[i] = act[(size_t)pair * MOE_INTER + i];
     __syncthreads();
 {}    int row = blockIdx.y * MOE_WARPS + warp;
-    if (row >= HIDDEN) return;
-    float v = {dot}<Q, MOE_INTER, HIDDEN>(w, s, g, expert, row, xs, lane);
-    if (MOE_EBIAS) v += db[(size_t)expert * HIDDEN + row];
-    if (lane == 0) out[(size_t)pair * HIDDEN + row] = v;
+    if (row >= MOE_WIDTH) return;
+    float v = {dot}<Q, MOE_INTER, MOE_WIDTH>(w, s, g, expert, row, xs, lane);
+    if (MOE_EBIAS) v += db[(size_t)expert * MOE_WIDTH + row];
+    if (lane == 0) out[(size_t)pair * MOE_WIDTH + row] = v;
 "##,
                 resolve,
                 prim::warp_ids()
@@ -149,7 +149,7 @@ fn group_up_impl(name: &str, dot2: &str) -> String {
             name,
             &format!("{UP_ARGS}, const float* xn, const int* offsets, const int* sorted, float* act"),
             &format!(
-                r##"    __shared__ __align__(16) float xs[MOE_TJ * HIDDEN];
+                r##"    __shared__ __align__(16) float xs[MOE_TJ * MOE_WIDTH];
     int expert = blockIdx.x;
     int begin = offsets[expert];
     int end = offsets[expert + 1];
@@ -159,13 +159,13 @@ fn group_up_impl(name: &str, dot2: &str) -> String {
         __syncthreads();
         for (int j = 0; j < live; j++) {{
             int t = MOE_INPUT_SCALED ? sorted[base + j] : sorted[base + j] / MOE_PAIRS;
-            for (int i = threadIdx.x; i < HIDDEN; i += 256) xs[j * HIDDEN + i] = xn[(size_t)t * HIDDEN + i];
+            for (int i = threadIdx.x; i < MOE_WIDTH; i += 256) xs[j * MOE_WIDTH + i] = xn[(size_t)t * MOE_WIDTH + i];
         }}
         __syncthreads();
         if (row < MOE_INTER) {{
             float gv[MOE_TJ], uv[MOE_TJ];
-            if (!MOE_MAPPED) {dot2}<Q, HIDDEN, MOE_INTER>(gw, gs, gg, expert, row, xs, lane, live, gv);
-            {dot2}<Q, HIDDEN, MOE_INTER>(uw, us, ug, expert, row, xs, lane, live, uv);
+            if (!MOE_MAPPED) {dot2}<Q, MOE_WIDTH, MOE_INTER>(gw, gs, gg, expert, row, xs, lane, live, gv);
+            {dot2}<Q, MOE_WIDTH, MOE_INTER>(uw, us, ug, expert, row, xs, lane, live, uv);
             if (MOE_EBIAS) {{
                 for (int j = 0; j < live; j++) {{
                     gv[j] += eb[(size_t)expert * 2 * MOE_INTER + row];
@@ -205,14 +205,14 @@ fn group_down_impl(name: &str, dot2: &str) -> String {
             for (int i = threadIdx.x; i < MOE_INTER; i += 256) xs[j * MOE_INTER + i] = act[p * MOE_INTER + i];
         }}
         __syncthreads();
-        if (row < HIDDEN) {{
+        if (row < MOE_WIDTH) {{
             float v[MOE_TJ];
-            {dot2}<Q, MOE_INTER, HIDDEN>(w, s, g, expert, row, xs, lane, live, v);
+            {dot2}<Q, MOE_INTER, MOE_WIDTH>(w, s, g, expert, row, xs, lane, live, v);
             if (MOE_EBIAS) {{
-                for (int j = 0; j < live; j++) v[j] += db[(size_t)expert * HIDDEN + row];
+                for (int j = 0; j < live; j++) v[j] += db[(size_t)expert * MOE_WIDTH + row];
             }}
             if (lane == 0) {{
-                for (int j = 0; j < live; j++) out[(size_t)sorted[base + j] * HIDDEN + row] = v[j];
+                for (int j = 0; j < live; j++) out[(size_t)sorted[base + j] * MOE_WIDTH + row] = v[j];
             }}
         }}
     }}

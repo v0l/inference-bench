@@ -43,6 +43,20 @@ pub(super) struct Run<'a> {
     pub mtp: Option<super::mtp::MtpArgs<'a>>,
 }
 
+pub(super) struct PreludeGeom<'a> {
+    pub seqs: usize,
+    pub rows_per_seq: usize,
+    pub slot_base: i32,
+    pub slot_step: i32,
+    pub slots: cudarc::driver::CudaView<'a, i32>,
+}
+
+pub(super) struct PreludeBufs<'a> {
+    pub tokens: cudarc::driver::CudaView<'a, i32>,
+    pub scratch: &'a std::collections::BTreeMap<String, CudaSlice<f32>>,
+    pub ints: &'a std::collections::BTreeMap<String, CudaSlice<i32>>,
+}
+
 impl PlanBackend<Run<'_>> for Runtime {
     fn layers(&self) -> usize {
         self.layers.len()
@@ -117,6 +131,7 @@ impl Runtime {
             Op::Kernel { node } => self.kernel_op(node, self.attn_of(layer), run),
             Op::MixKernel { node } => self.mix_kernel_op(node, layer.expect("mixer ops run inside a layer"), run),
             Op::Gated { node, site } => self.gated_op(node, site, layer, run),
+            Op::Prelude { node } => self.prelude_op(node, layer, run),
             Op::Swiglu => self.swiglu_legacy(n),
             Op::GdnPrefill => self.gdn_prefill_rows(self.gdn_of(layer), n, 0),
             Op::GdnDecode => self.gdn_decode_rows(self.gdn_of(layer), &run.bb.expect("decode runs carry batch buffers").slots, n),
@@ -131,6 +146,9 @@ impl Runtime {
             Op::Gemv { .. } | Op::GemvStore { .. } | Op::StepAttention | Op::GdnStep => unreachable!("{} runs on the single row plan", op.label()),
             Op::HyperExpand | Op::HyperPre { .. } | Op::HyperPost | Op::HyperMean => self.hyper_op(op, layer, n),
             Op::PerLayer { node, stage } => self.per_layer_op(node, stage, layer, run),
+            Op::Dit(_) => anyhow::bail!("{} runs in the denoiser, not the token runtime", op.label()),
+            Op::BlockRes { stage } => self.block_res_op(stage, layer, run),
+            Op::LatentNorm => self.latent_norm_op(layer, run),
         }
     }
 
@@ -527,6 +545,7 @@ impl Runtime {
         let launch = &hb.launch[node as usize];
         let spec_node = &h.node[node as usize];
         let weights = match layer {
+            _ if site == crate::plan::GATED_DRAFT => self.mtp_mixer(),
             Some(l) if site != crate::plan::GATED_MODULE => &l.gated[site as usize],
             _ => &hb.head,
         };
@@ -561,6 +580,81 @@ impl Runtime {
         let dim = |symbol: &String| -> Result<u32> {
             Ok(match symbol.as_str() {
                 "rows" => run.n as u32,
+                other => crate::state::dim(&self.spec, other)? as u32,
+            })
+        };
+        let dims = spec_node.grid.iter().map(dim).collect::<Result<Vec<_>>>()?;
+        let config = LaunchConfig { grid_dim: (dims[0], dims.get(1).copied().unwrap_or(1), dims.get(2).copied().unwrap_or(1)), block_dim: (launch.threads, 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    fn prelude_op(&self, node: u8, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
+        if layer.and_then(|l| l.prelude.as_ref()).is_none() {
+            return Ok(());
+        }
+        let pb = self.prelude.as_ref().expect("a prelude has buffers");
+        let verify_slots = if run.qlen > 1 && run.mtp.is_none() { self.mtp_seq_slots() } else { None };
+        let geom = match run.bb {
+            Some(_) if run.n > 0 && verify_slots.is_some() => PreludeGeom { seqs: run.n / run.qlen, rows_per_seq: run.qlen, slot_base: 0, slot_step: 1, slots: verify_slots.expect("checked") },
+            Some(bb) if run.n > 0 => PreludeGeom { seqs: run.n / run.qlen.max(1), rows_per_seq: run.qlen.max(1), slot_base: 0, slot_step: 1, slots: bb.slots.as_view() },
+            _ => PreludeGeom { seqs: 1, rows_per_seq: run.n, slot_base: self.seq, slot_step: 0, slots: self.buf.zero_slots.as_view() },
+        };
+        let buffers = PreludeBufs { tokens: run.tokens.as_view(), scratch: &pb.scratch, ints: &pb.int_scratch };
+        self.prelude_launch(node, layer.expect("a prelude layer"), &geom, &buffers)
+    }
+
+    pub(super) fn prelude_launch(&self, node: u8, layer: &DeviceLayer, geom: &PreludeGeom, buffers: &PreludeBufs) -> Result<()> {
+        let (slot, weights) = layer.prelude.as_ref().map(|(s, w)| (*s, w)).context("a prelude layer")?;
+        let layer = Some(layer);
+        let pb = self.prelude.as_ref().expect("a prelude has buffers");
+        let p = self.spec.prelude.as_ref().expect("a prelude");
+        let launch = &pb.launch[node as usize];
+        let spec_node = &p.node[node as usize];
+        let mut b = self.launcher(self.kernel(launch.name));
+        let mut values: Vec<(i32, f32)> = Vec::with_capacity(launch.params.len());
+        for q in &launch.params {
+            let v = match q.name {
+                "layer" => f64::from(slot),
+                "slot_base" => f64::from(geom.slot_base),
+                "slot_step" => f64::from(geom.slot_step),
+                "rows_per_seq" => geom.rows_per_seq as f64,
+                name => match spec_node.bind.get(name) {
+                    Some(Bind::Number(v)) => *v,
+                    Some(Bind::Name(n)) => *p.params.get(n).with_context(|| format!("{n:?} is not a [prelude.params] entry"))?,
+                    _ => 0.0,
+                },
+            };
+            values.push((v as i32, v as f32));
+        }
+        for (q, (int, float)) in launch.params.iter().zip(&values) {
+            match (q.role, spec_node.bind.get(q.name)) {
+                (kir::Role::Value, _) => match q.ty {
+                    kir::Scalar::F32 => b.arg(float),
+                    _ => b.arg(int),
+                },
+                (_, Some(Bind::Weight { weight, .. })) => match layer.and_then(|l| l.prelude_stored.get(weight)) {
+                    Some(stored) => b.arg(stored),
+                    None => b.arg(weights.get(weight).with_context(|| format!("layer has no prelude weight {weight}"))?),
+                },
+                (_, Some(Bind::Buffer { buffer })) => match buffer.as_str() {
+                    "x" => b.arg(&self.pre.x),
+                    "streams" => b.arg(&self.gated.as_ref().context("[prelude] streams needs a [gated_residual]")?.streams),
+                    "tokens" => b.arg(&buffers.tokens),
+                    other => match buffers.ints.get(other) {
+                        Some(ints) => b.arg(ints),
+                        None => b.arg(buffers.scratch.get(other).with_context(|| format!("no prelude scratch {other:?}"))?),
+                    },
+                },
+                (_, Some(Bind::State { state })) => b.arg(&pb.states.iter().find(|s| s.name == *state).with_context(|| format!("no prelude state {state:?}"))?.slice),
+                (_, None) if q.name == "slots" => b.arg(&geom.slots),
+                _ => bail!("param {:?} of {} is not bound to a buffer, state or weight", q.name, launch.name),
+            };
+        }
+        let dim = |symbol: &String| -> Result<u32> {
+            Ok(match symbol.as_str() {
+                "rows" => (geom.seqs * geom.rows_per_seq) as u32,
+                "seqs" => geom.seqs as u32,
                 other => crate::state::dim(&self.spec, other)? as u32,
             })
         };
@@ -617,6 +711,8 @@ impl Runtime {
             Buf::GdnPlanes => &self.gdn.as_ref().expect("linear layers have gdn buffers").planes,
             Buf::MixPlanes => &self.mixer.as_ref().expect("a described mixer has buffers").planes,
             Buf::FcPlanes => self.mtp_fc_planes(),
+            Buf::LatentPlanes => &self.residual_of().latent_planes,
+            Buf::DraftPlanes => self.mtp_draft_planes(),
             other => unreachable!("{} is not a plane pair", other.label()),
         }
     }
@@ -638,6 +734,11 @@ impl Runtime {
             Buf::Logits => run.logits,
             Buf::MtpLogits => self.mtp_logits(),
             Buf::Partial => &self.partial,
+            Buf::Latent => &self.residual_of().latent,
+            Buf::Streams => match &self.gated {
+                Some(hb) => &hb.streams,
+                None => &self.pre.streams,
+            },
             other => unreachable!("{} is not an f32 buffer", other.label()),
         }
     }
@@ -661,8 +762,75 @@ impl Runtime {
             Weight::MtpO => (&attn().o, None),
             Weight::MtpGateUp => (&layer_of().gate_up, None),
             Weight::MtpDown => (&layer_of().down, None),
-            Weight::MtpFc | Weight::MtpHead => (self.mtp_weight(weight), None),
+            Weight::MtpFc | Weight::MtpFcHidden | Weight::MtpHead => (self.mtp_weight(weight), None),
+            Weight::LatentDown => (&self.latent_of(layer).down, None),
+            Weight::LatentUp => (&self.latent_of(layer).up, None),
+            Weight::SharedGateUp => (&self.latent_of(layer).shared_gate_up, None),
+            Weight::SharedDown => (&self.latent_of(layer).shared_down, None),
         }
+    }
+
+    fn residual_of(&self) -> &super::ResidualBuffers {
+        self.residual.as_ref().expect("block residual ops need [block_residual] buffers")
+    }
+
+    fn latent_of<'a>(&self, layer: Option<&'a DeviceLayer>) -> &'a super::DeviceLatent {
+        layer.and_then(|l| l.latent.as_ref()).expect("latent expert ops run on a latent moe layer")
+    }
+
+    fn block_res_op(&self, stage: crate::plan::ResStage, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
+        use crate::plan::ResStage;
+        let rb = self.residual_of();
+        let r = self.spec.block_residual.as_ref().expect("a block residual spec");
+        let config = LaunchConfig { grid_dim: (1, run.n as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let copy = |name: &str| -> Result<()> {
+            let mut b = self.launcher(self.kernel(name));
+            b.arg(&self.pre.x).arg(&rb.prefix);
+            unsafe { b.launch(config) }?;
+            Ok(())
+        };
+        let mix = |w: &CudaSlice<f32>, count: i32| -> Result<()> {
+            let mut b = self.launcher(self.kernel("block_res_mix"));
+            b.arg(&rb.stack).arg(&rb.prefix).arg(w).arg(&self.pre.x).arg(&count);
+            unsafe { b.launch(config) }?;
+            Ok(())
+        };
+        let global = layer.map(|l| l.global);
+        match stage {
+            ResStage::Enter => {
+                let i = global.context("block residual enter runs inside a layer")?;
+                let l = layer.context("block residual enter runs inside a layer")?;
+                let done = (i.div_ceil(r.size)) as i32;
+                if i == 0 {
+                    copy("block_res_set")?;
+                } else {
+                    mix(&l.residual[0], done)?;
+                }
+                if r.opens(i) {
+                    let mut b = self.launcher(self.kernel("block_res_push"));
+                    let slot = (i / r.size) as i32;
+                    b.arg(&rb.stack).arg(&rb.prefix).arg(&slot);
+                    unsafe { b.launch(config) }?;
+                }
+                Ok(())
+            }
+            ResStage::Mixed => {
+                let i = global.context("block residual mixed runs inside a layer")?;
+                let l = layer.context("block residual mixed runs inside a layer")?;
+                copy(if r.opens(i) { "block_res_set" } else { "block_res_add" })?;
+                mix(&l.residual[1], (i / r.size + 1) as i32)
+            }
+            ResStage::Done => copy("block_res_out"),
+            ResStage::Tail => mix(&rb.head, r.blocks(self.spec.layers.count) as i32),
+        }
+    }
+
+    fn latent_norm_op(&self, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
+        let rb = self.residual_of();
+        let mut b = self.launcher(self.kernel("latent_norm"));
+        b.arg(&rb.latent).arg(&rb.latent).arg(&self.latent_of(layer).norm).arg(&rb.latent_planes.hi).arg(&rb.latent_planes.lo);
+        unsafe { b.launch(LaunchConfig { grid_dim: (1, run.n as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
+        Ok(())
     }
 
     fn linear_op(&self, weight: Weight, input: Buf, output: Buf, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
@@ -673,7 +841,7 @@ impl Runtime {
         let rows = weight.rows(&self.spec);
         let hidden = self.spec.dims.hidden;
         let head = weight == Weight::LmHead;
-        let tokens = if head { run.rows.len() } else { run.n };
+        let tokens = if head { run.rows.len() } else if weight == Weight::MtpFcHidden { run.n * self.spec.draft_width() / hidden } else { run.n };
         if input.is_planes() {
             let planes = self.planes(input);
             let x = if head { planes.rows(0, tokens, hidden) } else { planes.all() };

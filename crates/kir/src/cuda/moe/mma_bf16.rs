@@ -182,9 +182,9 @@ pub fn grouped() -> String {
     out.push_str(&mma::tiles("moe_tiles_b16"));
     out.push_str(&prim::swizzle("mmb_chunk", "MMB_ROW"));
     out.push_str(&gemm());
-    out.push_str(&variant("moe_mma_up_b16", "MOE_INTER, HIDDEN, MOE_UP_WEIGHTS, 64, 64, 2, 2, 3, false"));
-    out.push_str(&variant("moe_mma_up_b16_s", "MOE_INTER, HIDDEN, MOE_UP_WEIGHTS, 16, 64, 1, 4, 3, false"));
-    out.push_str(&variant("moe_mma_down_b16", "HIDDEN, MOE_INTER, 1, 64, 64, 2, 2, 3, true"));
-    out.push_str(&variant("moe_mma_down_b16_s", "HIDDEN, MOE_INTER, 1, 16, 64, 1, 4, 3, true"));
+    out.push_str(&variant("moe_mma_up_b16", "MOE_INTER, MOE_WIDTH, MOE_UP_WEIGHTS, 64, 64, 2, 2, 3, false"));
+    out.push_str(&variant("moe_mma_up_b16_s", "MOE_INTER, MOE_WIDTH, MOE_UP_WEIGHTS, 16, 64, 1, 4, 3, false"));
+    out.push_str(&variant("moe_mma_down_b16", "MOE_WIDTH, MOE_INTER, 1, 64, 64, 2, 2, 3, true"));
+    out.push_str(&variant("moe_mma_down_b16_s", "MOE_WIDTH, MOE_INTER, 1, 16, 64, 1, 4, 3, true"));
     out
 }

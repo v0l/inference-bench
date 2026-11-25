@@ -310,6 +310,13 @@ fn run_planes(tokens: usize, expected_bm: usize, mx: bool, hidden: usize, inter:
 
 #[test]
 #[ignore = "needs an sm_120 GPU"]
+fn grouped_mma_matches_cpu_at_an_expert_width_of_640() {
+    run_with(48, MOE_MMA_BM, false, 512, 640);
+    run_with(8, MOE_MMA_BM_SMALL, false, 512, 640);
+}
+
+#[test]
+#[ignore = "needs an sm_120 GPU"]
 fn grouped_mma_matches_cpu_with_big_tiles() {
     run(48, MOE_MMA_BM);
 }

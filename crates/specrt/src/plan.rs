@@ -6,6 +6,100 @@ pub enum Phase {
     Prefill,
     Decode,
     Verify,
+    Forward,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Stream {
+    Image,
+    Text,
+    Joint,
+    Seqs,
+    Latent,
+}
+
+impl Stream {
+    pub fn label(self) -> &'static str {
+        match self {
+            Stream::Image => "image",
+            Stream::Text => "text",
+            Stream::Joint => "joint",
+            Stream::Seqs => "seqs",
+            Stream::Latent => "latent",
+        }
+    }
+}
+
+fn short(weight: &str) -> String {
+    weight.split('+').map(|w| w.rsplit_once("{i}.").map_or(w, |(_, t)| t)).collect::<Vec<_>>().join("+")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DitOp {
+    Patchify { from: &'static str, into: &'static str },
+    Unpatchify { from: &'static str, into: &'static str },
+    Split { from: &'static str, into: &'static str, rows: Stream, act: bool },
+    Copy { from: &'static str, into: &'static str, rows: Stream },
+    TimestepEmbed { from: &'static str, into: &'static str },
+    Linear { weight: &'static str, input: &'static str, output: &'static str, rows: Stream, add: bool },
+    Modulate { from: &'static str, into: &'static str, rows: Stream, set: &'static str, shift: u8, scale: u8 },
+    GatedAdd { from: &'static str, into: &'static str, rows: Stream, set: &'static str, gate: u8 },
+    Glu { from: &'static str, into: &'static str, rows: Stream, offset: &'static str },
+    AxisRope { from: &'static str, text: &'static str, image: &'static str },
+    JointAttention { into: &'static str },
+    Step { from: &'static str, into: &'static str, rule: &'static str, guided: bool },
+}
+
+impl DitOp {
+    pub fn label(&self) -> String {
+        match self {
+            DitOp::Patchify { .. } => "patchify".into(),
+            DitOp::Unpatchify { .. } => "unpatchify".into(),
+            DitOp::Split { act: true, from, .. } => format!("silu {from}"),
+            DitOp::Split { from, .. } => format!("split {from}"),
+            DitOp::Copy { from, .. } => format!("copy {from}"),
+            DitOp::TimestepEmbed { .. } => "timestep embed".into(),
+            DitOp::Linear { weight, rows, .. } => format!("{} ({})", short(weight), rows.label()),
+            DitOp::Modulate { rows, set, shift, scale, .. } => format!("{} modulate {set}[{shift},{scale}]", rows.label()),
+            DitOp::GatedAdd { rows, from, set, gate, .. } => format!("{} gated add {from} {set}[{gate}]", rows.label()),
+            DitOp::Glu { from, rows, .. } => format!("{} swiglu {from}", rows.label()),
+            DitOp::AxisRope { .. } => "qk norm and axis rope".into(),
+            DitOp::JointAttention { .. } => "joint attention".into(),
+            DitOp::Step { guided: true, .. } => "guided scheduler step".into(),
+            DitOp::Step { .. } => "scheduler step".into(),
+        }
+    }
+
+    pub fn flow(&self) -> String {
+        match self {
+            DitOp::Patchify { from, into } | DitOp::Unpatchify { from, into } | DitOp::TimestepEmbed { from, into } => format!("{from} to {into}"),
+            DitOp::Glu { from, into, rows, .. } => format!("{from} to {into} ({})", rows.label()),
+            DitOp::Split { from, into, rows, .. } | DitOp::Copy { from, into, rows } | DitOp::Modulate { from, into, rows, .. } => format!("{from} to {into} ({})", rows.label()),
+            DitOp::Linear { input, output, rows, add, .. } => format!("{input} to {output} ({}{})", rows.label(), if *add { ", added" } else { "" }),
+            DitOp::GatedAdd { from, into, rows, .. } => format!("{from} gated into {into} ({})", rows.label()),
+            DitOp::AxisRope { from, .. } => format!("{from} to attention planes"),
+            DitOp::JointAttention { into } => format!("attention planes to {into}"),
+            DitOp::Step { from, into, .. } => format!("{into} and {from} to {into}"),
+        }
+    }
+
+    pub fn kernel(&self) -> &'static str {
+        match self {
+            DitOp::Patchify { .. } => "dit_patchify",
+            DitOp::Unpatchify { .. } => "dit_unpatchify",
+            DitOp::Split { act: true, .. } => "dit_silu_split",
+            DitOp::Split { .. } => "dit_split",
+            DitOp::Copy { .. } => "dit_copy",
+            DitOp::TimestepEmbed { .. } => "dit_timestep",
+            DitOp::Linear { .. } => "vis_mma",
+            DitOp::Modulate { .. } => "dit_modulate",
+            DitOp::GatedAdd { .. } => "dit_gated_add",
+            DitOp::Glu { .. } => "dit_glu",
+            DitOp::AxisRope { .. } => "vis_axis_rope",
+            DitOp::JointAttention { .. } => "vis_flash",
+            DitOp::Step { .. } => "dit_step",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -27,11 +121,14 @@ pub enum Buf {
     Branch,
     Logits,
     FcPlanes,
+    DraftPlanes,
     MtpLogits,
     Partial,
     Gdn,
     Streams,
     Merged,
+    Latent,
+    LatentPlanes,
 }
 
 impl Buf {
@@ -54,16 +151,19 @@ impl Buf {
             Buf::Branch => "branch",
             Buf::Logits => "logits",
             Buf::FcPlanes => "fc planes",
+            Buf::DraftPlanes => "draft stream planes",
             Buf::MtpLogits => "draft logits",
             Buf::Partial => "rank partial",
             Buf::Gdn => "gdn",
             Buf::Streams => "streams",
             Buf::Merged => "merged",
+            Buf::Latent => "latent",
+            Buf::LatentPlanes => "latent planes",
         }
     }
 
     pub fn is_planes(self) -> bool {
-        matches!(self, Buf::XnPlanes | Buf::AttnPlanes | Buf::ActPlanes | Buf::GdnPlanes | Buf::MixPlanes | Buf::FcPlanes)
+        matches!(self, Buf::XnPlanes | Buf::AttnPlanes | Buf::ActPlanes | Buf::GdnPlanes | Buf::MixPlanes | Buf::FcPlanes | Buf::LatentPlanes | Buf::DraftPlanes)
     }
 
     pub fn holds_activation(self) -> bool {
@@ -86,11 +186,16 @@ pub enum Weight {
     MixOut,
     LmHead,
     MtpFc,
+    MtpFcHidden,
     MtpQkv,
     MtpO,
     MtpGateUp,
     MtpDown,
     MtpHead,
+    LatentDown,
+    LatentUp,
+    SharedGateUp,
+    SharedDown,
 }
 
 impl Weight {
@@ -109,11 +214,16 @@ impl Weight {
             Weight::MixOut => "mix_out",
             Weight::LmHead => "lm_head",
             Weight::MtpFc => "mtp_fc",
+            Weight::MtpFcHidden => "mtp_fc_hidden",
             Weight::MtpQkv => "mtp_qkv",
             Weight::MtpO => "mtp_o",
             Weight::MtpGateUp => "mtp_gate_up",
             Weight::MtpDown => "mtp_down",
             Weight::MtpHead => "mtp_head",
+            Weight::LatentDown => "latent_down",
+            Weight::LatentUp => "latent_up",
+            Weight::SharedGateUp => "shared_gate_up",
+            Weight::SharedDown => "shared_down",
         }
     }
 
@@ -124,12 +234,15 @@ impl Weight {
             Weight::GateUp => spec.gate_up_rows(),
             Weight::GateUpWide => spec.gate_up_rows_wide(),
             Weight::MtpGateUp => 2 * spec.dims.intermediate,
-            Weight::O | Weight::Down | Weight::DownWide | Weight::LinOut | Weight::MtpFc | Weight::MtpO | Weight::MtpDown => spec.dims.hidden,
+            Weight::O | Weight::Down | Weight::DownWide | Weight::LinOut | Weight::MtpFc | Weight::MtpFcHidden | Weight::MtpO | Weight::MtpDown => spec.dims.hidden,
             Weight::LinIn => la.map_or(0, |l| l.in_proj_rows()),
             Weight::LinBa => la.map_or(0, |l| l.ba_rows()),
             Weight::MixIn => spec.mix_in_rows(),
             Weight::MixOut => spec.dims.hidden,
             Weight::LmHead | Weight::MtpHead => spec.head_rows().len(),
+            Weight::LatentDown => spec.expert_width(),
+            Weight::LatentUp | Weight::SharedDown => spec.dims.hidden,
+            Weight::SharedGateUp => 2 * spec.shared_expert_rows(),
         }
     }
 
@@ -166,7 +279,11 @@ impl Weight {
             Weight::MixOut => spec.mixer.iter().map(|m| format!("{}.{}.weight", m.module, m.out_tensor)).collect(),
             Weight::LmHead if spec.dims.tie_embeddings => vec![w("embed_tokens")],
             Weight::LmHead => vec![w("lm_head")],
-            Weight::MtpFc | Weight::MtpQkv | Weight::MtpO | Weight::MtpGateUp | Weight::MtpDown | Weight::MtpHead => Vec::new(),
+            Weight::MtpFc | Weight::MtpFcHidden | Weight::MtpQkv | Weight::MtpO | Weight::MtpGateUp | Weight::MtpDown | Weight::MtpHead => Vec::new(),
+            Weight::LatentDown => spec.latent_tensors(false),
+            Weight::LatentUp => spec.latent_tensors(true),
+            Weight::SharedGateUp => spec.shared_tensors(false),
+            Weight::SharedDown => spec.shared_tensors(true),
         }
     }
 }
@@ -248,6 +365,7 @@ pub enum Op {
     Kernel { node: u8 },
     MixKernel { node: u8 },
     Gated { node: u8, site: u8 },
+    Prelude { node: u8 },
     Swiglu,
     GdnPrefill,
     GdnDecode,
@@ -271,12 +389,35 @@ pub enum Op {
     HyperPost,
     HyperMean,
     PerLayer { node: u8, stage: u8 },
+    Dit(DitOp),
+    BlockRes { stage: ResStage },
+    LatentNorm,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResStage {
+    Enter,
+    Mixed,
+    Done,
+    Tail,
+}
+
+impl ResStage {
+    pub fn name(self) -> &'static str {
+        match self {
+            ResStage::Enter => "enter",
+            ResStage::Mixed => "mixed",
+            ResStage::Done => "done",
+            ResStage::Tail => "tail",
+        }
+    }
 }
 
 pub const PLE_HEAD: u8 = 0;
 pub const PLE_LAYER: u8 = 1;
 
 pub const GATED_MODULE: u8 = u8::MAX;
+pub const GATED_DRAFT: u8 = u8::MAX - 1;
 
 pub fn weight_kind(q: Quant) -> WeightKind {
     match q {
@@ -316,7 +457,9 @@ impl Op {
             Op::Kernel { .. } => "described kernel".into(),
             Op::MixKernel { .. } => "described mixer kernel".into(),
             Op::Gated { site: GATED_MODULE, .. } => "gated residual mixer".into(),
+            Op::Gated { site: GATED_DRAFT, .. } => "gated residual draft mixer".into(),
             Op::Gated { site, .. } => format!("gated residual site {site}"),
+            Op::Prelude { .. } => "described prelude kernel".into(),
             Op::Swiglu => "swiglu".into(),
             Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => "delta rule".into(),
             Op::MtpIn => "draft input".into(),
@@ -340,6 +483,9 @@ impl Op {
             Op::HyperMean => "hyper mean".into(),
             Op::PerLayer { stage: PLE_HEAD, .. } => "per layer inputs".into(),
             Op::PerLayer { .. } => "per layer residual".into(),
+            Op::Dit(d) => d.label(),
+            Op::BlockRes { stage } => format!("block residual {}", stage.name()),
+            Op::LatentNorm => "latent expert norm".into(),
         }
     }
 
@@ -359,6 +505,7 @@ impl Op {
             Op::Flash | Op::FlashLegacy | Op::DecodeAttention | Op::Kernel { .. } => "qkv and kv cache to attn".into(),
             Op::MixKernel { .. } => "mix and sequence state to mix planes".into(),
             Op::Gated { .. } => "streams and x".into(),
+            Op::Prelude { .. } => "tokens, streams and sequence state to streams".into(),
             Op::Swiglu => "gate_up to act".into(),
             Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => "lin, ba and state to gdn".into(),
             Op::MtpIn => "tokens and hidden to fc planes".into(),
@@ -382,6 +529,10 @@ impl Op {
             Op::HyperMean => "streams to x".into(),
             Op::PerLayer { stage: PLE_HEAD, .. } => "tokens and hidden to per layer inputs".into(),
             Op::PerLayer { .. } => "x and per layer inputs into x".into(),
+            Op::Dit(d) => d.flow(),
+            Op::BlockRes { stage: ResStage::Done } => "prefix added to x".into(),
+            Op::BlockRes { .. } => "x, prefix and block stack to x".into(),
+            Op::LatentNorm => "latent to latent planes".into(),
         }
     }
 
@@ -430,6 +581,17 @@ impl Op {
                     })
                 })
                 .collect(),
+            Op::Prelude { node } => spec
+                .prelude
+                .iter()
+                .filter_map(|p| p.node.get(*node as usize).map(|n| (p, n)))
+                .flat_map(|(p, n)| {
+                    n.bind.values().filter_map(move |b| match b {
+                        crate::graph::Bind::Weight { weight, .. } => Some(format!("{}.{weight}", p.module)),
+                        _ => None,
+                    })
+                })
+                .collect(),
             Op::GdnPrefill | Op::GdnDecode | Op::GdnStep => ["conv1d.weight", "A_log", "dt_bias", "norm.weight"].iter().map(|t| format!("linear_attn.{t}")).collect(),
             Op::MoeRoute => vec!["mlp.gate.weight".into(), "mlp.shared_expert_gate.weight".into()],
             Op::MoeExperts => spec.expert_tensors(),
@@ -438,6 +600,10 @@ impl Op {
                 crate::graph::Bind::Weight { weight, .. } => Some(weight.clone()),
                 _ => None,
             }).collect(),
+            Op::BlockRes { stage: ResStage::Enter } => spec.block_residual.iter().flat_map(|r| ["norm", "proj"].map(|t| format!("{}_{t}.weight", r.sites[0]))).collect(),
+            Op::BlockRes { stage: ResStage::Mixed } => spec.block_residual.iter().flat_map(|r| ["norm", "proj"].map(|t| format!("{}_{t}.weight", r.sites[1]))).collect(),
+            Op::BlockRes { stage: ResStage::Tail } => spec.block_residual.iter().flat_map(|r| ["norm", "proj"].map(|t| format!("{}_{t}.weight", r.output))).collect(),
+            Op::LatentNorm => spec.latent_norm_tensors(),
             _ => Vec::new(),
         }
     }
@@ -505,6 +671,7 @@ impl Op {
             Op::Kernel { node } => spec.attention.node.get(*node as usize).and_then(|n| n.kernel.clone()).into_iter().collect(),
             Op::MixKernel { node } => spec.mixer.as_ref().and_then(|m| m.node.get(*node as usize)).and_then(|n| n.kernel.clone()).into_iter().collect(),
             Op::Gated { node, .. } => spec.gated_residual().and_then(|h| h.node.get(*node as usize)).and_then(|n| n.kernel.clone()).into_iter().collect(),
+            Op::Prelude { node } => spec.prelude.as_ref().and_then(|p| p.node.get(*node as usize)).and_then(|n| n.kernel.clone()).into_iter().collect(),
             Op::Swiglu => names(&["swiglu"]),
             Op::GdnPrefill => names(&[
                 "gdn_conv_prefill",
@@ -517,7 +684,9 @@ impl Op {
             ]),
             Op::GdnDecode => names(&["gdn_conv_step", "gdn_step", "split_rows"]),
             Op::GdnVerify => names(&["gdn_conv_verify", "gdn_verify", "split_rows"]),
+            Op::MtpIn if spec.streamed_mtp() => names(&["mtp_streams_in"]),
             Op::MtpIn => names(&["mtp_fc_in"]),
+            Op::MtpGather if spec.streamed_mtp() => names(&["mtp_copy_w", "mtp_copy_w"]),
             Op::MtpGather => names(&["mtp_copy"]),
             Op::MtpNorm => names(&["rms_split"]),
             Op::MtpDraft => names(&["mtp_draft"]),
@@ -541,6 +710,12 @@ impl Op {
             Op::HyperPost => names(&["hyper_post"]),
             Op::HyperMean => names(&["hyper_mean"]),
             Op::PerLayer { node, .. } => spec.per_layer.as_ref().and_then(|p| p.node.get(*node as usize)).and_then(|n| n.kernel.clone()).into_iter().collect(),
+            Op::Dit(d) => names(&[d.kernel()]),
+            Op::BlockRes { stage: ResStage::Enter } => names(&["block_res_set", "block_res_mix", "block_res_push"]),
+            Op::BlockRes { stage: ResStage::Mixed } => names(&["block_res_add", "block_res_mix"]),
+            Op::BlockRes { stage: ResStage::Done } => names(&["block_res_out"]),
+            Op::BlockRes { stage: ResStage::Tail } => names(&["block_res_mix"]),
+            Op::LatentNorm => names(&["latent_norm"]),
         }
     }
 }

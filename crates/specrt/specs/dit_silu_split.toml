@@ -1,0 +1,45 @@
+kind = "kir-kernel"
+family = "compose"
+name = "dit_silu_split"
+threads = 256
+
+[args]
+width = "split_width"
+
+[rows]
+iter = "grid"
+address = "advance"
+per_row = ["x", "out_hi", "out_lo"]
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "out_hi"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "out_lo"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[stage]]
+op = "tile_load"
+name = "v"
+src = "x"
+
+[[stage]]
+op = "epilogue"
+name = "y"
+expr = "silu(v)"
+
+[[stage]]
+op = "split_store"
+dst = "out_hi"
+lo = "out_lo"
+value = "y"

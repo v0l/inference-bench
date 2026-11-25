@@ -1,0 +1,32 @@
+kind = "kir-kernel"
+family = "compose"
+name = "dit_copy"
+threads = 256
+
+[args]
+width = "split_width"
+
+[rows]
+iter = "grid"
+address = "advance"
+per_row = ["x", "out"]
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "out"
+role = "activation"
+access = "write"
+
+[[stage]]
+op = "tile_load"
+name = "v"
+src = "x"
+
+[[stage]]
+op = "tile_store"
+dst = "out"
+value = "v"

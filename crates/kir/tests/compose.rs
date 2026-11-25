@@ -329,3 +329,39 @@ fn indexed_access_checks_the_index_buffer_and_has_no_wgsl_lowering() {
     let wgsl = Description::parse(GATHER).unwrap().build(&Target::wgpu_baseline(), &Shape::new());
     assert!(wgsl.is_err(), "{wgsl:?}");
 }
+
+const MODULATE: &str = include_str!("../../specrt/specs/dit_modulate.toml");
+
+#[test]
+fn two_block_sums_give_a_layernorm_in_three_passes() {
+    let k = Description::parse(MODULATE).unwrap().build(&Target::sm_120(), &Shape::new().num("hidden", 64.0).num("norm_eps", 1e-6)).unwrap();
+    let cuda = emit(&k);
+    assert_eq!(cuda.matches("kir_block_sum(ss, scratch)").count(), 2, "{cuda}");
+    assert!(cuda.contains("float total = kir_block_sum(ss, scratch);"), "{cuda}");
+    assert!(cuda.contains("float mean = total / WIDTH;"), "{cuda}");
+    assert!(cuda.contains("    ss = 0.0f;\n"), "{cuda}");
+    let mean_at = cuda.find("float mean").unwrap();
+    let second = cuda.find("ss += (x[i] - mean)").unwrap();
+    assert!(mean_at < second, "{cuda}");
+    assert!(cuda.contains("out_hi += (size_t)blockIdx.x * 64;"), "{cuda}");
+    assert!(cuda.contains("kir_split_bf16((x[i] - mean) * inv * (1.0f + scale[i]) + shift[i], out_hi[i], out_lo[i]);"), "{cuda}");
+    assert!(cuda.contains("void kir_split_bf16("), "{cuda}");
+    assert!(cuda.contains("unsigned short* out_hi"), "{cuda}");
+}
+
+#[test]
+fn several_block_sums_and_split_stores_have_no_wgsl_lowering() {
+    let e = Description::parse(MODULATE).unwrap().build(&Target::wgpu_baseline(), &Shape::new().num("hidden", 64.0).num("norm_eps", 1e-6)).unwrap_err();
+    assert!(e.contains("CUDA"), "{e}");
+}
+
+#[test]
+fn index_stages_name_the_column_and_the_row() {
+    let text = GATHER
+        .replace("op = \"gather\"\nname = \"row\"\nsrc = \"table\"\nindex = \"ids\"", "op = \"index\"\nname = \"col\"\n[[stage]]\nop = \"index\"\nname = \"row\"")
+        .replace("expr = \"row * 2.0\"", "expr = \"cos(row * col)\"");
+    let cuda = emit(&Description::parse(&text).unwrap().build(&Target::sm_120(), &Shape::new()).unwrap());
+    assert!(cuda.contains("out[i] = cosf((float)blockIdx.y * (float)i);"), "{cuda}");
+    let bad = text.replace("name = \"col\"", "name = \"lane_id\"");
+    assert!(Description::parse(&bad).unwrap().build(&Target::sm_120(), &Shape::new()).unwrap_err().contains("col or row"));
+}

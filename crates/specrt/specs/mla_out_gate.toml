@@ -1,0 +1,47 @@
+kind = "kir-kernel"
+family = "group_map"
+name = "mla_out_gate"
+threads = 128
+
+[args]
+width = "heads * v_head_dim"
+
+[[param]]
+name = "attn"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "gate"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "out_hi"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "out_lo"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[stage]]
+op = "load"
+name = "a"
+src = "attn"
+row = "heads * v_head_dim"
+
+[[stage]]
+op = "load"
+name = "g"
+src = "gate"
+row = "qkv_row"
+offset = "mla_gate_offset"
+
+[[stage]]
+op = "planes"
+value = "a * sigmoid(g)"
+row = "heads * v_head_dim"

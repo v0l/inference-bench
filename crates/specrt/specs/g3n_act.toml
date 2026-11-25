@@ -22,13 +22,13 @@ role = "value"
 access = "read"
 
 [[param]]
-name = "act_hi"
+name = "out_hi"
 type = "bf16"
 role = "activation"
 access = "write"
 
 [[param]]
-name = "act_lo"
+name = "out_lo"
 type = "bf16"
 role = "activation"
 access = "write"
@@ -74,8 +74,6 @@ name = "kept"
 expr = "select(on > 0.5, max(g - edge, 0.0), g)"
 
 [[stage]]
-op = "store"
-dst = "act"
+op = "planes"
 value = "gelu_tanh(kept) * u"
 row = "inter"
-planes = true

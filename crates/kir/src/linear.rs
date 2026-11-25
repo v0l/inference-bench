@@ -47,6 +47,7 @@ pub enum Family {
     Chunk,
     Verify,
     Draft,
+    DraftStreams,
 }
 
 impl Family {
@@ -59,6 +60,7 @@ impl Family {
             Family::Chunk => "GdnChunk",
             Family::Verify => "GdnVerify",
             Family::Draft => "MtpDraft",
+            Family::DraftStreams => "MtpDraftStreams",
         }
     }
 
@@ -78,6 +80,7 @@ impl Family {
                 "mtp_chain_rows",
                 "spec_accept",
             ],
+            Family::DraftStreams => &["mtp_streams_in", "mtp_copy_w", "mtp_state_save", "mtp_state_load", "mtp_replay_rows", "mtp_replay_seqs"],
         }
     }
 
@@ -89,7 +92,7 @@ impl Family {
     }
 
     pub fn uses_shape(self) -> bool {
-        self != Family::Draft
+        !matches!(self, Family::Draft | Family::DraftStreams)
     }
 }
 
@@ -123,7 +126,7 @@ impl LinearKernel {
                 let floats = tuning.chunk * (shape.head_dim + 1) + tuning.chunk * (tuning.chunk + 1) + 2 * tuning.chunk;
                 (256.max(tuning.chunk_threads()), (floats * 4) as u32)
             }
-            Family::Conv | Family::Draft => (256, 0),
+            Family::Conv | Family::Draft | Family::DraftStreams => (256, 0),
         };
         let k = LinearKernel { family, target: *t, shape, tuning, threads, smem_bytes };
         k.validate()?;

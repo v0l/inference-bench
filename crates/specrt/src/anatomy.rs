@@ -258,7 +258,8 @@ fn layer(spec: &Spec, index: usize) -> LayerInfo {
     let mlp = parts.total();
     let norm_params = if spec.layers.split { 1 } else { 2 } * spec.dims.hidden as u64;
     let mixer_params = mixer.quantised + mixer.plain;
-    let fixed = quant_bytes(mixer.quantised, mixer_quant) + 2 * mixer.plain + 2 * norm_params;
+    let (residual_params, residual_bytes) = residual_counts(spec, index);
+    let fixed = quant_bytes(mixer.quantised, mixer_quant) + 2 * mixer.plain + 2 * norm_params + residual_bytes;
     LayerInfo {
         index,
         kind,
@@ -270,12 +271,27 @@ fn layer(spec: &Spec, index: usize) -> LayerInfo {
         router_params: parts.router,
         routed_params: parts.routed,
         shared_params: parts.shared,
-        active_params: mixer_params + parts.active() + norm_params,
+        active_params: mixer_params + parts.active() + norm_params + residual_params,
         active_bytes: fixed + parts.active_bytes(mlp_quant, expert_quant(spec, mlp_quant)),
         norm_params,
-        params: mixer_params + mlp + norm_params,
+        params: mixer_params + mlp + norm_params + residual_params,
         bytes: fixed + parts.bytes(mlp_quant, expert_quant(spec, mlp_quant)),
     }
+}
+
+fn residual_counts(spec: &Spec, index: usize) -> (u64, u64) {
+    let len = |w: &str| spec.weight_len(w).unwrap_or(0) as u64;
+    let gated: u64 = spec.gated_residual().map_or(0, |h| h.weights(crate::spec::GatedStage::Pre).iter().map(|(_, l)| len(l)).sum::<u64>() * h.sites.len() as u64);
+    let Some(p) = spec.prelude.as_ref().filter(|p| p.slot(index).is_some()) else { return (gated, 2 * gated) };
+    let table_width = if spec.quant == Quant::Bf16 && spec.mlp.quant.is_none() { 2 } else { 1 };
+    let mut params = gated;
+    let mut bytes = 2 * gated;
+    for (_, l) in p.weights() {
+        let n = len(&l);
+        params += n;
+        bytes += n * if n > 1 << 24 { table_width } else { 2 };
+    }
+    (params, bytes)
 }
 
 fn mtp_counts(spec: &Spec, count: usize) -> (u64, u64) {
@@ -344,6 +360,10 @@ impl ModelAnatomy {
             components.push(Component { name: "router", params: router_total, bytes: router_bytes });
         }
         components.push(Component { name: "norms", params: norm_total, bytes: norm_bytes });
+        let residual: (u64, u64) = (0..spec.layers.count).map(|i| residual_counts(spec, i)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        if residual.0 > 0 {
+            components.push(Component { name: "residual streams and prelude", params: residual.0, bytes: residual.1 });
+        }
         components.push(Component { name: "lm_head", params: head_params, bytes: head_bytes });
         if mtp_params > 0 {
             components.push(Component { name: "mtp", params: mtp_params, bytes: mtp_bytes });

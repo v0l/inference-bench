@@ -187,7 +187,7 @@ fn the_26b_quantised_copies_are_held_back_only_by_their_quant_tile_sizes() {
     let fp8 = Spec::from_hf_config_serving(&popular("RedHatAI__gemma-4-26B-A4B-it-FP8-dynamic")).unwrap_err().to_string();
     assert!(fp8.contains("multiples of 128"), "{fp8}");
     let nvfp4 = Spec::from_hf_config_serving(&popular("nvidia__Gemma-4-26B-A4B-NVFP4")).unwrap_err().to_string();
-    assert!(nvfp4.contains("multiples of 256"), "{nvfp4}");
+    assert!(nvfp4.contains("hidden to be a multiple of 256"), "{nvfp4}");
 }
 
 #[test]

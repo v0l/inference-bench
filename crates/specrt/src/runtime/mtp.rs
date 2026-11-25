@@ -12,9 +12,11 @@ use std::sync::Arc;
 
 pub(super) struct DeviceMtp {
     fc: DeviceMatrix,
+    fc_hidden: Option<DeviceMatrix>,
     norm_embed: CudaSlice<f32>,
     norm_hidden: CudaSlice<f32>,
     norm: CudaSlice<f32>,
+    mixer: super::GatedWeights,
     layer: DeviceLayer,
     head: Option<DeviceMatrix>,
 }
@@ -41,9 +43,14 @@ impl DeviceMtp {
             ln2: stream.clone_htod(&w.layer.ln2)?,
             ln_pre_mlp: None,
             ln_post_mlp: None,
-            gated: Vec::new(),
+            gated: w.layer.gated.iter().map(|s| super::upload_gated(stream, s)).collect::<Result<_>>()?,
+            prelude: None,
+            prelude_stored: Default::default(),
             ple: crate::runtime::PleWeights::new(),
             ple_at: -1,
+            residual: Vec::new(),
+            latent: None,
+            global: spec.layers.count,
             mixer: DeviceMixer::Attention(DeviceAttn {
                 qkv: DeviceMatrix::upload(stream, &a.qkv)?,
                 qkv_bias: up(&a.qkv_bias)?,
@@ -64,9 +71,11 @@ impl DeviceMtp {
         };
         let m = DeviceMtp {
             fc: DeviceMatrix::upload(stream, &w.fc)?,
+            fc_hidden: w.fc_hidden.as_ref().map(|f| DeviceMatrix::upload(stream, f)).transpose()?,
             norm_embed: stream.clone_htod(&w.norm_embed)?,
             norm_hidden: stream.clone_htod(&w.norm_hidden)?,
             norm: stream.clone_htod(&w.norm)?,
+            mixer: super::upload_gated(stream, &w.mixer)?,
             layer,
             head: match spec.draft_head_quant().filter(|_| with_head) {
                 Some(q) => Some(DeviceMatrix::upload(stream, &checkpoint.draft_head(spec, q)?)?),
@@ -79,9 +88,34 @@ impl DeviceMtp {
 
     pub(super) fn bytes(&self) -> u64 {
         self.fc.bytes()
+            + self.fc_hidden.as_ref().map_or(0, DeviceMatrix::bytes)
             + self.head.as_ref().map_or(0, DeviceMatrix::bytes)
             + self.layer.bytes()
+            + self.mixer.values().map(|v| v.num_bytes() as u64).sum::<u64>()
             + (self.norm_embed.num_bytes() + self.norm_hidden.num_bytes() + self.norm.num_bytes()) as u64
+    }
+}
+
+struct Rollback {
+    saved: Vec<CudaSlice<f32>>,
+    scratch: std::collections::BTreeMap<String, CudaSlice<f32>>,
+    ints: std::collections::BTreeMap<String, CudaSlice<i32>>,
+    tokens: CudaSlice<i32>,
+    slots: CudaSlice<i32>,
+}
+
+impl Rollback {
+    fn new(rt: &Runtime, rows: usize) -> Result<Option<Rollback>> {
+        let (Some(pb), Some(p)) = (rt.prelude.as_ref(), rt.spec.prelude.as_ref()) else { return Ok(None) };
+        let stream = &rt.stream;
+        let dim = |w: &String| crate::state::dim(&rt.spec, w);
+        Ok(Some(Rollback {
+            saved: pb.states.iter().map(|s| Ok(stream.alloc_zeros::<f32>(rows * s.stride)?)).collect::<Result<_>>()?,
+            scratch: p.scratch.iter().map(|(n, w)| Ok((n.clone(), stream.alloc_zeros::<f32>(rows * dim(w)?)?))).collect::<Result<_>>()?,
+            ints: p.int_scratch.iter().map(|(n, w)| Ok((n.clone(), stream.alloc_zeros::<i32>(rows * dim(w)?)?))).collect::<Result<_>>()?,
+            tokens: stream.alloc_zeros(rows)?,
+            slots: stream.alloc_zeros(rows)?,
+        }))
     }
 }
 
@@ -93,6 +127,9 @@ pub(super) struct MtpState {
     rows: usize,
     vb: BatchBuffers,
     fc_planes: Planes,
+    draft_planes: Planes,
+    width: usize,
+    rollback: Option<Rollback>,
     vx: CudaSlice<f32>,
     pending: CudaSlice<f32>,
     cg: CudaSlice<f32>,
@@ -165,6 +202,7 @@ impl MtpState {
         ensure!(rows <= rt.chunk, "{rows} verify rows do not fit a step of {}", rt.chunk);
         let stream = &rt.stream;
         let h = s.dims.hidden;
+        let width = s.draft_width();
         let vb_rows = rows.max(rt.slots) + 1;
         let wide = rt.chunk.max(vb_rows);
         let parts = vb_rows * s.attention.heads * crate::codegen::decode_splits(rt.max_ctx);
@@ -188,9 +226,12 @@ impl MtpState {
                 slots: zi(vb_rows)?,
             },
             fc_planes: Planes::new(stream, wide * 2 * h)?,
-            vx: z(wide * h)?,
-            pending: z((rt.slots + 1) * h)?,
-            cg: z(acap * h)?,
+            draft_planes: Planes::new(stream, if s.streamed_mtp() { wide * width } else { 1 })?,
+            width,
+            rollback: Rollback::new(rt, acap)?,
+            vx: z(wide * width)?,
+            pending: z((rt.slots + 1) * width)?,
+            cg: z(acap * width)?,
             logits: z(acap * s.dims.vocab)?,
             drafts: zi((rt.slots + 1) * k)?,
             ctok: zi(acap)?,
@@ -275,19 +316,19 @@ impl Runtime {
     }
 
     pub(super) fn mtp_pending_host(&self, slot: usize) -> Result<Vec<f32>> {
-        let h = self.spec.dims.hidden;
+        let h = self.mtp().width;
         Ok(self.stream.clone_dtoh(&self.mtp().pending.slice(slot * h..(slot + 1) * h))?)
     }
 
     pub(super) fn mtp_pending_to(&self, slot: usize, dst: &mut cudarc::driver::CudaViewMut<f32>) -> Result<()> {
-        let h = self.spec.dims.hidden;
+        let h = self.mtp().width;
         self.stream.memcpy_dtod(&self.mtp().pending.slice(slot * h..(slot + 1) * h), dst)?;
         Ok(())
     }
 
     pub(super) fn mtp_pending_from(&mut self, slot: usize, host: &[f32]) -> Result<()> {
-        let h = self.spec.dims.hidden;
-        ensure!(host.len() == h, "pending hidden of {} values for a hidden size of {h}", host.len());
+        let h = self.mtp().width;
+        ensure!(host.len() == h, "pending hidden of {} values for a draft width of {h}", host.len());
         let stream = self.stream.clone();
         let m = self.mtp.as_mut().context("no MTP layer")?;
         stream.memcpy_htod(host, &mut m.pending.slice_mut(slot * h..(slot + 1) * h))?;
@@ -312,14 +353,99 @@ impl Runtime {
         let m = self.mtp();
         self.up_i32(sidx, &m.sidx)?;
         self.up_i32(didx, &m.didx)?;
-        let mut b = self.launcher(self.kernel("mtp_copy"));
-        b.arg(src).arg(&m.sidx).arg(dst).arg(&m.didx);
-        let config = LaunchConfig {
-            grid_dim: (grid(self.spec.dims.hidden, 256), sidx.len() as u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        self.copy_rows_by_index(src, &m.sidx.slice(..sidx.len()), dst, &m.didx.slice(..sidx.len()), sidx.len())
+    }
+
+    pub(super) fn mtp_width(&self) -> usize {
+        self.mtp.as_ref().map_or(self.spec.dims.hidden, |m| m.width)
+    }
+
+    fn hidden_source(&self) -> &CudaSlice<f32> {
+        match &self.gated {
+            Some(hb) if self.spec.streamed_mtp() => &hb.streams,
+            _ => &self.pre.x,
+        }
+    }
+
+    pub(super) fn mtp_draft_planes(&self) -> &Planes {
+        &self.mtp().draft_planes
+    }
+
+    pub(super) fn mtp_mixer(&self) -> &super::GatedWeights {
+        &self.mtp().w.mixer
+    }
+
+    fn launch_wide<'a>(&self, mut b: crate::launch::Launch<'a>, rows: usize, width: &'a i32) -> Result<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        b.arg(width);
+        let config = LaunchConfig { grid_dim: (grid(*width as usize, 256), rows as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
         unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    fn copy_wide(&self, src: &CudaSlice<f32>, sidx: &CudaView<i32>, dst: &CudaSlice<f32>, didx: &CudaView<i32>, n: usize) -> Result<()> {
+        let width = self.mtp().width as i32;
+        let mut b = self.launcher(self.kernel("mtp_copy_w"));
+        b.arg(src).arg(sidx).arg(dst).arg(didx);
+        self.launch_wide(b, n, &width)
+    }
+
+    fn save_prelude(&self, n: usize, k1: usize) -> Result<()> {
+        let (Some(rb), Some(pb)) = (self.mtp().rollback.as_ref(), self.prelude.as_ref()) else { return Ok(()) };
+        let m = self.mtp();
+        let k1_i = k1 as i32;
+        for (s, saved) in pb.states.iter().zip(&rb.saved) {
+            let stride = s.stride as i32;
+            let mut b = self.launcher(self.kernel("mtp_state_save"));
+            b.arg(&s.slice).arg(saved).arg(&m.vb.slots).arg(&k1_i);
+            self.launch_wide(b, n, &stride)?;
+        }
+        self.replay_seqs(n, k1, 0, &m.zeros.slice(..n))
+    }
+
+    pub(super) fn mtp_seq_slots(&self) -> Option<CudaView<'_, i32>> {
+        self.mtp.as_ref()?.rollback.as_ref().map(|rb| rb.slots.as_view())
+    }
+
+    fn replay_seqs(&self, n: usize, k1: usize, j: usize, accepted: &CudaView<i32>) -> Result<()> {
+        let m = self.mtp();
+        let rb = m.rollback.as_ref().expect("a prelude rollback");
+        let (k1_i, j_i, pad, n_i) = (k1 as i32, j as i32, self.slots as i32, n as i32);
+        let mut b = self.launcher(self.kernel("mtp_replay_seqs"));
+        b.arg(&m.vb.tokens).arg(&m.vb.slots).arg(accepted).arg(&k1_i).arg(&j_i).arg(&pad).arg(&n_i).arg(&rb.tokens).arg(&rb.slots);
+        unsafe { b.launch(cfg(grid(n, 128), 128)) }?;
+        Ok(())
+    }
+
+    fn replay_prelude(&self, n: usize, k1: usize, accepted: &CudaView<i32>) -> Result<()> {
+        let (Some(rb), Some(pb), Some(p)) = (self.mtp().rollback.as_ref(), self.prelude.as_ref(), self.spec.prelude.as_ref()) else { return Ok(()) };
+        let m = self.mtp();
+        let k1_i = k1 as i32;
+        for (s, saved) in pb.states.iter().zip(&rb.saved) {
+            let stride = s.stride as i32;
+            let mut b = self.launcher(self.kernel("mtp_state_load"));
+            b.arg(&s.slice).arg(saved).arg(&m.vb.slots).arg(&k1_i);
+            self.launch_wide(b, n, &stride)?;
+        }
+        let layer = self.layers.iter().find(|l| l.prelude.is_some()).context("a prelude layer")?;
+        let stateful: Vec<usize> = p.node.iter().enumerate().filter(|(_, d)| d.bind.values().any(|b| matches!(b, crate::graph::Bind::State { .. }))).map(|(i, _)| i).collect();
+        for j in 0..k1 {
+            self.replay_seqs(n, k1, j, accepted)?;
+            for (name, w) in &p.scratch {
+                let width = crate::state::dim(&self.spec, w)? as i32;
+                let j_i = j as i32;
+                let mut b = self.launcher(self.kernel("mtp_replay_rows"));
+                b.arg(&pb.scratch[name]).arg(&rb.scratch[name]).arg(&k1_i).arg(&j_i);
+                self.launch_wide(b, n, &width)?;
+            }
+            let geom = super::exec::PreludeGeom { seqs: n, rows_per_seq: 1, slot_base: 0, slot_step: 1, slots: rb.slots.slice(..n) };
+            let bufs = super::exec::PreludeBufs { tokens: rb.tokens.slice(..n), scratch: &rb.scratch, ints: &rb.ints };
+            for &i in &stateful {
+                self.prelude_launch(i as u8, layer, &geom, &bufs)?;
+            }
+        }
         Ok(())
     }
 
@@ -361,6 +487,7 @@ impl Runtime {
         let m = self.mtp();
         match w {
             crate::plan::Weight::MtpFc => &m.w.fc,
+            crate::plan::Weight::MtpFcHidden => m.w.fc_hidden.as_ref().expect("a streamed MTP layer has fc_hidden"),
             _ => m.w.head.as_ref().unwrap_or(&self.lm_head),
         }
     }
@@ -379,6 +506,29 @@ impl Runtime {
         let a = run.mtp.as_ref().expect("mtp ops carry their arguments");
         let n = run.n;
         match op {
+            Op::MtpIn if self.spec.streamed_mtp() => {
+                let width = m.width as i32;
+                let mut b = self.launcher(self.kernel("mtp_streams_in"));
+                b.arg(&self.embed)
+                    .arg(a.tokens)
+                    .arg(a.xsrc)
+                    .arg(&m.pending)
+                    .arg(a.hidx)
+                    .arg(&m.w.norm_embed)
+                    .arg(&m.w.norm_hidden)
+                    .arg(&m.fc_planes.hi)
+                    .arg(&m.fc_planes.lo)
+                    .arg(&m.draft_planes.hi)
+                    .arg(&m.draft_planes.lo)
+                    .arg(&width);
+                unsafe { b.launch(cfg(n as u32, 256)) }?;
+                Ok(())
+            }
+            Op::MtpGather if self.spec.streamed_mtp() => {
+                let iota = m.iota.slice(..n);
+                self.copy_wide(self.hidden_source(), a.src, &m.cg, &iota, n)?;
+                self.copy_wide(&m.cg, &iota, self.hidden_source(), &iota, n)
+            }
             Op::MtpIn => {
                 let mut b = self.launcher(self.kernel("mtp_fc_in"));
                 b.arg(&self.embed)
@@ -455,6 +605,9 @@ impl Runtime {
     }
 
     fn copy_rows_by_index(&self, src: &CudaSlice<f32>, sidx: &CudaView<i32>, dst: &CudaSlice<f32>, didx: &CudaView<i32>, n: usize) -> Result<()> {
+        if self.mtp_width() != self.spec.dims.hidden {
+            return self.copy_wide(src, sidx, dst, didx, n);
+        }
         let mut b = self.launcher(self.kernel("mtp_copy"));
         b.arg(src).arg(sidx).arg(dst).arg(didx);
         let config = LaunchConfig {
@@ -499,9 +652,9 @@ impl Runtime {
             return Ok(());
         }
         let n = tokens.len();
-        let h = self.spec.dims.hidden;
+        let h = self.mtp_width();
         let m = self.mtp();
-        self.copy_rows(&self.pre.x.slice(..n * h), &m.vx.slice(..n * h), n * h)?;
+        self.copy_rows(&self.hidden_source().slice(..n * h), &m.vx.slice(..n * h), n * h)?;
         let (from, mut hidx) = if start == 0 { (1, Vec::new()) } else { (0, vec![-1 - slot as i32]) };
         hidx.extend((0..n.saturating_sub(1)) .map(|i| i as i32));
         let rows = hidx.len();
@@ -524,9 +677,9 @@ impl Runtime {
             return Ok(());
         }
         let n = rows.len();
-        let h = self.spec.dims.hidden;
+        let h = self.mtp_width();
         let m = self.mtp();
-        self.copy_rows(&self.pre.x.slice(..n * h), &m.vx.slice(..n * h), n * h)?;
+        self.copy_rows(&self.hidden_source().slice(..n * h), &m.vx.slice(..n * h), n * h)?;
         let live: Vec<&super::DecodeRow> = rows.iter().filter(|r| r.pos >= 1).collect();
         let tokens: Vec<i32> = live.iter().map(|r| r.token as i32).collect();
         let hidx: Vec<i32> = live.iter().map(|r| -1 - r.slot as i32).collect();
@@ -610,7 +763,7 @@ impl Runtime {
     fn round_body(&self, n: usize, k: usize) -> Result<()> {
         let m = self.mtp();
         let k1 = k + 1;
-        let h = self.spec.dims.hidden;
+        let h = self.mtp_width();
         let (n_i, k_i, stride_i) = (n as i32, k as i32, m.k as i32);
         let rin = m.rin.slice(..);
         let accepted = m.res.slice(..n);
@@ -618,14 +771,16 @@ impl Runtime {
         let mut b = self.launcher(self.kernel("mtp_round_in"));
         b.arg(&rin).arg(&m.drafts).arg(&n_i).arg(&k_i).arg(&stride_i).arg(&m.vb.tokens).arg(&m.vb.pos).arg(&m.vb.slots);
         unsafe { b.launch(cfg(n as u32, k1 as u32)) }?;
+        self.save_prelude(n, k1)?;
         self.verify_rows(n, k)?;
-        self.copy_rows(&self.pre.x.slice(..n * k1 * h), &m.vx.slice(..n * k1 * h), n * k1 * h)?;
+        self.copy_rows(&self.hidden_source().slice(..n * k1 * h), &m.vx.slice(..n * k1 * h), n * k1 * h)?;
         let maxa = rin.slice(3 * n..4 * n);
         let params = rin.slice(4 * n..10 * n);
         let mut b = self.launcher(self.kernel("spec_accept"));
         b.arg(&m.vb.logits).arg(&m.vb.tokens).arg(&params).arg(&maxa).arg(&k_i).arg(&vout).arg(&accepted);
         unsafe { b.launch(cfg(n as u32, 1024)) }?;
         self.commit(n, k)?;
+        self.replay_prelude(n, k1, &accepted)?;
         let mut b = self.launcher(self.kernel("mtp_pick_rows"));
         b.arg(&accepted).arg(&k_i).arg(&m.sidx);
         unsafe { b.launch(cfg(1, n as u32)) }?;

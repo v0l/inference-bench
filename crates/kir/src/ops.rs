@@ -42,6 +42,8 @@ impl GatedExpr {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MoeShape {
     pub hidden: usize,
+    pub width: usize,
+    pub assign: bool,
     pub experts: usize,
     pub local: usize,
     pub top_k: usize,

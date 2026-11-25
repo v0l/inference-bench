@@ -57,7 +57,7 @@ fn weight_plan(ck: &Checkpoint, spec: &Spec, range: StageRange, role: StageRole)
     let layers: Vec<usize> = (0..spec.layers.count).collect();
     let half = layers.len() / 2;
     for &i in &layers[..half] {
-        push(ck.names_under(&format!("{root}.layers.{}.", range.start + i)), Work::Layer(i));
+        push(layer_names(ck, &format!("{root}.layers.{}.", range.start + i)), Work::Layer(i));
     }
     if role.first && !(tied && role.last) {
         push(ck.tensor_names(&[embed]), Work::Embed);
@@ -70,9 +70,13 @@ fn weight_plan(ck: &Checkpoint, spec: &Spec, range: StageRange, role: StageRole)
         push(names, Work::Mtp);
     }
     for &i in &layers[half..] {
-        push(ck.names_under(&format!("{root}.layers.{}.", range.start + i)), Work::Layer(i));
+        push(layer_names(ck, &format!("{root}.layers.{}.", range.start + i)), Work::Layer(i));
     }
     plan
+}
+
+fn layer_names(ck: &Checkpoint, prefix: &str) -> Vec<String> {
+    ck.names_under(prefix).into_iter().filter(|n| !ck.is_part(n)).collect()
 }
 
 #[derive(Clone, Copy)]
@@ -102,6 +106,32 @@ struct Weights {
 }
 
 type GatedWeights = std::collections::BTreeMap<String, CudaSlice<f32>>;
+type StoredWeights = std::collections::BTreeMap<String, CudaSlice<u8>>;
+
+fn upload_stored(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, i: usize, global: usize) -> Result<StoredWeights> {
+    let mut out = StoredWeights::new();
+    for (name, s) in ck.stored_prelude(spec, i, global)? {
+        let bytes: usize = s.parts.iter().map(|p| p.len()).sum();
+        let mut dst = stream.alloc_zeros::<u8>(bytes)?;
+        let mut at = 0;
+        for part in &s.parts {
+            stream.memcpy_htod(*part, &mut dst.slice_mut(at..at + part.len()))?;
+            stream.synchronize()?;
+            at += part.len();
+        }
+        out.insert(name, dst);
+    }
+    if !out.is_empty() {
+        let pre = spec.prelude.as_ref().expect("stored weights come from a prelude");
+        let module = format!("{}.layers.{global}.{}", ck.root(), pre.module);
+        for w in out.keys() {
+            ck.release_names(&ck.parts(&format!("{module}.{w}")));
+        }
+    }
+    Ok(out)
+}
+
+const RES_HEAD: &str = "block residual output";
 
 fn upload_gated(stream: &Arc<CudaStream>, weights: &[(String, Vec<f32>)]) -> Result<GatedWeights> {
     weights.iter().map(|(n, v)| Ok((n.clone(), stream.clone_htod(v)?))).collect()
@@ -161,7 +191,10 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, store: &
             slot: before(true),
         }),
     };
-    let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, ln_pre_mlp: up_opt(&l.ln_pre_mlp)?, ln_post_mlp: up_opt(&l.ln_post_mlp)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)?, moe: l.moe.as_ref().map(|m| moe::DeviceMoe::upload(stream, m, i, cached.as_ref().map(|(p, n)| (*p, *n)))).transpose()?, hyper: l.hyper.iter().map(|v| Ok(stream.clone_htod(v)?)).collect::<Result<_>>()?, gated: l.gated.iter().map(|s| upload_gated(stream, s)).collect::<Result<_>>()?, ple: upload_ple(stream, &l.ple)?, ple_at: i as i32 };
+    let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, ln_pre_mlp: up_opt(&l.ln_pre_mlp)?, ln_post_mlp: up_opt(&l.ln_post_mlp)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)?, moe: l.moe.as_ref().map(|m| moe::DeviceMoe::upload(stream, m, i, cached.as_ref().map(|(p, n)| (*p, *n)))).transpose()?, hyper: l.hyper.iter().map(|v| Ok(stream.clone_htod(v)?)).collect::<Result<_>>()?, gated: l.gated.iter().map(|s| upload_gated(stream, s)).collect::<Result<_>>()?, prelude: spec.prelude_slot(i).map(|s| Ok::<_, anyhow::Error>((s as i32, upload_gated(stream, &l.prelude)?))).transpose()?, prelude_stored: upload_stored(stream, ck, spec, i, global)?, ple: upload_ple(stream, &l.ple)?, ple_at: i as i32, residual: l.residual.iter().map(|v| Ok(stream.clone_htod(v)?)).collect::<Result<_>>()?, latent: match &l.latent {
+        Some(w) => Some(DeviceLatent { down: up_m(&w.down)?, up: up_m(&w.up)?, norm: stream.clone_htod(&w.norm)?, shared_gate_up: up_m(&w.shared_gate_up)?, shared_down: up_m(&w.shared_down)? }),
+        None => None,
+    }, global };
     copied(stream)?;
     Ok(layer)
 }
@@ -246,7 +279,13 @@ fn upload_head(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, role: Sta
         norm: stream.clone_htod(&norm)?,
         lm_head: DeviceMatrix::upload(stream, &head)?,
         embed,
-        gated: upload_gated(stream, &ck.gated_head(spec)?)?,
+        gated: {
+            let mut g = upload_gated(stream, &ck.gated_head(spec)?)?;
+            if spec.block_residual.is_some() {
+                g.insert(RES_HEAD.into(), stream.clone_htod(&ck.residual_head(spec)?)?);
+            }
+            g
+        },
         ple: upload_ple(stream, &ck.ple_head(spec)?)?,
         draft: match spec.draft_head_quant() {
             Some(q) => {
@@ -567,6 +606,42 @@ struct GatedTrace {
     inject: std::collections::BTreeMap<usize, CudaSlice<f32>>,
 }
 
+struct PreludeState {
+    name: String,
+    stride: usize,
+    slice: CudaSlice<f32>,
+}
+
+struct PreludeBuffers {
+    launch: Vec<DescribedLaunch>,
+    scratch: std::collections::BTreeMap<String, CudaSlice<f32>>,
+    int_scratch: std::collections::BTreeMap<String, CudaSlice<i32>>,
+    states: Vec<PreludeState>,
+}
+
+impl PreludeBuffers {
+    fn new(stream: &Arc<CudaStream>, spec: &Spec, slots: usize, chunk: usize, max_ctx: usize, target: &kir::Target) -> Result<Option<Self>> {
+        let Some(p) = &spec.prelude else { return Ok(None) };
+        let launch = crate::codegen::prelude_kernels(spec, max_ctx, target)?.into_iter().map(|k| DescribedLaunch { name: k.name, threads: k.threads, chunk: None, tile: false, params: k.params }).collect();
+        let mut states = Vec::new();
+        for s in crate::state::sequence(spec).filter(|s| s.layers == crate::state::Layers::Prelude) {
+            ensure!(s.dtype == crate::state::Dtype::F32, "[[state]] {} on the prelude is not f32", s.name);
+            let stride = s.sequence_bytes(spec) / 4;
+            states.push(PreludeState { name: s.name.clone(), stride, slice: stream.alloc_zeros(stride * slots)? });
+        }
+        Ok(Some(PreludeBuffers {
+            launch,
+            scratch: p.scratch.iter().map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim(spec, w)?)?))).collect::<Result<_>>()?,
+            int_scratch: p.int_scratch.iter().map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim(spec, w)?)?))).collect::<Result<_>>()?,
+            states,
+        }))
+    }
+
+    fn floats(&self) -> usize {
+        self.states.iter().map(|s| s.stride).sum()
+    }
+}
+
 struct DeviceLayer {
     ln1: CudaSlice<f32>,
     ln2: CudaSlice<f32>,
@@ -578,8 +653,29 @@ struct DeviceLayer {
     moe: Option<moe::DeviceMoe>,
     hyper: Vec<CudaSlice<f32>>,
     gated: Vec<GatedWeights>,
+    prelude: Option<(i32, GatedWeights)>,
+    prelude_stored: StoredWeights,
     ple: PleWeights,
     ple_at: i32,
+    residual: Vec<CudaSlice<f32>>,
+    latent: Option<DeviceLatent>,
+    global: usize,
+}
+
+struct DeviceLatent {
+    down: DeviceMatrix,
+    up: DeviceMatrix,
+    norm: CudaSlice<f32>,
+    shared_gate_up: DeviceMatrix,
+    shared_down: DeviceMatrix,
+}
+
+struct ResidualBuffers {
+    stack: CudaSlice<f32>,
+    prefix: CudaSlice<f32>,
+    head: CudaSlice<f32>,
+    latent: CudaSlice<f32>,
+    latent_planes: Planes,
 }
 
 type PleWeights = std::collections::BTreeMap<String, CudaSlice<f32>>;
@@ -619,7 +715,11 @@ impl DeviceLayer {
             + self.moe.as_ref().map_or(0, moe::DeviceMoe::bytes)
             + (self.ln1.num_bytes() + self.ln2.num_bytes()) as u64
             + self.hyper.iter().map(|v| v.num_bytes() as u64).sum::<u64>()
+            + self.gated.iter().flat_map(|g| g.values()).chain(self.prelude.iter().flat_map(|(_, w)| w.values())).map(|v| v.num_bytes() as u64).sum::<u64>()
+            + self.prelude_stored.values().map(|v| v.num_bytes() as u64).sum::<u64>()
             + self.ple.values().map(|v| v.num_bytes() as u64).sum::<u64>()
+            + self.residual.iter().map(|v| v.num_bytes() as u64).sum::<u64>()
+            + self.latent.as_ref().map_or(0, |l| l.down.bytes() + l.up.bytes() + l.shared_gate_up.bytes() + l.shared_down.bytes() + l.norm.num_bytes() as u64)
     }
 }
 
@@ -874,7 +974,9 @@ pub struct Runtime {
     mixer: Option<MixBuffers>,
     mixer_launch: Vec<DescribedLaunch>,
     gated: Option<GatedBuffers>,
+    prelude: Option<PreludeBuffers>,
     ple: Option<PleBuffers>,
+    residual: Option<ResidualBuffers>,
     moe: Option<moe::MoeBuffers>,
     fp8_act: Option<Fp8Act>,
     fp4_act: Option<Fp4Act>,
@@ -922,6 +1024,7 @@ pub struct Runtime {
     partial: CudaSlice<f32>,
     head_part: Option<CudaSlice<f32>>,
     comm: Option<crate::allreduce::Comm>,
+    key_limit: i32,
 }
 
 const HEAD_PART_ROWS: usize = 64;
@@ -1084,6 +1187,9 @@ impl Runtime {
         if staged.runtime.offload.enabled() {
             staged.runtime.graphs = false;
         }
+        if staged.prelude.is_some() {
+            Checkpoint::for_repo(&staged.repo)?.renamed(&staged.tensors).complete_prelude(&mut staged, range.start)?;
+        }
         let spec = &staged;
         ensure!(layout.slots >= 1, "need at least one slot");
         let layout = if spec.runtime.kv_dtype.is_fp8() { Layout { kv_planes: 1, ..layout } } else { layout };
@@ -1140,8 +1246,9 @@ impl Runtime {
         };
         checkpoint.check_quant_layout(&checkpoint.quant_map()?.renamed(&spec.tensors))?;
         let weights_started = Instant::now();
-        let Weights { mut layers, embed, norm, lm_head, mtp: mtp_weights, direct: weights_direct, gated: gated_head, ple: ple_head } =
+        let Weights { mut layers, embed, norm, lm_head, mtp: mtp_weights, direct: weights_direct, gated: mut gated_head, ple: ple_head } =
             load_weights(&ctx, &stream, &checkpoint, spec, range, role)?;
+        let res_head = gated_head.remove(RES_HEAD);
         let weight_secs = weights_started.elapsed().as_secs_f64();
         let weight_bytes = layers.iter().map(DeviceLayer::bytes).sum::<u64>()
             + (embed.num_bytes() + norm.num_bytes()) as u64
@@ -1270,6 +1377,19 @@ impl Runtime {
             gdn,
             mixer,
             mixer_launch,
+            residual: match (&spec.block_residual, res_head) {
+                (Some(r), Some(head)) => {
+                    let width = spec.moe.as_ref().map_or(1, |m| m.width(d.hidden));
+                    Some(ResidualBuffers {
+                        stack: stream.alloc_zeros(chunk * r.blocks(spec.layers.count) * d.hidden)?,
+                        prefix: stream.alloc_zeros(chunk * d.hidden)?,
+                        head,
+                        latent: stream.alloc_zeros(chunk * width)?,
+                        latent_planes: Planes::new(&stream, chunk * width)?,
+                    })
+                }
+                _ => None,
+            },
             gated: match spec.gated_residual() {
                 Some(h) => Some(GatedBuffers {
                     streams: stream.alloc_zeros(chunk * h.width(d.hidden))?,
@@ -1280,6 +1400,7 @@ impl Runtime {
                 }),
                 None => None,
             },
+            prelude: PreludeBuffers::new(&stream, spec, layout.slots + 1, chunk, max_ctx, &target)?,
             ple: match spec.per_layer() {
                 Some(p) => Some(PleBuffers {
                     scratch: p.scratch.iter().map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim(spec, w)?)?))).collect::<Result<_>>()?,
@@ -1323,6 +1444,7 @@ impl Runtime {
                 _ => None,
             },
             comm,
+            key_limit: i32::MAX,
             role,
             spec: spec.clone(),
             max_ctx,
@@ -1337,13 +1459,13 @@ impl Runtime {
                 .attention
                 .scratch
                 .iter()
-                .map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim(spec, w)?)?)))
+                .map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim_at(spec, w, max_ctx)?)?)))
                 .collect::<Result<_>>()?,
             int_scratch: spec
                 .attention
                 .int_scratch
                 .iter()
-                .map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim(spec, w)?)?)))
+                .map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim_at(spec, w, max_ctx)?)?)))
                 .collect::<Result<_>>()?,
             buf,
             kernels,
@@ -1457,7 +1579,7 @@ impl Runtime {
     }
 
     fn kernel(&self, name: &str) -> &CudaFunction {
-        &self.kernels[name]
+        self.kernels.get(name).unwrap_or_else(|| panic!("kernel {name} is not in the module"))
     }
 
     fn slot_table(&self, slot: usize) -> CudaView<'_, i32> {
@@ -1647,7 +1769,7 @@ impl Runtime {
     fn step_traced(&self, trace: Option<&CudaSlice<f32>>) -> Result<()> {
         ensure!(self.head_part.is_none(), "a vocabulary sharded rank decodes through the plan, not the single stream step");
         ensure!(self.spec.requanted_linears().is_empty(), "requantised attention and delta-net projections run on the plan decode path (the scheduler), not the single stream step");
-        ensure!(self.spec.mixer.is_none() && self.spec.hyper.is_none() && !self.spec.layers.split && self.spec.mlp.mapped.is_none(), "mixers, hyper-connections, mlp-only layers and non-gated mlps run on the batched decode path (generate_batch and the scheduler), not the single stream step");
+        ensure!(self.spec.mixer.is_none() && self.spec.hyper.is_none() && self.spec.gated_residual().is_none() && !self.spec.layers.split && self.spec.mlp.mapped.is_none(), "mixers, hyper-connections, gated residuals, mlp-only layers and non-gated mlps run on the batched decode path (generate_batch and the scheduler), not the single stream step");
         if !self.spec.attention.node.is_empty() {
             ensure!(self.use_mma, "described attention needs the tensor core path");
             let run = exec::Run { n: 1, tokens: &self.buf.token, logits: &self.buf.logits, rows: 0..1, bb: None, start: None, qlen: 1, mtp: None };
@@ -2219,7 +2341,8 @@ impl Runtime {
             .arg(&mm_stride)
             .arg(&self.seq)
             .arg(&l.window)
-            .arg(&self.mm_bidi);
+            .arg(&self.mm_bidi)
+            .arg(&self.key_limit);
         let rows = crate::codegen::flash_rows(a.head_dim, self.kv_planes);
         let config = LaunchConfig {
             grid_dim: (grid(n, rows), a.heads as u32, 1),
@@ -2518,6 +2641,7 @@ impl Runtime {
 
     pub fn acquire_state(&mut self, slot: usize) -> Result<()> {
         ensure!(slot <= self.slots, "slot {slot} out of {}", self.slots);
+        self.zero_prelude_state(slot)?;
         let need = self.state_slot_bytes();
         let free = self.ctx.mem_get_info().map(|(f, _)| f).unwrap_or(usize::MAX);
         if self.mixer.is_some() {
@@ -2543,6 +2667,48 @@ impl Runtime {
         Ok(())
     }
 
+    fn zero_prelude_state(&mut self, slot: usize) -> Result<()> {
+        let Some(pb) = self.prelude.as_mut() else { return Ok(()) };
+        for s in &mut pb.states {
+            self.stream.memset_zeros(&mut s.slice.slice_mut(slot * s.stride..(slot + 1) * s.stride))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn prelude_floats(&self) -> usize {
+        self.prelude.as_ref().map_or(0, PreludeBuffers::floats)
+    }
+
+    pub(super) fn prelude_to(&self, slot: usize, dst: &mut cudarc::driver::CudaViewMut<f32>) -> Result<()> {
+        let Some(pb) = &self.prelude else { return Ok(()) };
+        let mut at = 0;
+        for s in &pb.states {
+            self.stream.memcpy_dtod(&s.slice.slice(slot * s.stride..(slot + 1) * s.stride), &mut dst.slice_mut(at..at + s.stride))?;
+            at += s.stride;
+        }
+        Ok(())
+    }
+
+    pub(super) fn prelude_host(&self, slot: usize) -> Result<Vec<f32>> {
+        let Some(pb) = &self.prelude else { return Ok(Vec::new()) };
+        let mut out = Vec::with_capacity(pb.floats());
+        for s in &pb.states {
+            out.extend(self.stream.clone_dtoh(&s.slice.slice(slot * s.stride..(slot + 1) * s.stride))?);
+        }
+        Ok(out)
+    }
+
+    pub(super) fn prelude_from(&mut self, slot: usize, host: &[f32]) -> Result<()> {
+        let Some(pb) = self.prelude.as_mut() else { return Ok(()) };
+        ensure!(host.len() == pb.floats(), "prelude state of {} values, expected {}", host.len(), pb.floats());
+        let mut at = 0;
+        for s in &mut pb.states {
+            self.stream.memcpy_htod(&host[at..at + s.stride], &mut s.slice.slice_mut(slot * s.stride..(slot + 1) * s.stride))?;
+            at += s.stride;
+        }
+        Ok(())
+    }
+
     pub fn release_state(&mut self, slot: usize) {
         if slot >= self.slots {
             return;
@@ -2562,6 +2728,7 @@ impl Runtime {
     pub fn reset_slot(&mut self, seq: usize) -> Result<()> {
         ensure!(seq < self.slots, "slot {seq} out of {}", self.slots);
         self.mtp_forget(seq);
+        self.zero_prelude_state(seq)?;
         if self.mixer.is_some() {
             return self.zero_mixer_state(seq);
         }
@@ -2664,6 +2831,52 @@ impl Runtime {
             conv: self.stream.clone_dtoh(&gb.conv_state.slice(..conv))?,
             state: self.stream.clone_dtoh(&gb.ssm_state.slice(..ssm))?,
         })
+    }
+
+    pub fn hidden_states(&mut self, tokens: &[u32], real: usize, layers: &[usize]) -> Result<Vec<f32>> {
+        let n = tokens.len();
+        let h = self.spec.dims.hidden;
+        let count = self.spec.layers.count;
+        ensure!(n >= 2 && n <= self.prefill_limit, "a hidden state run takes 2 to {} tokens, not {n}", self.prefill_limit);
+        ensure!(real >= 1 && real <= n, "{real} real tokens of {n}");
+        ensure!(layers.iter().all(|&l| l < count), "hidden states {layers:?} must come before the final norm (layer {count})");
+        ensure!(self.spec.hyper.is_none() && self.gated.is_none() && self.role.first, "hidden states read the single residual stream");
+        let last = layers.iter().copied().max().context("no hidden state layers")?;
+        self.check_tokens(tokens)?;
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        self.stream.memcpy_htod(&ids, &mut self.pre.tokens.slice_mut(..n))?;
+        self.stream.memcpy_htod(&[0i32], &mut self.buf.pos)?;
+        self.reset_linear_state()?;
+        let out = self.stream.alloc_zeros::<f32>(layers.len() * n * h)?;
+        self.key_limit = real as i32;
+        let ran = self.hidden_rows(n, last, layers, &out);
+        self.key_limit = i32::MAX;
+        ran?;
+        Ok(self.stream.clone_dtoh(&out)?)
+    }
+
+    fn hidden_rows(&self, n: usize, last: usize, layers: &[usize], out: &CudaSlice<f32>) -> Result<()> {
+        use crate::executor::{PlanBackend, run_ops};
+        let per = n * self.spec.dims.hidden;
+        let keep = |after: usize| -> Result<()> {
+            for (slot, _) in layers.iter().enumerate().filter(|(_, l)| **l == after) {
+                self.copy_rows(&self.pre.x.slice(..per), &out.slice(slot * per..(slot + 1) * per), per)?;
+            }
+            Ok(())
+        };
+        let plan = &self.plans.prefill;
+        let run = exec::Run { n, tokens: &self.pre.tokens, logits: &self.buf.logits, rows: n - 1..n, bb: None, start: Some(0), qlen: 1, mtp: None };
+        run_ops(self, &plan.head, None, &run)?;
+        keep(0)?;
+        for i in 0..last {
+            let be: &dyn PlanBackend<exec::Run<'_>> = self;
+            be.enter_layer(i)?;
+            run_ops(self, plan.layer_for(be.block(i), be.sparse(i), be.tail(i)), Some(i), &run)?;
+            run_ops(self, &plan.per_layer, Some(i), &run)?;
+            be.leave_layer(i)?;
+            keep(i + 1)?;
+        }
+        Ok(())
     }
 
     pub fn trace_prefill(&mut self, tokens: &[u32]) -> Result<Trace> {

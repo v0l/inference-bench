@@ -147,6 +147,37 @@ fn gemma3n_without_activation_sparsity_or_laurel_misses_transformers() {
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU and scripts/tiny_gemma3n.py output in SPECRT_REF_DIR_3N"]
+fn gemma3n_without_the_altup_correction_misses_transformers() {
+    let r = reference();
+    let mut stale = tiny();
+    let g = stale.gated_residual.as_mut().unwrap();
+    g.node.retain(|n| n.kernel.as_deref() != Some("g3n_router_x"));
+    let d = max_abs(&prompt_logits(&stale, &r.tokens), &r.logits);
+    eprintln!("tiny-gemma3n correcting with the prediction router: max_abs {d}");
+    assert!(d >= 5e-2, "the logit bound must catch a correction that skips its own router, max abs {d}");
+    let mut uncorrected = tiny();
+    let g = uncorrected.gated_residual.as_mut().unwrap();
+    for n in g.node.iter_mut().filter(|n| n.kernel.as_deref() == Some("g3n_correct")) {
+        n.bind.insert("x".into(), specrt::graph::Bind::Buffer { buffer: "laurel_hi".into() });
+    }
+    let mut rt = specrt::runtime::Runtime::load(&uncorrected, 256).unwrap();
+    let trace = rt.trace_streams(&r.tokens, &Default::default()).unwrap();
+    let per = r.tokens.len() * 4 * 128;
+    let d = max_abs(&trace.layers[..per], &r.streams[..per]);
+    eprintln!("tiny-gemma3n correcting with the wrong layer output: layer 0 streams max_abs {d}");
+    assert!(d >= 2e-2 * 25.0, "the stream bound must catch a correction fed the wrong innovation, max abs {d}");
+    let texts: Vec<String> = specrt::spec::EMBEDDED.iter().map(|(n, t)| if *n == "g3n_correct.toml" { t.replace("1.0 + c0", "c0") } else { t.to_string() }).collect();
+    assert!(texts.iter().any(|t| t.contains("expr = \"c0 * m0")), "the red edit hit g3n_correct");
+    specrt::kir_kernel::Registry::install(specrt::kir_kernel::Registry::from_texts(texts.iter().map(String::as_str)).unwrap());
+    let ran = std::panic::catch_unwind(|| prompt_logits(&tiny(), &r.tokens));
+    specrt::kir_kernel::Registry::install(specrt::kir_kernel::Registry::embedded());
+    let d = max_abs(&ran.unwrap(), &r.logits);
+    eprintln!("tiny-gemma3n correction coefficients without the + 1: max_abs {d}");
+    assert!(d >= 5e-2, "the logit bound must catch correction coefficients without the + 1, max abs {d}");
+}
+
+#[test]
 fn the_e2b_and_e4b_configs_map_every_piece_from_the_config() {
     for (name, layers, shared, inter) in [("google__gemma-3n-E2B-it", 30, 10, 8192), ("google__gemma-3n-E4B-it", 35, 15, 16384)] {
         let spec = Spec::from_hf_config_serving(&config(name)).unwrap_or_else(|e| panic!("{name}: {e:#}"));

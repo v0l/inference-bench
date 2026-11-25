@@ -119,6 +119,31 @@ fn the_ple_descriptions_build_and_emit() {
 }
 
 #[test]
+fn the_gather_reads_its_table_in_the_stored_dtype_with_one_fp8_scale() {
+    let t = Target::sm_120();
+    let emit = |shape: Shape| {
+        let k = desc("ple_embed_gather").build(&t, &shape).unwrap_or_else(|e| panic!("{e}"));
+        let src = kir::cuda::emit_module(std::slice::from_ref(&k)).unwrap().to_string();
+        (k.params.iter().find(|p| p.name == "table").unwrap().ty, src)
+    };
+    let (ty, f32_src) = emit(ple_shape());
+    assert_eq!(ty, kir::Scalar::F32);
+    assert!(f32_src.contains("const float* table") && !f32_src.contains("kir_e4m3") && !f32_src.contains("typedef"));
+    let (ty, bf16_src) = emit(ple_shape().word("ple_table_dtype", "bf16"));
+    assert_eq!(ty, kir::Scalar::Bf16);
+    assert!(bf16_src.contains("const bf16_t* table") && bf16_src.contains("__uint_as_float(((unsigned)table["), "{bf16_src}");
+    let (ty, fp8_src) = emit(ple_shape().word("ple_table_dtype", "fp8").num("ple_table_scale", 0.25));
+    assert_eq!(ty, kir::Scalar::U8);
+    assert!(fp8_src.contains("const unsigned char* table") && fp8_src.contains("(kir_e4m3(table[") && fp8_src.contains("* 2.5e-1f)"), "{fp8_src}");
+    assert!(fp8_src.contains("__device__ __forceinline__ float kir_e4m3"));
+    let bad = |shape: Shape| desc("ple_embed_gather").build(&t, &shape).unwrap_err();
+    assert!(bad(ple_shape().word("ple_table_dtype", "int4")).contains("int4"));
+    assert!(bad(ple_shape().word("ple_table_dtype", "bf16").num("ple_table_scale", 0.5)).contains("only fp8"));
+    let wrong = std::fs::read_to_string(specs().join("ple_key_proj.toml")).unwrap().replacen("access = \"read\"", "access = \"read\"\nstored = \"x\"", 1);
+    assert!(Description::parse(&wrong).unwrap().build(&t, &ple_shape()).unwrap_err().contains("stored"));
+}
+
+#[test]
 fn an_undilated_seq_conv_emits_the_same_text_as_before() {
     let text = std::fs::read_to_string(specs().join("mamba2_conv.toml")).unwrap();
     let shape = Shape::new().num("ssm_in", 300.0).num("ssm_inner", 64.0).num("ssm_conv", 96.0).num("ssm_taps", 4.0).num("linear_layers", 2.0);

@@ -1,6 +1,6 @@
 name = "gemma3n"
 kind = "family"
-min_engine = 16
+min_engine = 19
 extends = "gemma4"
 
 [match]
@@ -171,8 +171,8 @@ grid = ["1", "rows"]
 gate = { buffer = "gate_up" }
 on = "sparse_on"
 cut = "sparse_cut"
-act_hi = { buffer = "act_hi" }
-act_lo = { buffer = "act_lo" }
+out_hi = { buffer = "act_hi" }
+out_lo = { buffer = "act_lo" }
 
 [[gated_residual.node]]
 op = "correct"

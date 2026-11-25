@@ -4,6 +4,7 @@ pub mod allreduce;
 pub mod attention;
 pub mod bandwidth;
 pub mod compose;
+pub mod conv;
 pub mod desc;
 pub mod dequant;
 pub mod expr;
@@ -44,6 +45,7 @@ pub enum Scalar {
     U32,
     Bf16,
     I32,
+    U8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -304,6 +306,11 @@ impl Kernel {
         Ok(k)
     }
 
+    pub fn renamed(mut self, name: &str) -> Kernel {
+        self.name = crate::desc::intern_public(name);
+        self
+    }
+
     pub fn tile_scan(&self) -> bool {
         match &self.body {
             Body::Scan(s) => s.tile_eligible() && s.tile_names_free(&self.params) && self.target.has(Feature::Mma16816) && self.target.has(Feature::CpAsync) && self.target.language == Language::Cuda,
@@ -440,7 +447,7 @@ impl Kernel {
         }
         let wide = |p: &Param| match &self.body {
             Body::Scan(_) | Body::Rows(_) | Body::Recurrence(_) | Body::Seq(_) => true,
-            Body::Compose(_) => p.ty == Scalar::I32,
+            Body::Compose(_) => matches!(p.ty, Scalar::I32 | Scalar::Bf16),
             _ => false,
         };
         if self.params.iter().any(|p| p.ty != Scalar::F32 && !wide(p)) {
@@ -516,6 +523,10 @@ impl fmt::Display for Kernel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.describe())
     }
+}
+
+pub fn fnv_hash(text: &str) -> String {
+    fnv(text.bytes())
 }
 
 pub fn module_hash(kernels: &[Kernel]) -> String {

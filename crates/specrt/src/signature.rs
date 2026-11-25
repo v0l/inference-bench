@@ -13,6 +13,7 @@ pub enum Class {
     Attention,
     Scan,
     Gather,
+    GridReduce,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,7 +33,7 @@ pub enum Layout {
     Paged,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Rows {
     Tokens,
     Out,
@@ -41,6 +42,11 @@ pub enum Rows {
     Pairs(usize),
     Experts { total: usize, top_k: usize },
     Fixed(usize),
+    Image,
+    Text,
+    Joint,
+    Latent,
+    Grid(usize),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -69,20 +75,34 @@ pub struct Signature {
     pub writes: Vec<Tensor>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub const GRID_LEVELS: usize = 16;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Count {
     pub tokens: usize,
     pub out: usize,
     pub seqs: usize,
     pub context: usize,
+    pub image: usize,
+    pub text: usize,
+    pub grid: [usize; GRID_LEVELS],
 }
 
 impl Count {
     pub fn new(phase: Phase, tokens: usize, context: usize) -> Count {
         match phase {
-            Phase::Prefill => Count { tokens, out: 1, seqs: 1, context },
-            Phase::Decode | Phase::Verify => Count { tokens, out: tokens, seqs: tokens, context },
+            Phase::Prefill => Count { tokens, out: 1, seqs: 1, context, ..Count::default() },
+            Phase::Decode | Phase::Verify => Count { tokens, out: tokens, seqs: tokens, context, ..Count::default() },
+            Phase::Forward => Count { tokens, out: tokens, seqs: 1, context, ..Count::default() },
         }
+    }
+
+    pub fn grids(levels: &[usize]) -> Count {
+        let mut c = Count::new(Phase::Prefill, 0, 0);
+        for (g, l) in c.grid.iter_mut().zip(levels) {
+            *g = *l;
+        }
+        c
     }
 
     pub(crate) fn rows(&self, r: Rows) -> usize {
@@ -94,6 +114,11 @@ impl Count {
             Rows::Pairs(p) => self.tokens * p,
             Rows::Experts { total, top_k } => total.min(self.tokens * top_k),
             Rows::Fixed(n) => n,
+            Rows::Image => self.image * self.seqs,
+            Rows::Text => self.text * self.seqs,
+            Rows::Joint => (self.image + self.text) * self.seqs,
+            Rows::Latent => self.image,
+            Rows::Grid(l) => self.grid.get(l).copied().unwrap_or(0),
         }
     }
 }
@@ -162,7 +187,8 @@ fn class_of(body: &kir::Body) -> Class {
         kir::Body::Compose(_) => Class::Elementwise,
         kir::Body::Scan(_) => Class::Attention,
         kir::Body::Rows(r) => match r {
-            RowBody::HeadRms { .. } | RowBody::LayerNorm { .. } => Class::RowReduce,
+            RowBody::HeadRms { .. } | RowBody::LayerNorm { .. } | RowBody::BlockRes { mode: kir::rows::ResMode::Mix, .. } => Class::RowReduce,
+            RowBody::BlockRes { .. } => Class::Elementwise,
             RowBody::SpanRope { .. } => Class::Elementwise,
             RowBody::StateWrite { .. } | RowBody::BlockPool { .. } | RowBody::IndexTopk { .. } | RowBody::PoolTopk { .. } | RowBody::GroupPool { .. } | RowBody::GroupTopk { .. } => Class::Gather,
             RowBody::HeadMatvec { .. } => Class::Gemm,
@@ -182,6 +208,7 @@ pub struct Signer<'a> {
     described: Vec<Option<kir::Kernel>>,
     mixer: Vec<kir::Kernel>,
     gated: Vec<kir::Kernel>,
+    prelude: Vec<kir::Kernel>,
     per_layer: Vec<kir::Kernel>,
     ranked: bool,
 }
@@ -190,7 +217,7 @@ impl<'a> Signer<'a> {
     pub fn new(spec: &'a Spec) -> Result<Signer<'a>> {
         let target = crate::codegen::default_target();
         let ctx = crate::engine::DEFAULT_CTX;
-        Ok(Signer { spec, described: crate::codegen::described_kernels(spec, 1, ctx, &target)?, mixer: crate::codegen::mixer_kernels(spec, 1, ctx, &target)?, gated: crate::codegen::gated_kernels(spec, &target)?, per_layer: crate::codegen::per_layer_kernels(spec, &target)?, ranked: false })
+        Ok(Signer { spec, described: crate::codegen::described_kernels(spec, 1, ctx, &target)?, mixer: crate::codegen::mixer_kernels(spec, 1, ctx, &target)?, gated: crate::codegen::gated_kernels(spec, &target)?, prelude: crate::codegen::prelude_kernels(spec, ctx, &target)?, per_layer: crate::codegen::per_layer_kernels(spec, &target)?, ranked: false })
     }
 
     pub fn ranked(self, ranked: bool) -> Signer<'a> {
@@ -296,6 +323,12 @@ impl<'a> Signer<'a> {
     fn linear(&self, weight: Weight, quant: crate::plan::QuantSource, input: Buf, output: Buf, layer: usize) -> Signature {
         let s = crate::gemm::linear_shape(self.spec, weight.name());
         let q = quant.resolve_for(self.spec, layer, weight);
+        if weight == Weight::MtpFcHidden {
+            let width = self.spec.draft_width();
+            let streams = Tensor::new(Place::Local("streams".into()), Rows::Tokens, width, Form::F32);
+            let reads = vec![Tensor::buf(input, Rows::Tokens, width), Tensor::weight(weight.name(), weight.rows(self.spec), s.k, Form::Weight(q)), streams.clone()];
+            return Signature { class: Class::Gemm, reads, writes: vec![streams] };
+        }
         let head = matches!(weight, Weight::LmHead | Weight::MtpHead);
         let rows = if weight == Weight::LmHead { Rows::Out } else { Rows::Tokens };
         let out_cols = match s.epi {
@@ -316,7 +349,7 @@ impl<'a> Signer<'a> {
 
     fn bound(&self, kernel: &kir::Kernel, bind: &BTreeMap<String, Bind>, scratch: &BTreeMap<String, String>, ints: &BTreeMap<String, String>, defaults: &dyn Fn(&str) -> Option<Tensor>) -> Result<Signature> {
         let (mut reads, mut writes): (Vec<Tensor>, Vec<Tensor>) = (Vec::new(), Vec::new());
-        let dim = |s: &str| crate::state::dim(self.spec, s);
+        let dim = |s: &str| crate::state::dim_at(self.spec, s, crate::engine::DEFAULT_CTX);
         let mut planes_out = false;
         for p in kernel.params.iter().filter(|p| p.role != kir::Role::Value) {
             let t = match bind.get(p.name) {
@@ -435,6 +468,52 @@ impl<'a> Signer<'a> {
         Ok(sig)
     }
 
+    fn prelude_node(&self, node: u8) -> Result<Signature> {
+        let Some(p) = &self.spec.prelude else { bail!("a prelude node needs [prelude]") };
+        let Some(kernel) = self.prelude.get(node as usize) else { bail!("prelude node {node} has no kernel") };
+        let mut bind = p.node[node as usize].bind.clone();
+        for b in bind.values_mut() {
+            if let Bind::Weight { weight, .. } = b {
+                *weight = format!("{}.{weight}", p.module);
+            }
+        }
+        let width = self.spec.gated_residual().map_or(1, |h| h.width(self.hidden()));
+        let mut sig = Signature { class: class_of(&kernel.body), reads: Vec::new(), writes: Vec::new() };
+        for q in kernel.params.iter().filter(|q| q.role != kir::Role::Value) {
+            let t = match bind.get(q.name) {
+                Some(Bind::Weight { weight, len }) => {
+                    let form = match p.stored_as(&weight[p.module.len() + 1..]).map(|(_, d)| d) {
+                        Some("bf16") => Form::Bf16,
+                        Some("fp8") => Form::Weight(crate::spec::Quant::Fp8Block128),
+                        _ => Form::F32,
+                    };
+                    Tensor::weight(weight.clone(), 1, self.spec.weight_len(len)?, form)
+                }
+                Some(Bind::Buffer { buffer }) => match buffer.as_str() {
+                    "x" => self.x(),
+                    "streams" => Tensor::new(Place::Local("streams".into()), Rows::Tokens, width, Form::F32),
+                    "tokens" => Tensor::new(Place::Input("tokens"), Rows::Tokens, 1, Form::I32),
+                    name if p.int_scratch.contains_key(name) => Tensor::new(Place::Local(name.into()), Rows::Tokens, crate::state::dim(self.spec, &p.int_scratch[name])?, Form::I32),
+                    name => Tensor::new(Place::Local(name.into()), Rows::Tokens, crate::state::dim(self.spec, &p.scratch[name])?, Form::F32),
+                },
+                Some(Bind::State { state }) => {
+                    let s = crate::state::named(self.spec, state).ok_or_else(|| anyhow::anyhow!("prelude node {node} binds state {state:?}, which the spec does not declare"))?;
+                    let t = Tensor::new(Place::State(state.clone()), Rows::Seqs, s.elements(self.spec)?, Form::F32);
+                    sig.reads.push(t.clone());
+                    sig.writes.push(t);
+                    continue;
+                }
+                _ if q.name == "slots" => Tensor::new(Place::Input("positions"), Rows::Tokens, 1, Form::I32),
+                _ => continue,
+            };
+            match q.access {
+                kir::Access::Read => sig.reads.push(t),
+                kir::Access::Write => sig.writes.push(t),
+            }
+        }
+        Ok(sig)
+    }
+
     fn gdn(&self) -> Signature {
         let Some(la) = &self.spec.linear_attention else {
             return Signature { class: Class::Scan, reads: Vec::new(), writes: Vec::new() };
@@ -482,6 +561,7 @@ impl<'a> Signer<'a> {
             }
             _ => {
                 let target = match op {
+                    Op::MoeCombineInto { into: Buf::Latent } => Tensor::buf(Buf::Latent, Rows::Tokens, m.width(h)),
                     Op::MoeCombineInto { into } => Tensor::buf(*into, Rows::Tokens, h),
                     _ if self.ranked => Tensor::buf(Buf::Partial, Rows::Tokens, h),
                     _ => self.x(),
@@ -550,8 +630,21 @@ impl<'a> Signer<'a> {
             Op::Kernel { node } => self.described(node, layer)?,
             Op::MixKernel { node } => self.mixed(node)?,
             Op::Gated { node, site } => self.gated_node(node, site)?,
+            Op::Prelude { node } => self.prelude_node(node)?,
             Op::Swiglu => sig(Class::Elementwise, vec![Tensor::buf(Buf::GateUp, Rows::Tokens, 2 * spec.dims.intermediate)], vec![Tensor::buf(Buf::Act, Rows::Tokens, spec.dims.intermediate)]),
             Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => self.gdn(),
+            Op::MtpIn if spec.streamed_mtp() => {
+                let width = spec.draft_width();
+                sig(
+                    Class::Gather,
+                    vec![tokens_in, Tensor::new(Place::Input("hidden"), Rows::Tokens, width, Form::F32), Tensor::new(Place::Weight("embed_tokens.weight".into()), Rows::Tokens, h, Form::Bf16), Tensor::weight("mtp norms", 1, h + width, Form::F32)],
+                    vec![Tensor::buf(Buf::FcPlanes, Rows::Tokens, h), Tensor::buf(Buf::DraftPlanes, Rows::Tokens, width)],
+                )
+            }
+            Op::MtpGather if spec.streamed_mtp() => {
+                let streams = Tensor::new(Place::Local("streams".into()), Rows::Tokens, spec.draft_width(), Form::F32);
+                sig(Class::Gather, vec![streams.clone()], vec![streams])
+            }
             Op::MtpIn => sig(
                 Class::Gather,
                 vec![tokens_in, Tensor::new(Place::Input("hidden"), Rows::Tokens, h, Form::F32), Tensor::new(Place::Weight("embed_tokens.weight".into()), Rows::Tokens, h, Form::Bf16), Tensor::weight("mtp norms", 2, h, Form::F32)],
@@ -583,6 +676,25 @@ impl<'a> Signer<'a> {
                     Op::HyperPost => sig(Class::Elementwise, vec![self.x(), mix, streams.clone()], vec![streams]),
                     _ => sig(Class::Elementwise, vec![streams], vec![self.x()]),
                 }
+            }
+            Op::Dit(_) => bail!("{} is a denoiser op; sign it with denoiser::Signer", op.label()),
+            Op::BlockRes { stage } => {
+                use crate::plan::ResStage;
+                let blocks = spec.block_residual.as_ref().map_or(1, |r| r.blocks(spec.layers.count));
+                let prefix = Tensor::new(Place::Local("residual prefix".into()), Rows::Tokens, h, Form::F32);
+                let stack = Tensor::new(Place::Local("residual stack".into()), Rows::Tokens, blocks * h, Form::F32);
+                let score = Tensor::weight("block residual score", 1, h, Form::F32);
+                match stage {
+                    ResStage::Enter if layer == 0 => sig(Class::RowReduce, vec![self.x()], vec![prefix, stack, self.x()]),
+                    ResStage::Enter => sig(Class::RowReduce, vec![self.x(), prefix.clone(), stack.clone(), score], vec![prefix, stack, self.x()]),
+                    ResStage::Mixed => sig(Class::RowReduce, vec![self.x(), prefix.clone(), stack, score], vec![prefix, self.x()]),
+                    ResStage::Tail => sig(Class::RowReduce, vec![prefix, stack, score], vec![self.x()]),
+                    ResStage::Done => sig(Class::Elementwise, vec![self.x(), prefix.clone()], vec![prefix, self.x()]),
+                }
+            }
+            Op::LatentNorm => {
+                let w = spec.moe.as_ref().map_or(h, |m| m.width(h));
+                sig(Class::RowReduce, vec![Tensor::buf(Buf::Latent, Rows::Tokens, w), Tensor::weight("latent norm", 1, w, Form::F32)], vec![Tensor::buf(Buf::LatentPlanes, Rows::Tokens, w)])
             }
         })
     }

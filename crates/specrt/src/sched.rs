@@ -254,7 +254,7 @@ pub struct GpuExecutor {
 impl GpuExecutor {
     pub fn new(rt: Runtime) -> Result<Self> {
         let st = rt.stepper()?;
-        let fuse = rt.spec().runtime.fuse && rt.draft_tokens().is_none() && !rt.spec().uses_branch() && rt.spec().mixer.is_none() && rt.spec().hyper.is_none() && !rt.spec().layers.split;
+        let fuse = rt.spec().runtime.fuse && rt.draft_tokens().is_none() && !rt.spec().uses_branch() && rt.spec().mixer.is_none() && rt.spec().hyper.is_none() && rt.spec().gated_residual().is_none() && !rt.spec().layers.split;
         Ok(GpuExecutor { rt, st, fuse, fused_prefill: None })
     }
 

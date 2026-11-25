@@ -408,6 +408,11 @@ when = "legacy"
 in = "xn"
 
 [[tail]]
+op = "block_res"
+weight = "tail"
+when = "tensor_core+blockres"
+
+[[tail]]
 op = "rmsnorm"
 weight = "norm.weight"
 out = "xn_planes"
@@ -439,6 +444,388 @@ quant = "head"
 out = "logits"
 when = "tensor_core"
 in = "xn_planes"
+
+[[block]]
+name = "blockres_mixer"
+when = "blockres+tensor_core+mixer"
+layers = ["linear"]
+mlp = "dense"
+
+[[block.node]]
+op = "block_res"
+weight = "enter"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+out = "xn_planes"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "mix_in"
+shard = "column"
+quant = "attn"
+out = "mix"
+in = "xn_planes"
+
+[[block.node]]
+op = "mixer_nodes"
+
+[[block.node]]
+op = "clear"
+out = "x"
+
+[[block.node]]
+op = "linear"
+weight = "mix_out"
+shard = "row"
+quant = "attn"
+out = "x"
+in = "mix_planes"
+
+[[block.node]]
+op = "block_res"
+weight = "mixed"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "post_attention_layernorm.weight"
+out = "xn_planes"
+in = "x"
+
+[[block.node]]
+op = "clear"
+out = "x"
+
+[[block.node]]
+op = "linear"
+weight = "gate_up"
+shard = "column"
+quant = "mlp"
+out = "act_planes"
+in = "xn_planes"
+
+[[block.node]]
+op = "linear"
+weight = "down"
+shard = "row"
+quant = "mlp"
+out = "x"
+in = "act_planes"
+
+[[block.node]]
+op = "block_res"
+weight = "done"
+
+[[block]]
+name = "blockres_mixer_moe"
+when = "blockres+tensor_core+mixer+moe+latent"
+layers = ["linear"]
+mlp = "sparse"
+
+[[block.node]]
+op = "block_res"
+weight = "enter"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+out = "xn_planes"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "mix_in"
+shard = "column"
+quant = "attn"
+out = "mix"
+in = "xn_planes"
+
+[[block.node]]
+op = "mixer_nodes"
+
+[[block.node]]
+op = "clear"
+out = "x"
+
+[[block.node]]
+op = "linear"
+weight = "mix_out"
+shard = "row"
+quant = "attn"
+out = "x"
+in = "mix_planes"
+
+[[block.node]]
+op = "block_res"
+weight = "mixed"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "post_attention_layernorm.weight"
+out = "xn_planes"
+in = "x"
+
+[[block.node]]
+op = "moe_route"
+
+[[block.node]]
+op = "clear"
+out = "x"
+
+[[block.node]]
+op = "linear"
+weight = "shared_gate_up"
+shard = "column"
+quant = "attn"
+out = "act_planes"
+in = "xn_planes"
+
+[[block.node]]
+op = "linear"
+weight = "shared_down"
+shard = "row"
+quant = "attn"
+out = "x"
+in = "act_planes"
+
+[[block.node]]
+op = "linear"
+weight = "latent_down"
+shard = "replicate"
+quant = "attn"
+out = "latent"
+in = "xn_planes"
+
+[[block.node]]
+op = "moe_experts"
+
+[[block.node]]
+op = "moe_combine"
+out = "latent"
+
+[[block.node]]
+op = "latent_norm"
+
+[[block.node]]
+op = "linear"
+weight = "latent_up"
+shard = "replicate"
+quant = "attn"
+out = "x"
+in = "latent_planes"
+
+[[block.node]]
+op = "block_res"
+weight = "done"
+
+[[block]]
+name = "blockres_attention"
+when = "blockres+tensor_core"
+layers = ["dense", "full", "sliding", "shared", "compressed", "indexed"]
+mlp = "dense"
+
+[[block.node]]
+op = "block_res"
+weight = "enter"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+out = "xn_planes"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "qkv"
+shard = "column"
+quant = "attn"
+out = "qkv"
+in = "xn_planes"
+
+[[block.node]]
+op = "kv_rope"
+when = "stock"
+phase = "prefill"
+
+[[block.node]]
+op = "flash"
+when = "stock"
+phase = "prefill"
+
+[[block.node]]
+op = "decode_attention"
+when = "stock"
+phase = "rows"
+
+[[block.node]]
+op = "attention_nodes"
+when = "described"
+
+[[block.node]]
+op = "clear"
+out = "x"
+
+[[block.node]]
+op = "linear"
+weight = "o"
+shard = "row"
+quant = "attn"
+out = "x"
+in = "attn_planes"
+
+[[block.node]]
+op = "block_res"
+weight = "mixed"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "post_attention_layernorm.weight"
+out = "xn_planes"
+in = "x"
+
+[[block.node]]
+op = "clear"
+out = "x"
+
+[[block.node]]
+op = "linear"
+weight = "gate_up"
+shard = "column"
+quant = "mlp"
+out = "act_planes"
+in = "xn_planes"
+
+[[block.node]]
+op = "linear"
+weight = "down"
+shard = "row"
+quant = "mlp"
+out = "x"
+in = "act_planes"
+
+[[block.node]]
+op = "block_res"
+weight = "done"
+
+[[block]]
+name = "blockres_attention_moe"
+when = "blockres+tensor_core+moe+latent"
+layers = ["dense", "full", "sliding", "shared", "compressed", "indexed"]
+mlp = "sparse"
+
+[[block.node]]
+op = "block_res"
+weight = "enter"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+out = "xn_planes"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "qkv"
+shard = "column"
+quant = "attn"
+out = "qkv"
+in = "xn_planes"
+
+[[block.node]]
+op = "kv_rope"
+when = "stock"
+phase = "prefill"
+
+[[block.node]]
+op = "flash"
+when = "stock"
+phase = "prefill"
+
+[[block.node]]
+op = "decode_attention"
+when = "stock"
+phase = "rows"
+
+[[block.node]]
+op = "attention_nodes"
+when = "described"
+
+[[block.node]]
+op = "clear"
+out = "x"
+
+[[block.node]]
+op = "linear"
+weight = "o"
+shard = "row"
+quant = "attn"
+out = "x"
+in = "attn_planes"
+
+[[block.node]]
+op = "block_res"
+weight = "mixed"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "post_attention_layernorm.weight"
+out = "xn_planes"
+in = "x"
+
+[[block.node]]
+op = "moe_route"
+
+[[block.node]]
+op = "clear"
+out = "x"
+
+[[block.node]]
+op = "linear"
+weight = "shared_gate_up"
+shard = "column"
+quant = "attn"
+out = "act_planes"
+in = "xn_planes"
+
+[[block.node]]
+op = "linear"
+weight = "shared_down"
+shard = "row"
+quant = "attn"
+out = "x"
+in = "act_planes"
+
+[[block.node]]
+op = "linear"
+weight = "latent_down"
+shard = "replicate"
+quant = "attn"
+out = "latent"
+in = "xn_planes"
+
+[[block.node]]
+op = "moe_experts"
+
+[[block.node]]
+op = "moe_combine"
+out = "latent"
+
+[[block.node]]
+op = "latent_norm"
+
+[[block.node]]
+op = "linear"
+weight = "latent_up"
+shard = "replicate"
+quant = "attn"
+out = "x"
+in = "latent_planes"
+
+[[block.node]]
+op = "block_res"
+weight = "done"
 
 [[block]]
 name = "gated_sandwich"
@@ -549,6 +936,9 @@ layers = ["linear"]
 mlp = "sparse"
 
 [[block.node]]
+op = "prelude_nodes"
+
+[[block.node]]
 op = "gated_pre"
 weight = "0"
 
@@ -627,6 +1017,9 @@ name = "gated_attention_moe"
 when = "untagged+tensor_core+moe"
 layers = ["dense", "full", "sliding", "shared", "compressed", "indexed"]
 mlp = "sparse"
+
+[[block.node]]
+op = "prelude_nodes"
 
 [[block.node]]
 op = "gated_pre"
@@ -1633,7 +2026,7 @@ when = "tensor_core+logit_softcap"
 
 [[mtp]]
 op = "mtp_in"
-when = "speculative+tensor_core"
+when = "speculative+flat+tensor_core"
 out = "fc_planes"
 
 [[mtp]]
@@ -1641,7 +2034,7 @@ op = "linear"
 weight = "mtp_fc"
 shard = "replicate"
 quant = "attn"
-when = "speculative+tensor_core"
+when = "speculative+flat+tensor_core"
 in = "fc_planes"
 out = "x"
 
@@ -1649,7 +2042,7 @@ out = "x"
 op = "rmsnorm"
 weight = "input_layernorm.weight"
 out = "xn_planes"
-when = "speculative+tensor_core"
+when = "speculative+flat+tensor_core"
 in = "x"
 
 [[mtp]]
@@ -1657,35 +2050,35 @@ op = "linear"
 weight = "mtp_qkv"
 shard = "column"
 quant = "attn"
-when = "speculative+tensor_core"
+when = "speculative+flat+tensor_core"
 in = "xn_planes"
 out = "qkv"
 
 [[mtp]]
 op = "kv_rope"
 phase = "prefill"
-when = "speculative+tensor_core+stock"
+when = "speculative+flat+tensor_core+stock"
 
 [[mtp]]
 op = "flash"
 phase = "prefill"
-when = "speculative+tensor_core+stock"
+when = "speculative+flat+tensor_core+stock"
 
 [[mtp]]
 op = "decode_attention"
 phase = "rows"
-when = "speculative+tensor_core+stock"
+when = "speculative+flat+tensor_core+stock"
 
 [[mtp]]
 op = "attention_nodes"
-when = "speculative+tensor_core+described"
+when = "speculative+flat+tensor_core+described"
 
 [[mtp]]
 op = "linear"
 weight = "mtp_o"
 shard = "row"
 quant = "attn"
-when = "speculative+tensor_core"
+when = "speculative+flat+tensor_core"
 in = "attn_planes"
 out = "x"
 
@@ -1693,27 +2086,27 @@ out = "x"
 op = "rmsnorm"
 weight = "post_attention_layernorm.weight"
 out = "xn_planes"
-when = "speculative+tensor_core+dense"
+when = "speculative+flat+tensor_core+dense"
 in = "x"
 
 [[mtp]]
 op = "moe_route"
-when = "speculative+tensor_core+moe"
+when = "speculative+flat+tensor_core+moe"
 
 [[mtp]]
 op = "moe_experts"
-when = "speculative+tensor_core+moe"
+when = "speculative+flat+tensor_core+moe"
 
 [[mtp]]
 op = "moe_combine"
-when = "speculative+tensor_core+moe"
+when = "speculative+flat+tensor_core+moe"
 
 [[mtp]]
 op = "linear"
 weight = "mtp_gate_up"
 shard = "column"
 quant = "mlp"
-when = "speculative+tensor_core+dense"
+when = "speculative+flat+tensor_core+dense"
 in = "xn_planes"
 out = "act_planes"
 
@@ -1722,17 +2115,17 @@ op = "linear"
 weight = "mtp_down"
 shard = "row"
 quant = "mlp"
-when = "speculative+tensor_core+dense"
+when = "speculative+flat+tensor_core+dense"
 in = "act_planes"
 out = "x"
 
 [[mtp_head]]
 op = "mtp_gather"
-when = "speculative+tensor_core"
+when = "speculative+flat+tensor_core"
 
 [[mtp_head]]
 op = "mtp_norm"
-when = "speculative+tensor_core"
+when = "speculative+flat+tensor_core"
 out = "xn_planes"
 
 [[mtp_head]]
@@ -1740,13 +2133,153 @@ op = "linear"
 weight = "mtp_head"
 shard = "vocab"
 quant = "draft_head"
-when = "speculative+tensor_core"
+when = "speculative+flat+tensor_core"
 in = "xn_planes"
 out = "mtp_logits"
 
 [[mtp_head]]
 op = "mtp_draft"
-when = "speculative+tensor_core"
+when = "speculative+flat+tensor_core"
+
+[[mtp]]
+op = "mtp_in"
+when = "speculative+gated+tensor_core"
+out = "fc_planes"
+
+[[mtp]]
+op = "linear"
+weight = "mtp_fc"
+shard = "replicate"
+quant = "attn"
+when = "speculative+gated+tensor_core"
+in = "fc_planes"
+out = "x"
+
+[[mtp]]
+op = "gated_expand"
+when = "speculative+gated+tensor_core"
+
+[[mtp]]
+op = "linear"
+weight = "mtp_fc_hidden"
+shard = "replicate"
+quant = "attn"
+when = "speculative+gated+tensor_core"
+in = "draft_planes"
+out = "streams"
+
+[[mtp]]
+op = "gated_pre"
+weight = "0"
+when = "speculative+gated+tensor_core"
+
+[[mtp]]
+op = "split"
+in = "x"
+out = "xn_planes"
+when = "speculative+gated+tensor_core"
+
+[[mtp]]
+op = "linear"
+weight = "mtp_qkv"
+shard = "column"
+quant = "attn"
+when = "speculative+gated+tensor_core"
+in = "xn_planes"
+out = "qkv"
+
+[[mtp]]
+op = "kv_rope"
+phase = "prefill"
+when = "speculative+gated+tensor_core+stock"
+
+[[mtp]]
+op = "flash"
+phase = "prefill"
+when = "speculative+gated+tensor_core+stock"
+
+[[mtp]]
+op = "decode_attention"
+phase = "rows"
+when = "speculative+gated+tensor_core+stock"
+
+[[mtp]]
+op = "attention_nodes"
+when = "speculative+gated+tensor_core+described"
+
+[[mtp]]
+op = "clear"
+out = "x"
+when = "speculative+gated+tensor_core"
+
+[[mtp]]
+op = "linear"
+weight = "mtp_o"
+shard = "row"
+quant = "attn"
+when = "speculative+gated+tensor_core"
+in = "attn_planes"
+out = "x"
+
+[[mtp]]
+op = "gated_post"
+weight = "0"
+when = "speculative+gated+tensor_core"
+
+[[mtp]]
+op = "gated_pre"
+weight = "1"
+when = "speculative+gated+tensor_core"
+
+[[mtp]]
+op = "moe_route"
+when = "speculative+gated+tensor_core+moe"
+
+[[mtp]]
+op = "moe_experts"
+when = "speculative+gated+tensor_core+moe"
+
+[[mtp]]
+op = "clear"
+out = "x"
+when = "speculative+gated+tensor_core+moe"
+
+[[mtp]]
+op = "moe_combine"
+when = "speculative+gated+tensor_core+moe"
+
+[[mtp]]
+op = "gated_post"
+weight = "1"
+when = "speculative+gated+tensor_core"
+
+[[mtp_head]]
+op = "mtp_gather"
+when = "speculative+gated+tensor_core"
+
+[[mtp_head]]
+op = "gated_collapse"
+weight = "draft"
+when = "speculative+gated+tensor_core"
+
+[[mtp_head]]
+op = "split"
+in = "x"
+out = "xn_planes"
+when = "speculative+gated+tensor_core"
+
+[[mtp_head]]
+op = "linear"
+weight = "mtp_head"
+shard = "vocab"
+quant = "draft_head"
+when = "speculative+gated+tensor_core"
+in = "xn_planes"
+out = "mtp_logits"
+
+[[mtp_head]]
+op = "mtp_draft"
+when = "speculative+gated+tensor_core"
 
 [[vision_head]]
 op = "patch_embed"

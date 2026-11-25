@@ -66,8 +66,10 @@ pub enum Expr {
     Call(&'static str, Vec<Expr>),
 }
 
-const UNARY: [(&str, &str, &str); 7] = [
+const UNARY: [(&str, &str, &str); 9] = [
     ("floor", "floorf", "floor"),
+    ("sin", "sinf", "sin"),
+    ("cos", "cosf", "cos"),
     ("tanh", "tanhf", "tanh"),
     ("exp", "expf", "exp"),
     ("log", "logf", "log"),
@@ -354,6 +356,8 @@ impl Expr {
                     ("min", [a, b]) => a.min(*b),
                     ("max", [a, b]) => a.max(*b),
                     ("floor", [a]) => a.floor(),
+                    ("sin", [a]) => a.sin(),
+                    ("cos", [a]) => a.cos(),
                     ("tanh", [a]) => a.tanh(),
                     ("exp", [a]) => a.exp(),
                     ("log", [a]) => a.ln(),
@@ -475,6 +479,20 @@ pub fn probit(p: f64) -> Option<f64> {
         let r = q * q;
         (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q / (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0)
     })
+}
+
+impl std::fmt::Display for Expr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let child = |e: &Expr, paren: bool| if paren { format!("({e})") } else { e.to_string() };
+        match self {
+            Expr::Lit(t) | Expr::Raw(t) | Expr::Name(t) => f.write_str(t),
+            Expr::Const(n, _) => f.write_str(n),
+            Expr::Width => f.write_str("width"),
+            Expr::Neg(e) => write!(f, "-{}", child(e, e.prec() < 6)),
+            Expr::Bin(op, a, b) => write!(f, "{} {} {}", child(a, a.prec() < op.prec()), op.text(), child(b, b.prec() <= op.prec())),
+            Expr::Call(name, args) => write!(f, "{name}({})", args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")),
+        }
+    }
 }
 
 fn fold(op: Op, a: Expr, b: Expr, consts: &[Const]) -> Expr {

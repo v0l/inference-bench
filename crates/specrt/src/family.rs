@@ -25,6 +25,7 @@ pub enum ParamSource {
     Number(f64),
     Config { config: String, #[serde(default)] default: Option<f64>, #[serde(default)] alt: Option<String> },
     Expr { expr: String },
+    Int { int: String },
 }
 
 pub fn read_params(params: &std::collections::BTreeMap<String, ParamSource>, config: &serde_json::Value) -> Result<std::collections::BTreeMap<String, f64>> {
@@ -43,6 +44,17 @@ pub fn read_params(params: &std::collections::BTreeMap<String, ParamSource>, con
                         None => continue,
                     }
                 }
+                ParamSource::Int { int } => {
+                    let e = kir::int::IntExpr::parse(int).map_err(anyhow::Error::msg).with_context(|| format!("attention param {n}"))?;
+                    let whole = |v: f64| (v >= 0.0 && v.fract() == 0.0).then_some(v as u64);
+                    let mut names = Vec::new();
+                    e.names(&mut names);
+                    let value = |k: &str| out.get(k).copied().and_then(whole).or_else(|| config.get(k).and_then(|v| v.as_u64().or_else(|| v.as_f64().and_then(whole))));
+                    if names.iter().any(|k| value(k).is_none()) {
+                        continue;
+                    }
+                    e.eval(&value).map_err(anyhow::Error::msg).with_context(|| format!("attention param {n}"))? as f64
+                }
                 other => other.read(n, config)?,
             };
             out.insert(n.clone(), v);
@@ -58,7 +70,7 @@ impl ParamSource {
     pub fn read(&self, name: &str, config: &serde_json::Value) -> Result<f64> {
         match self {
             ParamSource::Number(v) => Ok(*v),
-            ParamSource::Expr { .. } => read_params(&[(name.to_string(), self.clone())].into_iter().collect(), config).map(|m| m[name]),
+            ParamSource::Expr { .. } | ParamSource::Int { .. } => read_params(&[(name.to_string(), self.clone())].into_iter().collect(), config).map(|m| m[name]),
             ParamSource::Config { config: key, default, alt } => std::iter::once(key).chain(alt.as_ref())
                 .find_map(|key| key.split('.').try_fold(config, |v, k| v.get(k)).and_then(|v| v.as_f64().or_else(|| v.as_bool().map(f64::from))))
                 .or(*default)
@@ -221,6 +233,50 @@ impl FamilyGatedResidual {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct FamilyPrelude {
+    pub module: String,
+    pub layers_key: Option<String>,
+    pub layers_base: usize,
+    pub index: Option<String>,
+    pub count: Option<String>,
+    pub params: std::collections::BTreeMap<String, ParamSource>,
+    pub scratch: std::collections::BTreeMap<String, String>,
+    pub int_scratch: std::collections::BTreeMap<String, String>,
+    pub stored: std::collections::BTreeMap<String, String>,
+    pub node: Vec<crate::graph::Node>,
+}
+
+impl FamilyPrelude {
+    pub fn read(&self, config: &serde_json::Value) -> Result<Option<crate::spec::Prelude>> {
+        if self.node.is_empty() {
+            return Ok(None);
+        }
+        let key = self.layers_key.as_deref().context("[prelude] needs layers_key, the config key of the layer list")?;
+        let Some(list) = dotted(config, key).and_then(|v| v.as_array()) else { return Ok(None) };
+        let layers = list
+            .iter()
+            .map(|v| v.as_u64().and_then(|n| (n as usize).checked_sub(self.layers_base)).with_context(|| format!("[prelude] {key} entry {v} is not a layer number from {}", self.layers_base)))
+            .collect::<Result<Vec<usize>>>()?;
+        if layers.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(crate::spec::Prelude {
+            module: self.module.clone(),
+            layers,
+            index: self.index.clone(),
+            count: self.count.clone(),
+            params: read_params(&self.params, config)?,
+            scratch: self.scratch.clone(),
+            int_scratch: self.int_scratch.clone(),
+            stored: self.stored.clone(),
+            words: Default::default(),
+            node: self.node.clone(),
+        }))
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct FamilyPerLayer {
     pub dim: Option<String>,
     pub params: std::collections::BTreeMap<String, ParamSource>,
@@ -281,6 +337,8 @@ impl Default for FamilyNorm {
 pub struct FamilyRefuse {
     pub when: String,
     pub message: String,
+    #[serde(default)]
+    pub part: Option<String>,
 }
 
 impl FamilyRefuse {
@@ -317,6 +375,14 @@ pub struct FamilyGated {
     pub expr: String,
     #[serde(default)]
     pub params: std::collections::BTreeMap<String, ParamSource>,
+    #[serde(default)]
+    pub act: Option<String>,
+}
+
+impl FamilyGated {
+    pub fn applies(&self, hidden_act: Option<&str>) -> bool {
+        self.act.as_deref().is_none_or(|a| hidden_act == Some(a))
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -345,6 +411,40 @@ pub struct FamilyMoe {
     pub router_norm_scale: Option<String>,
     pub input_norm: Option<String>,
     pub expert_scale: Option<String>,
+    pub latent: Option<FamilyLatent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FamilyLatent {
+    pub width: String,
+    pub down: String,
+    pub up: String,
+    pub norm: String,
+    pub norm_key: String,
+}
+
+impl FamilyLatent {
+    pub fn read(&self, config: &serde_json::Value) -> Option<crate::spec::LatentExperts> {
+        let width = dotted(config, &self.width).and_then(|v| v.as_u64()).filter(|w| *w > 0)? as usize;
+        let normed = dotted(config, &self.norm_key).and_then(|v| v.as_bool()).unwrap_or(false);
+        Some(crate::spec::LatentExperts { width, down: self.down.clone(), up: self.up.clone(), norm: normed.then(|| self.norm.clone()) })
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyBlockResidual {
+    pub size: Option<String>,
+    pub sites: Vec<String>,
+    pub output: String,
+}
+
+impl FamilyBlockResidual {
+    pub fn read(&self, config: &serde_json::Value) -> Option<crate::spec::BlockResidual> {
+        let size = dotted(config, self.size.as_deref()?).and_then(|v| v.as_u64()).filter(|s| *s > 0)? as usize;
+        Some(crate::spec::BlockResidual { size, sites: self.sites.clone(), output: self.output.clone() })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -693,7 +793,11 @@ pub struct Family {
     #[serde(default)]
     pub gated_residual: FamilyGatedResidual,
     #[serde(default)]
+    pub prelude: FamilyPrelude,
+    #[serde(default)]
     pub per_layer: FamilyPerLayer,
+    #[serde(default)]
+    pub block_residual: FamilyBlockResidual,
     #[serde(default)]
     pub tensors: std::collections::BTreeMap<String, String>,
     #[serde(default)]
@@ -715,7 +819,7 @@ impl Family {
                 push(a, &mut out);
             }
         }
-        for (_, key) in self.attention.params.iter().chain(self.mixer.params.iter()).chain(self.gated_residual.params.iter()).chain(self.per_layer.params.iter()) {
+        for (_, key) in self.attention.params.iter().chain(self.mixer.params.iter()).chain(self.gated_residual.params.iter()).chain(self.per_layer.params.iter()).chain(self.prelude.params.iter()) {
             match key {
                 ParamSource::Config { config, alt, .. } => {
                     push(config, &mut out);
@@ -724,6 +828,15 @@ impl Family {
                     }
                 }
                 ParamSource::Expr { expr } => expr_keys(expr, &mut out),
+                ParamSource::Int { int } => {
+                    if let Ok(e) = kir::int::IntExpr::parse(int) {
+                        let mut names = Vec::new();
+                        e.names(&mut names);
+                        for n in names {
+                            push(&n, &mut out);
+                        }
+                    }
+                }
                 ParamSource::Number(_) => {}
             }
         }
@@ -737,6 +850,9 @@ impl Family {
             expr_keys(s, &mut out);
         }
         if let Some(k) = self.linear.gate_key.as_deref() {
+            push(k, &mut out);
+        }
+        if let Some(k) = self.prelude.layers_key.as_deref() {
             push(k, &mut out);
         }
         if let Some(k) = self.blocks.attention_indices_key.as_deref() {
@@ -769,8 +885,12 @@ impl Family {
         if let Some(k) = self.rope.nope_zero_key.as_deref() {
             push(k, &mut out);
         }
-        for k in self.hyper.keys().chain(self.gated_residual.streams.as_deref()).chain(self.per_layer.dim.as_deref()).chain(self.gated_residual.layer_params.values().map(|p| p.config.as_str())) {
+        for k in self.hyper.keys().chain(self.gated_residual.streams.as_deref()).chain(self.per_layer.dim.as_deref()).chain(self.block_residual.size.as_deref()).chain(self.gated_residual.layer_params.values().map(|p| p.config.as_str())) {
             push(k, &mut out);
+        }
+        if let Some(l) = &self.moe.latent {
+            push(&l.width, &mut out);
+            push(&l.norm_key, &mut out);
         }
         if let Some(i) = &self.attention.indexer {
             for k in [Some(&i.heads), Some(&i.head_dim), Some(&i.topk), i.kpool.as_ref()].into_iter().flatten() {
