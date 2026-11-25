@@ -66,6 +66,8 @@ fn grid(n: usize, per: usize) -> u32 {
     n.div_ceil(per).max(1) as u32
 }
 
+pub const MAX_ROWS: usize = 65535;
+
 fn rows_of(rows: &str, sh: &Shapes, seqs: usize) -> usize {
     match rows {
         "joint" => seqs * sh.joint(),
@@ -406,6 +408,10 @@ impl Denoiser {
     }
 
     fn run(&self, op: &Op, block: Option<usize>, a: &mut Arena) -> Result<()> {
+        self.run_inner(op, block, a).with_context(|| format!("{} at {}x{} latent patches", op.label(), a.shapes.patch_h, a.shapes.patch_w))
+    }
+
+    fn run_inner(&self, op: &Op, block: Option<usize>, a: &mut Arena) -> Result<()> {
         let Op::Dit(d) = op else { bail!("{} is not a denoiser op", op.label()) };
         if let DitOp::JointAttention { .. } | DitOp::AxisRope { .. } | DitOp::Step { .. } | DitOp::TimestepEmbed { .. } = d {
             return self.run_seq(d, block, a, 0);

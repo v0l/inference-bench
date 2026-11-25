@@ -158,6 +158,15 @@ fn nearest(v: usize, step: usize) -> usize {
 }
 
 impl MediaInfo {
+    pub fn tokens(&self, width: usize, height: usize) -> usize {
+        let s = self.pixel_step.max(1);
+        (width / s) * (height / s)
+    }
+
+    pub fn fits(&self, size: &str) -> bool {
+        parse_size(size).is_some_and(|(w, h)| self.tokens(w, h) <= crate::denoiser_cuda::MAX_ROWS)
+    }
+
     pub fn check(&self, job: &MediaJob) -> Result<()> {
         if job.kind != self.kind {
             return Err(invalid(format!("this is a {} model; a {} job does not run on it", self.kind.label(), job.kind.label())));
@@ -174,6 +183,10 @@ impl MediaInfo {
         }
         if job.width > 4096 || job.height > 4096 {
             return Err(invalid(format!("size {}x{} is over 4096 on a side", job.width, job.height)));
+        }
+        let tokens = self.tokens(job.width, job.height);
+        if tokens > crate::denoiser_cuda::MAX_ROWS {
+            return Err(invalid(format!("size {}x{} is {tokens} latent tokens, over the {} one denoiser launch takes; pick a smaller size", job.width, job.height, crate::denoiser_cuda::MAX_ROWS)));
         }
         if let Some(steps) = job.steps
             && !(1..=200).contains(&steps)
@@ -230,7 +243,7 @@ pub fn info(dir: &Path) -> Result<MediaInfo> {
     ensure!(pipeline.name == fp.graph, "family {} runs the {} pipeline graph, the folder reads as {}", family.name, fp.graph, pipeline.name);
     let kind = ModelKind::parse(&fp.kind).with_context(|| format!("family {} has pipeline kind {:?}", family.name, fp.kind))?;
     let components = fp.components.iter().map(|c| Component { name: c.clone(), bytes: dir_bytes(&dir.join(c)), resident: fp.resident.contains(c) }).collect();
-    Ok(MediaInfo {
+    let mut i = MediaInfo {
         kind,
         family: family.name.clone(),
         pixel_step: pipeline.values.get("pixel_step").copied().unwrap_or(16.0) as usize,
@@ -241,7 +254,14 @@ pub fn info(dir: &Path) -> Result<MediaInfo> {
         samplers: fp.samplers.clone(),
         max_images: fp.max_images.max(1),
         components,
-    })
+    };
+    let sizes: Vec<String> = i.sizes.iter().filter(|s| i.fits(s)).cloned().collect();
+    ensure!(!sizes.is_empty(), "family {} offers no size this engine runs at pixel step {}", family.name, i.pixel_step);
+    if !sizes.contains(&i.default_size) {
+        i.default_size = sizes.iter().max_by_key(|s| parse_size(s).map_or(0, |(w, h)| w * h)).cloned().unwrap_or_default();
+    }
+    i.sizes = sizes;
+    Ok(i)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -297,7 +317,7 @@ pub fn admit(free: u64, resident: u64, guided: bool, latent: (usize, usize), b: 
             t += VAE_TILE_ALIGN;
         }
         let Some((t, bytes)) = best else {
-            return Err(invalid(format!("the VAE needs {} MB for its smallest tile of {VAE_TILE_ALIGN} latent pixels, and {} MB is free after the weights", (b.vae_arena)(VAE_TILE_ALIGN.min(lh), VAE_TILE_ALIGN.min(lw))? >> 20, vae_room >> 20)));
+            return Err(invalid(format!("the VAE does not fit for its smallest tile of {VAE_TILE_ALIGN} latent pixels with {} MB free after the weights", vae_room >> 20)));
         };
         a.vae_arena = bytes;
         a.vae_tile = Some(t);
@@ -379,7 +399,10 @@ impl ImageModel {
         let free = self.generator.free_bytes()?;
         let budget = Budget {
             denoiser_arena: &|seqs| Ok(crate::denoiser_cuda::arena_bytes(graph, &spec, &shapes, seqs)? as u64),
-            vae_arena: &|h, w| crate::vae::tiled::arena_bytes(&vae_plan, &target, h, w),
+            vae_arena: &|h, w| match kir::conv::attention_fits(&target, h * w) {
+                true => crate::vae::tiled::arena_bytes(&vae_plan, &target, h, w),
+                false => Ok(u64::MAX),
+            },
         };
         let (plan, mut a) = admit(free, resident, guided, (d.h, d.w), &budget)?;
         a.weights = weights;
@@ -440,6 +463,7 @@ mod tests {
     fn the_family_file_describes_the_tiny_pipeline() {
         let i = info(&tiny()).unwrap();
         assert_eq!((i.kind, i.family.as_str(), i.pixel_step, i.default_steps), (ModelKind::Image, "flux2_klein", 4, 4));
+        assert_eq!(i.default_size, "720x1280", "the largest offered size the tiny model's pixel step allows");
         assert_eq!(i.components.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["text_encoder", "transformer", "vae"]);
         assert!(i.components.iter().all(|c| c.bytes > 0));
         assert!(!i.components[0].resident && i.components[1].resident);
@@ -452,6 +476,9 @@ mod tests {
         i.check(&ok).unwrap();
         let bad = i.check(&MediaJob { width: 30, ..ok.clone() }).unwrap_err().to_string();
         assert!(bad.contains("not a multiple of 4") && bad.contains("nearest valid size is 32x32"), "{bad}");
+        let big = i.check(&MediaJob { width: 1024, height: 1024, ..ok.clone() }).unwrap_err().to_string();
+        assert!(big.contains("65536 latent tokens"), "{big}");
+        assert!(!i.sizes.contains(&"1024x1024".to_string()) && i.fits(&i.default_size), "{:?} {}", i.sizes, i.default_size);
         assert!(i.check(&MediaJob { n: 9, ..ok.clone() }).is_err());
         assert!(i.check(&MediaJob { prompt: " ".into(), ..ok.clone() }).is_err());
         assert!(i.check(&MediaJob { sampler: Some("ddim".into()), ..ok.clone() }).unwrap_err().to_string().contains("euler"));

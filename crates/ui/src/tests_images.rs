@@ -58,7 +58,8 @@ fn an_image_model_has_its_own_load_page_with_the_common_options_and_components()
     }
     assert!(!shows(&h, "ADVANCED"), "the common options are not behind Advanced");
     let d = h.state().image_load.as_ref().unwrap();
-    assert_eq!(d.defaults.size, "1024x1024");
+    assert_eq!(d.defaults.size, d.info.default_size);
+    assert_eq!(d.info.default_size, "720x1280", "the largest offered size the tiny model's pixel step allows");
     assert_eq!(d.defaults.steps, 4);
     assert!(d.defaults.offload_text_encoder);
     h.get_by_label("load model").click();
@@ -75,7 +76,7 @@ fn an_image_model_has_its_own_load_page_with_the_common_options_and_components()
 fn the_generate_page_runs_a_job_shows_the_result_and_a_request_row() {
     let mut h = image_app("img-gen", egui::vec2(1280.0, 800.0));
     load_through_the_page(&mut h);
-    assert_eq!(h.state().generate.size, "1024x1024");
+    assert_eq!(h.state().generate.size, "720x1280");
     let seed = h.state().generate.seed;
     generate(&mut h, "a red fox");
     let g = &h.state().generate;

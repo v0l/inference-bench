@@ -117,6 +117,24 @@ fn the_admission_fallbacks_sequential_guidance_and_tiled_vae_give_the_same_image
 
 #[test]
 #[ignore = "needs a GPU: ~/.agents/bin/gpu-run 1 -- cargo test --test sampler_gpu -- --ignored --test-threads=1"]
+fn the_largest_offered_size_runs_through_admission_and_decodes() {
+    let (ctx, jit) = gpu();
+    let mut model = specrt::media::ImageModel::load(&fixture().display().to_string(), None).unwrap();
+    drop((ctx, jit));
+    let size = model.info.default_size.clone();
+    let (w, h) = specrt::media::parse_size(&size).unwrap();
+    let job = specrt::media::MediaJob { steps: Some(1), ..specrt::media::MediaJob::image("w176 w476", w, h, 1) };
+    let (plan, a) = model.plan(&job).unwrap();
+    eprintln!("{size}: plan {plan:?} admission {a:?}");
+    let out = model.run(&job, &mut |_| true).unwrap();
+    assert_eq!((out.images[0].width, out.images[0].height), (w, h));
+    let square = specrt::media::MediaJob { steps: Some(1), ..specrt::media::MediaJob::image("w176", 1024, 1024, 1) };
+    let refused = model.run(&square, &mut |_| true).unwrap_err();
+    assert!(refused.downcast_ref::<specrt::media::InvalidJob>().is_some(), "{refused}");
+}
+
+#[test]
+#[ignore = "needs a GPU: ~/.agents/bin/gpu-run 1 -- cargo test --test sampler_gpu -- --ignored --test-threads=1"]
 fn three_unguided_steps_from_the_seed_give_the_reference_image() {
     check_run(1.0, "");
 }
