@@ -61,8 +61,8 @@ fn every_vae_kernel_compiles_with_nvrtc() {
     }
     for c in cases() {
         let k = case(&c);
-        let shape = kir::conv::ConvShape { cin: k.conv.cin, cout: k.conv.cout, k: k.conv.k, kt: k.conv.kt, upsample: k.upsample, interleave: k.interleave };
-        all.push(kir::conv::ConvKernel::new(&target, shape, kir::conv::Prologue::None, kir::conv::Epilogue { residual: false, stats: None }).unwrap());
+        let shape = kir::conv::ConvShape::grid(k.conv.cin, k.conv.cout, k.conv.k, k.conv.kt, k.upsample, k.interleave);
+        all.push(kir::conv::ConvKernel::new(&target, shape, kir::conv::Prologue::None, kir::conv::Epilogue { residual: false, stats: None, gelu: false }).unwrap());
     }
     all.sort_by_key(|k| k.name());
     all.dedup_by_key(|k| k.name());

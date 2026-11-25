@@ -20,9 +20,24 @@ pub struct ConvShape {
     pub kt: usize,
     pub upsample: bool,
     pub interleave: bool,
+    pub line: bool,
+    pub stride: usize,
+    pub phases: usize,
 }
 
 impl ConvShape {
+    pub fn grid(cin: usize, cout: usize, k: usize, kt: usize, upsample: bool, interleave: bool) -> ConvShape {
+        ConvShape { cin, cout, k, kt, upsample, interleave, line: false, stride: 1, phases: 1 }
+    }
+
+    pub fn line(cin: usize, cout: usize, taps: usize, stride: usize, phases: usize) -> ConvShape {
+        ConvShape { cin, cout, k: 1, kt: taps, upsample: false, interleave: false, line: true, stride, phases }
+    }
+
+    pub fn context(&self) -> usize {
+        self.kt - self.stride
+    }
+
     pub fn taps(&self) -> usize {
         self.k * self.k * self.kt
     }
@@ -80,6 +95,7 @@ pub enum Prologue {
 pub struct Epilogue {
     pub residual: bool,
     pub stats: Option<usize>,
+    pub gelu: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -119,8 +135,14 @@ impl ConvKernel {
         if s.cin == 0 || s.cout == 0 || s.k.is_multiple_of(2) || s.kt == 0 {
             return bad("needs channels, an odd spatial kernel and at least one frame tap".into());
         }
-        if s.interleave && (!s.cout.is_multiple_of(2) || s.upsample) {
+        if s.interleave && (!s.cout.is_multiple_of(2) || s.upsample || s.phases != 1) {
             return bad("an interleaved output splits an even channel count and does not upsample".into());
+        }
+        if s.line && (s.k != 1 || s.upsample || s.interleave || s.stride == 0 || s.stride > s.kt || s.phases == 0 || !s.cout.is_multiple_of(s.phases) || self.prologue != Prologue::None || self.epilogue.stats.is_some()) {
+            return bad(format!("a causal line conv over {} taps with stride {} and {} phases needs a 1x1 spatial kernel, whole phases and no group norm", s.kt, s.stride, s.phases));
+        }
+        if !s.line && (s.stride != 1 || s.phases != 1 || self.epilogue.gelu) {
+            return bad("stride, phases and gelu are line conv options".into());
         }
         if let Prologue::GroupApply { groups, .. } = self.prologue
             && (groups == 0 || groups > MAX_GROUPS || !s.cin.is_multiple_of(groups) || s.kt > 1)
@@ -146,7 +168,17 @@ impl ConvKernel {
 
     fn describe_shape(&self) -> String {
         let s = &self.shape;
-        format!("{}x{}x{} {}->{}{}{}", s.kt, s.k, s.k, s.cin, s.cout, if s.upsample { " up" } else { "" }, if s.interleave { " interleave" } else { "" })
+        format!(
+            "{}x{}x{} {}->{}{}{}{}",
+            s.kt,
+            s.k,
+            s.k,
+            s.cin,
+            s.cout,
+            if s.upsample { " up" } else { "" },
+            if s.interleave { " interleave" } else { "" },
+            if s.line { format!(" line stride {} phases {}", s.stride, s.phases) } else { String::new() }
+        )
     }
 
     pub fn groups_in(&self) -> usize {
@@ -173,7 +205,14 @@ impl ConvKernel {
     }
 
     pub fn name(&self) -> String {
-        format!("vae_conv_{}", &self.hash()[..12])
+        format!("{}_{}", if self.shape.line { "line_conv" } else { "vae_conv" }, &self.hash()[..12])
+    }
+
+    pub fn line_grid(&self, rows: usize) -> (u32, u32, u32) {
+        match self.family {
+            Family::Tile => (rows.div_ceil(self.tile.bm) as u32, self.shape.cout.div_ceil(self.tile.bn) as u32, 1),
+            Family::Direct => ((rows * self.shape.cout).div_ceil(THREADS as usize).max(1) as u32, 1, 1),
+        }
     }
 
     pub fn grid(&self, frames: usize, h: usize, w: usize) -> (u32, u32, u32) {
@@ -184,7 +223,9 @@ impl ConvKernel {
     }
 
     pub fn describe(&self) -> String {
-        format!("{}\nconv {} family={:?} tile={:?} prologue={:?} epilogue={:?}", self.target.describe(), self.describe_shape(), self.family, self.tile, self.prologue, self.epilogue)
+        let e = &self.epilogue;
+        let epi = format!("Epilogue {{ residual: {}, stats: {:?} }}{}", e.residual, e.stats, if e.gelu { " gelu" } else { "" });
+        format!("{}\nconv {} family={:?} tile={:?} prologue={:?} epilogue={epi}", self.target.describe(), self.describe_shape(), self.family, self.tile, self.prologue)
     }
 
     pub fn hash(&self) -> String {
@@ -205,3 +246,5 @@ pub fn attention_fits(t: &Target, keys: usize) -> bool {
 }
 
 pub const ROW_KERNELS: &[&str] = &["vae_zero", "vae_group_stats", "vae_group_apply", "vae_rms", "vae_upsample", "vae_add", "vae_clamp", "vae_attention"];
+
+pub const LINE_ROW_KERNELS: &[&str] = &["line_rms", "line_dwconv", "line_shift"];

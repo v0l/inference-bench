@@ -1,0 +1,60 @@
+name = "codec"
+kind = "graph"
+
+[[codec]]
+name = "causal-conv-codec"
+model_types = ["haru"]
+section = "codec"
+encoder = "encode"
+decoder = "decode"
+defaults = [
+  ["norm_eps", "0.00001"],
+]
+let = [
+  ["n", "len(ratios)"],
+  ["c", "base_channels"],
+]
+
+[[codec.macro]]
+name = "encode"
+node = [
+  { op = "conv", weight = "codec.encoder.stem", cin = "1", cout = "c", k = "7" },
+  { call = "block", repeat = "encoder_depths[0]", var = "j", prefix = "codec.encoder.stages.0.{j}", args = { ch = "c" } },
+  { call = "down", repeat = "n", var = "i", args = { s = "i + 1", cin = "c * pow(2, i)", cout = "c * pow(2, i + 1)", stride = "ratios[n - 1 - i]" } },
+  { op = "conv", weight = "codec.encoder.head", cin = "c * pow(2, n)", cout = "latent_dim", k = "7" },
+]
+
+[[codec.macro]]
+name = "down"
+node = [
+  { op = "conv", weight = "codec.encoder.down.{i}", cin = "cin", cout = "cout", k = "2 * stride", stride = "stride" },
+  { call = "block", repeat = "encoder_depths[s]", var = "j", prefix = "codec.encoder.stages.{s}.{j}", args = { ch = "cout" } },
+]
+
+[[codec.macro]]
+name = "decode"
+node = [
+  { op = "conv", weight = "codec.decoder.stem", cin = "latent_dim", cout = "c * pow(2, n)", k = "7" },
+  { call = "block", repeat = "decoder_depths[0]", var = "j", prefix = "codec.decoder.stages.0.{j}", args = { ch = "c * pow(2, n)" } },
+  { call = "up", repeat = "n", var = "i", args = { s = "i + 1", cin = "c * pow(2, n - i)", cout = "c * pow(2, n - i - 1)", stride = "ratios[i]" } },
+  { op = "conv", weight = "codec.decoder.head", cin = "c", cout = "1", k = "7" },
+]
+
+[[codec.macro]]
+name = "up"
+node = [
+  { op = "conv_up", weight = "codec.decoder.up.{i}", cin = "cin", cout = "cout", stride = "stride" },
+  { call = "block", repeat = "decoder_depths[s]", var = "j", prefix = "codec.decoder.stages.{s}.{j}", args = { ch = "cout" } },
+]
+
+[[codec.macro]]
+name = "block"
+node = [
+  { op = "rms_norm", weight = "{prefix}.norm", channels = "ch", eps = "norm_eps", out = "t" },
+  { op = "conv", weight = "{prefix}.conv", cin = "ch", cout = "ch", k = "7", groups = "ch", in = "t", out = "t" },
+  { op = "scale_add", weight = "{prefix}.gamma", channels = "ch", in = "t" },
+  { op = "rms_norm", weight = "{prefix}.ffn_norm", channels = "ch", eps = "norm_eps", out = "t" },
+  { op = "linear", weight = "{prefix}.fc1", cin = "ch", cout = "4 * ch", act = "gelu", in = "t", out = "t" },
+  { op = "linear", weight = "{prefix}.fc2", cin = "4 * ch", cout = "ch", in = "t", out = "t" },
+  { op = "scale_add", weight = "{prefix}.ffn_gamma", channels = "ch", in = "t" },
+]
