@@ -134,6 +134,23 @@ fn the_real_qwen3_8_flash_next_config_serves_text_with_offload_sized_pieces() {
     }
 }
 
+#[test]
+fn the_planner_counts_the_ngram_table_and_the_residual_weights_near_the_hub_sizes() {
+    for (repo, hub_gb) in [("Qwen__Qwen3.8-Flash-Next", 360.0), ("RadixArk__Qwen3.8-Flash-Next-NVFP4", 135.2), ("Qwen__Qwen3.8-Flash-Next-FP8", 185.5)] {
+        let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/popular").join(repo).join("config.json")).unwrap();
+        let s = Spec::from_hf_config_serving(&json).unwrap();
+        let a = specrt::anatomy::ModelAnatomy::new(&s, 0, None);
+        let gb = a.total_bytes as f64 / 1e9;
+        let ple = &a.layers[1];
+        eprintln!("{repo}: {gb:.1} GB counted, hub {hub_gb} GB, layer 1 {:.1} GB", ple.bytes as f64 / 1e9);
+        assert!(ple.params > 320_000_000 * 160, "{repo}: the n-gram table is in layer 1");
+        let table_bytes = if s.quant == Quant::Bf16 && s.mlp.quant.is_none() { 2.0 } else { 1.0 } * 320_001_536.0 * 160.0 / 1e9;
+        let extra = (ple.bytes - a.layers[0].bytes) as f64 / 1e9;
+        assert!(extra > table_bytes && extra < table_bytes + 0.2, "{repo}: layer 1 is layer 0 plus the table in its stored width ({extra} GB, table {table_bytes} GB)");
+        assert!(gb > hub_gb * 0.9 && gb < hub_gb, "{repo}: {gb} GB against {hub_gb} (the hub size also holds the vision tower and the MTP layer)");
+    }
+}
+
 fn engine() -> Spec {
     let mut s = Spec::from_hf_config_serving(&config()).unwrap_or_else(|e| panic!("{e:#}"));
     s.repo = fixture().display().to_string();
