@@ -61,11 +61,17 @@ pub struct MediaJob {
     pub preview_every: Option<usize>,
     #[serde(default)]
     pub offload_text_encoder: Option<bool>,
+    #[serde(default)]
+    pub fps: Option<u32>,
 }
 
 impl MediaJob {
     pub fn image(prompt: &str, width: usize, height: usize, seed: u64) -> MediaJob {
-        MediaJob { kind: ModelKind::Image, prompt: prompt.into(), negative_prompt: String::new(), n: 1, width, height, seed, steps: None, guidance: None, sampler: None, frames: None, preview_every: None, offload_text_encoder: None }
+        MediaJob { kind: ModelKind::Image, prompt: prompt.into(), negative_prompt: String::new(), n: 1, width, height, seed, steps: None, guidance: None, sampler: None, frames: None, preview_every: None, offload_text_encoder: None, fps: None }
+    }
+
+    pub fn video(prompt: &str, width: usize, height: usize, frames: usize, seed: u64) -> MediaJob {
+        MediaJob { kind: ModelKind::Video, frames: Some(frames), ..MediaJob::image(prompt, width, height, seed) }
     }
 }
 
@@ -94,6 +100,8 @@ pub fn png(rgb: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
 pub struct MediaOutput {
     pub images: Vec<Picture>,
     pub frames: Option<Vec<Vec<Picture>>>,
+    pub mp4: Option<Vec<u8>>,
+    pub fps: u32,
     pub steps: usize,
     pub step_secs: f64,
     pub total_secs: f64,
@@ -110,6 +118,7 @@ impl MediaOutput {
 pub enum MediaEvent {
     Progress { image: usize, step: usize, steps: usize },
     Preview { image: usize, step: usize, picture: Picture },
+    Frames { done: usize, total: usize },
 }
 
 #[derive(Debug)]
@@ -139,6 +148,14 @@ pub struct MediaInfo {
     pub samplers: Vec<String>,
     pub max_images: usize,
     pub components: Vec<Component>,
+    #[serde(default)]
+    pub frames: Vec<usize>,
+    #[serde(default)]
+    pub default_frames: usize,
+    #[serde(default)]
+    pub fps: u32,
+    #[serde(default)]
+    pub frame_step: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -163,6 +180,13 @@ impl MediaInfo {
         (width / s) * (height / s)
     }
 
+    pub fn latent_frames(&self, frames: Option<usize>) -> usize {
+        match (self.kind, frames) {
+            (ModelKind::Video, Some(f)) if self.frame_step > 0 => (f.saturating_sub(1)) / self.frame_step + 1,
+            _ => 1,
+        }
+    }
+
     pub fn fits(&self, size: &str) -> bool {
         parse_size(size).is_some_and(|(w, h)| self.tokens(w, h) <= crate::denoiser_cuda::MAX_ROWS)
     }
@@ -184,9 +208,9 @@ impl MediaInfo {
         if job.width > 4096 || job.height > 4096 {
             return Err(invalid(format!("size {}x{} is over 4096 on a side", job.width, job.height)));
         }
-        let tokens = self.tokens(job.width, job.height);
+        let tokens = self.tokens(job.width, job.height) * self.latent_frames(job.frames);
         if tokens > crate::denoiser_cuda::MAX_ROWS {
-            return Err(invalid(format!("size {}x{} is {tokens} latent tokens, over the {} one denoiser launch takes; pick a smaller size", job.width, job.height, crate::denoiser_cuda::MAX_ROWS)));
+            return Err(invalid(format!("size {}x{}{} is {tokens} latent tokens, over the {} one denoiser launch takes; pick a smaller size or fewer frames", job.width, job.height, job.frames.map_or(String::new(), |f| format!(" at {f} frames")), crate::denoiser_cuda::MAX_ROWS)));
         }
         if let Some(steps) = job.steps
             && !(1..=200).contains(&steps)
@@ -205,6 +229,22 @@ impl MediaInfo {
         }
         if job.frames.is_some() && self.kind != ModelKind::Video {
             return Err(invalid("frames is for video models".into()));
+        }
+        if self.kind == ModelKind::Video {
+            let f = job.frames.unwrap_or(self.default_frames);
+            let step = self.frame_step.max(1);
+            if f == 0 || f > 1025 || !(f - 1).is_multiple_of(step) {
+                let near = (f.saturating_sub(1) + step / 2) / step * step + 1;
+                return Err(invalid(format!("frames must be 1 plus a multiple of {step}, at most 1025, not {f}; the nearest valid count is {near}")));
+            }
+            if let Some(fps) = job.fps
+                && !(1..=120).contains(&fps)
+            {
+                return Err(invalid(format!("fps must be 1 to 120, not {fps}")));
+            }
+            if job.n != 1 {
+                return Err(invalid("a video job makes one video".into()));
+            }
         }
         Ok(())
     }
@@ -243,6 +283,7 @@ pub fn info(dir: &Path) -> Result<MediaInfo> {
     ensure!(pipeline.name == fp.graph, "family {} runs the {} pipeline graph, the folder reads as {}", family.name, fp.graph, pipeline.name);
     let kind = ModelKind::parse(&fp.kind).with_context(|| format!("family {} has pipeline kind {:?}", family.name, fp.kind))?;
     let components = fp.components.iter().map(|c| Component { name: c.clone(), bytes: dir_bytes(&dir.join(c)), resident: fp.resident.contains(c) }).collect();
+    let video = kind == ModelKind::Video;
     let mut i = MediaInfo {
         kind,
         family: family.name.clone(),
@@ -254,6 +295,10 @@ pub fn info(dir: &Path) -> Result<MediaInfo> {
         samplers: fp.samplers.clone(),
         max_images: fp.max_images.max(1),
         components,
+        frames: if video { fp.frames.clone() } else { Vec::new() },
+        default_frames: if video { fp.default_frames.max(1) } else { 0 },
+        fps: if video { fp.fps.max(1) } else { 0 },
+        frame_step: if video { pipeline.values.get("temporal_scale").copied().unwrap_or(1.0) as usize } else { 0 },
     };
     let sizes: Vec<String> = i.sizes.iter().filter(|s| i.fits(s)).cloned().collect();
     ensure!(!sizes.is_empty(), "family {} offers no size this engine runs at pixel step {}", family.name, i.pixel_step);
@@ -354,6 +399,10 @@ pub fn to_rgb(pixels: &[f32], width: usize, height: usize) -> Vec<u8> {
     out
 }
 
+pub fn crop_rgb(rgb: &[u8], width: usize, w: usize, h: usize) -> Vec<u8> {
+    (0..h).flat_map(|y| rgb[y * width * 3..(y * width + w) * 3].iter().copied()).collect()
+}
+
 pub struct ImageModel {
     pub info: MediaInfo,
     pub dir: PathBuf,
@@ -403,10 +452,12 @@ impl ImageModel {
         let guided = p.guided(guidance)?;
         let scale = p.values["vae_scale"] as usize;
         let patch = p.values["latent_patch"] as usize;
-        let d = Dims { t: 1, h: job.height / scale, w: job.width / scale };
-        let shapes = crate::denoiser::Shapes::image((d.h / patch) * (d.w / patch), self.prompts.max_length(p), d.h / patch, d.w / patch);
+        let t = self.info.latent_frames(job.frames.or((self.info.kind == ModelKind::Video).then_some(self.info.default_frames)));
+        let d = Dims { t, h: job.height / scale, w: job.width / scale };
+        let (ph, pw) = (d.h / patch, d.w / patch);
+        let shapes = crate::denoiser::Shapes { image: t * ph * pw, text: self.prompts.max_length(p), patch_h: ph, patch_w: pw, frames: t };
         let spec = crate::denoiser::DenoiserSpec::from_pipeline(&self.dir)?;
-        let graph = crate::denoiser::DenoiserGraph::embedded();
+        let graph = crate::denoiser::DenoiserGraph::for_pipeline(&self.dir)?;
         let weights = crate::denoiser_cuda::weight_bytes(&self.dir)?;
         let resident = if self.generator.denoiser_loaded() { 0 } else { weights };
         let vae_plan = crate::vae::graph::load_plan(&self.dir.join("vae"))?;
@@ -435,6 +486,34 @@ impl ImageModel {
         let prompt = self.prompts.encode(&p, &job.prompt, max)?;
         let negative = Some(self.prompts.encode(&p, &job.negative_prompt, max)?);
         let mut out = MediaOutput { admission, ..MediaOutput::default() };
+        if self.info.kind == ModelKind::Video {
+            let frames = job.frames.unwrap_or(self.info.default_frames);
+            let fps = job.fps.unwrap_or(self.info.fps);
+            let req = crate::generate::VideoRequest { request: Request { prompt, negative, height: job.height, width: job.width, steps: job.steps, guidance: job.guidance, seed: job.seed }, frames };
+            let mut last = std::time::Instant::now();
+            let mut step_secs = 0.0;
+            let video = {
+                let events = std::cell::RefCell::new(&mut *on_event);
+                let mut on_step = |step: usize, steps: usize, _: &[f32]| {
+                    step_secs += last.elapsed().as_secs_f64();
+                    last = std::time::Instant::now();
+                    (events.borrow_mut())(MediaEvent::Progress { image: 0, step, steps })
+                };
+                let mut on_frames = |done: usize, total: usize| (events.borrow_mut())(MediaEvent::Frames { done, total });
+                self.generator.generate_video(&req, plan, &mut crate::generate::VideoHooks { on_step: &mut on_step, on_frames: &mut on_frames })?
+            };
+            let pictures: Vec<Picture> = video.frames.iter().map(|f| Picture { width: video.width, height: video.height, rgb: to_rgb(f, video.width, video.height), seed: job.seed }).collect();
+            let (w, h) = (crate::mp4::even(video.width), crate::mp4::even(video.height));
+            let rgb: Vec<Vec<u8>> = pictures.iter().map(|p| crop_rgb(&p.rgb, p.width, w, h)).collect();
+            out.mp4 = Some(crate::mp4::encode(&rgb, w, h, fps)?.mp4());
+            out.fps = fps;
+            out.steps = video.latents.len();
+            out.images = pictures.first().cloned().into_iter().collect();
+            out.frames = Some(vec![pictures]);
+            out.step_secs = step_secs;
+            out.total_secs = started.elapsed().as_secs_f64();
+            return Ok(out);
+        }
         let mut step_secs = 0.0;
         for i in 0..job.n {
             let seed = job.seed.wrapping_add(i as u64);

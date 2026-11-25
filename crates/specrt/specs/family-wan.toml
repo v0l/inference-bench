@@ -1,0 +1,20 @@
+name = "wan"
+kind = "family"
+min_engine = 21
+
+[match]
+pipelines = ["WanPipeline"]
+
+[pipeline]
+kind = "video"
+graph = "unipc"
+components = ["text_encoder", "transformer", "vae"]
+resident = ["transformer", "vae"]
+sizes = ["832x480", "480x832", "640x640", "512x512", "320x192", "256x256", "32x32"]
+default_size = "832x480"
+samplers = ["unipc"]
+max_images = 1
+text_encoder_graph = "t5"
+frames = [17, 33, 49, 65, 81]
+default_frames = 81
+fps = 16

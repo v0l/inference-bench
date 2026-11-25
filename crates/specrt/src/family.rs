@@ -109,6 +109,10 @@ pub struct FamilyPipeline {
     pub samplers: Vec<String>,
     pub max_images: usize,
     pub text_encoder_family: String,
+    pub text_encoder_graph: String,
+    pub frames: Vec<usize>,
+    pub default_frames: usize,
+    pub fps: u32,
 }
 
 impl FamilyPipeline {

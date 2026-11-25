@@ -58,7 +58,7 @@ impl Gate {
     }
 }
 
-struct Ticket {
+pub(crate) struct Ticket {
     gate: Arc<Gate>,
 }
 
@@ -120,12 +120,13 @@ pub fn parse(body: &Value, partial_default: usize) -> Result<ImageRequest, ApiEr
         sampler: body["sampler"].as_str().map(String::from),
         frames: None,
         offload_text_encoder: None,
+        fps: None,
         preview_every: int(&body["partial_images"], "partial_images")?.map(|k| k as usize).or((partial_default > 0).then_some(partial_default)),
     };
     Ok(ImageRequest { model: body["model"].as_str().map(String::from), job, url, stream: body["stream"].as_bool().unwrap_or(false) })
 }
 
-enum Update {
+pub(crate) enum Update {
     Event(MediaEvent),
     Done(Result<MediaOutput, ApiError>),
 }
@@ -159,13 +160,22 @@ fn usage(out: &MediaOutput) -> Value {
 }
 
 async fn start(state: &Arc<AppState>, req: &ImageRequest) -> Result<(String, mpsc::UnboundedReceiver<Update>, CancelOnDrop), ApiError> {
-    let model = state.manager.requested_model(req.model.as_deref())?;
     let ticket = state.images.admit(state.config.retry_after_secs)?;
+    start_job(state, req.model.as_deref(), req.job.clone(), ticket).await
+}
+
+pub(crate) fn admit(state: &Arc<AppState>) -> Result<Ticket, ApiError> {
+    state.images.admit(state.config.retry_after_secs)
+}
+
+pub(crate) async fn start_job(state: &Arc<AppState>, model: Option<&str>, job: MediaJob, ticket: Ticket) -> Result<(String, mpsc::UnboundedReceiver<Update>, CancelOnDrop), ApiError> {
+    let model = state.manager.requested_model(model)?;
     let flag = Arc::new(AtomicBool::new(false));
     let guard = CancelOnDrop::new(flag.clone());
     let (tx, rx) = mpsc::unbounded_channel();
     let st = state.clone();
-    let mut job = req.job.clone();
+    let mut job = job;
+    let route = if job.kind == ModelKind::Video { "/v1/videos" } else { "/v1/images/generations" };
     let shown = model.clone();
     let label = model.clone();
     let span = tracing::Span::current();
@@ -189,12 +199,15 @@ async fn start(state: &Arc<AppState>, req: &ImageRequest) -> Result<(String, mps
         };
         let info = lease.backend().media_info();
         let checked = match &info {
-            None => Err(ApiError::bad_request(format!("model {model} is a text model; /v1/images/generations needs an image model"))),
+            None => Err(ApiError::bad_request(format!("model {model} is a text model; {route} needs a {} model", job.kind.label()))),
             Some(i) => {
                 if job.width == 0 {
                     let (w, h) = media::parse_size(&i.default_size).unwrap_or((1024, 1024));
                     job.width = w;
                     job.height = h;
+                }
+                if job.kind == ModelKind::Video && job.frames.is_none() {
+                    job.frames = Some(i.default_frames);
                 }
                 i.check(&job).map_err(|e| ApiError::bad_request(e.to_string()))
             }
@@ -220,7 +233,7 @@ async fn start(state: &Arc<AppState>, req: &ImageRequest) -> Result<(String, mps
                 let e = ApiError::from(e);
                 if e.kind == "cancelled" {
                     st.metrics.cancelled();
-                    tracing::info!("image job cancelled by client disconnect");
+                    tracing::info!("media job cancelled");
                 }
                 Err(e)
             }
@@ -252,6 +265,7 @@ pub async fn generations(State(state): State<Arc<AppState>>, headers: HeaderMap,
                         Ok(png) => (vec![("image_generation.partial_image", json!({"type": "image_generation.partial_image", "index": image, "partial_image_index": step, "b64_json": base64::engine::general_purpose::STANDARD.encode(png), "size": format!("{}x{}", picture.width, picture.height)}))], false),
                         Err(_) => (Vec::new(), false),
                     },
+                    Update::Event(MediaEvent::Frames { .. }) => (Vec::new(), false),
                     Update::Done(Ok(out)) => {
                         let mut list = Vec::new();
                         for (i, p) in out.images.iter().enumerate() {
