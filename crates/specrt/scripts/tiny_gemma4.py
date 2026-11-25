@@ -41,7 +41,6 @@ def config():
         hidden_size_per_layer_input=16 if E_STYLE else 0,
         vocab_size_per_layer_input=512,
         num_kv_shared_layers=2 if E_STYLE else 0,
-        enable_moe_block=False,
         use_double_wide_mlp=E_STYLE,
         rms_norm_eps=1e-6,
         tie_word_embeddings=True,
@@ -50,8 +49,10 @@ def config():
         bos_token_id=None,
         pad_token_id=None,
         attn_implementation="eager",
-        **(MOE_FIELDS if MOE else {"enable_moe_block": False}),
     )
+    if MOE:
+        for key, value in MOE_FIELDS.items():
+            setattr(cfg, key, value)
     if E_STYLE:
         cfg.attention_k_eq_v = False
         cfg.num_global_key_value_heads = None
