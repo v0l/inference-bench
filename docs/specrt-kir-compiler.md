@@ -298,3 +298,50 @@ Gap in percent of the best saving, per plan, sm_120 then sm_80 (decode 1 token, 
 | tinymistral-248m | prefill | 9.39 | 9.39 | A |
 
 Reading it: cause A is the large one and is the same group in every row (the KV write after the rope epilogue, about one launch plus one qkv write and read per attention layer). It does not show on the Qwen3.5 and 27B lines because their attention keeps a separate qk norm unit, so the kv write joins through a different path. A search would fix all three causes, but each has a cheaper local fix named in its issue: an order independent legality check (A), letting a prologue compete with a light merge (B), and the budget inside candidate legality (C). Until they land, greedy is good enough for every plan the runtime runs today (the compiled single step rows), and not for future prefill and dry run plans of the listed families.
+
+## 11. Pass contract
+
+Model semantics are fixed. A pass chooses how the model runs and never what it computes. When the faster or smaller choice would change the numbers, the pass refuses and the spec has to ask for it.
+
+A pass may change:
+
+- grouping (which ops share one launch, sections 5 and 6),
+- kernel family (tile, batch, GEMV, ggml, split reduce),
+- tile, split count and launch geometry (`kir::gemm`, `kir::gemv`, attention formulas),
+- layout planes, only where a declaration below allows it,
+- buffer reuse and aliasing (`Split` of x as an alias),
+- launch order between ops with no data dependency (S1 capture groups),
+- sharding of a row parallel linear into a rank partial plus an allreduce, when the spec has shards.
+
+A pass may not change:
+
+- the dtype or form of any tensor a model op writes (`Tensor::form`: f32, bf16, planes, fp8 or fp4 with scales, paged KV dtype),
+- the accumulator of an op (the tensor an op reads and writes in place, such as the residual add into x or the branch),
+- any explicit rounding: every write in a rounding form (bf16, planes, a quantised weight or activation form, a paged cache) must still be there, in the same form, and no new one may appear,
+- the order of an authored ordered reduction: the sequence of ops that add into one accumulator (`x`, the branch, the rank partial, the latent, the hyper streams) between two overwrites,
+- the set of tensors the model reads from outside the plan (inputs, weights, caches, state) and the live tensors it leaves at the end of a section (x, logits, draft logits, caches, state),
+- sharding semantics: the ops whose partials an allreduce sums, and in which order.
+
+Declared representation changes. Each of these changes numbers on purpose, and each is declared, not chosen by a pass:
+
+| Change | Declared in | Who uses it |
+|---|---|---|
+| bf16 hi/lo planes instead of f32 activations for tensor core GEMMs | the graph (`graphs/decoder.toml` writes `*_planes` buffers) and the signature table (`Form::Planes`); `[runtime] split_activations` and `unsplit` pick one or two planes per linear | every planes plan |
+| NVFP4 activation quantisation before an fp4 GEMM | spec `[mlp] act_quant = "fp4"` | `gemm::select` path `F4a`, `quant_rows_fp4` |
+| fp8 activation quantisation | spec `act_quant = "fp8"` | path `F8a`, `quant_rows_fp8` |
+| split K partials summed by a reduce kernel | the kernel family (`BatchShape::splits`, `ggml_splits`); the sum order inside one output element is the family's and is fixed by `Target` and shape | `F8b`, `F4b`, `Ggr` reduce |
+| fp8 KV cache | `[runtime] kv_dtype`, `kv_f16_layers` | the cache `Form::Paged` |
+| NVFP4 requant of fp8 checkpoint linears | `[runtime] requant` | `Spec::requanted` |
+| fp32 accumulate in the plain path | `[runtime] gemm_fp32` | runtime GEMM choice |
+| rank partials and their allreduce | `[tp]` shards from `Graph::shards` | `partition`, `AllReduce`, `AllReduceNorm` |
+
+Enforcement. `signature::contract` reads, for every section of a plan, each op's writes with their forms, its accumulators, the rounding writes (casts), the ordered reduction chains and the section's boundary tensors, all from the typed signatures of slice 1. `signature::check_contract(pass, model, plan, declared)` compares the authored plan's contract against a later plan and fails as `pass P: section S, op O: field: ...`, with the field one of `tensor dtype`, `accumulator`, `cast`, `reduction order into B` or `boundary`. `compile::compile_traced` takes the contract of the plan it was given and checks it after every pass (`partition`, `gemv_layout`, `fuse`), so a pass cannot return a plan that skips it. `Declared` carries the declarations a pass may use: `shards` when the options carry `[tp]` shards, `planes_as_rows` and `no_media` for the single row layout.
+
+Tests (`tests/plan_check.rs`). Each rule has a hand edited plan that `validate_plan` still accepts and the contract refuses, each seen failing with the check switched off before it passed: `the_contract_refuses_a_bf16_tensor_turned_f32` (input norm writes f32 xn instead of planes, `tensor dtype`), `the_contract_refuses_a_dropped_cast` (the rope and KV write op removed, `cast ... paged bf16 ... dropped`), `the_contract_refuses_a_changed_accumulator` (down writes planes instead of adding into x, `accumulator`), `the_contract_refuses_a_reordered_reduction` (a parallel residual whose scaled add moves before down, `reduction order into x`). `every_fixture_plan_keeps_its_contract_through_the_passes` runs `compile` on every fixture and spec in every phase, single rank and both tensor parallel variants; the `compile_plan` suite runs every single step plan and every TP rewrite through the same checks.
+
+Representation changes the spec does not declare today. Each is let through by a `Declared` flag that the pass options set, not the spec:
+
+| Pass | Change | Owner |
+|---|---|---|
+| `gemv_layout` | every planes buffer becomes its f32 row form in the single row decode plan, so the bf16 plane rounding of the authored plan is dropped (logits equal master, #1057, because the hand step did the same) | #1398 |
+| `gemv_layout` | the media splice is dropped from the decode head (a decode step carries no media) | #1398 |

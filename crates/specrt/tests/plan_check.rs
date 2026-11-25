@@ -192,6 +192,95 @@ fn the_plan_report_matches_hand_counted_bytes_on_the_tiny_dense_fixture() {
     assert!(report.render().contains("decode attention"));
 }
 
+fn contract_break(phase: Phase, model: impl Fn(&mut Vec<Op>), pass: impl Fn(&mut Vec<Op>)) -> String {
+    use specrt::signature::{Signer, check_contract, contract};
+    let spec = dense();
+    let mut before = Plan::build(&spec, phase, true);
+    let layer = |p: &mut Plan| -> usize { p.blocks.iter().position(|b| b.layers.iter().any(|l| l == spec.block(0).name()) && !b.sparse).unwrap() };
+    let at = layer(&mut before);
+    model(&mut before.blocks[at].ops);
+    let mut after = before.clone();
+    pass(&mut after.blocks[at].ops);
+    validate_plan(&before, &spec).unwrap();
+    validate_plan(&after, &spec).expect("the broken plan still passes validate_plan");
+    let signer = Signer::new(&spec).unwrap();
+    let (a, b) = (contract(&signer, &spec, &before).unwrap(), contract(&signer, &spec, &after).unwrap());
+    format!("{:#}", check_contract("test pass", &a, &b, specrt::signature::Declared::default()).expect_err("the pass breaks the contract"))
+}
+
+fn authored(_: &mut Vec<Op>) {}
+
+#[test]
+fn the_contract_refuses_a_bf16_tensor_turned_f32() {
+    let e = contract_break(Phase::Prefill, authored, |ops| {
+        for op in ops.iter_mut() {
+            match op {
+                Op::Norm { which: NormKind::Input, into } => *into = Buf::Xn,
+                Op::Linear { weight: Weight::Qkv, input, .. } => *input = Buf::Xn,
+                _ => {}
+            }
+        }
+    });
+    assert!(e.starts_with("pass test pass: layer dense, op input norm: tensor dtype") && e.contains("xn [Tokens x 128] f32") && e.contains("bf16 hi/lo planes"), "{e}");
+}
+
+#[test]
+fn the_contract_refuses_a_dropped_cast() {
+    let e = contract_break(Phase::Prefill, authored, |ops| ops.retain(|o| !matches!(o, Op::KvRope)));
+    assert!(e.starts_with("pass test pass: layer dense, op norm and rope: cast") && e.contains("paged bf16") && e.contains("dropped"), "{e}");
+}
+
+#[test]
+fn the_contract_refuses_a_changed_accumulator() {
+    let e = contract_break(Phase::Decode, authored, |ops| {
+        for op in ops.iter_mut() {
+            if let Op::Linear { weight: Weight::Down, output, .. } = op {
+                *output = Buf::XnPlanes;
+            }
+        }
+    });
+    assert!(e.starts_with("pass test pass: layer dense, op down: accumulator") && e.contains("bf16 hi/lo planes") && e.contains("x [Tokens x 128] f32"), "{e}");
+}
+
+fn parallel_residual(ops: &mut Vec<Op>) {
+    let o = index_of(ops, |o| matches!(o, Op::Linear { weight: Weight::O, .. }));
+    let Op::Linear { weight, quant, input, .. } = ops[o] else { unreachable!() };
+    ops[o] = Op::Linear { weight, quant, input, output: Buf::Branch };
+    ops.insert(o, Op::Clear { buf: Buf::Branch });
+    ops.push(Op::ScaledAdd { from: Buf::Branch });
+}
+
+#[test]
+fn the_contract_refuses_a_reordered_reduction() {
+    let e = contract_break(Phase::Decode, parallel_residual, |ops| {
+        let add = ops.pop().unwrap();
+        let down = index_of(ops, |o| matches!(o, Op::Linear { weight: Weight::Down, .. }));
+        ops.insert(down, add);
+    });
+    assert!(e.starts_with("pass test pass: layer dense, op scaled add: reduction order into x") && e.contains("the model adds down, scaled add, the plan adds scaled add, down"), "{e}");
+}
+
+#[test]
+fn every_fixture_plan_keeps_its_contract_through_the_passes() {
+    use specrt::compile::{Options, compile};
+    let shards = specrt::graph::Graph::decoder().shards().unwrap();
+    let mut checked = 0;
+    for (name, spec) in specs() {
+        for phase in [Phase::Prefill, Phase::Decode, Phase::Verify] {
+            let plan = Plan::build(&spec, phase, true);
+            let mut options = vec![Options::planes(4096)];
+            if !spec.uses_branch() {
+                options.extend([Options::ranked(shards.clone(), false, 4096), Options::ranked(shards.clone(), true, 4096)]);
+            }
+            for opts in options {
+                compile(&spec, plan.clone(), &kir::Target::sm_120(), &opts).unwrap_or_else(|e| panic!("{name} {phase:?}: {e:#}"));
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 200, "{checked}");
+}
+
 #[test]
 fn signatures_carry_the_class_and_forms() {
     use specrt::signature::{Class, Form, Signer};

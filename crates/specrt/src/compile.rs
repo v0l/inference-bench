@@ -1,7 +1,7 @@
 use crate::fusion::{self, CaptureSection, Costs, Fit, FusionReport, Part, Probe, Section, SectionFusion, Unit};
 use crate::gemm::{self, GemvLaunch};
 use crate::plan::{Buf, Op, Phase, Plan, QuantSource, Weight, weight_kind};
-use crate::signature::{Count, Signature, Tensor, key, Place, Signer, layers_using, ranked};
+use crate::signature::{Count, Contract, Declared, Signature, Tensor, check_contract, contract, key, Place, Signer, layers_using, ranked};
 use crate::spec::Spec;
 use crate::tp::Shard;
 use anyhow::{Result, bail};
@@ -254,12 +254,19 @@ pub fn compile(spec: &Spec, plan: Plan, target: &kir::Target, opts: &Options) ->
 }
 
 pub fn compile_traced(spec: &Spec, plan: Plan, target: &kir::Target, opts: &Options) -> Result<(Plan, FusionReport)> {
+    let authored = contract(&Signer::new(spec)?.ranked(ranked(&plan)), spec, &plan)?;
+    let shards = !opts.shards.is_empty();
+    let mut declared = Declared { shards, planes_as_rows: false, no_media: false };
     let mut plan = partition_plan(spec, plan, &opts.shards);
     let signer = Signer::new(spec)?.ranked(ranked(&plan));
+    keeps(&authored, &signer, spec, &plan, PARTITION, declared)?;
     if opts.family == Family::Gemv {
         for (_, layers, ops) in sections_mut(spec, &mut plan) {
             *ops = gemv_layout(&signer, ops, layers.first().copied().unwrap_or(0))?;
         }
+        declared.planes_as_rows = true;
+        declared.no_media = true;
+        keeps(&authored, &signer, spec, &plan, GEMV_LAYOUT, declared)?;
     }
     let costs = Costs::for_target(target);
     let phase = plan.phase;
@@ -272,6 +279,7 @@ pub fn compile_traced(spec: &Spec, plan: Plan, target: &kir::Target, opts: &Opti
         *ops = fused;
         report.sections.extend(section.filter(|_| !layers.is_empty()));
     }
+    keeps(&authored, &signer, spec, &plan, FUSE, declared)?;
     if opts.capture_groups {
         for (name, layers, ops) in sections_mut(spec, &mut plan) {
             let groups = capture_groups(&signer, ops, layers.first().copied().unwrap_or(0))?;
@@ -281,6 +289,10 @@ pub fn compile_traced(spec: &Spec, plan: Plan, target: &kir::Target, opts: &Opti
         }
     }
     Ok((plan, report))
+}
+
+fn keeps(authored: &Contract, signer: &Signer, spec: &Spec, plan: &Plan, pass: &str, declared: Declared) -> Result<()> {
+    check_contract(pass, authored, &contract(signer, spec, plan)?, declared)
 }
 
 pub fn capture_groups(signer: &Signer, ops: &[Op], layer: usize) -> Result<Vec<Vec<usize>>> {

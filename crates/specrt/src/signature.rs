@@ -802,6 +802,256 @@ pub fn validate_with(signer: &Signer, plan: &Plan, spec: &Spec) -> Result<()> {
     walk(&mut draft, "mtp head", spec.layers.count, &plan.mtp_head)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Declared {
+    pub planes_as_rows: bool,
+    pub shards: bool,
+    pub no_media: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Terms {
+    origin: String,
+    label: String,
+    writes: Vec<Tensor>,
+    accumulators: Vec<Tensor>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SectionContract {
+    pub name: String,
+    ops: Vec<Terms>,
+    casts: Vec<(String, Tensor)>,
+    chains: Vec<(Place, String, Vec<String>)>,
+    boundary: Vec<(String, Tensor)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Contract {
+    pub sections: Vec<SectionContract>,
+}
+
+const ALLREDUCE: &str = "allreduce";
+const ZERO: &str = "zero";
+
+fn origin(op: &Op) -> String {
+    match *op {
+        Op::Linear { weight, .. } | Op::Gemv { weight, .. } | Op::GemvStore { weight, .. } => weight.name().into(),
+        Op::StepAttention => Op::DecodeAttention.label(),
+        Op::GdnStep => Op::GdnDecode.label(),
+        Op::AllReduce | Op::AllReduceNorm { .. } => ALLREDUCE.into(),
+        ref o => o.label(),
+    }
+}
+
+fn row_key(place: &Place) -> Place {
+    match place {
+        Place::Buf(b) => Place::Buf(match b {
+            Buf::XnPlanes => Buf::Xn,
+            Buf::AttnPlanes => Buf::Attn,
+            Buf::ActPlanes => Buf::Act,
+            Buf::GdnPlanes => Buf::Gdn,
+            Buf::MixPlanes => Buf::Mix,
+            Buf::LatentPlanes => Buf::Latent,
+            b => *b,
+        }),
+        p => p.clone(),
+    }
+}
+
+fn rounds(form: Form) -> bool {
+    matches!(form, Form::Bf16 | Form::Planes | Form::Paged(_) | Form::Weight(_))
+}
+
+fn in_place(t: &Tensor) -> bool {
+    matches!(t.place, Place::Buf(_) | Place::Local(_) | Place::State(_))
+}
+
+fn accumulates(k: &Place) -> bool {
+    matches!(k, Place::Buf(Buf::X | Buf::Branch | Buf::Partial | Buf::Latent | Buf::Streams | Buf::Merged))
+}
+
+fn section_contract(signer: &Signer, name: String, layer: usize, ops: &[Op]) -> Result<SectionContract> {
+    let mut out = SectionContract { name, ops: Vec::new(), casts: Vec::new(), chains: Vec::new(), boundary: Vec::new() };
+    let mut written: Vec<Place> = Vec::new();
+    let mut pending: Vec<String> = Vec::new();
+    let mut live: BTreeMap<Place, (String, Tensor)> = BTreeMap::new();
+    for op in ops {
+        let sig = signer.signature(op, layer).with_context(|| format!("{} ({op:?})", op.label()))?;
+        let o = origin(op);
+        let label = op.label();
+        for r in &sig.reads {
+            let k = row_key(&r.place);
+            let outside = matches!(r.place, Place::Input(_) | Place::Weight(_) | Place::Cache(_) | Place::State(_)) || (matches!(r.place, Place::Buf(b) if b != Buf::Partial) && !written.contains(&k));
+            if outside && !out.boundary.iter().any(|(_, t)| row_key(&t.place) == k && t.form == r.form) {
+                out.boundary.push((label.clone(), r.clone()));
+            }
+        }
+        let mut accumulators = Vec::new();
+        for w in &sig.writes {
+            let k = row_key(&w.place);
+            if rounds(w.form) {
+                out.casts.push((label.clone(), w.clone()));
+            }
+            if matches!(w.place, Place::Buf(_) | Place::Cache(_) | Place::State(_)) {
+                live.insert(k.clone(), (label.clone(), w.clone()));
+            }
+            if !written.contains(&k) {
+                written.push(k.clone());
+            }
+            if !in_place(w) {
+                continue;
+            }
+            let read = sig.reads.iter().any(|r| row_key(&r.place) == k);
+            if !accumulates(&k) {
+                if read {
+                    accumulators.push(w.clone());
+                }
+                continue;
+            }
+            if o == ALLREDUCE {
+                if k == Place::Buf(Buf::X) {
+                    let chain = chain(&mut out.chains, &k, w);
+                    if chain.last().is_some_and(|s| s == ZERO) {
+                        chain.pop();
+                    }
+                    chain.append(&mut pending);
+                }
+                continue;
+            }
+            if k == Place::Buf(Buf::Partial) {
+                pending.push(o.clone());
+                if read {
+                    accumulators.push(w.clone());
+                }
+                continue;
+            }
+            let chain = chain(&mut out.chains, &k, w);
+            let fresh = chain.last().is_some_and(|s| s == ZERO);
+            if read && fresh {
+                *chain.last_mut().unwrap() = o.clone();
+            } else if read {
+                chain.push(o.clone());
+                accumulators.push(w.clone());
+            } else {
+                chain.clear();
+                chain.push(if matches!(op, Op::Clear { .. }) { ZERO.into() } else { o.clone() });
+            }
+        }
+        out.ops.push(Terms { origin: o, label, writes: sig.writes, accumulators });
+    }
+    out.boundary.extend(live.into_values().filter(|(_, t)| matches!(t.place, Place::Buf(Buf::X | Buf::Logits | Buf::MtpLogits) | Place::Cache(_) | Place::State(_))));
+    Ok(out)
+}
+
+fn chain<'c>(chains: &'c mut Vec<(Place, String, Vec<String>)>, k: &Place, w: &Tensor) -> &'c mut Vec<String> {
+    let at = match chains.iter().position(|(p, _, _)| p == k) {
+        Some(at) => at,
+        None => {
+            chains.push((k.clone(), w.describe().split(" [").next().unwrap_or_default().to_string(), Vec::new()));
+            chains.len() - 1
+        }
+    };
+    &mut chains[at].2
+}
+
+pub fn contract(signer: &Signer, spec: &Spec, plan: &Plan) -> Result<Contract> {
+    let mut out = Vec::new();
+    for s in sections(spec, plan) {
+        out.push(section_contract(signer, s.name, s.layer, s.ops)?);
+    }
+    Ok(Contract { sections: out })
+}
+
+fn same_form(a: &Tensor, b: &Tensor, d: Declared) -> bool {
+    a.form == b.form || (d.planes_as_rows && matches!((a.form, b.form), (Form::Planes, Form::F32) | (Form::F32, Form::Planes)))
+}
+
+fn same_place(a: &Tensor, b: &Tensor, d: Declared) -> bool {
+    let (pa, pb) = (row_key(&a.place), row_key(&b.place));
+    let x_or_partial = |p: &Place| matches!(p, Place::Buf(Buf::X | Buf::Partial));
+    pa == pb || (d.shards && x_or_partial(&pa) && x_or_partial(&pb))
+}
+
+fn list(ts: &[Tensor]) -> String {
+    if ts.is_empty() { "nothing".into() } else { ts.iter().map(Tensor::describe).collect::<Vec<_>>().join(", ") }
+}
+
+fn check_section(before: &SectionContract, after: &SectionContract, d: Declared) -> std::result::Result<(), (String, String)> {
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    for op in &after.ops {
+        let n = seen.entry(op.origin.as_str()).or_insert(0);
+        let model = before.ops.iter().filter(|b| b.origin == op.origin).nth(*n);
+        *n += 1;
+        for w in op.writes.iter().filter(|w| matches!(w.place, Place::Buf(_) | Place::Local(_))) {
+            let declared: Vec<&Tensor> = before.ops.iter().flat_map(|b| &b.writes).filter(|b| row_key(&b.place) == row_key(&w.place)).collect();
+            if let Some(first) = declared.first()
+                && !declared.iter().any(|b| same_form(w, b, d))
+            {
+                return Err((op.label.clone(), format!("tensor dtype: writes {}, the model declares {}", w.describe(), first.describe())));
+            }
+        }
+        if let Some(m) = model {
+            let kept = |ts: &[Tensor]| -> Vec<Tensor> { ts.iter().filter(|t| !(d.shards && matches!(row_key(&t.place), Place::Buf(Buf::Partial | Buf::X)))).cloned().collect() };
+            let (ma, oa) = (kept(&m.accumulators), kept(&op.accumulators));
+            let same = ma.len() == oa.len() && ma.iter().zip(&oa).all(|(a, b)| same_place(a, b, d) && same_form(a, b, d));
+            if !same {
+                return Err((op.label.clone(), format!("accumulator: accumulates into {}, the model declares {}", list(&oa), list(&ma))));
+            }
+        }
+    }
+    let mut left: Vec<&(String, Tensor)> = after.casts.iter().collect();
+    for (label, cast) in &before.casts {
+        match left.iter().position(|(_, t)| row_key(&t.place) == row_key(&cast.place) && same_form(t, cast, d)) {
+            Some(at) => {
+                left.remove(at);
+            }
+            None if d.planes_as_rows && cast.form == Form::Planes => {}
+            None => return Err((label.clone(), format!("cast: the model writes {}, the plan dropped it", cast.describe()))),
+        }
+    }
+    if let Some((label, cast)) = left.into_iter().find(|(_, t)| !before.casts.iter().any(|(_, b)| row_key(&b.place) == row_key(&t.place) && b.form == t.form)) {
+        return Err((label.clone(), format!("cast: writes {}, which the model does not declare", cast.describe())));
+    }
+    for (place, name, model) in &before.chains {
+        let plan = after.chains.iter().find(|(p, _, _)| p == place).map_or(&[][..], |(_, _, c)| &c[..]);
+        if model.len() <= 1 && plan.len() <= 1 {
+            continue;
+        }
+        if plan != &model[..] {
+            let at = model.iter().zip(plan).position(|(a, b)| a != b).unwrap_or(model.len().min(plan.len()));
+            let op = plan.get(at).or(model.get(at)).cloned().unwrap_or_default();
+            return Err((op, format!("reduction order into {name}: the model adds {}, the plan adds {}", model.join(", "), plan.join(", "))));
+        }
+    }
+    for (label, t) in &after.boundary {
+        if !before.boundary.iter().any(|(_, b)| same_place(t, b, d) && same_form(t, b, d)) {
+            return Err((label.clone(), format!("boundary: touches {}, which the model does not", t.describe())));
+        }
+    }
+    for (label, t) in &before.boundary {
+        if d.no_media && t.place == Place::Input("media") {
+            continue;
+        }
+        if !after.boundary.iter().any(|(_, b)| same_place(t, b, d) && same_form(t, b, d)) {
+            return Err((label.clone(), format!("boundary: the model touches {}, the plan does not", t.describe())));
+        }
+    }
+    Ok(())
+}
+
+pub fn check_contract(pass: &str, before: &Contract, after: &Contract, declared: Declared) -> Result<()> {
+    if before.sections.len() != after.sections.len() {
+        bail!("pass {pass}: the plan has {} sections, the model {}", after.sections.len(), before.sections.len());
+    }
+    for (b, a) in before.sections.iter().zip(&after.sections) {
+        if let Err((op, what)) = check_section(b, a, declared) {
+            bail!("pass {pass}: {}, op {op}: {what}", a.name);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct OpCost {
     pub label: String,
