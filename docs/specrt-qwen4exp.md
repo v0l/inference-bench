@@ -71,12 +71,44 @@ Spec side for #1280: the params the descriptions read are in `tests/qwen4_exp_pl
 
 Tests: `crates/kir/tests/ple.rs` (CPU: integer semantics, the hash description against `reference/tiny-qwen4-exp.ngram.json`, five cases checked against transformers when written, red when a multiplier changes), `crates/specrt/tests/qwen4_exp_ple.rs` (CPU: params from the tiny and real configs, every description builds, the state table sizes, the host reference against the transformers PLE capture at 2e-6; GPU: prefill and decode steps 1 to 4, chunked prefill plus slot reuse, two sequences side by side). Regenerate the references with `~/.venv-vllm/bin/python crates/specrt/scripts/tiny_qwen4_exp.py ple`.
 
-## Not done, and why `family-qwen4_exp.toml` is not added
+## Not done before #1280, and why `family-qwen4_exp.toml` waited
+
+## The family (#1280)
+
+`crates/specrt/specs/family-qwen4_exp.toml` matches `qwen4_exp` and `qwen4_exp_text` and extends `qwen3_5` (delta-net, MoE with a sigmoid gated shared expert, gated attention output). It adds, as data only:
+
+- `[gated_residual]` from #1277 (copied from the old test harness, now removed).
+- The QSA indexer from #1278: `[attention.params]` read from the config (`index_groups = indexer_budget / indexer_compress_ratio`, `index_out = indexer_budget + indexer_compress_ratio - 1`, `index_scale = rsqrt(indexer_head_dim)`), the appended `index_qk_proj` projection, the `index_raw` and `index_pool` per token states and the four kernel nodes. No `layers = ["full"]` is needed: attention nodes only run on attention layers.
+- The PLE from #1279 as a `[prelude]`: a new spec table of described kernel nodes that run at the start of each layer named by `ple_layer_ids` (1 based), before the attn gated residual. Its seven nodes are the `specs/ple_*` descriptions in the order of `Qwen4ExpTextPLELayer.forward`: hash, gather, key and value projections, gate, dilated conv, add into the streams. `ngram_history` and `ple_conv` are `layers = "prelude"` per sequence states, zeroed on reset and carried in state snapshots (the slot pending section), swap and sessions. The table row count is an `{ int = ... }` param: `ceil(prime_sum(ngram_vocab_size_base - 1, 1, ngram_heads) / 128) * 128`, 4096 on the tiny config and 320001536 on the real one (128 shards of 2500012).
+- The vision tower is ignored (text only, #1237). The MTP layer is refused by name with `[[refuse]] part = "mtp"` (#1350): the spec drops `[mtp]` and records the message, so text serves and `[speculative] enabled = true` fails with it.
+
+The gated residual has no fused prefill plus decode step and no single row plan, so the scheduler runs prefill and decode as separate steps.
+
+GPU1 (`gpu-run 1 --min-free 2000`, the user's app on the card), `tests/qwen4_exp.rs`, bar 1e-3 as the qwen3.5 tiny fixtures:
+
+| Check | Max abs |
+|---|---|
+| layer 0 streams, 30 rows | 9.5e-5 |
+| layer 1 streams, 30 rows, PLE computed in the engine | 2.6e-4 |
+| layer 3 streams, all 30 rows (the indexer selects from row 19) | 2.5e-4 |
+| prefill logits, 30 rows, every row's argmax equal | 2.5e-4 |
+| decode steps 1 to 4, greedy equal | 1.4e-4, 1.4e-4, 2.0e-4, 1.7e-4 |
+| in engine PLE against the injected #1279 capture, layer 1 | 2.4e-5 |
+
+Two served slots (prefill in chunks of 7, then 4 decode steps side by side) give the transformers greedy for slot 0 and the same tokens for slot 1 as its prompt served alone, also with the slots swapped after reuse. A state snapshot of slot 0 restored into slot 1 decodes the same greedy tokens; with the prelude restore disabled it does not (checked red once).
+
+The expert GEMMs were refused at an expert width of 640 by an old `% 256` rule; the grouped NVFP4 and FP8 MMA kernels only need `N % 64` and `K % 128`, and both match the CPU at hidden 512, intermediate 640 on GPU1 (`moe_mma.rs`, `moe_mma_fp8.rs`), so the rule is now `% 128` for quantised experts.
+
+Coverage (`model_coverage.sh`): Qwen/Qwen3.8-Flash-Next (360 GB bf16) 2 cards plus 21 GB host plus 166 GB NVMe, the planner models cards and host only; Qwen/Qwen3.8-Flash-Next-FP8 (185.5 GB) 2 cards plus 13 GB host, planner accepts; RadixArk/Qwen3.8-Flash-Next-NVFP4 (135.2 GB) 2 cards, planner accepts. All three SUPPORTED-WITH-OFFLOAD. The GGUF copy waits on #1204 (the GGUF spec is built in Rust and has none of these tables); the MXFP4 GPTQ copy on its quant format.
+
+The real checkpoints still need loader work before a real load (#1349): the n-gram table is 128 `shard_N` tensors in bf16 or fp8 (205 GB as f32, so it must stay in its stored dtype on the host tier), and the bf16 repo fuses experts as `experts.gate_up_proj` [512, 1280, 2560] without a `.weight` suffix. The real load itself needs both cards and a window (parked issue, `needs-both-gpus`).
+
+## History: why the family came last
 
 A family file makes `from_hf_config_serving` accept the model, so the coverage script would call the real config TOO-BIG while the engine cannot run it. The family file goes in last, after these engine pieces each have a kir description and a test against `tiny-qwen4-exp`:
 
 1. 4 stream residual with the low rank gate, collapse and inject kernels: done in #1277 (above).
-2. QSA block pool, score and block top-k stage over a GQA layer, producing a mask or a selected index list for `flash_attention`.
-3. n-gram hash and gather stage plus token history state.
-4. PLE gate and dilated conv stage.
-5. `family-qwen4_exp.toml`, `unsupported` entries removed, `model_coverage.sh` rerun (expected: Qwen/Qwen3.8-Flash-Next TOO-BIG, NVFP4 copy TOO-BIG with 2 cards), GPU1 logits check through `gpu-run 1 --`.
+2. QSA block pool, score and block top-k stage over a GQA layer: done in #1278.
+3. n-gram hash and gather stage plus token history state: done in #1279.
+4. PLE gate and dilated conv stage: done in #1279.
+5. `family-qwen4_exp.toml`: done in #1280 (above).

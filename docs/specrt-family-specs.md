@@ -118,3 +118,18 @@ Gemma 4 sliding layers use `head_dim` and `num_key_value_heads`, full layers use
 The kernels are kir descriptions (`specs/g4_*.toml`): `head_rms` with an optional weight (q, k norms; v norm without), `span_rope` with an explicit `theta` and `angles` (proportional rope rotates `partial_rotary_factor * head_dim / 2` angles over the full head), `state_write`, and a geometry `scan_attention` writing the split attention planes. The vision and audio towers are ignored (`[vision] ignore`); image input gets a text-only refusal (#1237).
 
 Tests: `tests/gemma4.rs` (31B and 12B mapping, refusals, per kind KV bytes, every kernel builds, and on GPU1 tiny-gemma4 logits, greedy and per-layer states against transformers from `scripts/tiny_gemma4.py`: max abs 4.6e-4 on logits).
+
+## A prelude before chosen layers, partial refusals (#1280, Qwen3.8-Flash-Next)
+
+`family-qwen4_exp.toml` extends `qwen3_5` and adds three tables, all data: `[gated_residual]` (four streams with a low rank gate, #1277), the QSA indexer as `[[attention.node]]` (#1278) and the PLE as a `[prelude]` (#1279). Details in [specrt-qwen4exp.md](specrt-qwen4exp.md).
+
+| Field | What it does |
+|---|---|
+| `[prelude] module`, `layers_key`, `layers_base` | Described kernel nodes that run at the start of each layer the config list names (`ple_layer_ids`, 1 based), before the block's own nodes. Weights load from `layers.N.<module>.*`. |
+| `[prelude] index`, `count` | Symbols the descriptions read: the layer's position in the list and the list length. One layer for now (kernels fold the index in). |
+| `[prelude.params]`, `[prelude.scratch]`, `[prelude.int_scratch]` | Params from the config; f32 and i32 buffers of the given row width. Nodes bind `x`, `streams`, `tokens`, a scratch buffer, a weight or a state. |
+| `{ int = "..." }` param | A 64 bit integer expression (`kir::int`: `prime_sum`, `splitmix64`, wrapping ops) over config keys and earlier params, for sizes like the n-gram table rows. |
+| `[[state]] layers = "prelude"` | A per sequence f32 state with one slice per prelude layer; zeroed on reset, carried in snapshots, swap and session restore. |
+| `[[refuse]] part = "mtp"` | A hit drops only that part (the MTP layer here) and records the message on the spec, so `[speculative] enabled = true` is refused by name while text still serves. |
+
+The gated residual runs prefill and decode as separate steps (no fused prefill plus decode, no single row plan).
