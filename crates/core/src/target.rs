@@ -16,6 +16,8 @@ pub struct Capabilities {
     pub logprobs: bool,
     #[serde(default)]
     pub batched: bool,
+    #[serde(default)]
+    pub kind: specrt::media::ModelKind,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -119,6 +121,14 @@ pub trait Target: Send {
 
     fn failure(&self) -> Option<String> {
         None
+    }
+
+    fn media_info(&self) -> Option<specrt::media::MediaInfo> {
+        None
+    }
+
+    fn generate_media(&mut self, _job: &specrt::media::MediaJob, _on_event: &mut dyn FnMut(specrt::media::MediaEvent) -> bool) -> Result<specrt::media::MediaOutput, BackendError> {
+        Err(BackendError::new(crate::result::ErrorKind::InvalidRequest, format!("{} generates text only; image and video jobs need an image or video model", self.name())))
     }
 }
 

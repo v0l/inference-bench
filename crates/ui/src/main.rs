@@ -9,6 +9,7 @@ mod detail;
 mod engine;
 mod fmt;
 mod hardware;
+mod imagegen;
 mod strip;
 mod job;
 mod load;
@@ -76,6 +77,8 @@ pub struct App {
     pub settings_ui: settings::SettingsState,
     pub specs: specs::SpecsUpdater,
     pub load: Option<load::LoadDialog>,
+    pub image_load: Option<imagegen::ImageLoad>,
+    pub generate: imagegen::GenerateState,
     pub picker_query: String,
     pub chat_model: Option<String>,
 }
@@ -116,6 +119,8 @@ impl App {
                 s
             },
             load: None,
+            image_load: None,
+            generate: imagegen::GenerateState::default(),
             picker_query: String::new(),
             chat_model: None,
             settings,
@@ -130,7 +135,10 @@ impl App {
     }
 
     pub fn landing(&self, l: &inference_bench_core::engine::Loaded) -> Option<inference_bench_core::inventory::Landing> {
-        let planned = l.engine.solved.as_deref().map(inference_bench_core::inventory::planned_names).unwrap_or_default();
+        let mut planned = l.engine.solved.as_deref().map(inference_bench_core::inventory::planned_names).unwrap_or_default();
+        if let Some(d) = l.engine.overrides.get(specrt::media::DEVICE_KEY).and_then(|v| v.as_u64()) {
+            planned.extend(self.inventory().local().filter(|c| c.ordinal == Some(d as usize)).map(|c| c.name.clone()));
+        }
         self.inventory().where_landed(&l.landed, &planned)
     }
 
@@ -168,8 +176,18 @@ impl App {
     }
 
     pub fn open_load_dialog(&mut self, model: &LocalModel) {
-        self.load = Some(load::LoadDialog::open(self, model));
+        if let Some(info) = imagegen::is_image(model) {
+            self.load = None;
+            self.image_load = Some(imagegen::ImageLoad::open(self, model, info));
+        } else {
+            self.image_load = None;
+            self.load = Some(load::LoadDialog::open(self, model));
+        }
         self.models.preselect.retain(|p| p.model != model.name);
+    }
+
+    pub fn generating(&self) -> bool {
+        self.loaded().is_some_and(|l| l.kind != specrt::media::ModelKind::Text)
     }
 
     pub fn load_model(&mut self, model: &LocalModel) {
@@ -288,6 +306,7 @@ impl eframe::App for App {
             self.rescan();
         }
         let animating = self.chat.streaming()
+            || self.generate.busy()
             || self.loading.is_some()
             || self.models.downloading()
             || self.specs.busy()
@@ -351,3 +370,5 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_images;

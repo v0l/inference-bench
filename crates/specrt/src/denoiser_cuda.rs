@@ -66,6 +66,39 @@ fn grid(n: usize, per: usize) -> u32 {
     n.div_ceil(per).max(1) as u32
 }
 
+pub const MAX_ROWS: usize = 65535;
+
+fn rows_of(rows: &str, sh: &Shapes, seqs: usize) -> usize {
+    match rows {
+        "joint" => seqs * sh.joint(),
+        "image" => seqs * sh.image,
+        "text" => seqs * sh.text,
+        "latent" => sh.image,
+        "seqs" => seqs,
+        _ => 1,
+    }
+}
+
+pub fn arena_bytes(graph: &DenoiserGraph, spec: &DenoiserSpec, sh: &Shapes, seqs: usize) -> Result<usize> {
+    let head_dim = spec.size("head_dim")?;
+    let mut bytes = 0usize;
+    for d in graph.buffer.iter().chain(&graph.input).chain(&graph.output).filter(|d| !d.int) {
+        bytes += 4 * rows_of(&d.rows, sh, seqs) * spec.size(&d.cols)?;
+    }
+    let plane = (spec.hidden() / head_dim) * seqs * sh.joint() * kir::vision::head_pad(head_dim);
+    Ok(bytes + 12 * plane + 8 * seqs * sh.joint() * (head_dim + 1))
+}
+
+pub fn weight_bytes(dir: &std::path::Path) -> Result<u64> {
+    let ck = Checkpoint::open(&dir.join("transformer"))?;
+    let mut bytes = 0u64;
+    for name in ck.names_under("") {
+        let n: usize = ck.shape_of(&name)?.iter().product();
+        bytes += 2 * n as u64;
+    }
+    Ok(bytes)
+}
+
 impl Denoiser {
     pub fn load(stream: &Arc<CudaStream>, jit: &Jit, dir: &std::path::Path, shapes: Shapes) -> Result<Denoiser> {
         let rule = crate::sampler::Pipeline::from_dir(dir)?.step_rule(false)?;
@@ -183,24 +216,11 @@ impl Denoiser {
     }
 
     fn rows_of(&self, rows: &str, sh: &Shapes, seqs: usize) -> usize {
-        match rows {
-            "joint" => seqs * sh.joint(),
-            "image" => seqs * sh.image,
-            "text" => seqs * sh.text,
-            "latent" => sh.image,
-            "seqs" => seqs,
-            _ => 1,
-        }
+        rows_of(rows, sh, seqs)
     }
 
     pub fn arena_bytes(&self, seqs: usize) -> Result<usize> {
-        let sh = &self.shapes;
-        let mut bytes = 0usize;
-        for d in self.graph.buffer.iter().chain(&self.graph.input).chain(&self.graph.output).filter(|d| !d.int) {
-            bytes += 4 * self.rows_of(&d.rows, sh, seqs) * self.spec.size(&d.cols)?;
-        }
-        let plane = (self.spec.hidden() / self.head_dim) * seqs * sh.joint() * kir::vision::head_pad(self.head_dim);
-        Ok(bytes + 12 * plane + 8 * seqs * sh.joint() * (self.head_dim + 1))
+        arena_bytes(self.graph, &self.spec, &self.shapes, seqs)
     }
 
     pub fn arena(&self) -> Result<Arena> {
@@ -388,6 +408,10 @@ impl Denoiser {
     }
 
     fn run(&self, op: &Op, block: Option<usize>, a: &mut Arena) -> Result<()> {
+        self.run_inner(op, block, a).with_context(|| format!("{} at {}x{} latent patches", op.label(), a.shapes.patch_h, a.shapes.patch_w))
+    }
+
+    fn run_inner(&self, op: &Op, block: Option<usize>, a: &mut Arena) -> Result<()> {
         let Op::Dit(d) = op else { bail!("{} is not a denoiser op", op.label()) };
         if let DitOp::JointAttention { .. } | DitOp::AxisRope { .. } | DitOp::Step { .. } | DitOp::TimestepEmbed { .. } = d {
             return self.run_seq(d, block, a, 0);

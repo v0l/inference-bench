@@ -264,6 +264,32 @@ def flux2_klein():
     check_size(fixture)
 
 
+def tiny_tokenizer(fixture, vocab_size, pad):
+    from tokenizers import Tokenizer, models, pre_tokenizers
+
+    vocab = {"<pad>": pad, "<unk>": 1}
+    vocab.update({f"w{i}": i for i in range(2, vocab_size)})
+    tok = Tokenizer(models.WordLevel(vocab=vocab, unk_token="<unk>"))
+    tok.pre_tokenizer = pre_tokenizers.Whitespace()
+    out = fixture / "tokenizer"
+    out.mkdir(parents=True, exist_ok=True)
+    tok.save(str(out / "tokenizer.json"))
+    config = {
+        "tokenizer_class": "PreTrainedTokenizerFast",
+        "pad_token": "<pad>",
+        "unk_token": "<unk>",
+        "model_max_length": TEXT_LEN,
+        "chat_template": "{{ messages[0]['content'] }}",
+    }
+    (out / "tokenizer_config.json").write_text(json.dumps(config, indent=1) + "\n")
+
+
+def flux2_tokenizer():
+    fixture = FIXTURES / "tiny-flux2-klein"
+    vocab = json.loads((fixture / "text_encoder/config.json").read_text())["vocab_size"]
+    tiny_tokenizer(fixture, vocab, 0)
+
+
 def wan21():
     from diffusers import AutoencoderKLWan, UniPCMultistepScheduler, WanPipeline, WanTransformer3DModel
     from transformers import UMT5Config, UMT5EncoderModel
@@ -427,5 +453,7 @@ if __name__ == "__main__":
     which = sys.argv[1:] or ["flux2", "wan"]
     if "flux2" in which:
         flux2_klein()
+    if "flux2" in which or "tokenizer" in which:
+        flux2_tokenizer()
     if "wan" in which:
         wan21()

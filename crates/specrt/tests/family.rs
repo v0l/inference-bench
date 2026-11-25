@@ -35,9 +35,28 @@ fn a_family_spec_file_can_change_a_flag_the_code_used_to_fix() {
 fn every_embedded_family_has_a_name_and_a_match_or_is_generic() {
     let r = Registry::embedded();
     for f in r.families() {
-        assert!(matches!(f.name.as_str(), "generic" | "base") || !f.matches.model_types.is_empty(), "{}", f.name);
+        assert!(matches!(f.name.as_str(), "generic" | "base") || !f.matches.model_types.is_empty() || !f.matches.pipelines.is_empty(), "{}", f.name);
     }
     assert!(r.for_model_type("qwen3_5_text").is_some() && r.for_model_type("mistral").is_some());
+}
+
+#[test]
+fn the_image_family_matches_its_pipeline_class_and_composes_finished_pieces() {
+    let r = Registry::embedded();
+    let f = r.for_pipeline("Flux2KleinPipeline").expect("family-flux2_klein.toml");
+    assert_eq!((f.name.as_str(), f.pipeline.kind.as_str(), f.pipeline.graph.as_str()), ("flux2_klein", "image", "flow-euler"));
+    assert!(f.pipeline.sizes.contains(&f.pipeline.default_size));
+    assert!(r.for_model_type(&f.pipeline.text_encoder_family).is_some(), "the text encoder is a family the engine runs");
+    assert!(f.matches.model_types.is_empty(), "an image family is not a text family");
+    assert!(r.for_pipeline("WanPipeline").is_none());
+    let dir = fixtures().join("tiny-flux2-klein");
+    let p = specrt::sampler::Pipeline::from_dir(&dir).unwrap();
+    assert_eq!(p.name, f.pipeline.graph);
+    let spec = specrt::denoiser::DenoiserSpec::from_pipeline(&dir).unwrap();
+    let plan = specrt::denoiser::DenoiserGraph::embedded().sampling_plan(&p.step_rule(false).unwrap(), false).unwrap();
+    specrt::denoiser::validate(specrt::denoiser::DenoiserGraph::embedded(), &spec, &plan).unwrap();
+    let vae = specrt::vae::graph::load_plan(&dir.join("vae")).unwrap();
+    assert!(!vae.temporal);
 }
 
 fn production_lines(file: &str) -> Vec<(usize, String)> {

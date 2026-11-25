@@ -8,7 +8,7 @@ card_gib = 96.0
 [selection]
 months = 9
 limit = 400
-pipelines = ["text-generation", "image-text-to-text", "any-to-any"]
+pipelines = ["text-generation", "image-text-to-text", "any-to-any", "text-to-image", "image-to-image"]
 exclude = "(?i)(OCR|Embed|Rerank|Transcribe|ASR|TTS|Image|Video|Guard|Voxtral|Timestral|LIDstral|SCAIL|Kaleido|SSVAE|eagle|dflash|dspark|draft|assistant|GGUF|ONNX|litert|mobile|qat|Diffusers|Diarization|Parse|Music|Audio|VoiceChat|Foley|3D|World|Nomas|Sports|Cosmos|GR00T|Metatron|MotionBricks|SAE-|Aligner|Proteina|Kimodo|colembed|WeMM|Reward|GenRM|Safety|mcore|Flamingo|Sigma|Teacher|tokenizer|MTP|-Vision-Exp|-pytorch|-keras|-flax|-tf|-jax)"
 quantised = "(?i)(fp8|nvfp4|mxfp4|mxfp8|awq|gptq|int4|int8|w4a16|w8a8|bnb|fp4|LiLiCorr)"
 
@@ -112,6 +112,15 @@ search = ["gemma-4", "gemma-2"]
 pattern = "^gemma-(4|2)-"
 current = "^gemma-4-(E2B|E4B|12B|26B-A4B|31B)(-it)?$|^gemma-2-(2b|9b|27b)(-it)?$"
 note = "Gemma 3 dense (1B, 4B, 12B, 27B, 270m) loads today and Gemma 3n is the `model_type gemma3n` gap on #1214. Gemma 2 is still documented and downloadable from Google (gemma.ai/models/gemma-2/, listed under Previous Gemma models beside Gemma 3), so its `model_type gemma2` gap is split out of #1203 into its own issue; opt, gpt_neox and bloom stay parked in #1203."
+
+[[lab]]
+key = "bfl"
+name = "Black Forest Labs (image)"
+orgs = ["black-forest-labs"]
+search = ["FLUX.2-klein"]
+pattern = "^FLUX\\.2-klein-(base-)?4B$"
+current = "^FLUX\\.2-klein-4B$"
+note = "Image pipelines (diffusers `model_index.json`), classified by the family file that matches the pipeline class (`family-flux2_klein.toml`, #1285). Size is the sum of the text encoder, denoiser and VAE safetensors; one image job runs per card and the text encoder is released after encoding. The FP8 and NVFP4 klein copies and the 9B are not listed until the denoiser reads those weights."
 
 [[lab]]
 key = "inclusionai"

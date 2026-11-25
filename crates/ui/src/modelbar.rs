@@ -90,7 +90,14 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, busy: bool, right: impl FnOnce(&mu
             (None, Some(l), _) => {
                 lamp(ui, if busy { "generating" } else { "ready" }, true, false);
                 chip(ui, &l.display, READOUT, true);
-                chip(ui, &format!("{} ctx", l.ctx), READOUT, false);
+                match l.kind {
+                    specrt::media::ModelKind::Text => {
+                        chip(ui, &format!("{} ctx", l.ctx), READOUT, false);
+                    }
+                    kind => {
+                        chip(ui, kind.label(), TRACE, false);
+                    }
+                }
                 for other in app.loaded_all().into_iter().filter(|o| o.display != l.display) {
                     let key = ui.add(Key::new(other.display.clone()).outline(VALUE).id_salt(("switch", other.model_id.clone())));
                     let key = key.on_hover_text(format!("chat with {} and show its stats", other.display));

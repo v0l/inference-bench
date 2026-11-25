@@ -426,3 +426,84 @@ impl crate::target::Target for ScriptedServing {
 pub fn engine(wake: crate::engine::Wake, script: Script) -> crate::engine::Engine {
     crate::engine::Engine::with_factories_sampled(wake, ScriptedModel::factory(script.clone()), ScriptedServing::factory(script), crate::engine::no_gpu_sampler())
 }
+
+pub fn tiny_pipeline() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures/tiny-flux2-klein")
+}
+
+pub struct FakeImage {
+    pub info: specrt::media::MediaInfo,
+    pub step_ms: u64,
+    pub runs: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FakeImage {
+    pub fn factory(step_ms: u64, runs: Arc<std::sync::atomic::AtomicUsize>, text: Option<crate::native::Factory>) -> crate::native::Factory {
+        Arc::new(move |model, ctx| {
+            if specrt::media::resolve_dir(model).is_some() {
+                let info = specrt::media::info(std::path::Path::new(model))?;
+                return Ok(Box::new(FakeImage { info, step_ms, runs: runs.clone() }) as Box<dyn crate::native::Model>);
+            }
+            match &text {
+                Some(f) => f(model, ctx),
+                None => anyhow::bail!("no model_index.json for {model}"),
+            }
+        })
+    }
+
+    pub fn pixels(seed: u64, width: usize, height: usize) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..width * height * 3)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 56) as u8
+            })
+            .collect()
+    }
+}
+
+impl crate::native::Model for FakeImage {
+    fn generate(&mut self, _: &str, _: usize, _: specrt::runtime::Sampling) -> anyhow::Result<specrt::engine::Reply> {
+        anyhow::bail!(specrt::media::InvalidJob("this is an image model".into()))
+    }
+
+    fn chat(&mut self, _: &[serde_json::Value], _: Option<&serde_json::Value>, _: usize, _: specrt::runtime::Sampling, _: &mut dyn FnMut(&str) -> bool) -> anyhow::Result<specrt::engine::Reply> {
+        anyhow::bail!(specrt::media::InvalidJob("this is an image model: send it to /v1/images/generations, not a text route".into()))
+    }
+
+    fn logits(&mut self, _: &str) -> anyhow::Result<specrt::engine::PromptLogits> {
+        anyhow::bail!("an image model has no logits")
+    }
+
+    fn media_info(&self) -> Option<specrt::media::MediaInfo> {
+        Some(self.info.clone())
+    }
+
+    fn generate_media(&mut self, job: &specrt::media::MediaJob, on_event: &mut dyn FnMut(specrt::media::MediaEvent) -> bool) -> anyhow::Result<specrt::media::MediaOutput> {
+        self.info.check(job)?;
+        self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let steps = job.steps.unwrap_or(self.info.default_steps);
+        let mut out = specrt::media::MediaOutput::default();
+        for i in 0..job.n {
+            let seed = job.seed.wrapping_add(i as u64);
+            for step in 1..=steps {
+                thread::sleep(Duration::from_millis(self.step_ms));
+                if !on_event(specrt::media::MediaEvent::Progress { image: i, step, steps }) {
+                    return Err(specrt::generate::Cancelled.into());
+                }
+                if job.preview_every.is_some_and(|k| k > 0 && step % k == 0) {
+                    let (w, h) = (job.width.div_ceil(4), job.height.div_ceil(4));
+                    on_event(specrt::media::MediaEvent::Preview { image: i, step, picture: specrt::media::Picture { width: w, height: h, rgb: Self::pixels(seed ^ step as u64, w, h), seed } });
+                }
+            }
+            out.images.push(specrt::media::Picture { width: job.width, height: job.height, rgb: Self::pixels(seed, job.width, job.height), seed });
+            out.steps += steps;
+        }
+        out.step_secs = started.elapsed().as_secs_f64();
+        out.total_secs = out.step_secs;
+        Ok(out)
+    }
+}

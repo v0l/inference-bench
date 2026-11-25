@@ -84,6 +84,57 @@ fn check_run(guidance: f32, prefix: &str) {
 
 #[test]
 #[ignore = "needs a GPU: ~/.agents/bin/gpu-run 1 -- cargo test --test sampler_gpu -- --ignored --test-threads=1"]
+fn the_admission_fallbacks_sequential_guidance_and_tiled_vae_give_the_same_image() {
+    use specrt::generate::{Hooks, Plan};
+    let (ctx, jit) = gpu();
+    let mut g = Generator::open(ctx, jit, &fixture(), 64).unwrap();
+    g.pipeline.values.insert("distilled".into(), 0.0);
+    let guidance = meta()["cfg_guidance"].as_f64().unwrap() as f32;
+    let batched = g.generate(&request(guidance)).unwrap();
+    let mut steps = Vec::new();
+    let mut hook = |i: usize, n: usize, _: &[f32]| {
+        steps.push((i, n));
+        true
+    };
+    let seq = g.generate_with(&request(guidance), Plan { sequential_cfg: true, vae_tile: None }, &mut Hooks { on_step: &mut hook }).unwrap();
+    assert_eq!(steps, vec![(1, 3), (2, 3), (3, 3)]);
+    assert!(seq.memory.sequential_cfg);
+    let d = max_diff(&seq.pixels, &batched.pixels);
+    eprintln!("sequential guidance against batched: {d:e}, arena {} against {}", seq.memory.arena, batched.memory.arena);
+    assert!(d < IMAGE_TOLERANCE, "{d}");
+    assert!(2 * seq.memory.arena <= batched.memory.arena + 8192, "sequential guidance holds one sequence: {} against {}", seq.memory.arena, batched.memory.arena);
+    let tiling = specrt::vae::tiled::Tiling { tile: 12, overlap: 8 };
+    let tiled = g.generate_with(&request(guidance), Plan { sequential_cfg: false, vae_tile: Some(tiling) }, &mut Hooks { on_step: &mut |_, _, _| true }).unwrap();
+    let db = psnr(&tiled.pixels, &batched.pixels);
+    eprintln!("tiled VAE against whole: PSNR {db:.1} dB, vae arena {} against {}", tiled.memory.vae_arena, batched.memory.vae_arena);
+    assert!(db > 20.0, "{db}");
+    assert!(tiled.memory.vae_arena < batched.memory.vae_arena);
+    let mut n = 0;
+    let cancelled = g.generate_with(&request(guidance), Plan::default(), &mut Hooks { on_step: &mut |_, _, _| { n += 1; false } }).unwrap_err();
+    assert!(cancelled.downcast_ref::<specrt::generate::Cancelled>().is_some(), "{cancelled}");
+    assert_eq!(n, 1);
+}
+
+#[test]
+#[ignore = "needs a GPU: ~/.agents/bin/gpu-run 1 -- cargo test --test sampler_gpu -- --ignored --test-threads=1"]
+fn the_largest_offered_size_runs_through_admission_and_decodes() {
+    let (ctx, jit) = gpu();
+    let mut model = specrt::media::ImageModel::load(&fixture().display().to_string(), None).unwrap();
+    drop((ctx, jit));
+    let size = model.info.default_size.clone();
+    let (w, h) = specrt::media::parse_size(&size).unwrap();
+    let job = specrt::media::MediaJob { steps: Some(1), ..specrt::media::MediaJob::image("w176 w476", w, h, 1) };
+    let (plan, a) = model.plan(&job).unwrap();
+    eprintln!("{size}: plan {plan:?} admission {a:?}");
+    let out = model.run(&job, &mut |_| true).unwrap();
+    assert_eq!((out.images[0].width, out.images[0].height), (w, h));
+    let square = specrt::media::MediaJob { steps: Some(1), ..specrt::media::MediaJob::image("w176", 1024, 1024, 1) };
+    let refused = model.run(&square, &mut |_| true).unwrap_err();
+    assert!(refused.downcast_ref::<specrt::media::InvalidJob>().is_some(), "{refused}");
+}
+
+#[test]
+#[ignore = "needs a GPU: ~/.agents/bin/gpu-run 1 -- cargo test --test sampler_gpu -- --ignored --test-threads=1"]
 fn three_unguided_steps_from_the_seed_give_the_reference_image() {
     check_run(1.0, "");
 }

@@ -159,6 +159,7 @@ impl LocalModel {
         match (backend, self.format) {
             ("specrt", Format::Spec) => self.path.display().to_string(),
             ("specrt" | "llama.cpp", Format::Gguf) => self.path.display().to_string(),
+            ("specrt", _) if self.repo.is_empty() && specrt::media::is_pipeline(&self.path) => self.path.display().to_string(),
             ("specrt" | "vllm", _) if !self.repo.is_empty() => self.repo.clone(),
             _ => self.name.clone(),
         }
@@ -555,7 +556,46 @@ fn collect(dir: &Path, depth: usize, keep: &mut dyn FnMut(&Path) -> bool, out: &
     }
 }
 
+fn pipeline_model(dir: &Path, repo: &str, root: &Path) -> Option<LocalModel> {
+    let index: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("model_index.json")).ok()?).ok()?;
+    let class = index["_class_name"].as_str()?.to_string();
+    let mut files = Vec::new();
+    collect(dir, 1, &mut |p| p.extension().is_some_and(|e| e == "safetensors"), &mut files);
+    if files.is_empty() {
+        return None;
+    }
+    files.sort();
+    let support = match specrt::media::info(dir) {
+        Ok(i) => Support::yes("specrt", &format!("{} pipeline, {} family on CUDA", i.kind.label(), i.family)),
+        Err(e) => Support::no("specrt", e.root_cause().to_string()),
+    };
+    let name = match repo.is_empty() {
+        true => dir.file_name()?.to_string_lossy().into_owned(),
+        false => repo.to_string(),
+    };
+    Some(LocalModel {
+        name,
+        repo: repo.to_string(),
+        path: dir.to_path_buf(),
+        root: root.to_path_buf(),
+        format: Format::Safetensors,
+        size_bytes: dir_size(&files),
+        support: vec![support, Support::no("llama.cpp", "diffusers pipelines are specrt only"), Support::no("vllm", "diffusers pipelines are specrt only")],
+        architecture: class,
+        quant: "BF16".into(),
+        context_length: None,
+        files,
+        origin: None,
+        spec_source: None,
+        vision: false,
+        lineage: None,
+    })
+}
+
 fn safetensors_model(dir: &Path, repo: &str, root: &Path) -> Option<LocalModel> {
+    if dir.join("model_index.json").is_file() {
+        return pipeline_model(dir, repo, root);
+    }
     let text = std::fs::read_to_string(dir.join("config.json")).ok()?;
     let config: Value = serde_json::from_str(&text).ok()?;
     let mut files = Vec::new();
@@ -662,7 +702,9 @@ pub fn scan_folder(folder: &Path) -> Vec<LocalModel> {
     let mut found = Vec::new();
     gguf_models(folder, "", folder, &mut found);
     let mut configs = Vec::new();
-    collect(folder, 3, &mut |p| p.file_name().is_some_and(|n| n == "config.json"), &mut configs);
+    collect(folder, 3, &mut |p| p.file_name().is_some_and(|n| n == "config.json" || n == "model_index.json"), &mut configs);
+    let pipelines: Vec<PathBuf> = configs.iter().filter(|c| c.file_name().is_some_and(|n| n == "model_index.json")).filter_map(|c| c.parent().map(Path::to_path_buf)).collect();
+    configs.retain(|c| c.file_name().is_some_and(|n| n == "model_index.json") || !pipelines.iter().any(|p| c.starts_with(p)));
     for c in configs {
         if let Some(m) = c.parent().and_then(|d| safetensors_model(d, "", folder)) {
             found.push(m);
@@ -865,6 +907,19 @@ mod tests {
         std::fs::write(snap.join("config.json"), config).unwrap();
         std::fs::write(snap.join("model.safetensors"), vec![0u8; 2048]).unwrap();
         snap
+    }
+
+    #[test]
+    fn a_diffusers_pipeline_folder_is_one_image_model_named_by_its_family() {
+        let tiny = Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures/tiny-flux2-klein");
+        let found = scan_folder(&tiny);
+        assert_eq!(found.len(), 1, "{:?}", found.iter().map(|m| &m.path).collect::<Vec<_>>());
+        let m = &found[0];
+        assert_eq!(m.architecture, "Flux2KleinPipeline");
+        let s = m.support_for("specrt").unwrap();
+        assert!(s.supported && s.reason.contains("image pipeline") && s.reason.contains("flux2_klein"), "{s:?}");
+        assert!(m.files.len() >= 3);
+        assert_eq!(m.model_id("specrt"), tiny.display().to_string(), "a pipeline folder outside the hub loads by its path");
     }
 
     #[test]

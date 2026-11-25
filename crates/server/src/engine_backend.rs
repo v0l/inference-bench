@@ -9,7 +9,7 @@ fn source_model(l: inference_bench_core::engine::Loaded) -> SourceModel {
     let mut aliases = vec![l.model_id];
     aliases.extend(inference_bench_core::library::short_alias(&l.display));
     aliases.extend(l.served_names);
-    SourceModel { id: l.display, aliases, slots: Some(l.max_num_seqs) }
+    SourceModel { id: l.display, aliases, slots: Some(l.max_num_seqs), kind: l.kind }
 }
 
 impl ModelSource for Handle {
@@ -89,7 +89,30 @@ impl Target for EngineBackend {
             tools: loaded.as_ref().map(|l| l.tools).unwrap_or_default(),
             logprobs: batched,
             batched,
+            kind: loaded.as_ref().map(|l| l.kind).unwrap_or_default(),
             ..Capabilities::default()
+        }
+    }
+
+    fn media_info(&self) -> Option<inference_bench_core::specrt_media::MediaInfo> {
+        self.loaded().and_then(|l| l.media)
+    }
+
+    fn generate_media(&mut self, job: &inference_bench_core::specrt_media::MediaJob, on_event: &mut dyn FnMut(inference_bench_core::specrt_media::MediaEvent) -> bool) -> Result<inference_bench_core::specrt_media::MediaOutput, BackendError> {
+        use inference_bench_core::engine::MediaUpdate;
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let updates = self.handle.generate_media(self.model.as_deref(), job.clone(), cancel.clone());
+        loop {
+            match updates.recv() {
+                Ok(MediaUpdate::Event(e)) => {
+                    if !on_event(e) {
+                        cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                Ok(MediaUpdate::Done(o)) => return Ok(o),
+                Ok(MediaUpdate::Failed(e)) => return Err(e),
+                Err(_) => return Err(BackendError::failed("the engine has stopped")),
+            }
         }
     }
 

@@ -58,6 +58,7 @@ pub struct SourceModel {
     pub id: String,
     pub aliases: Vec<String>,
     pub slots: Option<usize>,
+    pub kind: inference_bench_core::specrt_media::ModelKind,
 }
 
 pub trait ModelSource: Send + Sync + 'static {
@@ -104,6 +105,7 @@ pub struct LoadedModel {
     sem: Arc<Semaphore>,
     stats: Mutex<Option<Box<dyn Target>>>,
     pub tools: inference_bench_core::specrt_chat::ToolFormat,
+    pub kind: inference_bench_core::specrt_media::ModelKind,
 }
 
 impl LoadedModel {
@@ -182,6 +184,7 @@ pub struct ModelStatus {
     pub idle_secs: Option<f64>,
     pub loading: Option<LoadingStatus>,
     pub failed: Option<String>,
+    pub kind: inference_bench_core::specrt_media::ModelKind,
 }
 
 fn remapped(requested: &str, cfg: ModelConfig) -> ModelConfig {
@@ -404,6 +407,11 @@ impl Manager {
             .collect()
     }
 
+    fn kind_on_disk(&self, m: &ModelConfig) -> inference_bench_core::specrt_media::ModelKind {
+        use inference_bench_core::specrt_media as media;
+        media::resolve_dir(m.upstream_name()).and_then(|d| media::info(&d).ok()).map(|i| i.kind).unwrap_or_default()
+    }
+
     pub fn status(&self) -> Vec<ModelStatus> {
         let loaded = self.loaded.lock().unwrap();
         if let Some(source) = &self.source {
@@ -419,6 +427,7 @@ impl Manager {
                     idle_secs: None,
                     loading: self.loading_of(&m.id),
                     failed: self.failed.lock().unwrap().get(&m.id).cloned(),
+                    kind: m.kind,
                 })
                 .collect();
             out.extend(source
@@ -437,6 +446,7 @@ impl Manager {
                         idle_secs: l.map(|l| l.idle_for().as_secs_f64()),
                         loading,
                         failed,
+                        kind: m.kind,
                     }
                 }));
             return out;
@@ -456,6 +466,7 @@ impl Manager {
                     idle_secs: l.map(|l| l.idle_for().as_secs_f64()),
                     loading: self.loading_of(&m.id),
                     failed: self.failed.lock().unwrap().get(&m.id).cloned().or_else(|| l.and_then(|l| l.failure())),
+                    kind: l.map(|l| l.kind).unwrap_or_else(|| self.kind_on_disk(m)),
                 }
             })
             .collect();
@@ -470,6 +481,7 @@ impl Manager {
                     idle_secs: Some(l.idle_for().as_secs_f64()),
                     loading: None,
                     failed: l.failure(),
+                    kind: l.kind,
                 });
             }
         }
@@ -622,6 +634,7 @@ impl Manager {
         let vram = if measured > 0 { measured } else { cfg.vram_bytes.unwrap_or(0) };
         let backend_label = backends.first().map(|b| b.name().to_string()).unwrap_or_default();
         let tools = backends.first().map(|b| b.capabilities().tools).unwrap_or_default();
+        let kind = backends.first().map(|b| b.capabilities().kind).unwrap_or_default();
         match (tools, &self.config.tool_parser) {
             (inference_bench_core::specrt_chat::ToolFormat::Unparsed, None) => tracing::warn!(model = %cfg.id, "the chat template has a tool format this server cannot parse: tool calls will come back as raw text"),
             (format, None) => tracing::info!(model = %cfg.id, tool_parser = ?format.parser(), "tool parser inferred from the chat template"),
@@ -650,6 +663,7 @@ impl Manager {
             pool: Mutex::new(backends),
             stats: Mutex::new(stats),
             tools,
+            kind,
         });
         self.loaded.lock().unwrap().insert(cfg.id.clone(), model.clone());
         Ok(model)

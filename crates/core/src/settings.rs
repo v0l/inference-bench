@@ -61,6 +61,29 @@ pub struct Settings {
     pub specs_update_hours: u64,
     #[serde(default)]
     pub cluster: ClusterSettings,
+    #[serde(default)]
+    pub model_image: BTreeMap<String, ImageDefaults>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImageDefaults {
+    pub size: String,
+    pub steps: usize,
+    pub guidance: f32,
+    pub offload_text_encoder: bool,
+}
+
+impl ImageDefaults {
+    pub fn from_info(info: &specrt::media::MediaInfo) -> Self {
+        Self { size: info.default_size.clone(), steps: info.default_steps, guidance: info.default_guidance, offload_text_encoder: true }
+    }
+}
+
+impl Default for ImageDefaults {
+    fn default() -> Self {
+        Self { size: "1024x1024".into(), steps: 4, guidance: 1.0, offload_text_encoder: true }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -143,6 +166,7 @@ impl Default for Settings {
             specs_tag: String::new(),
             specs_update_hours: default_specs_hours(),
             cluster: ClusterSettings::default(),
+            model_image: BTreeMap::new(),
         }
     }
 }
