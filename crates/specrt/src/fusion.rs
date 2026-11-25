@@ -262,6 +262,41 @@ pub struct Group {
     pub launches: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Order {
+    Best,
+    Worst,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Probe {
+    pub cap: usize,
+    pub order: Order,
+}
+
+impl Probe {
+    pub fn exhaustive(cap: usize) -> Probe {
+        Probe { cap, order: Order::Best }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Search {
+    pub greedy: u64,
+    pub best: u64,
+    pub states: usize,
+    pub capped: bool,
+    pub split: bool,
+    pub greedy_only: Vec<Vec<String>>,
+    pub best_only: Vec<Vec<String>>,
+}
+
+impl Search {
+    pub fn gap(&self) -> f64 {
+        if self.best == 0 { 0.0 } else { self.best.saturating_sub(self.greedy) as f64 * 100.0 / self.best as f64 }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SectionFusion {
     pub name: String,
@@ -272,6 +307,7 @@ pub struct SectionFusion {
     pub rejected: Vec<Decision>,
     pub launches_before: usize,
     pub launches_after: usize,
+    pub search: Option<Search>,
 }
 
 impl SectionFusion {
@@ -561,7 +597,10 @@ struct Engine<'a> {
     count: Count,
     library: Option<Library<'a>>,
     compute_prologue: bool,
+    order: Order,
+    split: bool,
 }
+
 
 struct Candidate {
     decision: Decision,
@@ -1020,7 +1059,7 @@ impl Engine<'_> {
             for phase in PHASES {
                 loop {
                     let candidates = self.candidates();
-                    let Some(best) = Self::best(&candidates, phase) else {
+                    let Some(best) = Self::best(&candidates, phase, self.order) else {
                         seen.extend(candidates.into_iter().map(|c| c.decision));
                         break;
                     };
@@ -1043,6 +1082,7 @@ impl Engine<'_> {
             }
             if !changed {
                 let splits = self.split_over_budget();
+                self.split = !splits.is_empty();
                 let kept = |d: &Decision| self.groups.iter().any(|g| d.producer.iter().chain(d.consumers.iter().flatten()).all(|u| g.iter().any(|&m| self.units[m].label == *u)));
                 let fused = fused.into_iter().filter(|d| kept(d)).collect();
                 seen.extend(splits);
@@ -1062,28 +1102,125 @@ impl Engine<'_> {
         !self.apply_set(apply).is_disjoint(taken)
     }
 
-    fn best(candidates: &[Candidate], phase: &[Rule]) -> Option<usize> {
-        candidates
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| phase.contains(&c.decision.rule) && c.decision.verdict.is_ok())
-            .max_by_key(|(i, c)| (c.decision.saving - c.decision.penalty, std::cmp::Reverse(*i)))
-            .map(|(i, _)| i)
+    fn best(candidates: &[Candidate], phase: &[Rule], order: Order) -> Option<usize> {
+        let legal = candidates.iter().enumerate().filter(|(_, c)| phase.contains(&c.decision.rule) && c.decision.verdict.is_ok());
+        let net = |c: &Candidate| c.decision.saving - c.decision.penalty;
+        match order {
+            Order::Best => legal.max_by_key(|(i, c)| (net(c), std::cmp::Reverse(*i))).map(|(i, _)| i),
+            Order::Worst => legal.min_by_key(|(i, c)| (net(c), *i)).map(|(i, _)| i),
+        }
+    }
+
+    fn upstream(&self, g: &BTreeSet<usize>, h: usize) -> BTreeSet<usize> {
+        let mut out = BTreeSet::new();
+        let mut stack = vec![h];
+        while let Some(n) = stack.pop() {
+            for v in self.values.iter().filter(|v| g.contains(&v.writer) && v.readers.iter().any(|(r, _)| *r == n)) {
+                if !self.units[v.writer].anchored() && out.insert(v.writer) {
+                    stack.push(v.writer);
+                }
+            }
+        }
+        out
+    }
+
+    fn group_penalty(&self, g: &BTreeSet<usize>) -> u64 {
+        let mut penalty = 0;
+        for &h in g.iter().filter(|&&u| self.units[u].heavy()) {
+            let Some(geo) = self.units[h].geometry else { continue };
+            let up = self.upstream(g, h);
+            if !up.is_empty() {
+                let rereads = geo.col_blocks.saturating_sub(1) as f64 * self.external_reads(&up) as f64 * self.costs.reread_rate;
+                let hidden = self.external_reads(&BTreeSet::from([h])) as f64 * self.costs.reread_overlap;
+                penalty += (rereads - hidden).max(0.0) as u64;
+            }
+        }
+        if let Some(a) = self.anchor(g)
+            && let Some(Geometry { owner: Owner::Split { serial }, .. }) = self.units[a].geometry
+            && self.values.iter().any(|v| v.writer == a && v.readers.iter().any(|(r, _)| g.contains(r)))
+        {
+            penalty += (serial as u64 + 1) * self.costs.round_trip_bytes;
+        }
+        penalty
+    }
+
+    pub(crate) fn cost(&self, groups: &[BTreeSet<usize>]) -> u64 {
+        let launches: u64 = groups.iter().map(|g| self.launches(g) as u64).sum::<u64>() * self.costs.launch_bytes;
+        let mut traffic = 0;
+        for v in &self.values {
+            let split = matches!(self.units[v.writer].geometry, Some(Geometry { owner: Owner::Split { .. }, .. }));
+            if split || Self::needs_memory(groups, v) {
+                traffic += self.bytes(&v.tensor);
+            }
+            traffic += v.readers.iter().filter(|(r, _)| split || !Self::served(groups, v, *r)).map(|(_, t)| self.bytes(t)).sum::<u64>();
+        }
+        launches + traffic + groups.iter().map(|g| self.group_penalty(g)).sum::<u64>()
+    }
+
+    fn explore(&mut self, start: Vec<BTreeSet<usize>>, cap: usize) -> (Vec<BTreeSet<usize>>, u64, usize, bool) {
+        let mut seen: BTreeSet<Vec<BTreeSet<usize>>> = BTreeSet::from([start.clone()]);
+        let mut stack = vec![start.clone()];
+        let mut best = (self.cost(&start), start);
+        while let Some(state) = stack.pop() {
+            if seen.len() >= cap {
+                return (best.1, best.0, seen.len(), true);
+            }
+            self.groups = state.clone();
+            let open: Vec<Candidate> = self.candidates().into_iter().filter(|c| matches!(c.decision.verdict, Ok(()) | Err(Reason::Cost))).collect();
+            for c in open {
+                self.groups = state.clone();
+                self.apply(&c.apply);
+                let mut next = std::mem::take(&mut self.groups);
+                next.sort();
+                if next.iter().any(|g| self.budget(g).is_err()) || !seen.insert(next.clone()) {
+                    continue;
+                }
+                let cost = self.cost(&next);
+                if cost < best.0 {
+                    best = (cost, next.clone());
+                }
+                stack.push(next);
+            }
+        }
+        (best.1, best.0, seen.len(), false)
+    }
+
+    fn search(&mut self, cap: usize) -> (u64, u64, Vec<BTreeSet<usize>>, usize, bool) {
+        let saved = std::mem::take(&mut self.groups);
+        let start: Vec<BTreeSet<usize>> = (0..self.units.len()).map(|u| BTreeSet::from([u])).collect();
+        let base = self.cost(&start);
+        let greedy = base.saturating_sub(self.cost(&saved));
+        let (groups, cost, states, capped) = self.explore(start, cap);
+        self.groups = saved;
+        (greedy, base.saturating_sub(cost), groups, states, capped)
     }
 }
 
 const PHASES: [&[Rule]; 2] = [&[Rule::Epilogue, Rule::Light, Rule::Fill], &[Rule::Prologue]];
 
-fn fuse_section(units: Vec<Unit>, internal: &BTreeSet<Place>, costs: &Costs, count: Count, name: String, repeats: usize, library: Option<Library>) -> SectionFusion {
-    fuse_section_with(units, internal, costs, count, name, repeats, library, false)
+#[allow(clippy::too_many_arguments)]
+fn fuse_section(units: Vec<Unit>, internal: &BTreeSet<Place>, costs: &Costs, count: Count, name: String, repeats: usize, library: Option<Library>, probe: Option<Probe>) -> SectionFusion {
+    fuse_section_with(units, internal, costs, count, name, repeats, library, false, probe)
+}
+
+fn labelled(units: &[Unit], groups: &[BTreeSet<usize>]) -> Vec<Vec<String>> {
+    groups.iter().map(|g| g.iter().map(|&u| units[u].label.clone()).collect()).collect()
 }
 
 #[allow(clippy::too_many_arguments)]
-fn fuse_section_with(units: Vec<Unit>, internal: &BTreeSet<Place>, costs: &Costs, count: Count, name: String, repeats: usize, library: Option<Library>, compute_prologue: bool) -> SectionFusion {
+fn fuse_section_with(units: Vec<Unit>, internal: &BTreeSet<Place>, costs: &Costs, count: Count, name: String, repeats: usize, library: Option<Library>, compute_prologue: bool, probe: Option<Probe>) -> SectionFusion {
     let vals = values(&units, internal);
-    let mut engine = Engine { units: &units, values: vals, groups: (0..units.len()).map(|u| BTreeSet::from([u])).collect(), costs, count, library, compute_prologue };
+    let order = probe.map_or(Order::Best, |p| p.order);
+    let mut engine = Engine { units: &units, values: vals, groups: (0..units.len()).map(|u| BTreeSet::from([u])).collect(), costs, count, library, compute_prologue, order, split: false };
     let launches_before = units.iter().map(|u| u.launches).sum();
     let (fused, seen) = engine.run();
+    let search = probe.map(|p| {
+        let (greedy_score, best, groups, states, capped) = engine.search(p.cap);
+        let mut greedy: Vec<BTreeSet<usize>> = engine.groups.clone();
+        greedy.sort();
+        let only = |a: &[BTreeSet<usize>], b: &[BTreeSet<usize>]| -> Vec<BTreeSet<usize>> { a.iter().filter(|g| !b.contains(g)).cloned().collect() };
+        Search { greedy: greedy_score, best, states, capped, split: engine.split, greedy_only: labelled(&units, &only(&greedy, &groups)), best_only: labelled(&units, &only(&groups, &greedy)) }
+    });
     let mut ordered = engine.groups.clone();
     ordered.sort_by_key(|g| (g.iter().copied().find(|&u| units[u].heavy()).unwrap_or(*g.first().unwrap()), g.len()));
     let groups: Vec<Group> = ordered.iter().map(|g| Group { units: engine.labels(g), members: g.iter().copied().collect(), ops: engine.ops(g), launches: engine.launches(g) }).collect();
@@ -1096,7 +1233,7 @@ fn fuse_section_with(units: Vec<Unit>, internal: &BTreeSet<Place>, costs: &Costs
     }
     let launches_after = groups.iter().map(|g| g.launches).sum();
     drop(engine);
-    SectionFusion { name, repeats, units, groups, fused, rejected, launches_before, launches_after }
+    SectionFusion { name, repeats, units, groups, fused, rejected, launches_before, launches_after, search }
 }
 
 pub struct Section<'a> {
@@ -1109,13 +1246,18 @@ pub struct Section<'a> {
 
 #[allow(clippy::too_many_arguments)]
 pub fn fuse_ops(spec: &Spec, signer: &Signer, target: &kir::Target, count: Count, costs: &Costs, section: Section, library: Option<Library>) -> Result<SectionFusion> {
+    fuse_ops_probed(spec, signer, target, count, costs, section, library, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn fuse_ops_probed(spec: &Spec, signer: &Signer, target: &kir::Target, count: Count, costs: &Costs, section: Section, library: Option<Library>, probe: Option<Probe>) -> Result<SectionFusion> {
     let mut lower = Lower { spec, signer, target, count, phase: section.phase, layer: section.layer, units: Vec::new(), internal: BTreeSet::new() };
     for (i, op) in section.ops.iter().enumerate() {
         lower.op(i, op)?;
     }
     let Lower { mut units, internal, .. } = lower;
     unique_labels(&mut units);
-    Ok(fuse_section(units, &internal, costs, count, section.name, section.repeats, library))
+    Ok(fuse_section(units, &internal, costs, count, section.name, section.repeats, library, probe))
 }
 
 pub fn denoiser_units(graph: &crate::denoiser::DenoiserGraph, dspec: &crate::denoiser::DenoiserSpec, ops: &[Op], count: Count) -> Result<(Vec<Unit>, BTreeSet<Place>)> {
@@ -1166,6 +1308,10 @@ pub fn denoiser_units(graph: &crate::denoiser::DenoiserGraph, dspec: &crate::den
 }
 
 pub fn denoiser_fusion(graph: &crate::denoiser::DenoiserGraph, dspec: &crate::denoiser::DenoiserSpec, plan: &Plan, count: Count, costs: &Costs, compute_prologue: bool) -> Result<Vec<SectionFusion>> {
+    denoiser_probed(graph, dspec, plan, count, costs, compute_prologue, None)
+}
+
+pub fn denoiser_probed(graph: &crate::denoiser::DenoiserGraph, dspec: &crate::denoiser::DenoiserSpec, plan: &Plan, count: Count, costs: &Costs, compute_prologue: bool, probe: Option<Probe>) -> Result<Vec<SectionFusion>> {
     let mut out = Vec::new();
     let mut parts: Vec<(String, usize, &[Op])> = vec![("head".into(), 1, &plan.head)];
     for (b, g) in plan.blocks.iter().zip(&graph.block) {
@@ -1187,7 +1333,7 @@ pub fn denoiser_fusion(graph: &crate::denoiser::DenoiserGraph, dspec: &crate::de
                 }
             }
         }
-        out.push(fuse_section_with(units, &internal, costs, count, name, repeats, None, compute_prologue));
+        out.push(fuse_section_with(units, &internal, costs, count, name, repeats, None, compute_prologue, probe));
     }
     Ok(out)
 }
@@ -1218,7 +1364,7 @@ fn split_streams(units: &mut [Unit]) {
 pub fn fuse_units(units: Vec<Unit>, internal: &BTreeSet<Place>, costs: &Costs, count: Count, name: String, library: Option<Library>) -> SectionFusion {
     let mut units = units;
     unique_labels(&mut units);
-    fuse_section(units, internal, costs, count, name, 1, library)
+    fuse_section(units, internal, costs, count, name, 1, library, None)
 }
 
 pub fn unfused_units(units: Vec<Unit>, count: Count, name: String) -> SectionFusion {
@@ -1227,15 +1373,19 @@ pub fn unfused_units(units: Vec<Unit>, count: Count, name: String) -> SectionFus
     let groups: Vec<Group> = units.iter().enumerate().map(|(i, u)| Group { units: vec![u.label.clone()], members: vec![i], ops: vec![u.op], launches: u.launches }).collect();
     let launches = units.iter().map(|u| u.launches).sum();
     let _ = count;
-    SectionFusion { name, repeats: 1, units, groups, fused: Vec::new(), rejected: Vec::new(), launches_before: launches, launches_after: launches }
+    SectionFusion { name, repeats: 1, units, groups, fused: Vec::new(), rejected: Vec::new(), launches_before: launches, launches_after: launches, search: None }
 }
 
 pub fn fusion_report(spec: &Spec, plan: &Plan, count: Count, target: &kir::Target, costs: &Costs) -> Result<FusionReport> {
+    probed_report(spec, plan, count, target, costs, None)
+}
+
+pub fn probed_report(spec: &Spec, plan: &Plan, count: Count, target: &kir::Target, costs: &Costs, probe: Option<Probe>) -> Result<FusionReport> {
     let signer = Signer::new(spec)?.ranked(ranked(plan));
     let mut out = Vec::new();
     for s in sections(spec, plan).into_iter().filter(|s| !s.ops.is_empty()) {
         let section = Section { name: s.name, repeats: s.repeats, phase: plan.phase, layer: s.layer, ops: s.ops };
-        out.push(fuse_ops(spec, &signer, target, count, costs, section, None)?);
+        out.push(fuse_ops_probed(spec, &signer, target, count, costs, section, None, probe)?);
     }
     Ok(FusionReport { phase: plan.phase, count, costs: *costs, sections: out, capture: Vec::new() })
 }

@@ -198,3 +198,150 @@ Every CUDA kernel the engine compiles comes out of a kir emitter, and the compil
 Guard (`crates/specrt/tests/codegen.rs`, `every_kernel_comes_from_kir`, `the_kernel_text_guards_catch_a_new_offender`, `moe_builders_use_shared_prims_unless_listed`, `launch_geometry_comes_from_kir_builders`): it fails when an `include_str!` of a `.cu`, `.cuh` or `.wgsl` appears outside crates/kir, a `__global__` appears outside `kir/src/cuda` and the listed emitters and test references, NVRTC is called outside `src/jit.rs`, library code builds a `KirSource` from raw text or turns on `test-text`, library code reads `tools/`, an allowlist entry goes stale, or any allowlist changes size (every list is pinned). Each check was seen failing on a planted offender before it passed.
 
 Prim library. Device function text stays text where it is a thin wrapper over one PTX instruction or a numeric conversion, because there is nothing to generate: `mma.sync` variants (`gemm/prim.rs`, `attention/mma.rs`), `cp.async`, `ldmatrix`, `ld.global.nc`, `ex2.approx`, `cvt` to and from e4m3, e2m1 and bf16 (`prelude.cu`, `decode_common.rs`), the warp and block reductions, and the `Dec*` weight format structs that the GEMV and tile templates are written against. Those are the instruction set the builders compose, and a new kernel calls them, it does not rewrite them. What can come from `Target` and `Layout` already does: KV addressing (`attention::prim::kv_addr` from `layout::addr_chain`), tile shapes, stage counts, thread counts and splits. Two pieces remain hand written that a new kernel could need to copy: the shared memory swizzle `swz<CPR>` in `prelude.cu` and the per family 2 bit swizzle `gemm::prim::swizzle`. Neither has a second user waiting, so they stay until one does; when one appears, express both as a `Layout` XOR mode and emit them.
+
+## 10. Greedy versus exhaustive
+
+The G4 to G6 engine is greedy: it merges the candidate with the best net saving and never undoes it. This section asks whether that leaves anything on the table by our own cost model (#1370). It tests the ordering only. The cost model itself is unmeasured against real timings for many shapes (#408 found no 5 percent win from measuring tile choices), so a gap here is a gap in bytes plus launches, not in microseconds.
+
+Reference. `Probe` on `fuse_ops_probed`, `probed_report`, `denoiser_probed` and `compile::single_probed` (test and dev use only; the runtime passes no probe and runs the same engine as before). For each section it walks every grouping reachable from the singletons by merges the engine itself offers: the same `candidates`, the same `pair_legal`, `prologue_legal` and `fill_legal` checks from section 3, the same library predicate when one is given, and `budget` on every state. Candidates refused only for `Cost` stay open, so a merge that loses alone but enables a better one later is still seen. States are deduplicated, so the walk is a memoised search over sets of groups; it stops at 200,000 states per section and reports `capped` instead of guessing. No plan hit the cap.
+
+Score. Both sides are scored on the final grouping with one function, `Engine::cost`: launches times `launch_bytes`, plus every value that still goes through memory (written once, read by each reader outside the writer's group; a split mainloop always writes its parts), plus the prologue reread penalty and the split ticket penalty of section 6. The table reports the saving against the unfused section, summed over layers. The greedy column is the engine's own grouping scored the same way, so two merge orders that reach the same groups score the same.
+
+Plans: every fixture config and spec TOML that `Spec::from_hf_config_serving` or `Spec::load` accepts (tiny families, `tiny-qwen3.5-27b`, the 27B specs, Qwen3.5-4B, the 122B shape, the popular configs), decode at 1 token and prefill at 512 tokens with a 1,024 context, on sm_120 and sm_80; the compiled single step plan (`compile::single`, library predicate on) on both targets; and the klein-4b denoiser at 1,024 and 512 pixels. 436 plans.
+
+Rule. If greedy is within 2 percent of the best on every plan, no search is needed. That does not hold, so each distinct cause has one follow-up issue. None is implemented here.
+
+Result.
+
+- Every compiled single step plan (the one the runtime launches) is at 0.00 on both targets, for every spec. The library predicate removes the groups that differ, because no GEMV kernel takes a rope or kv write epilogue and no kernel takes a hyper connection prologue.
+- The klein-4b denoiser is at 0.00 at both sizes.
+- `tiny-qwen3.5-27b`, every 27B spec, Qwen3.5-4B, the 122B, qwen3-next-80b, qwen3.6-35b-a3b and qwen3-0.6b are at 0.00 in every phase and target.
+- 68 plan and phase pairs of the dry run are above 0, 52 of them above 2 percent on at least one target. Three causes:
+
+| Cause | What greedy builds | What the best builds | Why greedy missed it | Issue |
+|---|---|---|---|---|
+| A | `[input norm + qkv + rope]` and `[kv write]` | `[input norm + qkv + rope + kv write]` | merge order: `Epilogue qkv -> rope` wins the round by 2 KB, then `Epilogue qkv + rope -> kv write` is refused as `Readers` (the qkv value is held for attention), while the other order, `Light rope -> kv write` first, passes every check. Legality depends on the path | #1386 |
+| B | `[PostAttention norm and add + pre mlp norm]` and `[gate_up + gate_up act]`, or `[hyper pre 0 + input norm]` and `[qkv]` | `[pre mlp norm + gate_up + gate_up act]`, `[input norm + qkv]` | merge order: light merges run to a fixed point before any prologue (`PHASES`), so a norm joins its light neighbour and can no longer be a prologue of the next GEMV | #1387 |
+| C | on prefill sm_120, `[input norm + qkv + rope]` over the shared memory budget, then split back to singletons | `[qkv + rope + kv write]` | a legality refusal applied late: the budget is checked only in `split_over_budget` after the merge rounds, and no merge round runs after the split | #1388 |
+
+Gap in percent of the best saving, per plan, sm_120 then sm_80 (decode 1 token, prefill 512). Plans not listed are at 0.00. `fusion_exhaustive::greedy_stays_within_the_recorded_gap_of_the_exhaustive_pick` reads this table and fails when any plan's gap exceeds its number here (a plan not listed is held at 0), or when a search hits the cap. `a_worse_pair_order_breaks_the_recorded_gaps` merges the least saving candidate first on `tiny-qwen3.5-27b` and qwen3-0.6b and checks that the table catches it. When a follow-up closes a cause, lower its rows; print fresh rows with `FUSION_TABLE=1 cargo test -p inference-bench-specrt --test fusion_exhaustive print_doc_rows -- --nocapture`.
+
+| Plan | Phase | sm_120 | sm_80 | Cause |
+|---|---|---|---|---|
+| gemma3-1b | decode | 0.02 | 0.02 | B |
+| gemma4-31b | decode | 0.10 | 0.10 | B |
+| glm4.5-air | decode | 24.34 | 24.34 | A |
+| glm4.5-air | prefill | 27.85 | 27.85 | A |
+| glm5.3-flash | decode | 1.66 | 1.66 | B |
+| glm5.3-flash | prefill | 0.96 | 0.96 | B |
+| gpt-oss-20b | decode | 24.70 | 24.70 | A |
+| gpt-oss-20b | prefill | 25.83 | 25.83 | A |
+| granite-3.3-2b | decode | 9.01 | 9.01 | A |
+| granite-3.3-2b | prefill | 5.75 | 5.75 | A |
+| granite-4.0-h-tiny | decode | 1.94 | 1.94 | A |
+| granite-4.0-h-tiny | prefill | 2.74 | 2.74 | A |
+| llama-3.2-1b | decode | 14.07 | 14.07 | A |
+| llama-3.2-1b | prefill | 7.98 | 7.98 | A |
+| llama4-scout | prefill | 0.00 | 16.68 | A |
+| nemotron-3-nano-30b-a3b | decode | 6.37 | 6.37 | A |
+| nemotron-3-nano-30b-a3b | prefill | 12.16 | 12.16 | A |
+| nemotron-nano-9b-v2 | decode | 2.30 | 2.30 | A |
+| nemotron-nano-9b-v2 | prefill | 2.31 | 2.31 | A |
+| olmo2-1b | decode | 0.04 | 0.04 | B |
+| phi3-mini | decode | 13.79 | 13.79 | A |
+| phi3-mini | prefill | 13.38 | 13.38 | A |
+| phi4-mini | decode | 14.14 | 14.14 | A |
+| phi4-mini | prefill | 9.79 | 9.79 | A |
+| qwen2.5-0.5b | decode | 14.15 | 14.15 | A |
+| qwen2.5-0.5b | prefill | 7.90 | 7.90 | A |
+| smollm2-135m | decode | 14.21 | 14.21 | A |
+| smollm2-135m | prefill | 13.15 | 13.15 | A |
+| smollm3-3b | decode | 14.11 | 14.11 | A |
+| smollm3-3b | prefill | 6.69 | 6.69 | A |
+| tiny-bamba | decode | 7.41 | 7.41 | A |
+| tiny-bamba | prefill | 8.62 | 8.48 | A, C |
+| tiny-chunked | decode | 13.80 | 13.80 | A |
+| tiny-chunked | prefill | 13.19 | 13.19 | A |
+| tiny-gemma3 | decode | 0.01 | 0.01 | B |
+| tiny-gemma3-vision | decode | 0.01 | 0.01 | B |
+| tiny-gemma3n | decode | 0.01 | 0.01 | B |
+| tiny-gemma3n | prefill | 0.49 | 0.49 | B |
+| tiny-gemma4 | decode | 0.01 | 0.01 | B |
+| tiny-gemma4-e | decode | 0.01 | 0.01 | B |
+| tiny-gemma4-moe | decode | 0.01 | 0.01 | B |
+| tiny-glm5-next | decode | 4.55 | 4.55 | B |
+| tiny-glm5-next | prefill | 4.56 | 4.56 | B |
+| tiny-gpt-oss | decode | 23.53 | 23.53 | A |
+| tiny-gpt-oss | prefill | 24.06 | 24.06 | A |
+| tiny-granite | decode | 8.70 | 8.70 | A |
+| tiny-granite | prefill | 8.48 | 8.48 | A |
+| tiny-granitehybrid | decode | 8.34 | 8.34 | A |
+| tiny-granitehybrid | prefill | 10.08 | 9.89 | A, C |
+| tiny-mistral | decode | 13.80 | 13.80 | A |
+| tiny-mistral | prefill | 14.48 | 14.48 | A |
+| tiny-nemotronh | decode | 7.41 | 7.41 | A |
+| tiny-nemotronh | prefill | 9.43 | 9.19 | A, C |
+| tiny-nemotronh-moe | decode | 11.11 | 11.11 | A |
+| tiny-nemotronh-moe | prefill | 16.33 | 16.32 | A, C |
+| tiny-nemotronh-moe-mma | decode | 11.11 | 11.11 | A |
+| tiny-nemotronh-moe-mma | prefill | 42.57 | 16.41 | A, C |
+| tiny-olmo2 | decode | 0.01 | 0.01 | B |
+| tiny-phi3 | decode | 13.43 | 13.43 | A |
+| tiny-phi3 | prefill | 13.85 | 13.85 | A |
+| tiny-phi3-hd96 | decode | 13.43 | 13.43 | A |
+| tiny-phi3-hd96 | prefill | 14.41 | 14.41 | A |
+| tiny-sandwich-pre-qknorm.toml | decode | 0.01 | 0.01 | B |
+| tiny-sandwich-scaled.toml | decode | 0.01 | 0.01 | B |
+| tiny-smollm3 | decode | 13.80 | 13.80 | A |
+| tiny-smollm3 | prefill | 13.19 | 13.19 | A |
+| tinymistral-248m | decode | 14.08 | 14.08 | A |
+| tinymistral-248m | prefill | 9.39 | 9.39 | A |
+
+Reading it: cause A is the large one and is the same group in every row (the KV write after the rope epilogue, about one launch plus one qkv write and read per attention layer). It does not show on the Qwen3.5 and 27B lines because their attention keeps a separate qk norm unit, so the kv write joins through a different path. A search would fix all three causes, but each has a cheaper local fix named in its issue: an order independent legality check (A), letting a prologue compete with a light merge (B), and the budget inside candidate legality (C). Until they land, greedy is good enough for every plan the runtime runs today (the compiled single step rows), and not for future prefill and dry run plans of the listed families.
+
+## 11. Pass contract
+
+Model semantics are fixed. A pass chooses how the model runs and never what it computes. When the faster or smaller choice would change the numbers, the pass refuses and the spec has to ask for it.
+
+A pass may change:
+
+- grouping (which ops share one launch, sections 5 and 6),
+- kernel family (tile, batch, GEMV, ggml, split reduce),
+- tile, split count and launch geometry (`kir::gemm`, `kir::gemv`, attention formulas),
+- layout planes, only where a declaration below allows it,
+- buffer reuse and aliasing (`Split` of x as an alias),
+- launch order between ops with no data dependency (S1 capture groups),
+- sharding of a row parallel linear into a rank partial plus an allreduce, when the spec has shards.
+
+A pass may not change:
+
+- the dtype or form of any tensor a model op writes (`Tensor::form`: f32, bf16, planes, fp8 or fp4 with scales, paged KV dtype),
+- the accumulator of an op (the tensor an op reads and writes in place, such as the residual add into x or the branch),
+- any explicit rounding: every write in a rounding form (bf16, planes, a quantised weight or activation form, a paged cache) must still be there, in the same form, and no new one may appear,
+- the order of an authored ordered reduction: the sequence of ops that add into one accumulator (`x`, the branch, the rank partial, the latent, the hyper streams) between two overwrites,
+- the set of tensors the model reads from outside the plan (inputs, weights, caches, state) and the live tensors it leaves at the end of a section (x, logits, draft logits, caches, state),
+- sharding semantics: the ops whose partials an allreduce sums, and in which order.
+
+Declared representation changes. Each of these changes numbers on purpose, and each is declared, not chosen by a pass:
+
+| Change | Declared in | Who uses it |
+|---|---|---|
+| bf16 hi/lo planes instead of f32 activations for tensor core GEMMs | the graph (`graphs/decoder.toml` writes `*_planes` buffers) and the signature table (`Form::Planes`); `[runtime] split_activations` and `unsplit` pick one or two planes per linear | every planes plan |
+| NVFP4 activation quantisation before an fp4 GEMM | spec `[mlp] act_quant = "fp4"` | `gemm::select` path `F4a`, `quant_rows_fp4` |
+| fp8 activation quantisation | spec `act_quant = "fp8"` | path `F8a`, `quant_rows_fp8` |
+| split K partials summed by a reduce kernel | the kernel family (`BatchShape::splits`, `ggml_splits`); the sum order inside one output element is the family's and is fixed by `Target` and shape | `F8b`, `F4b`, `Ggr` reduce |
+| fp8 KV cache | `[runtime] kv_dtype`, `kv_f16_layers` | the cache `Form::Paged` |
+| NVFP4 requant of fp8 checkpoint linears | `[runtime] requant` | `Spec::requanted` |
+| fp32 accumulate in the plain path | `[runtime] gemm_fp32` | runtime GEMM choice |
+| rank partials and their allreduce | `[tp]` shards from `Graph::shards` | `partition`, `AllReduce`, `AllReduceNorm` |
+
+Enforcement. `signature::contract` reads, for every section of a plan, each op's writes with their forms, its accumulators, the rounding writes (casts), the ordered reduction chains and the section's boundary tensors, all from the typed signatures of slice 1. `signature::check_contract(pass, model, plan, declared)` compares the authored plan's contract against a later plan and fails as `pass P: section S, op O: field: ...`, with the field one of `tensor dtype`, `accumulator`, `cast`, `reduction order into B` or `boundary`. `compile::compile_traced` takes the contract of the plan it was given and checks it after every pass (`partition`, `gemv_layout`, `fuse`), so a pass cannot return a plan that skips it. `Declared` carries the declarations a pass may use: `shards` when the options carry `[tp]` shards, `planes_as_rows` and `no_media` for the single row layout.
+
+Tests (`tests/plan_check.rs`). Each rule has a hand edited plan that `validate_plan` still accepts and the contract refuses, each seen failing with the check switched off before it passed: `the_contract_refuses_a_bf16_tensor_turned_f32` (input norm writes f32 xn instead of planes, `tensor dtype`), `the_contract_refuses_a_dropped_cast` (the rope and KV write op removed, `cast ... paged bf16 ... dropped`), `the_contract_refuses_a_changed_accumulator` (down writes planes instead of adding into x, `accumulator`), `the_contract_refuses_a_reordered_reduction` (a parallel residual whose scaled add moves before down, `reduction order into x`). `every_fixture_plan_keeps_its_contract_through_the_passes` runs `compile` on every fixture and spec in every phase, single rank and both tensor parallel variants; the `compile_plan` suite runs every single step plan and every TP rewrite through the same checks.
+
+Representation changes the spec does not declare today. Each is let through by a `Declared` flag that the pass options set, not the spec:
+
+| Pass | Change | Owner |
+|---|---|---|
+| `gemv_layout` | every planes buffer becomes its f32 row form in the single row decode plan, so the bf16 plane rounding of the authored plan is dropped (logits equal master, #1057, because the hand step did the same) | #1398 |
+| `gemv_layout` | the media splice is dropped from the decode head (a decode step carries no media) | #1398 |
