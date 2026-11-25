@@ -1,7 +1,7 @@
 use crate::App;
 use eframe::egui;
 use egui_bench::prelude::*;
-use inference_bench_core::engine::{MediaUpdate, Wake};
+use inference_bench_core::engine::MediaUpdate;
 use inference_bench_core::library::{LocalModel, human_size};
 use inference_bench_core::settings::ImageDefaults;
 use specrt::media::{MediaEvent, MediaInfo, MediaJob, MediaOutput, ModelKind, Picture, parse_size};
@@ -138,15 +138,14 @@ impl GenerateState {
     }
 }
 
-fn dice(wake: &Wake) -> u64 {
-    let _ = wake;
+fn dice() -> u64 {
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(7);
     (t ^ (t >> 29)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 24
 }
 
 fn controls(app: &mut App, ui: &mut egui::Ui, info: &MediaInfo, model: &str) {
     let busy = app.generate.busy();
-    let offload = app.settings.model_image.get(model).map_or(true, |d| d.offload_text_encoder);
+    let offload = app.settings.model_image.get(model).is_none_or(|d| d.offload_text_encoder);
     let g = &mut app.generate;
     section(ui, "prompt", "what to draw", |ui| {
         prose(ui, &mut g.prompt, "a red fox in studio light", 4);
@@ -173,7 +172,7 @@ fn controls(app: &mut App, ui: &mut egui::Ui, info: &MediaInfo, model: &str) {
         row(ui, "seed", |ui| {
             ui.add(egui::DragValue::new(&mut g.seed).speed(1.0));
             if ui.add(Key::new("dice").outline(VALUE).id_salt("gen-dice")).clicked() {
-                g.seed = dice(&app.wake);
+                g.seed = dice();
             }
             ui.checkbox(&mut g.lock_seed, "lock");
         });

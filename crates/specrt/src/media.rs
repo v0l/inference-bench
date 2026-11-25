@@ -307,7 +307,7 @@ pub fn admit(free: u64, resident: u64, guided: bool, latent: (usize, usize), b: 
 }
 
 pub fn latent_preview(tokens: &[f32], count: usize) -> Vec<u8> {
-    let channels = if count == 0 { 0 } else { tokens.len() / count };
+    let channels = tokens.len().checked_div(count).unwrap_or(0);
     let mut out = vec![0u8; count * 3];
     if channels == 0 {
         return out;
@@ -408,7 +408,7 @@ impl ImageModel {
                 step_secs += last.elapsed().as_secs_f64();
                 last = std::time::Instant::now();
                 let go = on_event(MediaEvent::Progress { image: i, step, steps });
-                if go && every.is_some_and(|k| step % k == 0) && pw * ph > 0 {
+                if go && every.is_some_and(|k| step.is_multiple_of(k)) && pw * ph > 0 {
                     let picture = Picture { width: pw, height: ph, rgb: latent_preview(latent, pw * ph), seed };
                     return on_event(MediaEvent::Preview { image: i, step, picture });
                 }
