@@ -606,12 +606,10 @@ extern "C" __global__ void gdn_gated_norm(const float* o, const float* lin, cons
     int h = blockIdx.x;
     int t = blockIdx.y;
     int d = 2 * threadIdx.x;
-    bool live = d < LA_D;
     const float* src = o + ((size_t)t * LA_VH + h) * LA_D;
-    float a = live ? src[d] : 0.0f;
-    float b = live ? src[d + 1] : 0.0f;
+    float a = src[d];
+    float b = src[d + 1];
     float inv = rsqrtf(block_reduce<false>(a * a + b * b, scratch) / LA_D + EPS);
-    if (!live) return;
     const float* z = lin + (size_t)t * LA_IN_ROWS + LA_Z_OFF + h * LA_D;
     split_store2(hi, lo, (size_t)t * LA_VALUE_DIM + h * LA_D + d, norm_w[d] * (a * inv) * silu(z[d]),
                  norm_w[d + 1] * (b * inv) * silu(z[d + 1]));

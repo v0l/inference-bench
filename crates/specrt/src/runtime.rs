@@ -2297,7 +2297,7 @@ impl Runtime {
         unsafe { b.launch(launch("", (la.value_heads as u32, (d / self.linear_tuning.cols) as u32, 1), self.linear_tuning.chunk_threads(), 0)) }?;
         let mut b = self.launcher(self.kernel("gdn_gated_norm"));
         b.arg(&o).arg(&lin).arg(&g.norm).arg(&hi).arg(&lo);
-        unsafe { b.launch(launch("", (la.value_heads as u32, n as u32, 1), (d / 2).max(32) as u32, 0)) }?;
+        unsafe { b.launch(launch("", (la.value_heads as u32, n as u32, 1), (d / 2) as u32, 0)) }?;
         Ok(())
     }
 
