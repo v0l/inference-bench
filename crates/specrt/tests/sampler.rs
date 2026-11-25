@@ -77,7 +77,7 @@ fn the_euler_rule_from_the_pipeline_reproduces_the_recorded_latents() {
 #[test]
 fn a_wrong_update_rule_fails_the_recorded_latents() {
     let mut p = pipeline();
-    p.update = kir::expr::Expr::parse("x + (s0 - s1) * v").unwrap();
+    p.update = Some(kir::expr::Expr::parse("x + (s0 - s1) * v").unwrap());
     let sched = p.schedule(3, 64).unwrap();
     let mut x = floats("noise");
     p.step_host(&mut x, &floats("step0.velocity"), None, &sched, 0, 1.0).unwrap();

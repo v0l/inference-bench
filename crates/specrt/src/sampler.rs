@@ -25,10 +25,42 @@ struct ScheduleDecl {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StepDecl {
-    update: String,
+    #[serde(default)]
+    update: Option<String>,
     combine: String,
     latent_in: String,
     output: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MultistepDecl {
+    state: Vec<String>,
+    scalars: Vec<(String, String)>,
+    assign: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Multistep {
+    pub state: Vec<String>,
+    pub scalars: Vec<(String, Expr)>,
+    pub assign: Vec<(String, Expr)>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncoderKind {
+    #[default]
+    Decoder,
+    Graph,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LatentLayout {
+    #[default]
+    Tokens,
+    Grid,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
@@ -64,6 +96,12 @@ struct PipelineDecl {
     guidance: Num,
     cfg: String,
     #[serde(default)]
+    encoder: EncoderKind,
+    #[serde(default)]
+    latent: LatentLayout,
+    #[serde(default)]
+    require: BTreeMap<String, String>,
+    #[serde(default)]
     fields: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     defaults: BTreeMap<String, f64>,
@@ -71,8 +109,12 @@ struct PipelineDecl {
     symbols: Vec<(String, String)>,
     #[serde(default)]
     tensors: BTreeMap<String, String>,
+    #[serde(default)]
+    vectors: BTreeMap<String, String>,
     schedule: ScheduleDecl,
     step: StepDecl,
+    #[serde(default)]
+    multistep: Option<MultistepDecl>,
     #[serde(default)]
     options: Options,
 }
@@ -90,8 +132,11 @@ pub struct Pipeline {
     pub name: String,
     pub values: BTreeMap<String, f64>,
     pub tensors: BTreeMap<String, String>,
+    pub vectors: BTreeMap<String, Vec<f32>>,
     pub chat_prompt: bool,
     pub masked_pad_keys: bool,
+    pub encoder: EncoderKind,
+    pub latent: LatentLayout,
     pub text_layers: Vec<usize>,
     pub max_length: usize,
     pub steps: usize,
@@ -101,10 +146,11 @@ pub struct Pipeline {
     per_step: Vec<(String, Expr)>,
     last: Expr,
     model_timestep: Expr,
-    pub update: Expr,
+    pub update: Option<Expr>,
     pub combine: Expr,
     pub latent_in: Expr,
     pub output: Expr,
+    pub multistep: Option<Multistep>,
     pub options: Options,
 }
 
@@ -193,6 +239,15 @@ impl Pipeline {
             bail!("no pipeline graph for {class} (graphs/pipeline.toml has {})", known.join(", "));
         };
         ensure!(d.schedulers.contains(&scheduler), "the {} pipeline runs {}, not {scheduler}", d.name, d.schedulers.join(", "));
+        for (path, want) in &d.require {
+            let got = lookup(configs, path).map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string));
+            ensure!(got.as_deref() == Some(want.as_str()), "the {} pipeline needs {path} = {want}, the config has {}", d.name, got.as_deref().unwrap_or("nothing"));
+        }
+        let mut vectors = BTreeMap::new();
+        for (name, path) in &d.vectors {
+            let v = lookup(configs, path).and_then(|v| v.as_array()).with_context(|| format!("{path} is not a list of numbers"))?;
+            vectors.insert(name.clone(), v.iter().map(|x| x.as_f64().map(|f| f as f32).with_context(|| format!("{path} holds {x}"))).collect::<Result<Vec<f32>>>()?);
+        }
         let mut values = d.defaults.clone();
         for (name, paths) in &d.fields {
             let Some(v) = paths.iter().find_map(|p| lookup(configs, p)) else { continue };
@@ -211,10 +266,16 @@ impl Pipeline {
         let steps = number(&d.steps, &values)? as usize;
         let guidance = number(&d.guidance, &values)? as f32;
         let pairs = |list: &[(String, String)]| list.iter().map(|(n, t)| Ok((n.clone(), parse(t)?))).collect::<Result<Vec<_>>>();
+        let multistep = match &d.multistep {
+            Some(m) => Some(Multistep { state: m.state.clone(), scalars: pairs(&m.scalars)?, assign: pairs(&m.assign)? }),
+            None => None,
+        };
+        ensure!(d.step.update.is_some() || multistep.is_some(), "the {} pipeline has neither a step update nor a multistep rule", d.name);
         Ok(Pipeline {
             name: d.name.clone(),
             values,
             tensors: d.tensors.clone(),
+            vectors,
             chat_prompt: match d.prompt.as_str() {
                 "chat" => true,
                 "plain" => false,
@@ -225,6 +286,8 @@ impl Pipeline {
                 "zeroed" => false,
                 other => bail!("pad_keys {other:?} is not masked or zeroed"),
             },
+            encoder: d.encoder,
+            latent: d.latent,
             text_layers,
             max_length: d.max_length,
             steps,
@@ -234,10 +297,11 @@ impl Pipeline {
             per_step: pairs(&d.schedule.step)?,
             last: parse(&d.schedule.last)?,
             model_timestep: parse(&d.schedule.model_timestep)?,
-            update: parse(&d.step.update)?,
+            update: d.step.update.as_deref().map(parse).transpose()?,
             combine: parse(&d.step.combine)?,
             latent_in: parse(&d.step.latent_in)?,
             output: parse(&d.step.output)?,
+            multistep,
             options: d.options,
         })
     }
@@ -280,11 +344,91 @@ impl Pipeline {
     }
 
     pub fn step_rule(&self, guided: bool) -> Result<Expr> {
+        let update = self.update.clone().with_context(|| format!("the {} pipeline steps with a multistep rule, not a one line update", self.name))?;
         if !guided {
-            return Ok(self.update.clone());
+            return Ok(update);
         }
         let combine = self.combine.clone();
-        self.update.subst(&|n| Some(if n == "v" { combine.clone() } else { Expr::Name(n.to_string()) })).map_err(anyhow::Error::msg)
+        update.subst(&|n| Some(if n == "v" { combine.clone() } else { Expr::Name(n.to_string()) })).map_err(anyhow::Error::msg)
+    }
+
+    pub fn multistep_scalars(&self, sched: &Schedule, i: usize) -> Result<BTreeMap<String, f64>> {
+        let m = self.multistep.as_ref().context("the pipeline has no multistep rule")?;
+        let s = &sched.sigmas;
+        let mut v = sched.values.clone();
+        v.insert("k".into(), i as f64);
+        v.insert("s0".into(), f64::from(s[i]));
+        v.insert("s1".into(), f64::from(s[i + 1]));
+        v.insert("sp".into(), f64::from(s[i.saturating_sub(1)]));
+        v.insert("spp".into(), f64::from(s[i.saturating_sub(2)]));
+        let mut out = BTreeMap::new();
+        for (n, e) in &m.scalars {
+            let x = eval(e, &v)?;
+            ensure!(x.is_finite(), "step {i}: the multistep scalar {n} is {x}");
+            v.insert(n.clone(), x);
+            out.insert(n.clone(), x);
+        }
+        out.insert("s0".into(), f64::from(s[i]));
+        out.insert("s1".into(), f64::from(s[i + 1]));
+        Ok(out)
+    }
+
+    pub fn new_state(&self, n: usize) -> Vec<Vec<f32>> {
+        self.multistep.as_ref().map_or_else(Vec::new, |m| vec![vec![0.0; n]; m.state.len()])
+    }
+
+    pub fn step_host_state(&self, x: &mut [f32], state: &mut [Vec<f32>], cond: &[f32], uncond: Option<&[f32]>, sched: &Schedule, i: usize, guidance: f32) -> Result<()> {
+        let Some(m) = &self.multistep else { return self.step_host(x, cond, uncond, sched, i, guidance) };
+        ensure!(i < sched.steps(), "step {i} of {}", sched.steps());
+        ensure!(state.len() == m.state.len() && state.iter().all(|s| s.len() == x.len()), "the multistep state holds {} vectors of the latent size", m.state.len());
+        ensure!(cond.len() == x.len() && uncond.is_none_or(|u| u.len() == x.len()), "the velocity and the latent differ in size");
+        let scalars: BTreeMap<String, f32> = self.multistep_scalars(sched, i)?.into_iter().map(|(k, v)| (k, v as f32)).collect();
+        let combine = uncond.is_some().then_some(&self.combine);
+        let mut env: BTreeMap<String, f32> = scalars.clone();
+        env.insert("g".into(), guidance);
+        for j in 0..x.len() {
+            env.insert("x".into(), x[j]);
+            for (n, s) in m.state.iter().zip(state.iter()) {
+                env.insert(n.clone(), s[j]);
+            }
+            let v = match combine {
+                Some(c) => {
+                    env.insert("c".into(), cond[j]);
+                    env.insert("u".into(), uncond.unwrap()[j]);
+                    eval32(c, &env).context("the combine rule does not evaluate")?
+                }
+                None => cond[j],
+            };
+            env.insert("v".into(), v);
+            for (n, e) in &m.assign {
+                let y = eval32(e, &env).with_context(|| format!("the multistep assignment {n} does not evaluate"))?;
+                env.insert(n.clone(), y);
+            }
+            x[j] = env["x"];
+            for (n, s) in m.state.iter().zip(state.iter_mut()) {
+                s[j] = env[n];
+            }
+        }
+        Ok(())
+    }
+
+    pub fn denormalise_channels(&self, x: &mut [f32], plane: usize) -> Result<()> {
+        let mean = self.vectors.get("latents_mean").context("the pipeline has no latents_mean")?;
+        let std = self.vectors.get("latents_std").context("the pipeline has no latents_std")?;
+        ensure!(mean.len() == std.len() && x.len() == mean.len() * plane, "the latent is not {} channel planes of {plane}", mean.len());
+        for (j, v) in x.iter_mut().enumerate() {
+            let c = j / plane;
+            let xv = *v;
+            *v = f32_eval(&self.latent_in, &|n| {
+                Some(f64::from(match n {
+                    "x" => xv,
+                    "latents_mean" => mean[c],
+                    "latents_std" => std[c],
+                    _ => return None,
+                }))
+            })?;
+        }
+        Ok(())
     }
 
     pub fn step_host(&self, x: &mut [f32], cond: &[f32], uncond: Option<&[f32]>, sched: &Schedule, i: usize, guidance: f32) -> Result<()> {
@@ -366,6 +510,7 @@ fn eval32(e: &Expr, v: &BTreeMap<String, f32>) -> Option<f32> {
                 ("sqrt", [p]) => p.sqrt(),
                 ("exp", [p]) => p.exp(),
                 ("select", [c, p, q]) => if *c != 0.0 { *p } else { *q },
+                ("abs", [p]) => p.abs(),
                 _ => e.eval(&|n| v.get(n).map(|x| f64::from(*x)))? as f32,
             }
         }

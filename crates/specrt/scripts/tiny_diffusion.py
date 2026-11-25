@@ -290,6 +290,12 @@ def flux2_tokenizer():
     tiny_tokenizer(fixture, vocab, 0)
 
 
+def wan_tokenizer():
+    fixture = FIXTURES / "tiny-wan21"
+    vocab = json.loads((fixture / "text_encoder/config.json").read_text())["vocab_size"]
+    tiny_tokenizer(fixture, vocab, 0)
+
+
 def wan21():
     from diffusers import AutoencoderKLWan, UniPCMultistepScheduler, WanPipeline, WanTransformer3DModel
     from transformers import UMT5Config, UMT5EncoderModel
@@ -381,33 +387,38 @@ def wan21():
     negative_embeds = embed(neg_ids, neg_mask)
     frames, height, width = 5, 32, 32
     latent_frames = (frames - 1) // 2 + 1
-    latents = torch.randn((1, z, latent_frames, height // 4, width // 4), generator=torch.Generator().manual_seed(SEED + 1))
-    steps = []
-    velocities = []
-    handle = reload.transformer.register_forward_hook(lambda m, i, o: velocities.append(o[0].clone() if isinstance(o, tuple) else o.sample.clone()))
-
-    def on_step(p, i, t, kw):
-        steps.append(kw["latents"].clone())
-        return {}
-
+    latents = engine_noise(SEED + 1, (1, z, latent_frames, height // 4, width // 4))
     guidance = 5.0
-    with torch.no_grad():
-        video = reload(
-            prompt=None,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_embeds,
-            height=height,
-            width=width,
-            num_frames=frames,
-            num_inference_steps=STEPS,
-            guidance_scale=guidance,
-            latents=latents.clone(),
-            output_type="pt",
-            callback_on_step_end=on_step,
-        ).frames
-    handle.remove()
-    if len(steps) != STEPS or len(velocities) != 2 * STEPS:
-        sys.exit(f"captured {len(steps)} latents and {len(velocities)} velocities")
+
+    def run():
+        steps = []
+        velocities = []
+        handle = reload.transformer.register_forward_hook(lambda m, i, o: velocities.append(o[0].clone() if isinstance(o, tuple) else o.sample.clone()))
+
+        def on_step(p, i, t, kw):
+            steps.append(kw["latents"].clone())
+            return {}
+
+        with torch.no_grad():
+            video = reload(
+                prompt=None,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_embeds,
+                height=height,
+                width=width,
+                num_frames=frames,
+                num_inference_steps=STEPS,
+                guidance_scale=guidance,
+                latents=latents.clone(),
+                output_type="pt",
+                callback_on_step_end=on_step,
+            ).frames
+        handle.remove()
+        if len(steps) != STEPS or len(velocities) != 2 * STEPS:
+            sys.exit(f"captured {len(steps)} latents and {len(velocities)} velocities")
+        return steps, velocities, video
+
+    steps, velocities, video = run()
     ref = Reference(fixture, name)
     ref.put("text.ids", ids.float())
     ref.put("text.mask", mask.float())
@@ -428,9 +439,19 @@ def wan21():
     ref.put("vae.latent", vae_latent)
     ref.put("vae.decoded", decoded)
     ref.put("video", video)
+    sigmas = reload.scheduler.sigmas.tolist()
+    timesteps = reload.scheduler.timesteps.tolist()
+    round_bf16(reload.transformer)
+    bf16_steps, bf16_velocities, bf16_video = run()
+    for i in range(STEPS):
+        ref.put(f"bf16.step{i}.velocity.cond", bf16_velocities[2 * i])
+        ref.put(f"bf16.step{i}.velocity.uncond", bf16_velocities[2 * i + 1])
+        ref.put(f"bf16.step{i}.latent", bf16_steps[i])
+    ref.put("bf16.video", bf16_video)
     ref.finish(
         pipeline="WanPipeline",
         seed=SEED + 1,
+        noise="splitmix64 counter, Box-Muller pairs",
         steps=STEPS,
         frames=frames,
         height=height,
@@ -440,8 +461,8 @@ def wan21():
         text_tokens=TEXT_LEN,
         prompt_tokens=PROMPT_LEN,
         guidance=guidance,
-        sigmas=reload.scheduler.sigmas.tolist(),
-        timesteps=reload.scheduler.timesteps.tolist(),
+        sigmas=sigmas,
+        timesteps=timesteps,
         decoded_frames=int(decoded.shape[2]),
         diffusers=__import__("diffusers").__version__,
         torch=torch.__version__,
@@ -457,3 +478,4 @@ if __name__ == "__main__":
         flux2_tokenizer()
     if "wan" in which:
         wan21()
+        wan_tokenizer()

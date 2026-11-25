@@ -173,10 +173,111 @@
     32,
     32
    ]
+  },
+  "bf16.step0.velocity.cond": {
+   "file": "tiny-wan21.bf16.step0.velocity.cond.bin",
+   "shape": [
+    1,
+    4,
+    3,
+    8,
+    8
+   ]
+  },
+  "bf16.step0.velocity.uncond": {
+   "file": "tiny-wan21.bf16.step0.velocity.uncond.bin",
+   "shape": [
+    1,
+    4,
+    3,
+    8,
+    8
+   ]
+  },
+  "bf16.step0.latent": {
+   "file": "tiny-wan21.bf16.step0.latent.bin",
+   "shape": [
+    1,
+    4,
+    3,
+    8,
+    8
+   ]
+  },
+  "bf16.step1.velocity.cond": {
+   "file": "tiny-wan21.bf16.step1.velocity.cond.bin",
+   "shape": [
+    1,
+    4,
+    3,
+    8,
+    8
+   ]
+  },
+  "bf16.step1.velocity.uncond": {
+   "file": "tiny-wan21.bf16.step1.velocity.uncond.bin",
+   "shape": [
+    1,
+    4,
+    3,
+    8,
+    8
+   ]
+  },
+  "bf16.step1.latent": {
+   "file": "tiny-wan21.bf16.step1.latent.bin",
+   "shape": [
+    1,
+    4,
+    3,
+    8,
+    8
+   ]
+  },
+  "bf16.step2.velocity.cond": {
+   "file": "tiny-wan21.bf16.step2.velocity.cond.bin",
+   "shape": [
+    1,
+    4,
+    3,
+    8,
+    8
+   ]
+  },
+  "bf16.step2.velocity.uncond": {
+   "file": "tiny-wan21.bf16.step2.velocity.uncond.bin",
+   "shape": [
+    1,
+    4,
+    3,
+    8,
+    8
+   ]
+  },
+  "bf16.step2.latent": {
+   "file": "tiny-wan21.bf16.step2.latent.bin",
+   "shape": [
+    1,
+    4,
+    3,
+    8,
+    8
+   ]
+  },
+  "bf16.video": {
+   "file": "tiny-wan21.bf16.video.bin",
+   "shape": [
+    1,
+    5,
+    3,
+    32,
+    32
+   ]
   }
  },
  "pipeline": "WanPipeline",
  "seed": 1,
+ "noise": "splitmix64 counter, Box-Muller pairs",
  "steps": 3,
  "frames": 5,
  "height": 32,

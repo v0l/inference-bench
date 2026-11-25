@@ -64,3 +64,106 @@ output = "min(max(x / 2 + 0.5, 0), 1)"
 [pipeline.options]
 offload_text_encoder = true
 offload_vae = false
+
+[[pipeline]]
+name = "unipc"
+classes = ["WanPipeline"]
+schedulers = ["UniPCMultistepScheduler"]
+prompt = "plain"
+pad_keys = "zeroed"
+encoder = "graph"
+text_layers = []
+max_length = 512
+steps = 50
+guidance = 5
+cfg = "guidance > 1"
+latent = "grid"
+symbols = [
+  ["vae_scale", "spatial_scale"],
+  ["pixel_step", "vae_scale * latent_patch"],
+  ["token_channels", "latent_channels"],
+]
+
+[pipeline.require]
+"scheduler.solver_type" = "bh2"
+"scheduler.prediction_type" = "flow_prediction"
+"scheduler.use_flow_sigmas" = "true"
+"scheduler.predict_x0" = "true"
+"scheduler.timestep_spacing" = "linspace"
+"scheduler.final_sigmas_type" = "zero"
+"scheduler.use_dynamic_shifting" = "false"
+
+[pipeline.fields]
+train_steps = ["scheduler.num_train_timesteps"]
+flow_shift = ["scheduler.flow_shift"]
+order = ["scheduler.solver_order"]
+lower_order_final = ["scheduler.lower_order_final"]
+latent_patch = ["transformer.patch_size.1"]
+latent_channels = ["vae.z_dim"]
+spatial_scale = ["vae.scale_factor_spatial"]
+temporal_scale = ["vae.scale_factor_temporal"]
+
+[pipeline.defaults]
+lower_order_final = 1
+latent_patch = 2
+
+[pipeline.vectors]
+latents_mean = "vae.latents_mean"
+latents_std = "vae.latents_std"
+
+[pipeline.schedule]
+request = []
+step = [
+  ["base", "1 + k * (1 / train_steps - 1) / steps"],
+  ["shifted", "flow_shift * base / (1 + (flow_shift - 1) * base)"],
+  ["sigma", "select(abs(shifted - 1) < 0.000001, shifted - 0.000001, shifted)"],
+]
+last = "0"
+model_timestep = "floor(s0 * train_steps)"
+
+[pipeline.step]
+combine = "u + g * (c - u)"
+latent_in = "x * latents_std + latents_mean"
+output = "min(max(x / 2 + 0.5, 0), 1)"
+
+[pipeline.multistep]
+state = ["last", "m1", "m2"]
+scalars = [
+  ["p_order", "min(min(order, select(lower_order_final, steps - k, order)), k + 1)"],
+  ["c_order", "min(min(order, select(lower_order_final, steps - k + 1, order)), k)"],
+  ["lam0", "log(1 - s0) - log(s0)"],
+  ["lam1", "select(s1 > 0, log(1 - s1) - log(s1), 1e30)"],
+  ["lamp", "log(1 - sp) - log(sp)"],
+  ["lampp", "log(1 - spp) - log(spp)"],
+  ["ph", "lam1 - lam0"],
+  ["pbh", "exp(-ph) - 1"],
+  ["prk", "(lamp - lam0) / ph"],
+  ["pa", "s1 / s0"],
+  ["pm", "(1 - s1) * (-pbh) + select(p_order == 2, (1 - s1) * pbh * 0.5 / prk, 0)"],
+  ["pp", "select(p_order == 2, -(1 - s1) * pbh * 0.5 / prk, 0)"],
+  ["ch", "select(k > 0, lam0 - lamp, 1)"],
+  ["chh", "-ch"],
+  ["cbh", "exp(chh) - 1"],
+  ["crk", "select(k > 1, (lampp - lamp) / ch, 1)"],
+  ["b1", "((exp(chh) - 1) / chh - 1) / cbh"],
+  ["b2", "(((exp(chh) - 1) / chh - 1) / chh - 0.5) * 2 / cbh"],
+  ["rho0", "select(c_order == 2, (b1 - b2) / (1 - crk), 0)"],
+  ["rho1", "select(c_order == 2, b1 - rho0, 0.5)"],
+  ["cx", "select(k > 0, 0, 1)"],
+  ["ca", "select(k > 0, s0 / sp, 0)"],
+  ["cc", "select(k > 0, -(1 - s0) * cbh * rho0 / crk, 0)"],
+  ["cd", "select(k > 0, -(1 - s0) * cbh * rho1, 0)"],
+  ["cb", "select(k > 0, -(1 - s0) * cbh - cc - cd, 0)"],
+]
+assign = [
+  ["m", "x - s0 * v"],
+  ["y", "cx * x + ca * last + cb * m1 + cc * m2 + cd * m"],
+  ["x", "pa * y + pm * m + pp * m1"],
+  ["m2", "m1"],
+  ["m1", "m"],
+  ["last", "y"],
+]
+
+[pipeline.options]
+offload_text_encoder = true
+offload_vae = false
