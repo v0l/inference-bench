@@ -14,6 +14,26 @@ fn floats(key: &str) -> Vec<f32> {
     std::fs::read(fixture().join("reference").join(file)).unwrap().chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
 }
 
+fn recorded_prompt(key: &str) -> String {
+    let ids = floats(&format!("{key}.ids"));
+    let mask = floats(&format!("{key}.mask"));
+    ids.iter().zip(&mask).filter(|(_, m)| **m == 1.0).map(|(i, _)| format!("w{}", *i as u32)).collect::<Vec<_>>().join(" ")
+}
+
+#[test]
+fn the_fixture_tokenizer_turns_a_text_prompt_into_the_recorded_ids() {
+    let p = pipeline();
+    let encoder = specrt::sampler::PromptEncoder::open(&fixture().join("tokenizer")).unwrap();
+    let tokens = meta()["text_tokens"].as_u64().unwrap() as usize;
+    assert_eq!(encoder.max_length(&p), tokens);
+    for key in ["text", "negative"] {
+        let got = encoder.encode(&p, &recorded_prompt(key), encoder.max_length(&p)).unwrap();
+        let ids: Vec<u32> = floats(&format!("{key}.ids")).iter().map(|v| *v as u32).collect();
+        let mask: Vec<u8> = floats(&format!("{key}.mask")).iter().map(|v| *v as u8).collect();
+        assert_eq!((got.ids, got.mask), (ids, mask), "{key}");
+    }
+}
+
 fn max_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
     a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)

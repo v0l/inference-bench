@@ -389,6 +389,7 @@ pub struct PromptEncoder {
     tokenizer: tokenizers::Tokenizer,
     template: Option<crate::chat::ChatTemplate>,
     pad: u32,
+    model_max: Option<usize>,
 }
 
 impl PromptEncoder {
@@ -400,7 +401,12 @@ impl PromptEncoder {
         };
         let pad = tokenizer.token_to_id(&pad_text).with_context(|| format!("pad token {pad_text:?} is not in the vocabulary"))?;
         let tokenizer = crate::engine::without_truncation(tokenizer)?;
-        Ok(PromptEncoder { tokenizer, template: crate::chat::ChatTemplate::from_tokenizer_config(tokenizer_config)?, pad })
+        let model_max = config["model_max_length"].as_u64().map(|n| n as usize);
+        Ok(PromptEncoder { tokenizer, template: crate::chat::ChatTemplate::from_tokenizer_config(tokenizer_config)?, pad, model_max })
+    }
+
+    pub fn max_length(&self, pipeline: &Pipeline) -> usize {
+        self.model_max.map_or(pipeline.max_length, |m| m.min(pipeline.max_length))
     }
 
     pub fn open(dir: &Path) -> Result<PromptEncoder> {
