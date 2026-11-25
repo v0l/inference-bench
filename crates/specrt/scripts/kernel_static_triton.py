@@ -137,4 +137,5 @@ def main():
         print(e["arch"], e["name"], e.get("error", "ok"))
 
 
-main()
+if __name__ == "__main__":
+    main()
