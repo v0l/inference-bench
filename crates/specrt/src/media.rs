@@ -264,8 +264,8 @@ pub fn admit(free: u64, resident: u64, guided: bool, latent: (usize, usize), b: 
     let one = (b.denoiser_arena)(1)?;
     let (den, sequential) = if resident + both <= room {
         (both, false)
-    } else if guided && resident + 2 * one <= room {
-        (2 * one, true)
+    } else if guided && resident + one <= room {
+        (one, true)
     } else {
         return Err(invalid(format!(
             "the denoiser needs {} MB of activations{} on top of {} MB of weights, and the GPU has {} MB free: lower the size or free GPU memory",
@@ -330,7 +330,9 @@ impl ImageModel {
         crate::hardware::ensure_nvrtc(&cache)?;
         let ctx = cudarc::driver::CudaContext::new(0).context("cuda init")?;
         let jit = crate::jit::Jit::new(ctx.clone(), cache)?;
-        let mut generator = Generator::open(ctx, jit, &dir, 0)?;
+        let probe = Pipeline::from_dir(&dir)?;
+        let max_tokens = PromptEncoder::open(&dir.join("tokenizer")).map(|p| p.max_length(&probe)).unwrap_or(probe.max_length).max(16).next_multiple_of(64);
+        let mut generator = Generator::open(ctx, jit, &dir, max_tokens)?;
         generator.keep_denoiser = true;
         let prompts = generator.prompt_encoder()?;
         crate::progress::report(crate::progress::Stage::Weights, 1, 1);

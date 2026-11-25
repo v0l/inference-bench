@@ -252,15 +252,16 @@ impl Generator {
             let den = self.denoiser_for(shapes.clone(), guided, sequential)?;
             memory.denoiser_weights = den.weight_bytes as u64;
             if sequential {
-                let (mut ca, mut ua) = (den.arena_for(1)?, den.arena_for(1)?);
-                memory.arena = 2 * ca.bytes as u64;
-                den.prepare(&mut ca, &[cond.as_slice()])?;
-                den.prepare(&mut ua, &[uncond.as_deref().context("no negative embedding")?])?;
+                let mut a = den.arena_for(1)?;
+                memory.arena = a.bytes as u64;
+                let neg = uncond.as_deref().context("no negative embedding")?;
                 let mut x = tokens.clone();
                 for i in 0..steps {
                     let s0 = sched.model_timestep(i);
-                    let c = den.forward(&mut ca, &x, s0, None)?;
-                    let u = den.forward(&mut ua, &x, s0, None)?;
+                    den.prepare(&mut a, &[cond.as_slice()])?;
+                    let c = den.forward(&mut a, &x, s0, None)?;
+                    den.prepare(&mut a, &[neg])?;
+                    let u = den.forward(&mut a, &x, s0, None)?;
                     p.step_host(&mut x, &c, Some(&u), &sched, i, guidance)?;
                     if !(hooks.on_step)(i + 1, steps, &x) {
                         return Err(Cancelled.into());
