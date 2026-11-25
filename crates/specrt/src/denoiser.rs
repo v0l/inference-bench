@@ -279,9 +279,9 @@ impl DenoiserGraph {
         let lower = |nodes: &[DitNode], prefix: &str| nodes.iter().map(|n| n.lower(prefix).map(Op::Dit)).collect::<Result<Vec<Op>>>();
         let mut blocks = Vec::new();
         for b in &self.block {
-            blocks.push(PlanBlock { layers: vec![b.name.clone()], sparse: false, ops: lower(&b.node, &format!("{}.{{i}}", b.prefix))? });
+            blocks.push(PlanBlock { layers: vec![b.name.clone()], sparse: false, tail: false, ops: lower(&b.node, &format!("{}.{{i}}", b.prefix))? });
         }
-        Ok(Plan { phase: Phase::Forward, tensor_core: true, head: lower(&self.head, "")?, blocks, tail: lower(&self.tail, "")?, mtp: Vec::new(), mtp_head: Vec::new() })
+        Ok(Plan { phase: Phase::Forward, tensor_core: true, head: lower(&self.head, "")?, blocks, per_layer: Vec::new(), tail: lower(&self.tail, "")?, mtp: Vec::new(), mtp_head: Vec::new() })
     }
 
     pub fn decl(&self, name: &str) -> Option<&BufferDecl> {
