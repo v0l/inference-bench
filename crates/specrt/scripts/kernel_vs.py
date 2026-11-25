@@ -643,10 +643,12 @@ def measure(sides, iters, warmup):
     reps = {label: chain_len(fn) for label, fn in sides}
     enqueue = {label: [] for label, _ in sides}
     out = {label: {} for label, _ in sides}
+    rng = torch.Generator()
+    rng.manual_seed(SEED)
     for mode in ("warm", "cold"):
         times = {label: [] for label, _ in sides}
         for i in range(iters):
-            order = sides[i % len(sides):] + sides[: i % len(sides)]
+            order = [sides[j] for j in torch.randperm(len(sides), generator=rng).tolist()]
             pending = []
             for label, fn in order:
                 n = reps[label] if mode == "warm" else 1
