@@ -1,0 +1,29 @@
+max_num_seqs = 1
+max_model_len = 8192
+max_batched_tokens = 1024
+kv_cache_gb = 0.25
+
+[placement]
+context = 8192
+slots = 1
+max_tp = 1
+
+[[placement.devices]]
+name = "gpu0"
+memory_gib = 89.4
+reserve_gib = 2
+bandwidth_gbs = 1792
+tflops = 500
+ordinal = 0
+
+[[placement.devices]]
+name = "gpu1"
+memory_gib = 95.0
+reserve_gib = 2
+bandwidth_gbs = 1792
+tflops = 500
+ordinal = 1
+
+[[models]]
+id = "glm-5.3-flash"
+model = "/home/kieran/.cache/huggingface/hub/models--Piecrust--GLM-5.3-Flash-FP4-Abliterated/snapshots/5c15d09158c533cc9064bb29c620a7d543e12777"
