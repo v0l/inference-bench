@@ -172,6 +172,22 @@ Decode is 270 ms a step against the planned 36.5 ms: the pipelined path runs one
 
 Text check: "The capital of France is" gives " Paris. Paris is the capital of France. The capital of Germany is Berlin. Berlin is the capital of Germany. The capital of Italy is Rome. Rome is" (32 tokens). The 32 greedy tokens and the top 20 logprobs per step are saved for the vLLM comparison in `docs/qwen4exp-real/nvfp4-france.json` and, for a 200 token plain text prompt (`docs/qwen4exp-real/prompt200.json`), `docs/qwen4exp-real/nvfp4-prompt200.json` (OpenAI `logprobs.tokens` and `logprobs.top_logprobs`). The long one stopped after 20 tokens on a natural end of text. The same request against vLLM `/v1/completions` with `"logprobs":20`, `temperature` 0 gives the files to diff.
 
+### FP8 copy (`Qwen/Qwen3.8-Flash-Next-FP8`, 131 shards, all in the index)
+
+Same prompt, greedy: " Paris. The capital of Germany is Berlin. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of Portugal is Lisbon. The capital" (coherent). The FP8 repo keeps attention, shared experts and the router in bf16 (`modules_to_not_convert`); an FP8 spec now requantises those to 128x128 FP8 blocks at load (`quantize_fp8_block128`). `serve` solves its own split from the device list and put 11 layers on gpu0, which left gpu1 with no KV room, so the run pins the planner's split in the server config:
+
+```
+[[placement.stages]]
+device = "gpu0"
+layers = [0, 14]
+
+[[placement.stages]]
+device = "gpu1"
+layers = [14, 48]
+```
+
+Planner: gpu0 layers 0..14 (82.90 GiB), gpu1 14..48 (83.74 GiB), 35.8 ms per step. Measured: gpu0 95.8 GB, gpu1 95.9 GB (weights 89.5 GB and 90.8 GB, rest KV and scratch). Load 61 s for stage 0, 47 s for stage 1, 109 s from the first request. Prefill and decode match the NVFP4 numbers above (0.29 s, 0.63 s, 4.36 s to first token for 20, 200, 2000 tokens; 3.5 to 3.6 decode tok/s). The FP8 copy was deleted after the run.
+
 Stages cannot start in front of a prelude layer (the PLE layer reads the token history only the first stage keeps): `StageRange::check` and the planner refuse it by name.
 
 ## History: why the family came last
