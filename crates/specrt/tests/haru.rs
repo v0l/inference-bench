@@ -414,6 +414,43 @@ fn the_codec_graph_plans_every_codec_tensor_of_the_real_checkpoint() {
 }
 
 #[test]
+fn the_host_codec_encodes_and_decodes_like_the_reference_whole_and_frame_by_frame() {
+    let codec = specrt::codec::HostCodec::open(&dir().join("tiny")).unwrap();
+    let frame = codec.plan.frame_samples;
+    let check = |what: &str, got: &[f32], want: &[f32], tol: f32| {
+        let e = max_rel(got, want);
+        eprintln!("{what}: max rel {e:e}");
+        assert!(e < tol, "{what} {e}");
+    };
+    let (clip, _) = reference("codec.clip");
+    let (clip_mean, _) = reference("codec.clip_mean");
+    let whole = codec.encode(&clip).unwrap();
+    check("codec.clip_mean", &whole, &clip_mean, 1e-4);
+
+    let (audio, _) = reference("session.user_audio");
+    let (user_mean, _) = reference("session.user_mean");
+    let mut state = codec.encoder.new_state();
+    assert_eq!(state.floats(), codec.plan.encoder.state_floats());
+    let streamed: Vec<f32> = audio.chunks(frame).flat_map(|f| codec.encoder.run(f, &mut state).unwrap()).collect();
+    check("session.user_mean", &streamed, &user_mean, 1e-4);
+    check("encode frame by frame against whole", &streamed, &codec.encode(&audio).unwrap(), 1e-5);
+
+    let (clip_audio, _) = reference("codec.clip_audio");
+    check("codec.clip_audio", &codec.decode(&clip_mean).unwrap(), &clip_audio, 1e-4);
+
+    let (latents, _) = reference("session.latent");
+    let (session_audio, _) = reference("session.audio");
+    let mut state = codec.decoder.new_state();
+    assert_eq!(state.floats(), codec.plan.decoder.state_floats());
+    let streamed: Vec<f32> = latents.chunks(codec.plan.latent_dim).flat_map(|z| codec.decoder.run(z, &mut state).unwrap()).collect();
+    check("session.audio", &streamed, &session_audio, 1e-4);
+    check("decode frame by frame against whole", &streamed, &codec.decode(&latents).unwrap(), 1e-5);
+
+    let (silence, _) = reference("codec.silence");
+    check("codec.silence", &codec.silence().unwrap(), &silence, 1e-4);
+}
+
+#[test]
 fn the_fixture_stays_under_3_mb() {
     fn size(p: &Path) -> u64 {
         std::fs::read_dir(p).unwrap().flatten().map(|e| if e.path().is_dir() { size(&e.path()) } else { e.metadata().unwrap().len() }).sum()
