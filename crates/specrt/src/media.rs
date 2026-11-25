@@ -59,11 +59,13 @@ pub struct MediaJob {
     pub frames: Option<usize>,
     #[serde(default)]
     pub preview_every: Option<usize>,
+    #[serde(default)]
+    pub offload_text_encoder: Option<bool>,
 }
 
 impl MediaJob {
     pub fn image(prompt: &str, width: usize, height: usize, seed: u64) -> MediaJob {
-        MediaJob { kind: ModelKind::Image, prompt: prompt.into(), negative_prompt: String::new(), n: 1, width, height, seed, steps: None, guidance: None, sampler: None, frames: None, preview_every: None }
+        MediaJob { kind: ModelKind::Image, prompt: prompt.into(), negative_prompt: String::new(), n: 1, width, height, seed, steps: None, guidance: None, sampler: None, frames: None, preview_every: None, offload_text_encoder: None }
     }
 }
 
@@ -370,6 +372,8 @@ impl ImageModel {
     pub fn run(&mut self, job: &MediaJob, on_event: &mut dyn FnMut(MediaEvent) -> bool) -> Result<MediaOutput> {
         self.info.check(job)?;
         let started = std::time::Instant::now();
+        let default_offload = Pipeline::from_dir(&self.dir)?.options.offload_text_encoder;
+        self.set_offload_text_encoder(job.offload_text_encoder.unwrap_or(default_offload));
         let (plan, admission) = self.plan(job)?;
         let p = self.generator.pipeline.clone();
         let max = self.prompts.max_length(&p);

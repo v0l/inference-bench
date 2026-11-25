@@ -159,6 +159,7 @@ impl LocalModel {
         match (backend, self.format) {
             ("specrt", Format::Spec) => self.path.display().to_string(),
             ("specrt" | "llama.cpp", Format::Gguf) => self.path.display().to_string(),
+            ("specrt", _) if self.repo.is_empty() && specrt::media::is_pipeline(&self.path) => self.path.display().to_string(),
             ("specrt" | "vllm", _) if !self.repo.is_empty() => self.repo.clone(),
             _ => self.name.clone(),
         }
@@ -918,6 +919,7 @@ mod tests {
         let s = m.support_for("specrt").unwrap();
         assert!(s.supported && s.reason.contains("image pipeline") && s.reason.contains("flux2_klein"), "{s:?}");
         assert!(m.files.len() >= 3);
+        assert_eq!(m.model_id("specrt"), tiny.display().to_string(), "a pipeline folder outside the hub loads by its path");
     }
 
     #[test]

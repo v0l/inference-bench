@@ -119,6 +119,7 @@ pub fn parse(body: &Value, partial_default: usize) -> Result<ImageRequest, ApiEr
         guidance,
         sampler: body["sampler"].as_str().map(String::from),
         frames: None,
+        offload_text_encoder: None,
         preview_every: int(&body["partial_images"], "partial_images")?.map(|k| k as usize).or((partial_default > 0).then_some(partial_default)),
     };
     Ok(ImageRequest { model: body["model"].as_str().map(String::from), job, url, stream: body["stream"].as_bool().unwrap_or(false) })
