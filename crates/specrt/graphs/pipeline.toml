@@ -70,6 +70,7 @@ name = "unipc"
 classes = ["WanPipeline"]
 schedulers = ["UniPCMultistepScheduler"]
 prompt = "plain"
+special_tokens = true
 pad_keys = "zeroed"
 encoder = "graph"
 text_layers = []

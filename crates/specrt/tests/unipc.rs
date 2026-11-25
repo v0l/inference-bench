@@ -89,6 +89,40 @@ fn dropping_the_corrector_fails_the_recorded_latents() {
 }
 
 #[test]
+fn the_t5_encoder_graph_gives_the_recorded_prompt_embeddings() {
+    let enc = specrt::encoder::HostEncoder::open(&fixture().join("text_encoder")).unwrap();
+    for key in ["text", "negative"] {
+        let ids: Vec<u32> = floats(&format!("{key}.ids")).iter().map(|v| *v as u32).collect();
+        let mask: Vec<u8> = floats(&format!("{key}.mask")).iter().map(|v| *v as u8).collect();
+        let got = enc.encode(&ids, &mask).unwrap();
+        let d = max_diff(&got, &floats(&format!("{key}.embeds")));
+        eprintln!("{key}: encoder embeds {d:e}");
+        assert!(d < 1e-5, "{key}: {d}");
+    }
+}
+
+#[test]
+fn the_relative_position_buckets_match_transformers() {
+    let enc = specrt::encoder::HostEncoder::open(&fixture().join("text_encoder")).unwrap();
+    let b = enc.buckets(200).unwrap();
+    let at = |q: usize, k: usize| b[q * 200 + k];
+    let pairs = [(0, 0), (5, 4), (4, 5), (0, 7), (7, 0), (0, 8), (0, 127), (0, 199), (199, 0), (0, 20), (30, 0), (0, 60), (100, 3)];
+    let got: Vec<usize> = pairs.iter().map(|&(q, k)| at(q, k)).collect();
+    assert_eq!(got, [0, 1, 17, 23, 7, 24, 31, 31, 15, 26, 11, 29, 15], "values from transformers' UMT5Attention._relative_position_bucket");
+}
+
+#[test]
+fn the_prompt_text_tokenizes_without_a_template() {
+    let p = pipeline();
+    let enc = specrt::sampler::PromptEncoder::open(&fixture().join("tokenizer")).unwrap();
+    let ids = floats("text.ids");
+    let mask = floats("text.mask");
+    let prompt = ids.iter().zip(&mask).filter(|(_, m)| **m == 1.0).map(|(i, _)| format!("w{}", *i as u32)).collect::<Vec<_>>().join(" ");
+    let got = enc.encode(&p, &prompt, enc.max_length(&p)).unwrap();
+    assert_eq!(got.ids, ids.iter().map(|v| *v as u32).collect::<Vec<_>>());
+}
+
+#[test]
 fn the_latent_denormalises_per_channel_from_the_vae_config() {
     let p = pipeline();
     let mut x = floats("step2.latent");

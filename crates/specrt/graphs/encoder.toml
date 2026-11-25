@@ -1,0 +1,95 @@
+name = "encoder"
+kind = "encoder-graph"
+
+[[encoder]]
+name = "t5"
+classes = ["UMT5EncoderModel", "T5EncoderModel"]
+embed = ["shared.weight", "encoder.embed_tokens.weight"]
+layers = "num_layers"
+prefix = "encoder.block.{i}"
+final_norm = "encoder.final_layer_norm"
+eps = "layer_norm_epsilon"
+pad_rows = "zeroed"
+
+[encoder.fields]
+hidden = "d_model"
+heads = "num_heads"
+head_dim = "d_kv"
+ffn = "d_ff"
+buckets = "relative_attention_num_buckets"
+max_distance = "relative_attention_max_distance"
+
+[encoder.attention]
+scale = "1"
+bias = ["layer.0.SelfAttention.relative_attention_bias.weight"]
+bias_fallback_block = 0
+half = "floor(buckets / 2)"
+exact = "floor(half / 2)"
+bucket = "select(d > 0, half, 0) + select(abs(d) < exact, abs(d), min(exact + floor(log(max(abs(d), 1) / exact) / log(max_distance / exact) * (half - exact)), half - 1))"
+
+[[encoder.node]]
+op = "rms_norm"
+weight = "layer.0.layer_norm"
+in = "x"
+out = "n"
+
+[[encoder.node]]
+op = "linear"
+weight = "layer.0.SelfAttention.q"
+in = "n"
+out = "q"
+
+[[encoder.node]]
+op = "linear"
+weight = "layer.0.SelfAttention.k"
+in = "n"
+out = "k"
+
+[[encoder.node]]
+op = "linear"
+weight = "layer.0.SelfAttention.v"
+in = "n"
+out = "v"
+
+[[encoder.node]]
+op = "attention"
+out = "a"
+
+[[encoder.node]]
+op = "linear"
+weight = "layer.0.SelfAttention.o"
+in = "a"
+out = "x"
+add = true
+
+[[encoder.node]]
+op = "rms_norm"
+weight = "layer.1.layer_norm"
+in = "x"
+out = "n"
+
+[[encoder.node]]
+op = "linear"
+weight = "layer.1.DenseReluDense.wi_0"
+in = "n"
+out = "g"
+act = "gelu_tanh"
+
+[[encoder.node]]
+op = "linear"
+weight = "layer.1.DenseReluDense.wi_1"
+in = "n"
+out = "u"
+
+[[encoder.node]]
+op = "mul"
+in = "g"
+with = "u"
+out = "m"
+
+[[encoder.node]]
+op = "linear"
+weight = "layer.1.DenseReluDense.wo"
+in = "m"
+out = "x"
+add = true

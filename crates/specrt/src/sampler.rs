@@ -89,6 +89,8 @@ struct PipelineDecl {
     classes: Vec<String>,
     schedulers: Vec<String>,
     prompt: String,
+    #[serde(default)]
+    special_tokens: bool,
     pad_keys: String,
     text_layers: Vec<Num>,
     max_length: usize,
@@ -134,6 +136,7 @@ pub struct Pipeline {
     pub tensors: BTreeMap<String, String>,
     pub vectors: BTreeMap<String, Vec<f32>>,
     pub chat_prompt: bool,
+    pub special_tokens: bool,
     pub masked_pad_keys: bool,
     pub encoder: EncoderKind,
     pub latent: LatentLayout,
@@ -281,6 +284,7 @@ impl Pipeline {
                 "plain" => false,
                 other => bail!("prompt {other:?} is not chat or plain"),
             },
+            special_tokens: d.special_tokens,
             masked_pad_keys: match d.pad_keys.as_str() {
                 "masked" => true,
                 "zeroed" => false,
@@ -568,7 +572,7 @@ impl PromptEncoder {
 
     pub fn encode(&self, pipeline: &Pipeline, prompt: &str, max_length: usize) -> Result<Prompt> {
         let text = self.text(pipeline, prompt)?;
-        let enc = self.tokenizer.encode(text.as_str(), false).map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+        let enc = self.tokenizer.encode(text.as_str(), pipeline.special_tokens).map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
         let mut ids: Vec<u32> = enc.get_ids().iter().copied().take(max_length).collect();
         let mut mask = vec![1u8; ids.len()];
         ids.resize(max_length, self.pad);
