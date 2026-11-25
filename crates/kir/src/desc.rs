@@ -801,7 +801,11 @@ impl Description {
                     let (row, group, offset) = at()?;
                     GroupStage::Store { dst: need(&s.dst, "dst", &s.op)?, value: parse(need(&s.value, "value", &s.op)?)?, row, group, offset, planes: s.planes }
                 }
-                o => return Err(format!("{}: group_map stage op {o:?} is not load, gather, gather_row, pick, value, sum, scalar or store", self.name)),
+                "put" => {
+                    let (row, group, offset) = at()?;
+                    GroupStage::Put { dst: need(&s.dst, "dst", &s.op)?, value: parse(need(&s.value, "value", &s.op)?)?, row, group, offset }
+                }
+                o => return Err(format!("{}: group_map stage op {o:?} is not load, gather, gather_row, pick, value, sum, scalar, store or put", self.name)),
             });
         }
         Ok(crate::group::GroupMap { width: n["width"], consts, stages })

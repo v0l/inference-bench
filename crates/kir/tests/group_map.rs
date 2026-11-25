@@ -55,10 +55,21 @@ fn a_plane_store_splits_into_bf16_hi_and_lo() {
 }
 
 #[test]
+fn a_put_stores_one_scalar_per_row_and_group() {
+    let text = format!("{HEAD}{}{}{}\n[[stage]]\nop = \"load\"\nname = \"v\"\nsrc = \"x\"\nrow = 8\n\n[[stage]]\nop = \"load\"\nname = \"wv\"\nsrc = \"w\"\nhead = 8\n\n[[stage]]\nop = \"sum\"\nname = \"d\"\nexpr = \"v * wv\"\n\n[[stage]]\nop = \"put\"\ndst = \"y\"\nvalue = \"tanh(d)\"\nrow = 4\nhead = 1\n", param("x", "f32", "activation", "read"), param("w", "f32", "weight", "read"), param("y", "f32", "activation", "write"));
+    let src = build(&text, &Shape::new()).unwrap();
+    assert!(src.contains("if (threadIdx.x == 0) y[(size_t)row * 4 + (size_t)grp * 1] = tanhf(d);"), "{src}");
+    let elementwise = text.replace("tanh(d)", "tanh(v)");
+    assert!(build(&elementwise, &Shape::new()).is_err(), "a put takes scalars, not elements");
+}
+
+#[test]
 fn probit_matches_the_normal_quantiles() {
     let p = |x: f64| kir::expr::Expr::parse(&format!("probit({x})")).unwrap().eval(&|_| None).unwrap();
     for (x, want) in [(0.5, 0.0), (0.95, 1.6448536269514722), (0.975, 1.959963984540054), (0.01, -2.3263478740408408), (0.999, 3.090232306167813)] {
         assert!((p(x) - want).abs() < 1e-8, "probit({x}) = {}, want {want}", p(x));
     }
     assert!(kir::expr::Expr::parse("probit(1.0)").unwrap().eval(&|_| None).is_none());
+    let cut = kir::expr::Expr::parse("select(v > 0, probit(v), 0)").unwrap();
+    assert_eq!(cut.eval(&|n| (n == "v").then_some(0.0)), Some(0.0), "select only evaluates the branch it takes");
 }

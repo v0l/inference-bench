@@ -10,6 +10,7 @@ pub enum GroupStage {
     Sum { dst: String, expr: Expr },
     Scalar { dst: String, expr: Expr },
     Store { dst: String, value: Expr, row: u32, group: u32, offset: u32, planes: bool },
+    Put { dst: String, value: Expr, row: u32, group: u32, offset: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -80,7 +81,7 @@ impl GroupMap {
                 return Err(format!("group_map param {:?} is not usable", p.name));
             }
         }
-        if !self.stages.iter().any(|s| matches!(s, GroupStage::Store { .. })) {
+        if !self.stages.iter().any(|s| matches!(s, GroupStage::Store { .. } | GroupStage::Put { .. })) {
             return Err("group_map has no store".into());
         }
         self.body(params)?;
@@ -186,6 +187,14 @@ impl GroupMap {
                     out.push_str(&format!("    const float {dst} = {text};\n"));
                     scalars.push(dst.clone());
                     defined.push(dst.clone());
+                }
+                GroupStage::Put { dst, value, row, group, offset } => {
+                    match params.iter().find(|p| p.name == dst) {
+                        Some(p) if p.role == Role::Activation && p.access == Access::Write && p.ty == Scalar::F32 => {}
+                        _ => return Err(format!("group_map put to {dst:?}, which is not a written f32 activation param")),
+                    }
+                    let text = element(value, &[], &scalars).map_err(|e| format!("group_map put {dst:?}: {e}"))?;
+                    out.push_str(&format!("    if (threadIdx.x == 0) {dst}[{}] = {text};\n", fixed(*row, *group, *offset)));
                 }
                 GroupStage::Store { dst, value, row, group, offset, planes } => {
                     let text = element(value, &elements, &scalars)?;

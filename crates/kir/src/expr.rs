@@ -344,6 +344,9 @@ impl Expr {
                     Op::Or => truth(a != 0.0 || b != 0.0),
                 }
             }
+            Expr::Call("select", args) if args.len() == 3 => {
+                return if args[0].eval(env)? != 0.0 { args[1].eval(env) } else { args[2].eval(env) };
+            }
             Expr::Call(f, args) => {
                 let v: Vec<f64> = args.iter().map(|a| a.eval(env)).collect::<Option<_>>()?;
                 match (*f, v.as_slice()) {
