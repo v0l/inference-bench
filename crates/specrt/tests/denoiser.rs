@@ -158,7 +158,7 @@ fn the_denoiser_modules_compile_with_nvrtc_for_sm_120() {
 }
 
 fn klein() -> DenoiserSpec {
-    let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/flux2-klein-4b.transformer.config.json")).unwrap();
+    let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-flux2-klein/klein-4b-transformer.json")).unwrap();
     DenoiserSpec::from_transformer_config(&json, 2).unwrap()
 }
 
