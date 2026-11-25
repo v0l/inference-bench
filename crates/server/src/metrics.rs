@@ -40,6 +40,12 @@ struct Inner {
     model_unloads: u64,
     spec_checks: BTreeMap<String, u64>,
     spec_last_success: Option<i64>,
+    image_jobs: BTreeMap<String, u64>,
+    images: BTreeMap<String, u64>,
+    image_steps: u64,
+    image_step_secs: f64,
+    image_seconds: f64,
+    last_image_steps_per_sec: f64,
 }
 
 #[derive(Default)]
@@ -54,6 +60,8 @@ pub struct Gauges {
     pub loaded_models: Vec<(String, u64)>,
     pub gpu_used_bytes: Option<u64>,
     pub engine: String,
+    pub image_queue: usize,
+    pub image_running: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -110,6 +118,18 @@ impl Metrics {
 
     pub fn cancelled(&self) {
         self.inner.lock().unwrap().cancelled += 1;
+    }
+
+    pub fn image_job(&self, model: &str, images: u64, steps: u64, step_secs: f64, total_secs: f64) {
+        let mut m = self.inner.lock().unwrap();
+        *m.image_jobs.entry(model.to_string()).or_default() += 1;
+        *m.images.entry(model.to_string()).or_default() += images;
+        m.image_steps += steps;
+        m.image_step_secs += step_secs;
+        m.image_seconds += total_secs;
+        if step_secs > 0.0 {
+            m.last_image_steps_per_sec = steps as f64 / step_secs;
+        }
     }
 
     pub fn model_loaded(&self, model: &str) {
@@ -194,6 +214,20 @@ impl Metrics {
             let _ = writeln!(o, "# HELP inference_gpu_memory_used_bytes GPU memory in use on device 0.\n# TYPE inference_gpu_memory_used_bytes gauge\ninference_gpu_memory_used_bytes {used}");
         }
         o.push_str(&g.engine);
+        let _ = writeln!(o, "# HELP inference_image_jobs_total Image generation jobs finished, by model.\n# TYPE inference_image_jobs_total counter");
+        for (model, n) in &m.image_jobs {
+            let _ = writeln!(o, "inference_image_jobs_total{{model=\"{model}\"}} {n}");
+        }
+        let _ = writeln!(o, "# TYPE inference_images_total counter");
+        for (model, n) in &m.images {
+            let _ = writeln!(o, "inference_images_total{{model=\"{model}\"}} {n}");
+        }
+        let _ = writeln!(o, "# TYPE inference_image_steps_total counter\ninference_image_steps_total {}", m.image_steps);
+        let _ = writeln!(o, "# TYPE inference_image_step_seconds_total counter\ninference_image_step_seconds_total {}", m.image_step_secs);
+        let _ = writeln!(o, "# TYPE inference_image_job_seconds_total counter\ninference_image_job_seconds_total {}", m.image_seconds);
+        let _ = writeln!(o, "# HELP inference_image_steps_per_second Denoiser steps per second of the last job.\n# TYPE inference_image_steps_per_second gauge\ninference_image_steps_per_second {}", m.last_image_steps_per_sec);
+        let _ = writeln!(o, "# HELP inference_image_queue_depth Image jobs waiting for a GPU.\n# TYPE inference_image_queue_depth gauge\ninference_image_queue_depth {}", g.image_queue);
+        let _ = writeln!(o, "# TYPE inference_image_jobs_running gauge\ninference_image_jobs_running {}", g.image_running);
         self.render_vllm(&mut o, &m, g);
         o
     }

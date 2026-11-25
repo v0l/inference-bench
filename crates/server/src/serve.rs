@@ -274,7 +274,7 @@ mod tests {
 
     #[test]
     fn app_mode_limits_show_effective_admission_and_engine_slots() {
-        let source = Fixed(vec![SourceModel { id: "qwen".into(), aliases: vec![], slots: Some(8) }]);
+        let source = Fixed(vec![SourceModel { id: "qwen".into(), aliases: vec![], slots: Some(8), kind: Default::default() }]);
         let l = ListeningLimits::new(&app_config(), Some(&source));
         assert_eq!(l.admission_limit, 64);
         assert_eq!(l.queue_depth, 16);

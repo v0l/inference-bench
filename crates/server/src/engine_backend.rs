@@ -9,7 +9,7 @@ fn source_model(l: inference_bench_core::engine::Loaded) -> SourceModel {
     let mut aliases = vec![l.model_id];
     aliases.extend(inference_bench_core::library::short_alias(&l.display));
     aliases.extend(l.served_names);
-    SourceModel { id: l.display, aliases, slots: Some(l.max_num_seqs) }
+    SourceModel { id: l.display, aliases, slots: Some(l.max_num_seqs), kind: l.kind }
 }
 
 impl ModelSource for Handle {
