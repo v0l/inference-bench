@@ -2163,8 +2163,8 @@ impl Spec {
                 down_act_planes: if block_act { family.moe.act_planes.unwrap_or(1) } else { 1 },
                 fused_gate_up: family.mlp.fused_gate_up,
                 gated: match &family.mlp.gated {
-                    Some(g) => Some(GatedAct { expr: g.expr.clone(), params: crate::family::read_params(&g.params, &value)? }),
-                    None => None,
+                    Some(g) if g.applies(hf.hidden_act.as_deref()) => Some(GatedAct { expr: g.expr.clone(), params: crate::family::read_params(&g.params, &value)? }),
+                    _ => None,
                 },
                 mapped: match &family.mlp.mapped {
                     Some(g) if activation == Activation::Mapped => Some(GatedAct { expr: g.expr.clone(), params: crate::family::read_params(&g.params, &value)? }),

@@ -9,6 +9,7 @@ pub enum GroupStage {
     Sum { dst: String, expr: Expr },
     Scalar { dst: String, expr: Expr },
     Store { dst: String, value: Expr, row: u32, group: u32, offset: u32 },
+    Planes { value: Expr, row: u32, group: u32, offset: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -19,7 +20,9 @@ pub struct GroupMap {
     pub scales: Vec<(String, f32)>,
 }
 
-const RESERVED: [&str; 6] = ["i", "row", "grp", "scratch", "WIDTH", "width"];
+const RESERVED: [&str; 8] = ["i", "row", "grp", "scratch", "WIDTH", "width", "hi", "lo"];
+
+const PLANES: [&str; 2] = ["out_hi", "out_lo"];
 
 fn address(row: u32, group: u32, offset: u32) -> String {
     let mut terms = Vec::new();
@@ -65,8 +68,11 @@ impl GroupMap {
         for (i, p) in params.iter().enumerate() {
             let index = self.stages.iter().any(|s| matches!(s, GroupStage::Load { index: Some(n), .. } if n == p.name));
             let shift = self.stages.iter().any(|s| matches!(s, GroupStage::Load { shift: Some(n), .. } if n == p.name));
+            let plane = PLANES.contains(&p.name);
             let ty_ok = if index {
                 p.ty == Scalar::I32 && p.role == Role::Activation && p.access == Access::Read
+            } else if plane {
+                p.ty == Scalar::Bf16 && p.role == Role::Activation && p.access == Access::Write
             } else if shift {
                 p.ty == Scalar::I32 && p.role == Role::Value
             } else if self.stored(p) {
@@ -78,7 +84,11 @@ impl GroupMap {
                 return Err(format!("group_map param {:?} is not usable", p.name));
             }
         }
-        if !self.stages.iter().any(|s| matches!(s, GroupStage::Store { .. })) {
+        let planes = self.stages.iter().any(|s| matches!(s, GroupStage::Planes { .. }));
+        if planes != PLANES.iter().all(|n| params.iter().any(|p| p.name == *n)) || PLANES.iter().filter(|n| params.iter().any(|p| p.name == **n)).count() == 1 {
+            return Err("group_map stores to planes through a planes stage with both out_hi and out_lo params".into());
+        }
+        if !self.stages.iter().any(|s| matches!(s, GroupStage::Store { .. } | GroupStage::Planes { .. })) {
             return Err("group_map has no store".into());
         }
         self.body(params)?;
@@ -173,6 +183,11 @@ impl GroupMap {
                     }
                     let text = element(value, &elements, &scalars)?;
                     out.push_str(&format!("{loop_head} {dst}[{}] = {text};\n", address(*row, *group, *offset)));
+                }
+                GroupStage::Planes { value, row, group, offset } => {
+                    let text = element(value, &elements, &scalars)?;
+                    let at = address(*row, *group, *offset);
+                    out.push_str(&format!("{loop_head} {{\n        unsigned hi, lo;\n        split_hi_lo({text}, hi, lo);\n        out_hi[{at}] = (bf16_t)hi;\n        out_lo[{at}] = (bf16_t)lo;\n    }}\n"));
                 }
             }
         }

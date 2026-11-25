@@ -343,6 +343,14 @@ pub struct FamilyGated {
     pub expr: String,
     #[serde(default)]
     pub params: std::collections::BTreeMap<String, ParamSource>,
+    #[serde(default)]
+    pub act: Option<String>,
+}
+
+impl FamilyGated {
+    pub fn applies(&self, hidden_act: Option<&str>) -> bool {
+        self.act.as_deref().is_none_or(|a| hidden_act == Some(a))
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

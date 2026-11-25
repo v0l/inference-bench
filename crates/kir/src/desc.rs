@@ -837,7 +837,11 @@ impl Description {
                     let (row, group, offset) = at()?;
                     GroupStage::Store { dst: need(&s.dst, "dst", &s.op)?, value: parse(need(&s.value, "value", &s.op)?)?, row, group, offset }
                 }
-                o => return Err(format!("{}: group_map stage op {o:?} is not load, gather, gather_row, value, sum, scalar or store", self.name)),
+                "planes" => {
+                    let (row, group, offset) = at()?;
+                    GroupStage::Planes { value: parse(need(&s.value, "value", &s.op)?)?, row, group, offset }
+                }
+                o => return Err(format!("{}: group_map stage op {o:?} is not load, gather, gather_row, value, sum, scalar, store or planes", self.name)),
             });
         }
         Ok(crate::group::GroupMap { width: n["width"], consts, stages, scales })
