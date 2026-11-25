@@ -1,0 +1,42 @@
+kind = "kir-kernel"
+family = "compose"
+name = "dit_patchify"
+threads = 256
+
+[args]
+width = "grid_elems"
+
+[rows]
+iter = "grid"
+address = "advance"
+per_row = ["grid"]
+
+[[param]]
+name = "grid"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "out_hi"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "out_lo"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[stage]]
+op = "tile_load"
+name = "v"
+src = "grid"
+
+[[stage]]
+op = "split_store"
+dst = "out_hi"
+lo = "out_lo"
+value = "v"
+layout = "((latent_patch,patch_w,latent_patch,patch_h,grid_channels)):((1,in_channels,latent_patch,patch_w * in_channels,latent_patch * latent_patch))"
+at = ["i"]

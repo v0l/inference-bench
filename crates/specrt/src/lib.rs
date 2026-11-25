@@ -17,6 +17,7 @@ pub mod codegen;
 pub mod compile;
 pub mod denoiser;
 pub mod denoiser_host;
+pub mod denoiser_cuda;
 pub mod gemm;
 pub mod engine;
 pub mod executor;

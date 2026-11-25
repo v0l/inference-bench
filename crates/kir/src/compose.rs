@@ -22,6 +22,7 @@ pub struct Rows {
     pub address: Address,
     pub per_row: Vec<(String, u32)>,
     pub stride: Vec<(String, u32)>,
+    pub offset: Vec<(String, u32)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -155,8 +156,13 @@ impl Compose {
         if sums(&self.stages) > 1 && t.language != crate::Language::Cuda {
             return Err("compose has more than one block_sum, which only the CUDA lowering runs".into());
         }
-        if !self.rows.stride.is_empty() && t.language != crate::Language::Cuda {
-            return Err("compose row strides have only a CUDA lowering".into());
+        if (!self.rows.stride.is_empty() || !self.rows.offset.is_empty()) && t.language != crate::Language::Cuda {
+            return Err("compose row strides and offsets have only a CUDA lowering".into());
+        }
+        for (n, _) in &self.rows.offset {
+            if !params.iter().any(|p| p.name == n) {
+                return Err(format!("rows offset names unknown param {n:?}"));
+            }
         }
         for (n, s) in &self.rows.stride {
             if !params.iter().any(|p| p.name == n) || *s == 0 || self.rows.per_row.iter().any(|(m, _)| m == n) {
@@ -427,6 +433,9 @@ impl Compose {
         }
         for (n, stride) in &self.rows.stride {
             s.push_str(&format!("    {n} += (size_t)blockIdx.{row} * {stride};\n"));
+        }
+        for (n, off) in self.rows.offset.iter().filter(|(_, o)| *o > 0) {
+            s.push_str(&format!("    {n} += {off};\n"));
         }
         let looped = |lines: &[String]| -> String {
             match lines {

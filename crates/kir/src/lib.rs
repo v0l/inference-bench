@@ -304,6 +304,11 @@ impl Kernel {
         Ok(k)
     }
 
+    pub fn renamed(mut self, name: &str) -> Kernel {
+        self.name = crate::desc::intern_public(name);
+        self
+    }
+
     pub fn tile_scan(&self) -> bool {
         match &self.body {
             Body::Scan(s) => s.tile_eligible() && s.tile_names_free(&self.params) && self.target.has(Feature::Mma16816) && self.target.has(Feature::CpAsync) && self.target.language == Language::Cuda,

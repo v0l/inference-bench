@@ -56,11 +56,12 @@ fn run_host(bf16: bool, step: usize, plan: &specrt::plan::Plan) -> (Vec<f32>, Tr
     let spec = spec();
     let ck = Checkpoint::open(&fixture().join("transformer")).unwrap();
     let host = HostDenoiser::load(graph, &spec, plan, &ck, bf16).unwrap();
-    let latent = step_input(step);
+    let latent = specrt::denoiser_host::unpatchify(&step_input(step), 4, 2, 8, 8);
     let text = pipeline("text.embeds");
     let ids = ids(&spec);
     let mut trace = Trace::default();
-    let v = host.forward(&Inputs { latent: &latent, text: &text, timestep: sigma(step), ids: &ids, image: 64, text_rows: 16 }, &mut trace).unwrap();
+    let grid = host.forward(&Inputs { latent: &latent, text: &text, timestep: sigma(step), ids: &ids, image: 64, text_rows: 16, patch_h: 8, patch_w: 8 }, &mut trace).unwrap();
+    let v = specrt::denoiser_host::patchify(&grid, 4, 2, 8, 8);
     (v, trace)
 }
 
@@ -111,6 +112,51 @@ fn the_timestep_embedding_matches_numpy() {
 }
 
 #[test]
+fn every_denoiser_kernel_builds_from_a_description_and_emits() {
+    let graph = DenoiserGraph::embedded();
+    let s = spec();
+    let plan = graph.plan().unwrap();
+    let shapes = denoiser::Shapes { image: 64, text: 16, patch_h: 8, patch_w: 8 };
+    let kernels = denoiser::described_kernels(graph, &s, &plan, &shapes, &kir::Target::sm_120()).unwrap();
+    let names: Vec<&str> = kernels.iter().map(|k| k.name).collect();
+    for want in ["dit_modulate", "dit_gated_add", "dit_timestep", "dit_patchify", "dit_unpatchify", "dit_glu_192_0", "dit_glu_288_96", "dit_split_96", "dit_silu_split_32", "dit_copy_32"] {
+        assert!(names.contains(&want), "{want} missing from {names:?}");
+    }
+    let src = kir::cuda::emit_module(&kernels).unwrap();
+    if std::env::var_os("DIT_DUMP").is_some() {
+        eprintln!("{src}");
+    }
+    assert!(src.contains("void __launch_bounds__(256) dit_modulate("), "{src}");
+    assert!(src.contains("cosf(") && src.contains("sinf("), "{src}");
+}
+
+#[test]
+fn the_patchify_layout_matches_the_pipeline_unpatchify() {
+    let noise = pipeline("noise");
+    let grid = reference("noise.grid");
+    let tokens = specrt::denoiser_host::patchify(&grid, 4, 2, 8, 8);
+    assert_eq!(max_diff(&tokens, &noise), 0.0);
+    assert_eq!(max_diff(&specrt::denoiser_host::unpatchify(&noise, 4, 2, 8, 8), &grid), 0.0);
+}
+
+#[test]
+fn the_denoiser_modules_compile_with_nvrtc_for_sm_120() {
+    let graph = DenoiserGraph::embedded();
+    let s = spec();
+    let plan = graph.plan().unwrap();
+    let shapes = denoiser::Shapes { image: 64, text: 16, patch_h: 8, patch_w: 8 };
+    let t = kir::Target::sm_120();
+    let kernels = denoiser::described_kernels(graph, &s, &plan, &shapes, &t).unwrap();
+    let compose = kir::cuda::emit_module(&kernels).unwrap();
+    let vk = kir::vision::VisionKernel::new(&t, s.size("head_dim").unwrap(), true).unwrap().joint();
+    let vision = kir::cuda::emit_vision(&vk).unwrap();
+    for (name, src) in [("compose", compose), ("vision", vision)] {
+        let cubin = specrt::jit::cubin_for(&src, "sm_120", 1).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+        assert!(!cubin.is_empty(), "{name}");
+    }
+}
+
+#[test]
 fn the_host_plan_matches_diffusers_in_f32() {
     let plan = DenoiserGraph::embedded().plan().unwrap();
     for step in 0..3 {
@@ -147,9 +193,12 @@ fn the_step_invariant_ops_are_the_text_projection_only() {
     let graph = DenoiserGraph::embedded();
     let s = spec();
     let plan = graph.plan().unwrap();
-    let inv = denoiser::invariant_ops(graph, &s, &plan.head, &["latent", "timestep"]).unwrap();
+    let inv = denoiser::hoisted(graph, &s, &plan).unwrap();
     let hoisted: Vec<String> = plan.head.iter().zip(&inv).filter(|(_, i)| **i).map(|(o, _)| o.label()).collect();
-    assert_eq!(hoisted, ["split text", "context_embedder (text)", "copy context"], "{hoisted:?}");
+    assert_eq!(hoisted, ["split text", "context_embedder (text)"], "{hoisted:?}");
+    let naive = denoiser::invariant_ops(graph, &s, &plan.head, &["latent", "timestep"]).unwrap();
+    assert!(naive[3], "without the later writes the copy of the context into x looks invariant");
+    assert!(!inv[3], "the blocks rewrite x every step, so the copy stays in the step");
 }
 
 #[test]

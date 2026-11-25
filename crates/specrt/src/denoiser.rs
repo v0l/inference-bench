@@ -88,6 +88,10 @@ pub struct DenoiserSpec {
     pub axes: Vec<usize>,
 }
 
+pub fn intern_name(s: &str) -> &'static str {
+    intern(s)
+}
+
 fn intern(s: &str) -> &'static str {
     static NAMES: std::sync::Mutex<BTreeSet<&'static str>> = std::sync::Mutex::new(BTreeSet::new());
     let mut set = NAMES.lock().unwrap();
@@ -454,19 +458,35 @@ pub fn validate(graph: &DenoiserGraph, spec: &DenoiserSpec, plan: &Plan) -> Resu
 }
 
 pub fn invariant_ops(graph: &DenoiserGraph, spec: &DenoiserSpec, ops: &[Op], varying: &[&str]) -> Result<Vec<bool>> {
+    invariant_in(graph, spec, ops, &[], varying)
+}
+
+pub fn invariant_in(graph: &DenoiserGraph, spec: &DenoiserSpec, ops: &[Op], later: &[&[Op]], varying: &[&str]) -> Result<Vec<bool>> {
     let signer = Signer { graph, spec };
+    let sign = |op: &Op| -> Result<DitSignature> {
+        let Op::Dit(d) = op else { bail!("{} is not a denoiser op", op.label()) };
+        signer.sign(d)
+    };
+    let mut rewritten: BTreeSet<Place> = BTreeSet::new();
+    for op in later.iter().flat_map(|o| o.iter()) {
+        rewritten.extend(sign(op)?.writes.into_iter().map(|w| w.place));
+    }
     let mut moving: BTreeSet<Place> = varying.iter().map(|n| Place::Input(intern(n))).collect();
     let mut out = Vec::with_capacity(ops.len());
     for op in ops {
-        let Op::Dit(d) = op else { bail!("{} is not a denoiser op", op.label()) };
-        let sig = signer.sign(d)?;
-        let moves = sig.reads.iter().any(|r| moving.contains(&r.place)) || sig.writes.iter().any(|w| moving.contains(&w.place) && !matches!(d, DitOp::Linear { .. } | DitOp::Copy { .. }));
+        let sig = sign(op)?;
+        let moves = sig.reads.iter().any(|r| moving.contains(&r.place)) || sig.writes.iter().any(|w| rewritten.contains(&w.place));
         if moves {
             moving.extend(sig.writes.iter().map(|w| w.place.clone()));
         }
         out.push(!moves);
     }
     Ok(out)
+}
+
+pub fn hoisted(graph: &DenoiserGraph, spec: &DenoiserSpec, plan: &Plan) -> Result<Vec<bool>> {
+    let later: Vec<&[Op]> = plan.blocks.iter().map(|b| b.ops.as_slice()).chain([plan.tail.as_slice()]).collect();
+    invariant_in(graph, spec, &plan.head, &later, &["latent", "timestep"])
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -541,14 +561,14 @@ pub fn report(graph: &DenoiserGraph, spec: &DenoiserSpec, plan: &Plan, count: Co
     }
     parts.push(("tail".into(), 1, &plan.tail));
     for (name, repeats, ops) in parts {
-        let invariant = invariant_ops(graph, spec, ops, &["latent", "timestep"])?;
+        let invariant = if name == "head" { hoisted(graph, spec, plan)? } else { vec![false; ops.len()] };
         let mut costs = Vec::new();
         for (op, inv) in ops.iter().zip(invariant) {
             let Op::Dit(d) = op else { bail!("{} is not a denoiser op", op.label()) };
             let sig = signer.sign(d)?;
             let read = sig.reads.iter().map(|t| t.bytes(&count)).sum();
             let written = sig.writes.iter().map(|t| t.bytes(&count)).sum();
-            costs.push(DitOpCost { label: d.label(), class: sig.class, read, written, flops: signer.flops(d, &count)?, launches: 1, invariant: inv && name == "head" });
+            costs.push(DitOpCost { label: d.label(), class: sig.class, read, written, flops: signer.flops(d, &count)?, launches: 1, invariant: inv });
         }
         sections.push(DitSection { name, repeats, ops: costs });
     }
@@ -557,4 +577,65 @@ pub fn report(graph: &DenoiserGraph, spec: &DenoiserSpec, plan: &Plan, count: Co
 
 pub fn count(image: usize, text: usize) -> Count {
     Count { tokens: image + text, out: image, seqs: 1, context: image + text, image, text }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Shapes {
+    pub image: usize,
+    pub text: usize,
+    pub patch_h: usize,
+    pub patch_w: usize,
+}
+
+impl Shapes {
+    pub fn joint(&self) -> usize {
+        self.image + self.text
+    }
+}
+
+pub fn kernel_key(op: &DitOp, graph: &DenoiserGraph, spec: &DenoiserSpec) -> Result<Option<(String, String, Vec<(String, f64)>)>> {
+    let width = |name: &str| -> Result<f64> { Ok(spec.size(&graph.decl(name).with_context(|| format!("no buffer {name}"))?.cols)? as f64) };
+    Ok(Some(match *op {
+        DitOp::Split { from, act, .. } => {
+            let w = width(from)?;
+            let base = if act { "dit_silu_split" } else { "dit_split" };
+            (format!("{base}_{w}"), base.into(), vec![("split_width".into(), w)])
+        }
+        DitOp::Copy { from, .. } => {
+            let w = width(from)?;
+            (format!("dit_copy_{w}"), "dit_copy".into(), vec![("split_width".into(), w)])
+        }
+        DitOp::Glu { from, offset, .. } => {
+            let off = spec.size(offset)? as f64;
+            let w = width(from)?;
+            (format!("dit_glu_{w}_{off}"), "dit_glu".into(), vec![("glu_stride".into(), w), ("glu_offset".into(), off)])
+        }
+        DitOp::Modulate { .. } => ("dit_modulate".into(), "dit_modulate".into(), Vec::new()),
+        DitOp::GatedAdd { .. } => ("dit_gated_add".into(), "dit_gated_add".into(), Vec::new()),
+        DitOp::TimestepEmbed { .. } => ("dit_timestep".into(), "dit_timestep".into(), Vec::new()),
+        DitOp::Patchify { .. } => ("dit_patchify".into(), "dit_patchify".into(), Vec::new()),
+        DitOp::Unpatchify { .. } => ("dit_unpatchify".into(), "dit_unpatchify".into(), Vec::new()),
+        DitOp::Linear { .. } | DitOp::AxisRope { .. } | DitOp::JointAttention { .. } => return Ok(None),
+    }))
+}
+
+pub fn described_kernels(graph: &DenoiserGraph, spec: &DenoiserSpec, plan: &Plan, shapes: &Shapes, target: &kir::Target) -> Result<Vec<kir::Kernel>> {
+    let registry = crate::kir_kernel::Registry::active();
+    let base = spec.kir_shape().num("patch_h", shapes.patch_h as f64).num("patch_w", shapes.patch_w as f64).num("grid_elems", (shapes.image * spec.size("in_channels")?) as f64);
+    let mut out: BTreeMap<String, kir::Kernel> = BTreeMap::new();
+    for op in plan.head.iter().chain(plan.blocks.iter().flat_map(|b| &b.ops)).chain(&plan.tail) {
+        let Op::Dit(d) = op else { continue };
+        let Some((name, desc, extra)) = kernel_key(d, graph, spec)? else { continue };
+        if out.contains_key(&name) {
+            continue;
+        }
+        let mut shape = base.clone();
+        for (k, v) in &extra {
+            shape = shape.num(k, *v);
+        }
+        let d = registry.get(&desc).with_context(|| format!("no kernel description {desc}"))?;
+        let k = d.build(target, &shape).map_err(anyhow::Error::msg)?.renamed(&name);
+        out.insert(name, k);
+    }
+    Ok(out.into_values().collect())
 }

@@ -11,6 +11,8 @@ pub struct Inputs<'a> {
     pub ids: &'a [i32],
     pub image: usize,
     pub text_rows: usize,
+    pub patch_h: usize,
+    pub patch_w: usize,
 }
 
 pub struct HostDenoiser<'a> {
@@ -28,10 +30,6 @@ pub struct Trace {
 
 fn silu(v: f32) -> f32 {
     v / (1.0 + (-v).exp())
-}
-
-fn round_bf16(v: f32) -> f32 {
-    crate::weights::bf16_to_f32(crate::weights::f32_to_bf16(v))
 }
 
 impl<'a> HostDenoiser<'a> {
@@ -109,6 +107,10 @@ impl<'a> HostDenoiser<'a> {
         bufs.remove("velocity").context("the plan wrote no velocity")
     }
 
+    fn patch_dims(&self, x: &Inputs) -> Result<(usize, usize, usize, usize)> {
+        Ok((self.spec.size("grid_channels")?, self.spec.size("latent_patch")?, x.patch_h, x.patch_w))
+    }
+
     fn span(&self, rows: Stream, x: &Inputs) -> (usize, usize) {
         match rows {
             Stream::Text => (0, x.text_rows),
@@ -127,10 +129,16 @@ impl<'a> HostDenoiser<'a> {
         let h = self.spec.hidden();
         let width = |name: &str| -> Result<usize> { self.spec.size(&self.graph.decl(name).with_context(|| format!("no buffer {name}"))?.cols) };
         let eps = self.spec.get("norm_eps")? as f32;
-        let act_round = |v: f32| if self.bf16 { round_bf16(v) } else { v };
+        let act_round = |v: f32| v;
         match *d {
-            DitOp::Patchify { from, into } | DitOp::Unpatchify { from, into } => {
-                let v = bufs[from].clone();
+            DitOp::Patchify { from, into } => {
+                let (c, p, ph, pw) = self.patch_dims(x)?;
+                let v = patchify(&bufs[from], c, p, ph, pw).into_iter().map(act_round).collect();
+                bufs.insert(into, v);
+            }
+            DitOp::Unpatchify { from, into } => {
+                let (c, p, ph, pw) = self.patch_dims(x)?;
+                let v = unpatchify(&bufs[from], c, p, ph, pw);
                 bufs.insert(into, v);
             }
             DitOp::Split { from, into, rows, act } => {
@@ -282,6 +290,36 @@ impl<'a> HostDenoiser<'a> {
         }
         Ok(())
     }
+}
+
+pub fn patchify(grid: &[f32], channels: usize, p: usize, ph: usize, pw: usize) -> Vec<f32> {
+    let width = channels * p * p;
+    let mut out = vec![0f32; ph * pw * width];
+    for c in 0..channels {
+        for y in 0..ph * p {
+            for xx in 0..pw * p {
+                let token = (y / p) * pw + xx / p;
+                let col = c * p * p + (y % p) * p + xx % p;
+                out[token * width + col] = grid[(c * ph * p + y) * pw * p + xx];
+            }
+        }
+    }
+    out
+}
+
+pub fn unpatchify(tokens: &[f32], channels: usize, p: usize, ph: usize, pw: usize) -> Vec<f32> {
+    let width = channels * p * p;
+    let mut out = vec![0f32; tokens.len()];
+    for c in 0..channels {
+        for y in 0..ph * p {
+            for xx in 0..pw * p {
+                let token = (y / p) * pw + xx / p;
+                let col = c * p * p + (y % p) * p + xx % p;
+                out[(c * ph * p + y) * pw * p + xx] = tokens[token * width + col];
+            }
+        }
+    }
+    out
 }
 
 pub fn timestep_embedding(t: f32, channels: usize) -> Vec<f32> {

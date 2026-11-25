@@ -296,6 +296,8 @@ pub struct RowsDesc {
     pub per_row: Vec<String>,
     #[serde(default)]
     pub stride: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub offset: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
@@ -393,6 +395,10 @@ impl Shape {
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.0.get(name)
     }
+}
+
+pub fn intern_public(name: &str) -> &'static str {
+    intern(name)
 }
 
 pub(crate) fn intern(name: &str) -> &'static str {
@@ -1100,8 +1106,12 @@ impl Description {
         for (n, v) in &rows.stride {
             stride.push((n.clone(), self.size(shape, v, n)?));
         }
+        let mut offset = Vec::new();
+        for (n, v) in &rows.offset {
+            offset.push((n.clone(), self.size(shape, v, n)?));
+        }
         let sum = stages.iter().any(|s| matches!(s, Stage::BlockSum { .. })).then(|| BlockSum::for_target(t));
-        Kernel::compose(t, intern(&self.name), self.threads(shape)?, params, Compose { width, rows: Rows { iter, address, per_row, stride }, consts, sum, stages }).map_err(|e| format!("{}: {e}", self.name))
+        Kernel::compose(t, intern(&self.name), self.threads(shape)?, params, Compose { width, rows: Rows { iter, address, per_row, stride, offset }, consts, sum, stages }).map_err(|e| format!("{}: {e}", self.name))
     }
 
     fn threads(&self, shape: &Shape) -> Result<u32, String> {
