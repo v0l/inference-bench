@@ -208,6 +208,79 @@ B is the only one that runs without the user, and only at the speeds above.
 4. `family-glm5_next.toml` last, flipping `glm5_3_flash_describes_with_its_glm_keys_and_refuses_to_serve` into `glm5_3_flash_serves_text_with_its_glm_keys` (done in #1192).
 5. Real checkpoint run, parked as #1335: option A or C needs both GPUs, option B needs the expert cache and NVMe tier on GPU1. Reference: the user's running vLLM (same checkpoint, same machine), logits and top-1 against its logprobs.
 
+## Real checkpoint (#1335)
+
+Option C: both desktop cards, the user's app and vLLM stopped, a two stage pipeline with every weight resident (no expert cache, no offload). Numbers taken on quiet GPUs: no other job held a GPU lock and nothing but the display (about 6 GB on GPU0) used the cards. Engine commit a2f1dc52 (branch issue-1335), JIT cache warm.
+
+```
+export CARGO_TARGET_DIR=/mnt/data/cargo-target/inference-bench-1335
+cargo build --release -p inference-bench-cli
+B=$CARGO_TARGET_DIR/release/inference-bench
+M=~/.cache/huggingface/hub/models--Piecrust--GLM-5.3-Flash-FP4-Abliterated/snapshots/5c15d09158c533cc9064bb29c620a7d543e12777
+$B spec --model $M --out /tmp/glm5.toml
+$B plan --spec /tmp/glm5.toml --config docs/glm5-real/server.toml
+~/.agents/bin/gpu-run 0,1 -- systemd-run --user --wait --collect -P -q -p MemoryMax=16G -p MemorySwapMax=0 --unit=glm1335 \
+  $B serve --config docs/glm5-real/server.toml --bind 127.0.0.1:8013
+docs/glm5-real/capture.sh http://127.0.0.1:8013 glm-5.3-flash docs/glm5-real/specrt
+```
+
+`docs/glm5-real/server.toml`: 1 slot, 8192 context, 1024 token prefill chunks, a 0.25 GiB KV pool, gpu0 89.4 GiB and gpu1 95 GiB with 2 GiB reserve each. With 2048 token chunks and the default pool stage 1 stopped at `no device memory left for the KV cache (1016791040 bytes free)`.
+
+Two engine fixes were needed to load it:
+
+- `StageRange::check` refused any pipeline over a MoE model with dense layers. `Spec::stage` now renumbers `[moe] dense_layers` and `[rope] nope_layers` into the stage, and `Checkpoint::layer_at` decides sparse by the stage local index. Tests: `stage_specs_renumber_dense_moe_layers_and_nope_layers` (CPU), `moe_with_dense_first_layers_and_hyper_streams_pipeline_is_bit_identical_to_the_single_runtime` (`tests/pipeline.rs`, GPU1, tiny-glm5-next split in two and three stages over both hops, tokens and logits bit identical).
+- The describe path (what the app's load dialog sizes from) ignored the per tensor quant map and counted the routed experts as bf16: 598.4 GB of weights. It now reads the map as the engine does: 189.5 GB. Test: `glm5_3_flash_serves_text_with_its_glm_keys` checks the describe and the serving spec agree within 1%.
+
+Placement (planner and the run agree): gpu0 layers 0..23, gpu1 layers 23..45, planned 11.3 ms per decode step (88.7 tok/s one stream).
+
+| | stage 0 (gpu0) | stage 1 (gpu1) |
+| --- | --- | --- |
+| layers | 0..23 | 23..45 |
+| weight bytes (log) | 89.9 GB | 96.8 GB |
+| device bytes after load (log) | 92.2 GB | 99.4 GB |
+| `nvidia-smi --query-compute-apps` | 88,610 MiB | 95,386 MiB |
+| load time | 89.7 s | 98.8 s |
+| peak host RSS | 9.4 GB | 9.7 GB |
+
+193 s from the first request to the first token (weights read from the page cache and the drive at about 1 GB/s per stage, stages one after the other).
+
+Speed, greedy, one request at a time (time to first token and decode tok/s from the server log):
+
+| prompt tokens | new tokens | time to first token | prefill tok/s | decode tok/s |
+| --- | --- | --- | --- | --- |
+| 5 | 64 | 0.25 s | 20 | 4.36 |
+| 11 | 64 | 0.28 s | 40 | 4.42 |
+| 17 | 64 | 0.31 s | 54 | 4.40 |
+| 27 | 64 | 0.35 s | 76 | 4.41 |
+| 463 | 32 | 2.66 s | 174 | 4.35 |
+| 3101 | 32 | 20.0 s | 155 | 3.96 |
+
+Expert cache hit ratio: none. Every expert is resident, so the cache is off and `/metrics` has no `inference_offload_hit_ratio`. Decode at 4.4 tok/s against the planned 88.7 is the same pipelined path gap as the Qwen4Exp run (3.7 against 36.5, `docs/specrt-qwen4exp.md`): one stream runs through both stages a row at a time. Prefill is slow because KDA prefill runs the recurrent form (the chunked form refuses KDA, see stage 3b).
+
+Greedy text is coherent on all four prompts (`docs/glm5-real/specrt/p0.json` to `p3.json`, 64 tokens each with `logprobs: 20`, `temperature: 0`, `ignore_eos`):
+
+- "The capital of France is": " Paris. In French, Paris is pronounced "pa-REE". You stress the "REE" syllable, ..."
+- "... def fib(n):": " if n <= 1: return n else: return fib(n-1) + fib(n-2) ..."
+- "Explain in two sentences why the sky is blue.": " Use the word "scatter" in your answer. ... the shorter blue wavelengths are scattered more ..."
+- "Q: A train leaves at 3 pm ... When does it arrive?": " Distance = 120 km, Speed = 60 km/h → Time = 120/60 = 2 hours → Arrival = 3 pm + 2 h = 5 pm."
+
+The top logprob of " Paris" is -0.726.
+
+### Against vLLM
+
+Not run yet: the user's vLLM (`~/glm-5.3-flash-uncensored.sh`) was down for this window and only the supervisor starts it. With it up on :8001, the same prompts and the check:
+
+```
+docs/glm5-real/capture.sh http://127.0.0.1:8001 Piecrust/GLM-5.3-Flash-FP4-Abliterated docs/glm5-real/vllm
+python3 docs/glm5-real/compare.py docs/glm5-real/specrt docs/glm5-real/vllm
+```
+
+`compare.py` prints top-1 agreement per prompt, the first divergence and the logprob gap over tokens both have in their top 20 before the first divergence, and passes at 95% top-1, 16 identical leading tokens and a gap under 0.1. vLLM's tok/s comes from its own log for the same requests.
+
+### Load dialog
+
+Walked in headless sway (`inference-bench-ui`, both cards visible, model picked from the model bar). After the describe fix the dialog shows 189.5 GB of weights and 185.4 GB free on 2 GPUs, but the planner blocks the load: it gives the planner 90% of free memory per card (`inventory.rs` `usable`, 166.9 GiB) against 176.9 GiB needed. Filed as #1394 with the screenshots `docs/glm5-real/load-dialog.png` and `load-dialog-mtp-off.png`. The dialog also ticks MTP on, which the engine refuses for this family.
+
 ## Other MoE configs in the fixtures
 
 `from_hf_config_serving` over every `crates/specrt/tests/fixtures/*.config.json` (from the `*.serving.json` goldens, which `tests/golden.rs` checks): every MoE config is accepted except `glm5_next`.
