@@ -230,6 +230,7 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
             Op::AllReduce | Op::AllReduceNorm { .. } => bail!("tensor parallel is not on wgpu"),
             Op::Gemv { .. } | Op::GemvStore { .. } | Op::StepAttention | Op::GdnStep => bail!("the single row cuda plan is not on wgpu"),
             Op::HyperExpand | Op::HyperPre { .. } | Op::HyperPost | Op::HyperMean | Op::PerLayer { .. } => bail!("hyper-connections are not yet on wgpu"),
+            Op::Prelude { .. } | Op::Dit(_) | Op::BlockRes { .. } | Op::LatentNorm => bail!("{} is not supported on the wgpu backend", op.label()),
         }
     }
 }

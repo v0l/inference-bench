@@ -243,7 +243,7 @@ fn direct_flag() -> i32 {
     libc::O_DIRECT
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 fn direct_flag() -> i32 {
     0
 }

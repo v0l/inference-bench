@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::net::{IpAddr, TcpStream};
-use std::os::fd::AsRawFd;
 use std::ptr::null_mut;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -626,7 +625,9 @@ impl RdmaChannel {
         &self.ep.device
     }
 
+    #[cfg(unix)]
     fn peer_alive(&self) -> bool {
+        use std::os::fd::AsRawFd;
         let mut byte = 0u8;
         let n = unsafe { libc::recv(self.tcp.as_raw_fd(), &mut byte as *mut u8 as *mut c_void, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
         if n == 0 {
@@ -637,6 +638,21 @@ impl RdmaChannel {
             return matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted);
         }
         true
+    }
+
+    #[cfg(not(unix))]
+    fn peer_alive(&self) -> bool {
+        let mut byte = [0u8; 1];
+        if self.tcp.set_nonblocking(true).is_err() {
+            return true;
+        }
+        let r = self.tcp.peek(&mut byte);
+        let _ = self.tcp.set_nonblocking(false);
+        match r {
+            Ok(0) => false,
+            Ok(_) => true,
+            Err(e) => matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted),
+        }
     }
 
     fn drain(&mut self) -> Result<bool> {
