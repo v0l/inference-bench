@@ -1,0 +1,52 @@
+kind = "kir-kernel"
+family = "compose"
+name = "dit_table_add"
+threads = 256
+
+[args]
+width = "table_out"
+
+[rows]
+iter = "grid"
+address = "advance"
+per_row = ["out"]
+
+[rows.stride]
+temb = "table_in"
+
+[[param]]
+name = "table"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "temb"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "out"
+role = "activation"
+access = "write"
+
+[[stage]]
+op = "tile_load"
+name = "tab"
+src = "table"
+
+[[stage]]
+op = "tile_load"
+name = "e"
+src = "temb"
+layout = "((table_in,table_rep)):((1,0))"
+at = ["i"]
+
+[[stage]]
+op = "epilogue"
+name = "y"
+expr = "tab + e"
+
+[[stage]]
+op = "tile_store"
+dst = "out"
+value = "y"

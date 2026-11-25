@@ -88,6 +88,8 @@ pub struct DenoiserGraph {
     #[serde(default)]
     pub checks: Vec<String>,
     #[serde(default)]
+    pub positions: String,
+    #[serde(default)]
     pub fields: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub symbols: BTreeMap<String, String>,
@@ -383,6 +385,22 @@ impl DenoiserGraph {
             let from = n.need(&n.input, "in")?;
             let into = n.need(&n.out, "out")?;
             plan.tail.push(Op::Dit(DitOp::Step { from, into, rule: intern(&text), guided }));
+        }
+        Ok(plan)
+    }
+
+    pub fn multistep_plan(&self, m: &crate::sampler::Multistep, combine: &kir::expr::Expr, guided: bool) -> Result<Plan> {
+        let mut plan = self.plan()?;
+        ensure!(!self.step.is_empty(), "the denoiser graph has no [[step]] node");
+        let mut rule = m.assign.iter().map(|(n, e)| format!("{n} = {e}")).collect::<Vec<_>>().join("; ");
+        if guided {
+            rule = format!("v = {combine}; {rule}");
+        }
+        let scalars = multistep_scalars(m, combine, guided);
+        for n in &self.step {
+            ensure!(n.op == "scheduler_step", "[[step]] holds scheduler_step nodes, not {}", n.op);
+            let (from, into) = (n.need(&n.input, "in")?, n.need(&n.out, "out")?);
+            plan.tail.push(Op::Dit(DitOp::MultiStep { from, into, rule: intern(&rule), state: intern(&m.state.join(",")), scalars: intern(&scalars.join(",")), guided }));
         }
         Ok(plan)
     }
@@ -786,11 +804,34 @@ pub struct Shapes {
     pub text: usize,
     pub patch_h: usize,
     pub patch_w: usize,
+    pub frames: usize,
 }
 
 impl Shapes {
+    pub fn image(image: usize, text: usize, patch_h: usize, patch_w: usize) -> Shapes {
+        Shapes { image, text, patch_h, patch_w, frames: 1 }
+    }
+
     pub fn joint(&self) -> usize {
         self.image + self.text
+    }
+
+    pub fn grid_rows(&self) -> usize {
+        self.patch_h * self.frames.max(1)
+    }
+}
+
+pub fn rope_ids(graph: &DenoiserGraph, spec: &DenoiserSpec, sh: &Shapes) -> Vec<i32> {
+    match graph.positions.as_str() {
+        "frames" => crate::denoiser_host::video_ids(sh.frames.max(1), sh.patch_h, sh.patch_w),
+        _ => crate::denoiser_host::grid_ids(sh.text, sh.patch_h, sh.patch_w, spec.axes.len()),
+    }
+}
+
+pub fn attention_segment(graph: &DenoiserGraph, sh: &Shapes) -> usize {
+    match graph.positions.as_str() {
+        "frames" => sh.image,
+        _ => sh.joint(),
     }
 }
 
@@ -818,7 +859,7 @@ pub fn kernel_key(op: &DitOp, graph: &DenoiserGraph, spec: &DenoiserSpec) -> Res
         DitOp::Unpatchify { channels_last: false, .. } => ("dit_unpatchify".into(), "dit_unpatchify".into(), Vec::new()),
         DitOp::Unpatchify { channels_last: true, .. } => ("dit_unpatchify_last".into(), "dit_unpatchify_last".into(), Vec::new()),
         DitOp::Step { guided, .. } => (if guided { "dit_step_cfg" } else { "dit_step" }.into(), "dit_step".into(), Vec::new()),
-        DitOp::MultiStep { guided, .. } => (if guided { "dit_multistep_cfg" } else { "dit_multistep" }.into(), "dit_step".into(), Vec::new()),
+        DitOp::MultiStep { guided, .. } => (if guided { "dit_multistep_cfg" } else { "dit_multistep" }.into(), "dit_multistep".into(), Vec::new()),
         DitOp::TableAdd { from, into, .. } => {
             let (a, b) = (width(from)?, width(into)?);
             (format!("dit_table_add_{a}_{b}"), "dit_table_add".into(), vec![("table_in".into(), a), ("table_out".into(), b), ("table_rep".into(), b / a)])
@@ -855,9 +896,68 @@ pub fn step_description(op: &DitOp, graph: &DenoiserGraph) -> Result<String> {
 
 pub const STEP_SCALARS: [&str; 3] = ["s0", "s1", "g"];
 
+pub fn multistep_scalars(m: &crate::sampler::Multistep, combine: &kir::expr::Expr, guided: bool) -> Vec<String> {
+    let mut names = Vec::new();
+    for (_, e) in &m.assign {
+        e.names(&mut names);
+    }
+    if guided {
+        combine.names(&mut names);
+    }
+    let bound: Vec<&str> = m.assign.iter().map(|(n, _)| n.as_str()).chain(m.state.iter().map(String::as_str)).chain(["x", "v", "c", "u"]).collect();
+    names.retain(|n| !bound.contains(&n.as_str()));
+    names
+}
+
+pub fn multistep_description(op: &DitOp, graph: &DenoiserGraph) -> Result<String> {
+    let DitOp::MultiStep { into, rule, state, scalars, guided, .. } = *op else { bail!("{} is not a multistep", op.label()) };
+    let width = &graph.decl(into).with_context(|| format!("no buffer {into}"))?.cols;
+    let states: Vec<&str> = state.split(',').collect();
+    let scalars: Vec<&str> = scalars.split(',').filter(|s| !s.is_empty()).collect();
+    let rows: Vec<&str> = if guided { vec!["c", "u"] } else { vec!["v"] };
+    let mut per_row: Vec<String> = vec!["p_x".into()];
+    per_row.extend(states.iter().map(|s| format!("p_{s}")));
+    per_row.extend(rows.iter().map(|s| format!("p_{s}")));
+    let mut t = format!("kind = \"kir-kernel\"\nfamily = \"compose\"\nname = \"dit_multistep\"\nthreads = 256\n\n[args]\nwidth = \"{width}\"\n\n[rows]\niter = \"grid\"\naddress = \"advance\"\nper_row = [{}]\n", per_row.iter().map(|p| format!("\"{p}\"")).collect::<Vec<_>>().join(", "));
+    for p in std::iter::once(&"x").chain(&states) {
+        t.push_str(&format!("\n[[param]]\nname = \"p_{p}\"\nrole = \"activation\"\naccess = \"write\"\n"));
+    }
+    for p in rows.iter().chain(&scalars) {
+        t.push_str(&format!("\n[[param]]\nname = \"p_{p}\"\nrole = \"activation\"\naccess = \"read\"\n"));
+    }
+    let mut current: BTreeMap<String, String> = BTreeMap::new();
+    for p in std::iter::once(&"x").chain(&states).chain(&rows) {
+        t.push_str(&format!("\n[[stage]]\nop = \"tile_load\"\nname = \"{p}_0\"\nsrc = \"p_{p}\"\n"));
+        current.insert(p.to_string(), format!("{p}_0"));
+    }
+    for s in &scalars {
+        t.push_str(&format!("\n[[stage]]\nop = \"tile_load\"\nname = \"{s}_0\"\nsrc = \"p_{s}\"\nlayout = \"(width):(0)\"\nat = [\"i\"]\n"));
+        current.insert(s.to_string(), format!("{s}_0"));
+    }
+    let mut version: BTreeMap<String, usize> = BTreeMap::new();
+    let mut bind = |name: &str, e: &kir::expr::Expr, t: &mut String, current: &mut BTreeMap<String, String>| -> Result<()> {
+        let e = e.subst(&|n| current.get(n).map(|s| kir::expr::Expr::Name(s.clone()))).map_err(anyhow::Error::msg)?;
+        let v = version.entry(name.to_string()).or_insert(0);
+        *v += 1;
+        let ssa = format!("{name}_{v}");
+        t.push_str(&format!("\n[[stage]]\nop = \"epilogue\"\nname = \"{ssa}\"\nexpr = \"{e}\"\nmaterialize = \"cuda\"\n"));
+        current.insert(name.to_string(), ssa);
+        Ok(())
+    };
+    for part in rule.split(';') {
+        let (n, e) = part.split_once('=').with_context(|| format!("multistep assignment {part:?}"))?;
+        let e = kir::expr::Expr::parse(e.trim()).map_err(anyhow::Error::msg)?;
+        bind(n.trim(), &e, &mut t, &mut current)?;
+    }
+    for p in std::iter::once(&"x").chain(&states) {
+        t.push_str(&format!("\n[[stage]]\nop = \"tile_store\"\ndst = \"p_{p}\"\nvalue = \"{}\"\n", current[*p]));
+    }
+    Ok(t)
+}
+
 pub fn described_kernels(graph: &DenoiserGraph, spec: &DenoiserSpec, plan: &Plan, shapes: &Shapes, target: &kir::Target) -> Result<Vec<kir::Kernel>> {
     let registry = crate::kir_kernel::Registry::active();
-    let base = spec.kir_shape().num("patch_h", shapes.patch_h as f64).num("patch_w", shapes.patch_w as f64).num("grid_elems", (shapes.image * spec.size("in_channels")?) as f64);
+    let base = spec.kir_shape().num("patch_h", shapes.grid_rows() as f64).num("patch_w", shapes.patch_w as f64).num("grid_elems", (shapes.image * spec.size("in_channels")?) as f64);
     let mut out: BTreeMap<String, kir::Kernel> = BTreeMap::new();
     for op in plan.head.iter().chain(plan.blocks.iter().flat_map(|b| &b.ops)).chain(&plan.tail) {
         let Op::Dit(d) = op else { continue };
@@ -869,8 +969,8 @@ pub fn described_kernels(graph: &DenoiserGraph, spec: &DenoiserSpec, plan: &Plan
         for (k, v) in &extra {
             shape = shape.num(k, *v);
         }
-        if desc == "dit_step" {
-            let text = step_description(d, graph)?;
+        if desc == "dit_step" || desc == "dit_multistep" {
+            let text = if desc == "dit_step" { step_description(d, graph)? } else { multistep_description(d, graph)? };
             let k = kir::desc::Description::parse(&text).map_err(anyhow::Error::msg)?.build(target, &shape).map_err(anyhow::Error::msg)?.renamed(&name);
             out.insert(name, k);
             continue;

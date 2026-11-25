@@ -404,7 +404,7 @@ impl ImageModel {
         let scale = p.values["vae_scale"] as usize;
         let patch = p.values["latent_patch"] as usize;
         let d = Dims { t: 1, h: job.height / scale, w: job.width / scale };
-        let shapes = crate::denoiser::Shapes { image: (d.h / patch) * (d.w / patch), text: self.prompts.max_length(p), patch_h: d.h / patch, patch_w: d.w / patch };
+        let shapes = crate::denoiser::Shapes::image((d.h / patch) * (d.w / patch), self.prompts.max_length(p), d.h / patch, d.w / patch);
         let spec = crate::denoiser::DenoiserSpec::from_pipeline(&self.dir)?;
         let graph = crate::denoiser::DenoiserGraph::embedded();
         let weights = crate::denoiser_cuda::weight_bytes(&self.dir)?;

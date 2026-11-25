@@ -239,7 +239,7 @@ impl Generator {
         if opts.offload_vae {
             self.vae = None;
         }
-        let shapes = Shapes { image, text, patch_h: ph, patch_w: pw };
+        let shapes = Shapes::image(image, text, ph, pw);
         let sequential = guided && plan.sequential_cfg;
         let channels = p.values["token_channels"] as usize;
         let grid = noise(req.seed, image * channels);

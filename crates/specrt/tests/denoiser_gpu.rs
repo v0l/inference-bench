@@ -48,7 +48,7 @@ fn denoiser() -> Denoiser {
     let stream = ctx.new_stream().unwrap();
     let dir = std::env::temp_dir().join(format!("specrt-denoiser-{}", std::process::id()));
     let jit = Jit::new(ctx, dir).unwrap();
-    Denoiser::load(&stream, &jit, &fixture(), Shapes { image: 64, text: 16, patch_h: 8, patch_w: 8 }).unwrap()
+    Denoiser::load(&stream, &jit, &fixture(), Shapes::image(64, 16, 8, 8)).unwrap()
 }
 
 fn joint_rows(x: &[f32], h: usize) -> Vec<f32> {

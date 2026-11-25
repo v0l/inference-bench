@@ -107,6 +107,31 @@ fn a_rope_on_the_wrong_axes_fails_the_reference() {
 }
 
 #[test]
+fn every_wan_kernel_builds_from_a_description_and_compiles_with_nvrtc() {
+    let graph = DenoiserGraph::for_pipeline(&fixture()).unwrap();
+    let spec = DenoiserSpec::from_pipeline(&fixture()).unwrap();
+    let p = specrt::sampler::Pipeline::from_dir(&fixture()).unwrap();
+    let shapes = denoiser::Shapes { image: 48, text: 16, patch_h: 4, patch_w: 4, frames: 3 };
+    let t = kir::Target::sm_120();
+    for guided in [false, true] {
+        let plan = graph.multistep_plan(p.multistep.as_ref().unwrap(), &p.combine, guided).unwrap();
+        denoiser::validate(graph, &spec, &plan).unwrap();
+        let kernels = denoiser::described_kernels(graph, &spec, &plan, &shapes, &t).unwrap();
+        let names: Vec<&str> = kernels.iter().map(|k| k.name).collect();
+        let step = if guided { "dit_multistep_cfg" } else { "dit_multistep" };
+        for want in ["dit_layernorm", "dit_modulate", "dit_unpatchify_last", "dit_table_add_288_288", "dit_table_add_48_96", step] {
+            assert!(names.contains(&want), "{want} missing from {names:?}");
+        }
+        let src = kir::cuda::emit_module(&kernels).unwrap();
+        specrt::jit::cubin_for(&src, "sm_120", 1).unwrap_or_else(|e| panic!("compose: {e:#}\n{src}"));
+    }
+    let vk = kir::vision::VisionKernel::new(&t, spec.size("head_dim").unwrap(), true).unwrap().joint();
+    let vision = kir::cuda::emit_vision(&vk).unwrap();
+    assert!(vision.contains("vis_qk_pack(") && vision.contains("vis_flash_kv("));
+    specrt::jit::cubin_for(&vision, "sm_120", 1).unwrap();
+}
+
+#[test]
 fn the_wan_text_keys_and_values_are_step_invariant() {
     let graph = DenoiserGraph::for_pipeline(&fixture()).unwrap();
     let spec = DenoiserSpec::from_pipeline(&fixture()).unwrap();

@@ -1,0 +1,103 @@
+kind = "kir-kernel"
+family = "compose"
+name = "dit_layernorm"
+threads = 256
+
+[args]
+width = "hidden"
+
+[rows]
+iter = "block"
+address = "advance"
+per_row = ["x"]
+
+[rows.stride]
+out_hi = "hidden"
+out_lo = "hidden"
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "gamma"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "beta"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "out_hi"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "out_lo"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[const]]
+name = "eps"
+value = "norm_eps"
+
+[[stage]]
+op = "tile_load"
+name = "v"
+src = "x"
+
+[[stage]]
+op = "block_sum"
+name = "total"
+expr = "v"
+
+[[stage]]
+op = "epilogue"
+name = "mean"
+expr = "total / width"
+
+[[stage]]
+op = "tile_load"
+name = "w"
+src = "x"
+
+[[stage]]
+op = "block_sum"
+name = "spread"
+expr = "(w - mean) * (w - mean)"
+
+[[stage]]
+op = "epilogue"
+name = "inv"
+expr = "rsqrt(spread / width + eps)"
+
+[[stage]]
+op = "tile_load"
+name = "u"
+src = "x"
+
+[[stage]]
+op = "tile_load"
+name = "g"
+src = "gamma"
+
+[[stage]]
+op = "tile_load"
+name = "b"
+src = "beta"
+
+[[stage]]
+op = "epilogue"
+name = "y"
+expr = "(u - mean) * inv * g + b"
+
+[[stage]]
+op = "split_store"
+dst = "out_hi"
+lo = "out_lo"
+value = "y"

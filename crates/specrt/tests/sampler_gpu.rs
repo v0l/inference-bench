@@ -176,7 +176,7 @@ fn the_euler_epilogue_on_proj_out_equals_the_unfused_step() {
     let stream = ctx.default_stream();
     let p = Pipeline::from_dir(&fixture()).unwrap();
     let rule = p.step_rule(false).unwrap();
-    let shapes = Shapes { image: 64, text: 16, patch_h: 8, patch_w: 8 };
+    let shapes = Shapes::image(64, 16, 8, 8);
     let d = Denoiser::load_with(&stream, &jit, &fixture(), shapes, &rule, false).unwrap();
     assert!(d.fused_step);
     let sched = p.schedule(3, 64).unwrap();
@@ -205,7 +205,7 @@ fn the_euler_epilogue_on_proj_out_equals_the_unfused_step() {
 fn two_sequences_in_one_forward_equal_two_single_forwards() {
     let (ctx, jit) = gpu();
     let stream = ctx.default_stream();
-    let shapes = Shapes { image: 64, text: 16, patch_h: 8, patch_w: 8 };
+    let shapes = Shapes::image(64, 16, 8, 8);
     let rule = Pipeline::from_dir(&fixture()).unwrap().step_rule(true).unwrap();
     let d = Denoiser::load_with(&stream, &jit, &fixture(), shapes.clone(), &rule, true).unwrap();
     let (cond, uncond) = (floats("text.embeds"), floats("negative.embeds"));

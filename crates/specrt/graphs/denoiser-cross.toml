@@ -1,6 +1,7 @@
 name = "cross-dit"
 kind = "denoiser-graph"
 classes = ["WanTransformer3DModel"]
+positions = "frames"
 checks = ["frame_patch == 1", "latent_patch == 2"]
 
 [fields]

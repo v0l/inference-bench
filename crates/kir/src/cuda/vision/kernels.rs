@@ -303,7 +303,42 @@ pub fn pool_kernel() -> String {
 
 pub fn joint_kernels() -> String {
     format!(
-        r#"extern "C" __global__ void vis_axis_rope(const float* qkv, const float* qw_text, const float* kw_text, const float* qw_image, const float* kw_image,
+        r#"extern "C" __global__ void vis_qk_pack(const float* src, int row_stride, const float* n0, const float* n1, const float* n2,
+                                       const float* cosv, const float* sinv, bf16_t* out, int tokens, int heads, int head_dim,
+                                       int parts, float eps, int rope) {{
+    __shared__ float red[32];
+    int tok = blockIdx.x;
+    int hidden = heads * head_dim;
+    size_t plane = (size_t)heads * tokens * AT_HDP;
+    for (int part = 0; part < parts; part++) {{
+        const float* s = src + (size_t)tok * row_stride + (size_t)part * hidden;
+        const float* w = part == 0 ? n0 : (part == 1 ? n1 : n2);
+        float ss = 0.0f;
+        for (int c = threadIdx.x; c < hidden; c += blockDim.x) ss += s[c] * s[c];
+        float inv = rsqrtf(block_sum(ss, red) / hidden + eps);
+        for (int i = threadIdx.x; i < heads * AT_HDP; i += blockDim.x) {{
+            int h = i / AT_HDP, d = i % AT_HDP;
+            float v = 0.0f;
+            if (d < head_dim) {{
+                int c = h * head_dim + d;
+                v = w ? s[c] * inv * w[c] : s[c];
+                if (rope && part < 2) {{
+                    int c2 = c ^ 1;
+                    float o = w ? s[c2] * inv * w[c2] : s[c2];
+                    float cs = cosv[(size_t)tok * head_dim + d];
+                    float sn = sinv[(size_t)tok * head_dim + d];
+                    v = (d & 1) ? v * cs + o * sn : v * cs - o * sn;
+                }}
+            }}
+            size_t at = (size_t)(2 * part) * plane + ((size_t)h * tokens + tok) * AT_HDP + d;
+            unsigned b = f16_bits(v);
+            out[at] = (bf16_t)b;
+            if (ATT_SPLIT) out[at + plane] = (bf16_t)f16_bits(v - f16_float(b));
+        }}
+    }}
+}}
+
+extern "C" __global__ void vis_axis_rope(const float* qkv, const float* qw_text, const float* kw_text, const float* qw_image, const float* kw_image,
                                          const float* cosv, const float* sinv, bf16_t* planes, int tokens, int heads, int head_dim,
                                          int row_stride, int text_rows, float eps, int seq_rows) {{
     __shared__ float red[32];
@@ -335,6 +370,28 @@ pub fn joint_kernels() -> String {
         norm = prim::head_rms_inv("ss", "src", "head_dim", "red", "inv", "eps"),
         rotate = prim::table_rotate("src", "inv", "w", "cosv", "sinv", "tok", "head_dim"),
     )
+}
+
+pub fn cross_attention_kernel(k: &VisionKernel) -> Result<String, String> {
+    let all = attention_kernels(k);
+    let start = all.find("extern \"C\" __global__ void __launch_bounds__(32 * AT_WARPS) vis_flash(").ok_or("no vis_flash entry")?;
+    let mut text = all[start..].to_string();
+    let swaps = [
+        ("vis_flash(const bf16_t* planes, const int* seg_lo, const int* seg_hi,", "vis_flash_kv(const bf16_t* planes, const bf16_t* kv, int kv_tokens, int q_seq, int k_seq,"),
+        ("    size_t plane = (size_t)heads * tokens * AT_HDP;\n", "    size_t plane = (size_t)heads * tokens * AT_HDP;\n    size_t kv_plane = (size_t)heads * kv_tokens * AT_HDP;\n"),
+        ("int lo0 = row0 < tokens ? seg_lo[row0] : 0, hi0 = row0 < tokens ? seg_hi[row0] : 0;", "int lo0 = row0 < tokens ? row0 / q_seq * k_seq : 0, hi0 = row0 < tokens ? lo0 + k_seq : 0;"),
+        ("int lo1 = row1 < tokens ? seg_lo[row1] : 0, hi1 = row1 < tokens ? seg_hi[row1] : 0;", "int lo1 = row1 < tokens ? row1 / q_seq * k_seq : 0, hi1 = row1 < tokens ? lo1 + k_seq : 0;"),
+        ("int kstart = seg_lo[q0];", "int kstart = q0 / q_seq * k_seq;"),
+        ("int kend = seg_hi[min(q0 + AT_BQ, tokens) - 1];", "int kend = (min(q0 + AT_BQ, tokens) - 1) / q_seq * k_seq + k_seq;"),
+        ("const bf16_t* src = head_base + (size_t)(2 + p) * plane + (size_t)min(key, tokens - 1) * AT_HDP + c * 8;", "const bf16_t* src = kv + (size_t)head * kv_tokens * AT_HDP + (size_t)p * kv_plane + (size_t)min(key, kv_tokens - 1) * AT_HDP + c * 8;"),
+    ];
+    for (from, to) in swaps {
+        if !text.contains(from) {
+            return Err(format!("the flash kernel has no {from:?}"));
+        }
+        text = text.replacen(from, to, 1);
+    }
+    Ok(text)
 }
 
 pub fn tiled_kernels() -> String {

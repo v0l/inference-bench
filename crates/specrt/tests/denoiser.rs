@@ -121,7 +121,7 @@ fn sampling_plan(guided: bool) -> specrt::plan::Plan {
 fn every_denoiser_kernel_builds_from_a_description_and_emits() {
     let graph = DenoiserGraph::embedded();
     let s = spec();
-    let shapes = denoiser::Shapes { image: 64, text: 16, patch_h: 8, patch_w: 8 };
+    let shapes = denoiser::Shapes::image(64, 16, 8, 8);
     let mut src = String::new();
     for guided in [false, true] {
         let kernels = denoiser::described_kernels(graph, &s, &sampling_plan(guided), &shapes, &kir::Target::sm_120()).unwrap();
@@ -195,7 +195,7 @@ fn the_denoiser_modules_compile_with_nvrtc_for_sm_120() {
     let graph = DenoiserGraph::embedded();
     let s = spec();
     let plan = sampling_plan(true);
-    let shapes = denoiser::Shapes { image: 64, text: 16, patch_h: 8, patch_w: 8 };
+    let shapes = denoiser::Shapes::image(64, 16, 8, 8);
     let t = kir::Target::sm_120();
     let kernels = denoiser::described_kernels(graph, &s, &plan, &shapes, &t).unwrap();
     let compose = kir::cuda::emit_module(&kernels).unwrap();
