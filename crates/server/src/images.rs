@@ -161,14 +161,14 @@ fn usage(out: &MediaOutput) -> Value {
 
 async fn start(state: &Arc<AppState>, req: &ImageRequest) -> Result<(String, mpsc::UnboundedReceiver<Update>, CancelOnDrop), ApiError> {
     let ticket = state.images.admit(state.config.retry_after_secs)?;
-    start_job(state, req.model.as_deref(), req.job.clone(), ticket).await
+    start_job(state, req.model.as_deref(), req.job.clone(), ticket, None).await
 }
 
 pub(crate) fn admit(state: &Arc<AppState>) -> Result<Ticket, ApiError> {
     state.images.admit(state.config.retry_after_secs)
 }
 
-pub(crate) async fn start_job(state: &Arc<AppState>, model: Option<&str>, job: MediaJob, ticket: Ticket) -> Result<(String, mpsc::UnboundedReceiver<Update>, CancelOnDrop), ApiError> {
+pub(crate) async fn start_job(state: &Arc<AppState>, model: Option<&str>, job: MediaJob, ticket: Ticket, seconds: Option<f64>) -> Result<(String, mpsc::UnboundedReceiver<Update>, CancelOnDrop), ApiError> {
     let model = state.manager.requested_model(model)?;
     let flag = Arc::new(AtomicBool::new(false));
     let guard = CancelOnDrop::new(flag.clone());
@@ -206,8 +206,12 @@ pub(crate) async fn start_job(state: &Arc<AppState>, model: Option<&str>, job: M
                     job.width = w;
                     job.height = h;
                 }
-                if job.kind == ModelKind::Video && job.frames.is_none() {
-                    job.frames = Some(i.default_frames);
+                if job.kind == ModelKind::Video {
+                    match seconds {
+                        Some(s) => job.frames = Some(crate::videos::frames_for(s, job.fps.unwrap_or(i.fps), i.frame_step)),
+                        None if job.frames.is_none() => job.frames = Some(i.default_frames),
+                        None => {}
+                    }
                 }
                 i.check(&job).map_err(|e| ApiError::bad_request(e.to_string()))
             }

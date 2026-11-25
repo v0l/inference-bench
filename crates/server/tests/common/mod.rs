@@ -245,6 +245,20 @@ impl Rig {
         collect(req.send_json(&body))
     }
 
+    pub fn get_bytes(&self, path: &str) -> (u16, Vec<u8>, Vec<(String, String)>) {
+        match agent().get(format!("{}{path}", self.url)).call() {
+            Ok(mut r) => {
+                let headers = r.headers().iter().map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string())).collect();
+                (r.status().as_u16(), r.body_mut().read_to_vec().unwrap(), headers)
+            }
+            Err(e) => panic!("GET {path}: {e}"),
+        }
+    }
+
+    pub fn delete(&self, path: &str) -> (u16, String, Vec<(String, String)>) {
+        collect(agent().delete(format!("{}{path}", self.url)).call())
+    }
+
     pub fn raw_post(&self, path: &str, body: &str) -> TcpStream {
         let addr = self.handle.as_ref().unwrap().addr;
         let mut s = TcpStream::connect(addr).unwrap();

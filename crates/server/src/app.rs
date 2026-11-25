@@ -40,6 +40,7 @@ pub struct AppState {
     access_log: Option<Mutex<std::fs::File>>,
     pub started: Instant,
     pub images: Arc<crate::images::Gate>,
+    pub videos: crate::videos::Jobs,
 }
 
 impl AppState {
@@ -69,6 +70,7 @@ impl AppState {
             access_log,
             started: Instant::now(),
             images: Arc::new(crate::images::Gate::new(config.images.jobs_per_gpu, config.images.queue_depth)),
+            videos: crate::videos::Jobs::default(),
             config,
         }))
     }
@@ -165,6 +167,10 @@ fn api_routes() -> Vec<(ApiRoute, MethodRouter<Arc<AppState>>)> {
         (r("POST", "/v1/completions", "Text completions"), post(completions)),
         (r("POST", "/v1/images/generations", "Image generation (OpenAI), b64_json or url, stream for step progress"), post(crate::images::generations)),
         (r("GET", "/v1/images/files/{name}", "A generated image served for a short time after a url response"), get(crate::images::file)),
+        (r("POST", "/v1/videos", "Video generation (OpenAI Videos), an async job: poll it, then fetch the MP4"), post(crate::videos::create)),
+        (r("GET", "/v1/videos/{id}", "A video job's status, progress by step and decoded frame"), get(crate::videos::get_one)),
+        (r("DELETE", "/v1/videos/{id}", "Cancel a running video job or delete a finished one"), delete(crate::videos::delete)),
+        (r("GET", "/v1/videos/{id}/content", "The finished video as H.264 MP4"), get(crate::videos::content)),
         (r("POST", "/v1/messages", "Anthropic Messages, streaming, tools, thinking"), post(crate::dialects::messages)),
         (r("POST", "/v1/responses", "OpenAI Responses (stateless), streaming, function tools"), post(crate::dialects::responses)),
         (r("POST", "/v1/messages/count_tokens", "Anthropic token estimate"), post(crate::dialects::count_tokens)),
@@ -188,8 +194,15 @@ fn api_routes() -> Vec<(ApiRoute, MethodRouter<Arc<AppState>>)> {
 
 pub fn router(state: Arc<AppState>) -> Router {
     let mut app = Router::new();
+    let mut merged: Vec<(&'static str, MethodRouter<Arc<AppState>>)> = Vec::new();
     for (route, handler) in api_routes() {
-        app = app.route(route.path, handler);
+        match merged.iter_mut().find(|(p, _)| *p == route.path) {
+            Some((_, h)) => *h = std::mem::take(h).merge(handler),
+            None => merged.push((route.path, handler)),
+        }
+    }
+    for (path, handler) in merged {
+        app = app.route(path, handler);
     }
     let mut app = app
         .layer(axum::extract::DefaultBodyLimit::max(state.config.media.request_body_limit()))
@@ -274,6 +287,8 @@ fn endpoint_label(path: &str) -> &'static str {
         "/v1/completions" => "completions",
         "/v1/images/generations" => "images_generations",
         p if p.starts_with("/v1/images/files/") => "images_files",
+        "/v1/videos" => "videos",
+        p if p.starts_with("/v1/videos/") => "videos_job",
         "/v1/messages" => "messages",
         "/v1/messages/count_tokens" => "count_tokens",
         "/v1/responses" => "responses",

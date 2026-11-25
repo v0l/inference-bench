@@ -4,6 +4,8 @@ pub const CHAT: u8 = 1;
 pub const COMPLETIONS: u8 = 2;
 pub const BENCH: u8 = 4;
 pub const IMAGES: u8 = 8;
+pub const VIDEOS: u8 = 16;
+const MEDIA: u8 = IMAGES | VIDEOS;
 const GENERATE: u8 = CHAT | COMPLETIONS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,20 +40,23 @@ const fn f(name: &'static str, on: u8, usage: Usage, ty: &'static str, note: &'s
 }
 
 pub const FIELDS: &[Field] = &[
-    f("model", CHAT | COMPLETIONS | BENCH | IMAGES, Usage::Read, "string", "a configured model id or served name; defaults to the only model"),
-    f("size", IMAGES, Usage::Validated, "string", "WIDTHxHEIGHT, a multiple of the model's pixel step; refused with the nearest valid size; auto takes the family default"),
+    f("model", CHAT | COMPLETIONS | BENCH | MEDIA, Usage::Read, "string", "a configured model id or served name; defaults to the only model"),
+    f("size", MEDIA, Usage::Validated, "string", "WIDTHxHEIGHT, a multiple of the model's pixel step; refused with the nearest valid size; auto or absent takes the family default"),
     f("output_format", IMAGES, Usage::Validated, "string", "png only"),
-    f("negative_prompt", IMAGES, Usage::Read, "string", "extension; used when guidance turns on classifier free guidance"),
-    f("steps", IMAGES, Usage::Read, "integer", "extension, 1 to 200; defaults to the pipeline's steps"),
-    f("guidance", IMAGES, Usage::Read, "number", "extension, 0 to 30; defaults to the pipeline's guidance"),
-    f("sampler", IMAGES, Usage::Validated, "string", "extension; one of the family's samplers"),
+    f("negative_prompt", MEDIA, Usage::Read, "string", "extension; used when guidance turns on classifier free guidance"),
+    f("steps", MEDIA, Usage::Read, "integer", "extension, 1 to 200; defaults to the pipeline's steps"),
+    f("guidance", MEDIA, Usage::Read, "number", "extension, 0 to 30; defaults to the pipeline's guidance"),
+    f("sampler", MEDIA, Usage::Validated, "string", "extension; one of the family's samplers"),
+    f("seconds", VIDEOS, Usage::Read, "string or number", "clip length; becomes the nearest frame count the video VAE takes at fps"),
+    f("frames", VIDEOS, Usage::Read, "integer", "extension; 1 plus a multiple of the VAE's temporal step, wins over seconds"),
+    f("fps", VIDEOS, Usage::Read, "integer", "extension, 1 to 120; the MP4 frame rate, defaults to the family's fps"),
     f("partial_images", IMAGES, Usage::Read, "integer", "with stream, a low resolution preview every k steps"),
     f("quality", IMAGES, Usage::Ignored, "string", "accepted and ignored"),
     f("style", IMAGES, Usage::Ignored, "string", "accepted and ignored"),
     f("background", IMAGES, Usage::Ignored, "string", "accepted and ignored"),
     f("moderation", IMAGES, Usage::Ignored, "string", "accepted and ignored"),
     f("messages", CHAT, Usage::Read, "array", "non-empty; text content only, images and video go through content parts when the model has vision"),
-    f("prompt", COMPLETIONS | IMAGES, Usage::Read, "string", "one prompt; batched prompts are refused"),
+    f("prompt", COMPLETIONS | MEDIA, Usage::Read, "string", "one prompt; batched prompts are refused"),
     f("prompts", BENCH, Usage::Read, "array", "non-empty array of strings"),
     f("repeat", BENCH, Usage::Read, "integer", "1 to 100"),
     f("max_tokens", CHAT | COMPLETIONS | BENCH, Usage::Read, "integer", "at least 1"),
@@ -60,7 +65,7 @@ pub const FIELDS: &[Field] = &[
     f("top_p", GENERATE, Usage::Read, "number", ""),
     f("top_k", GENERATE, Usage::Read, "integer", "extension"),
     f("min_p", GENERATE, Usage::Read, "number", "extension"),
-    f("seed", GENERATE | IMAGES, Usage::Read, "integer", "on images the same seed gives the same image, image i of n uses seed + i"),
+    f("seed", GENERATE | MEDIA, Usage::Read, "integer", "on images the same seed gives the same image, image i of n uses seed + i; on videos the same seed gives the same clip"),
     f("stop", GENERATE, Usage::Read, "string or array of strings", ""),
     f("stream", GENERATE | IMAGES, Usage::Read, "boolean", "on images: server sent events image_generation.progress, image_generation.partial_image, image_generation.completed"),
     f("stream_options", GENERATE, Usage::Read, "object", "include_usage"),
@@ -79,7 +84,7 @@ pub const FIELDS: &[Field] = &[
     f("response_format", GENERATE | IMAGES, Usage::Validated, "object or string", "chat and completions: json_object, json_schema, needs the batched engine; images: b64_json (default) or url, served from /v1/images/files for images.file_ttl_secs"),
     f("frequency_penalty", GENERATE, Usage::ZeroOnly, "number", "only 0 or null is accepted"),
     f("presence_penalty", GENERATE, Usage::ZeroOnly, "number", "only 0 or null is accepted"),
-    f("user", GENERATE | IMAGES, Usage::Ignored, "string", "accepted and ignored"),
+    f("user", GENERATE | MEDIA, Usage::Ignored, "string", "accepted and ignored"),
     f("parallel_tool_calls", GENERATE, Usage::Ignored, "boolean", "accepted and ignored"),
     f("store", GENERATE, Usage::Ignored, "boolean", "accepted and ignored"),
     f("metadata", GENERATE, Usage::Ignored, "object", "accepted and ignored"),
@@ -99,6 +104,7 @@ fn endpoint_of(method: &str, path: &str) -> u8 {
         ("POST", "/v1/completions") => COMPLETIONS,
         ("POST", "/v1/bench") => BENCH,
         ("POST", "/v1/images/generations") => IMAGES,
+        ("POST", "/v1/videos") => VIDEOS,
         _ => 0,
     }
 }
@@ -135,7 +141,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     fn read_by_handlers() -> BTreeSet<String> {
-        let source = concat!(include_str!("app.rs"), include_str!("images.rs"));
+        let source = concat!(include_str!("app.rs"), include_str!("images.rs"), include_str!("videos.rs"));
         let mut names = BTreeSet::new();
         let marker = "body[\"";
         for (at, _) in source.match_indices(marker) {
@@ -164,7 +170,7 @@ mod tests {
     fn field_names_are_unique_and_every_generate_endpoint_has_fields() {
         let names: BTreeSet<&str> = FIELDS.iter().map(|f| f.name).collect();
         assert_eq!(names.len(), FIELDS.len());
-        for on in [CHAT, COMPLETIONS, BENCH, IMAGES] {
+        for on in [CHAT, COMPLETIONS, BENCH, IMAGES, VIDEOS] {
             assert!(!fields_json(on).as_array().unwrap().is_empty());
         }
     }

@@ -8,6 +8,7 @@ pub mod engine_backend;
 pub mod error;
 pub mod gpu;
 pub mod images;
+pub mod videos;
 pub mod landing;
 pub mod manager;
 pub mod metrics;

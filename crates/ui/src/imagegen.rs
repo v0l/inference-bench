@@ -107,7 +107,7 @@ impl GenerateState {
                     r.step = step;
                     r.steps = steps;
                 }
-                MediaUpdate::Event(MediaEvent::Preview { .. }) => {}
+                MediaUpdate::Event(MediaEvent::Preview { .. } | MediaEvent::Frames { .. }) => {}
                 MediaUpdate::Done(o) => finished = Some(Ok(o)),
                 MediaUpdate::Failed(e) => finished = Some(Err(e.message)),
             }

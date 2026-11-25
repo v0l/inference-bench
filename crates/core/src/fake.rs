@@ -431,6 +431,10 @@ pub fn tiny_pipeline() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures/tiny-flux2-klein")
 }
 
+pub fn tiny_video_pipeline() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures/tiny-wan21")
+}
+
 pub struct FakeImage {
     pub info: specrt::media::MediaInfo,
     pub step_ms: u64,
@@ -487,6 +491,31 @@ impl crate::native::Model for FakeImage {
         let started = std::time::Instant::now();
         let steps = job.steps.unwrap_or(self.info.default_steps);
         let mut out = specrt::media::MediaOutput::default();
+        if job.kind == specrt::media::ModelKind::Video {
+            for step in 1..=steps {
+                thread::sleep(Duration::from_millis(self.step_ms));
+                if !on_event(specrt::media::MediaEvent::Progress { image: 0, step, steps }) {
+                    return Err(specrt::generate::Cancelled.into());
+                }
+            }
+            let total = job.frames.unwrap_or(self.info.default_frames);
+            let frames: Vec<specrt::media::Picture> = (0..total).map(|f| specrt::media::Picture { width: job.width, height: job.height, rgb: Self::pixels(job.seed ^ f as u64, job.width, job.height), seed: job.seed }).collect();
+            for done in 1..=total {
+                if !on_event(specrt::media::MediaEvent::Frames { done, total }) {
+                    return Err(specrt::generate::Cancelled.into());
+                }
+            }
+            let fps = job.fps.unwrap_or(self.info.fps);
+            let rgb: Vec<Vec<u8>> = frames.iter().map(|p| p.rgb.clone()).collect();
+            out.mp4 = Some(specrt::mp4::encode(&rgb, job.width, job.height, fps)?.mp4());
+            out.fps = fps;
+            out.images = frames.first().cloned().into_iter().collect();
+            out.frames = Some(vec![frames]);
+            out.steps = steps;
+            out.step_secs = started.elapsed().as_secs_f64();
+            out.total_secs = out.step_secs;
+            return Ok(out);
+        }
         for i in 0..job.n {
             let seed = job.seed.wrapping_add(i as u64);
             for step in 1..=steps {
