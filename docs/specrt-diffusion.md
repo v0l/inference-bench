@@ -354,6 +354,43 @@ Real UI walk (headless sway, `inference-bench-ui` from this branch, the tiny fix
 
 Not done here: the real klein 4B has not been loaded (it needs the 16 GB download and a supervisor GPU window); the Euler sampler is the only one. Partial images are a min-max view of the packed latent tokens (one pixel per latent token, a pixel step square of the image), not a VAE decode.
 
+## 7d. Text to video (#1286, landed)
+
+Wan 2.1 T2V from a prompt to an MP4 on the engine, with no per-architecture Rust:
+
+- Denoiser: a second graph file, `graphs/denoiser-cross.toml`, picked by the transformer class (`DenoiserGraph::for_class`, `classes = ["WanTransformer3DModel"]`). New ops: `table_add` (per block `scale_shift_table` plus the shared `time_proj`), `layer_norm` (affine, for `norm2`), `pack` (RMS norm across all heads, optional 3 axis table rope, split into attention planes), `attention` on image rows only, `cross_attention` (image queries against a per block `cross_kv` buffer), linears with bias and a GELU-tanh epilogue, and a channels last `unpatchify`. The rope axes come from `[symbols]` (`axis_0` 44, `axis_1` 42, `axis_2` 42 for head_dim 128), the positions from `positions = "frames"` (t, h, w per token). Kernels: `vis_qk_pack` and `vis_flash_kv` in the kir vision family (the flash kernel with a second key and value source and per sequence key ranges), compose descriptions `dit_table_add`, `dit_layernorm`, `dit_unpatchify_last`.
+- H1 hoist per block: `denoiser::block_invariant` finds that each block's text K and V projection and their pack read only step invariant values, so they run once per request into `cross_kv` (30 blocks x 512 tokens, 0.19 GB at the real size) and are skipped every step.
+- Scheduler: `graphs/pipeline.toml` entry `unipc` (`UniPCMultistepScheduler`, `bh2`, order 2, flow sigmas, `require` and `refuse` guards on the scheduler config). `[pipeline.multistep]` declares the state (`last`, `m1`, `m2`), the per step scalars as host expressions (lambda, h, the rho coefficients, the corrector weights) and the update as assignments. `DenoiserGraph::multistep_plan` lowers it to one `MultiStep` op whose compose kernel is generated from the assignments; the host path (`step_host_state`) runs the same data.
+- Text encoder: `graphs/encoder.toml` describes the T5 encoder (RMS norm, relative position buckets as an expression, gated GELU), run by `specrt::encoder::HostEncoder` on the CPU. The GPU lowering is #1406.
+- VAE: the causal 3D decoder from #1283, one latent frame at a time with the per conv frame cache, reporting each decoded frame. Spatial tiles apply to every frame.
+- Output: `specrt::mp4` encodes H.264 with `openh264` (new dependency: it builds the Cisco encoder from source, so no system ffmpeg is needed at run time) and writes the MP4 box tree itself (ftyp, mdat, moov with avcC, stts at the requested fps, stss for IDR frames).
+- Serving: `POST /v1/videos`, `GET /v1/videos/{id}`, `GET /v1/videos/{id}/content`, `DELETE /v1/videos/{id}` (crates/server/src/videos.rs) on the same media job, gate and queue as images (`images.jobs_per_gpu`, `images.queue_depth`, 429 with `Retry-After` when full). `seconds` becomes the nearest frame count the VAE takes at `fps` (5 s at 16 fps is 81 frames). Progress is 90% denoising steps and 10% decoded frames. `DELETE` on a running job cancels it between steps.
+- Family: `specs/family-wan.toml` (`kind = "video"`, frames, default 81, fps 16). Spec format 21.
+
+Tolerances (tiny fixture, GPU1, against diffusers with the transformer rounded to bf16): velocities 8e-6 per step, cond and uncond batched; latents after 3 UniPC steps 2.6e-5; decoded video 1.2e-7 (PSNR 150.8 dB); sequential guidance against batched 1.2e-7. Host plan in f32 against diffusers f32: velocities under 1e-4. T5 embeddings 1e-5. The served MP4 decoded by ffmpeg against the reference video: PSNR 39.7 dB (H.264 loss at 32x32).
+
+Memory, from the plan (`inference-bench kernels --spec crates/specrt/tests/fixtures/wan21-1.3b-configs --plan --graph denoiser --size 832x480 --frames 81 --fusion`, the real 1.3B configs):
+
+| | 5 s of 480p, 81 frames |
+|---|---|
+| Tokens | 21 latent frames x 30 x 52 = 32760, text 512 |
+| Per forward | 283 TFLOP, 166 GB read, 555 launches (30 blocks of 19, 15 after fusion) |
+| Denoiser activations | 3.67 GB one sequence, 7.34 GB guidance batched (sequential guidance halves it) |
+| Cross attention K and V, hoisted | 0.19 GB for all 30 blocks |
+| VAE per latent frame (`--graph vae --frames 21 --compiled`) | arena 0.46 GB for the first frame, 1.84 GB steady (4 output frames and the caches) |
+
+Options, each a `[pipeline.options]` field the admission reads, measured on `tiny-wan21` (GPU1):
+
+| Option | Arena | Result | Time |
+|---|---|---|---|
+| `sequential_cfg = true` | denoiser 187 KB against 372 KB | 1.2e-7 from batched | two forwards per step |
+| `vae_tile = 6` (overlap 4) | VAE 111 KB against 197 KB | 66.2 dB against whole frames | 0.078 s against 0.055 s |
+| per latent frame decode (always on) | bounded by one frame's grids plus 2 frame caches | exact | |
+
+Activation offload to host between blocks is not built: at 3.67 GB for one sequence the 1.3B fits any 24 GB card, and the decision belongs with the larger models (Wan 2.2 A14B) together with weight offload.
+
+Not done here: the real Wan 2.1 1.3B run (both cards, a supervisor window); the T5 encoder on the GPU (#1406); a video Generate page in the UI.
+
 ## 8. API shape
 
 Images, OpenAI compatible, all additions optional with defaults:
