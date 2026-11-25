@@ -18,7 +18,6 @@ CARD = {"name": "RTX PRO 6000 Blackwell Max-Q", "bw_gbs": 1792, "bf16_tflops": 4
 CUTLASS_SO = Path.home() / ".cache/flashinfer/0.7.3/120f/cached_ops/fp4_gemm_cutlass_sm120/fp4_gemm_cutlass_sm120.so"
 SPIN = 2_000_000
 CHAIN_US = 200.0
-EVENT_STEP_US = 2.0
 FLUSH_BYTES = 512 << 20
 CONTROL_TOL = 0.02
 SEED = 1158
@@ -619,13 +618,8 @@ SETUP = {
 def stats(ts):
     t = torch.tensor(ts, dtype=torch.float64)
     q = torch.quantile(t, torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9], dtype=torch.float64)).tolist()
-    center = q[2]
-    how = "median"
-    if center * 1e3 < 20 * EVENT_STEP_US:
-        inner = t[(t >= q[0]) & (t <= q[4])]
-        center = inner.mean().item()
-        how = "trimmed mean"
-    return {"median_us": center * 1e3, "iqr_us": (q[3] - q[1]) * 1e3, "n": len(ts), "center": how}
+    inner = t[(t >= q[0]) & (t <= q[4])]
+    return {"median_us": inner.mean().item() * 1e3, "p50_us": q[2] * 1e3, "iqr_us": (q[3] - q[1]) * 1e3, "n": len(ts)}
 
 
 def chain_len(fn):
@@ -761,7 +755,7 @@ def run(args):
 
 
 def fmt_us(s):
-    return f"{s['median_us']:.1f} ({s['iqr_us']:.1f})"
+    return f"{s['median_us']:.1f} ({s['p50_us']:.1f}, {s['iqr_us']:.1f})"
 
 
 def rate(s, side):
@@ -805,12 +799,12 @@ def report(args):
     if r.get("refused"):
         out.append(f"- REFUSED rows (control outside 1.00 +/- {CONTROL_TOL}): {', '.join(r['refused'])}")
     out.append("")
-    out.append("Times are median (IQR) in microseconds. Error is max abs / max abs relative to the largest reference value, against an f64 host reference. `x theirs` is our time divided by theirs as a speed (their time / our time): above 1 we are faster.")
+    out.append("Times are in microseconds: the 10 to 90% trimmed mean, then (median, IQR). The trimmed mean is the centre used for every ratio and the control, because single cold launches are timed by CUDA events that step in about 2 us units, which a median cannot resolve at a 2% control. Warm rows time a chain of launches sized to about 200 us and divide. Error is max abs / max abs relative to the largest reference value, against an f64 host reference. `ours / theirs` is their time divided by ours: above 1 we are faster.")
     for row in sorted({c["row"] for c in r["cases"]}):
         out.append("")
         out.append(f"## {row}. {ROWS[row]}")
         out.append("")
-        out.append("| Case | Side | Warm us | Cold us | Warm rate | Cold rate | Error | x theirs warm | x theirs cold | Verdict warm / cold | Control |")
+        out.append("| Case | Side | Warm us | Cold us | Warm rate | Cold rate | Error | ours / theirs warm | ours / theirs cold | Verdict warm / cold | Control |")
         out.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
         for c in [c for c in r["cases"] if c["row"] == row]:
             if "error" in c:
