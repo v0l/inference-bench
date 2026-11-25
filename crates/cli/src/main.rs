@@ -292,13 +292,13 @@ enum Cmd {
         context: Option<usize>,
         #[arg(long, default_value = "decode", help = "prefill, decode or verify")]
         phase: String,
-        #[arg(long, help = "With --plan: count a non decoder graph instead; denoiser reads --spec as a diffusers pipeline folder or a transformer config.json, vae as a diffusers pipeline or vae folder")]
+        #[arg(long, help = "With --plan: count a non decoder graph instead; denoiser reads --spec as a diffusers pipeline folder or a transformer config.json, vae as a diffusers pipeline or vae folder, codec as a model config.json with a codec section (--tokens is the session count)")]
         graph: Option<String>,
         #[arg(long, default_value = "1024x1024", help = "With --graph denoiser or vae: image size in pixels, WIDTHxHEIGHT")]
         size: String,
         #[arg(long, default_value_t = 512, help = "With --graph denoiser: text tokens")]
         text: usize,
-        #[arg(long, default_value_t = 1, help = "With --graph vae: latent frames of a video vae")]
+        #[arg(long, default_value_t = 1, help = "With --graph vae: latent frames of a video vae; with --graph codec: latent frames per call")]
         frames: usize,
     },
     #[command(about = "Compile and cache the kernels of a spec without loading weights")]
@@ -516,6 +516,26 @@ fn denoiser_command(path: &Path, size: &str, text: usize, frames: usize, fusion:
                 println!("  kept apart {}", d.describe());
             }
         }
+    }
+    Ok(())
+}
+
+fn codec_kernels_command(path: &Path, target: Option<&str>, frames: usize, sessions: usize) -> Result<()> {
+    let file = if path.is_dir() { path.join("config.json") } else { path.to_path_buf() };
+    let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).with_context(|| file.display().to_string())?)?;
+    let plan = specrt::codec::graph::plan(&config)?;
+    let target = match target {
+        Some(name) => kir::Target::named(name).with_context(|| format!("target {name:?} is not sm_120, sm_80, wgpu or wgpu-nosubgroups"))?,
+        None => specrt::codegen::default_target(),
+    };
+    let frames = frames.max(1);
+    for (name, stack, steps) in [("encoder", &plan.encoder, frames * plan.frame_samples), ("decoder", &plan.decoder, frames)] {
+        let p = specrt::codec::compile::plan(stack, steps, sessions.max(1))?;
+        let kernels = p.kernels(&target)?;
+        println!("== codec {} {name}, {frames} frame(s), {} session(s), {} weights, {} conv kernels", plan.graph, sessions.max(1), stack.params(), kernels.len());
+        print!("{}", specrt::codec::compile::report(stack, &p, sessions.max(1)));
+        let (r, w): (u64, u64) = p.launches.iter().map(|l| l.bytes(sessions.max(1))).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        println!("per frame: {} launches, {:.2} MB read, {:.2} MB written\n", p.launches.len(), r as f64 / 1e6 / frames as f64, w as f64 / 1e6 / frames as f64);
     }
     Ok(())
 }
@@ -817,7 +837,8 @@ fn main() -> Result<()> {
                 match g.as_str() {
                     "denoiser" => return denoiser_command(Path::new(spec), size, *text, *frames, *fusion),
                     "vae" => return vae_kernels_command(Path::new(spec), target.as_deref(), size, *frames, *fusion, *compiled),
-                    other => bail!("--graph {other:?} is not denoiser or vae"),
+                    "codec" => return codec_kernels_command(Path::new(spec), target.as_deref(), *frames, *tokens),
+                    other => bail!("--graph {other:?} is not denoiser, vae or codec"),
                 }
             }
             kernels_command(&data, spec, target.as_deref(), plan.then_some((phase.as_str(), *tokens, *context)), *fusion, *compiled)?
