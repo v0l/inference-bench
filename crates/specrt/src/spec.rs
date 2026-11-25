@@ -1735,7 +1735,7 @@ impl Spec {
         );
         ensure!(m.active.is_some_and(|k| k >= 1 && k <= m.experts), "mixture-of-experts needs num_experts_per_tok between 1 and the expert count");
         ensure!(!m.quantized_experts || matches!(experts_quant, Quant::Gguf | Quant::Q8), "[moe] quantized_experts keeps GGUF expert blocks and needs GGUF weights, not {experts_quant:?}");
-        ensure!(m.expert_intermediate.is_multiple_of(256) || experts_quant == Quant::Bf16, "nvfp4 experts need an intermediate size that is a multiple of 256");
+        ensure!(m.expert_intermediate.is_multiple_of(128) || experts_quant == Quant::Bf16, "quantised experts need an intermediate size that is a multiple of 128");
         ensure!(m.expert_intermediate.is_multiple_of(16) && m.shared_intermediate.is_multiple_of(16), "expert intermediate sizes must be multiples of 16");
         ensure!(
             m.shared_intermediate == 0 || m.shared_intermediate.is_multiple_of(m.expert_intermediate),
@@ -2228,9 +2228,10 @@ impl Spec {
                 let experts = self.quant == Quant::Bf16 && self.moe.is_some();
                 ensure!(m == Quant::Nvfp4G16 && (beside_fp8 || experts), "[mlp] quant {m:?} beside {:?} is not supported (nvfp4_g16 beside fp8_channel is, and beside bf16 for mixture-of-experts)", self.quant);
                 ensure!(until.is_none_or(|u| u > 0 && u < self.layers.count), "[mlp] quant_until must be inside the layer count");
+                let width = if self.moe.is_some() { 128 } else { 256 };
                 ensure!(
-                    self.dims.hidden.is_multiple_of(256) && self.dims.intermediate.is_multiple_of(256),
-                    "nvfp4_g16 needs hidden and intermediate to be multiples of 256"
+                    self.dims.hidden.is_multiple_of(256) && self.dims.intermediate.is_multiple_of(width),
+                    "nvfp4_g16 needs hidden to be a multiple of 256 and intermediate a multiple of {width}"
                 );
             }
             (None, None) => {}

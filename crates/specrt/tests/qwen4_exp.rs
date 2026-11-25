@@ -1,7 +1,7 @@
 use serde_json::Value;
 use specrt::family::Registry;
 use specrt::plan::{Buf, GATED_MODULE, Op, Phase, Plan};
-use specrt::spec::{AttentionKind, Block, Spec, EMBEDDED};
+use specrt::spec::{AttentionKind, Block, Quant, Spec, EMBEDDED};
 use std::path::{Path, PathBuf};
 
 const NAME: &str = "tiny-qwen4-exp";
@@ -126,6 +126,12 @@ fn the_real_qwen3_8_flash_next_config_serves_text_with_offload_sized_pieces() {
     let e = specrt::serve::SpeculativeOptions { enabled: Some(true), ..Default::default() }.apply(&mut on).unwrap_err().to_string();
     assert!(e.contains("refuses its MTP layer") && e.contains("#1350"), "{e}");
     specrt::serve::SpeculativeOptions::default().apply(&mut s.clone()).unwrap();
+    for (repo, quant) in [("Qwen__Qwen3.8-Flash-Next-FP8", Quant::Fp8Block128), ("RadixArk__Qwen3.8-Flash-Next-NVFP4", Quant::Nvfp4G16)] {
+        let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/popular").join(repo).join("config.json")).unwrap();
+        let q = Spec::from_hf_config_serving(&json).unwrap_or_else(|e| panic!("{repo}: {e:#}"));
+        assert_eq!(q.mlp.quant.unwrap_or(q.quant), quant, "{repo} experts");
+        assert_eq!(q.moe.as_ref().unwrap().expert_intermediate, 640, "640 = 5 x 128, the expert GEMMs need N % 64 and K % 128");
+    }
 }
 
 fn engine() -> Spec {
