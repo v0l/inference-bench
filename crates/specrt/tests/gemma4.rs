@@ -1,3 +1,4 @@
+use specrt::plan::{Buf, NormKind, Op, Phase, Plan, Weight};
 use specrt::spec::{Block, Spec};
 use std::path::{Path, PathBuf};
 
@@ -42,8 +43,6 @@ fn the_12b_unified_config_maps_like_the_31b() {
 
 #[test]
 fn the_parts_not_built_yet_are_refused_by_name() {
-    let moe = Spec::from_hf_config_serving(&popular("google__gemma-4-26B-A4B-it")).unwrap_err().to_string();
-    assert!(moe.contains("enable_moe_block"), "{moe}");
     for repo in ["google__gemma-4-E2B-it", "google__gemma-4-E4B-it"] {
         let spec = Spec::from_hf_config_serving(&popular(repo)).unwrap();
         assert!(spec.layers.shared_tail > 0 && spec.per_layer().is_some(), "{repo}");
@@ -54,6 +53,8 @@ fn the_parts_not_built_yet_are_refused_by_name() {
     assert!(!e4b.mlp.wide_shared_tail, "E4B does not use the double wide mlp");
     assert_eq!((e4b.layers.count, e4b.layers.shared_tail, e4b.per_layer().unwrap().dim), (42, 18, 256));
     assert_eq!((param(&e4b, "hd_s"), param(&e4b, "hd_g")), (256.0, 512.0));
+    let gemma3n = Spec::from_hf_config_serving(&popular("google__gemma-3n-E2B-it")).unwrap_err().to_string();
+    assert!(gemma3n.contains("altup_num_inputs"), "{gemma3n}");
 }
 
 fn unrefused() -> specrt::family::Registry {
@@ -62,8 +63,7 @@ fn unrefused() -> specrt::family::Registry {
         .map(|(_, text)| {
             let mut table: toml::Table = toml::from_str(text).unwrap();
             if table.get("name").and_then(|n| n.as_str()) == Some("gemma4") {
-                let rules = table.get_mut("refuse").and_then(|r| r.as_array_mut()).unwrap();
-                rules.retain(|r| r["when"].as_str() == Some("enable_moe_block"));
+                table.remove("refuse");
             }
             table.to_string()
         })
@@ -73,7 +73,6 @@ fn unrefused() -> specrt::family::Registry {
 
 #[test]
 fn the_e2b_spec_carries_per_layer_inputs() {
-    use specrt::plan::{Op, Phase, Plan};
     let spec = Spec::from_hf_config_serving_in(&unrefused(), &popular("google__gemma-4-E2B-it")).unwrap();
     let p = spec.per_layer().expect("the E2B config has per layer inputs");
     assert_eq!(p.dim, 256);
@@ -111,7 +110,6 @@ fn the_e2b_config_maps_its_shared_tail_and_wide_mlp() {
 
 #[test]
 fn the_wide_tail_plan_runs_the_wide_mlp_and_the_rest_is_unchanged() {
-    use specrt::plan::{Op, Phase, Plan, Weight};
     let spec = Spec::from_hf_config_serving_in(&unrefused(), &popular("google__gemma-4-E2B-it")).unwrap();
     let plan = Plan::build(&spec, Phase::Prefill, true);
     let wide = |ops: &[Op]| ops.iter().any(|o| matches!(o, Op::Linear { weight: Weight::GateUpWide | Weight::DownWide, .. }));
@@ -120,14 +118,13 @@ fn the_wide_tail_plan_runs_the_wide_mlp_and_the_rest_is_unchanged() {
         let ops = plan.layer_for(spec.block(layer), false, spec.shares_kv(layer));
         assert_eq!((wide(ops), narrow(ops)), (spec.shares_kv(layer), !spec.shares_kv(layer)), "layer {layer}");
     }
-    assert_eq!(specrt::plan::Weight::GateUpWide.rows(&spec), 4 * spec.dims.intermediate);
+    assert_eq!(Weight::GateUpWide.rows(&spec), 4 * spec.dims.intermediate);
     let dense = Spec::from_hf_config_serving(&popular("google__gemma-4-31B-it")).unwrap();
     assert!(Plan::build(&dense, Phase::Prefill, true).blocks.iter().all(|b| !b.tail));
 }
 
 #[test]
 fn shared_layers_own_no_cache_and_read_their_source() {
-    use specrt::plan::{Op, Phase, Plan};
     let spec = Spec::from_hf_config_serving_in(&unrefused(), &popular("google__gemma-4-E2B-it")).unwrap();
     let owners = (0..spec.layers.count).filter(|&l| spec.owns_kv(l)).count();
     assert_eq!(owners, 15);
@@ -139,14 +136,58 @@ fn shared_layers_own_no_cache_and_read_their_source() {
     }
     assert_eq!(spec.kind_index(34), spec.kind_before(spec.kv_source(34)));
     let plan = Plan::build(&spec, Phase::Prefill, true);
-    let writes = |tail: bool, block: specrt::spec::Block| plan.layer_for(block, false, tail).iter().filter(|o| matches!(o, Op::Kernel { node } if spec.attention.node[*node as usize].kernel.as_deref().is_some_and(|k| k.contains("write")))).count();
-    assert_eq!((writes(false, specrt::spec::Block::Sliding), writes(true, specrt::spec::Block::Sliding)), (2, 0));
-    assert_eq!((writes(false, specrt::spec::Block::Full), writes(true, specrt::spec::Block::Full)), (2, 0));
+    let writes = |tail: bool, block: Block| plan.layer_for(block, false, tail).iter().filter(|o| matches!(o, Op::Kernel { node } if spec.attention.node[*node as usize].kernel.as_deref().is_some_and(|k| k.contains("write")))).count();
+    assert_eq!((writes(false, Block::Sliding), writes(true, Block::Sliding)), (2, 0));
+    assert_eq!((writes(false, Block::Full), writes(true, Block::Full)), (2, 0));
     let per_token: u64 = (0..owners).map(|i| specrt::state::kv_bytes_per_token_at(&spec, i)).sum();
     let mut all_own = spec.clone();
     all_own.layers.shared_tail = 0;
     let full: u64 = (0..35).map(|i| specrt::state::kv_bytes_per_token_at(&all_own, i)).sum();
     assert!(per_token < full);
+}
+
+#[test]
+fn the_26b_a4b_maps_a_dense_mlp_beside_its_experts() {
+    let spec = Spec::from_hf_config_serving(&popular("google__gemma-4-26B-A4B-it")).unwrap();
+    let m = spec.moe.as_ref().unwrap();
+    assert_eq!((m.experts, m.top_k(), m.expert_intermediate, spec.dims.intermediate), (128, 8, 704, 2112));
+    assert!(m.parallel_dense && m.norm_topk && !m.shared_gate && m.shared_intermediate == 0);
+    assert!(m.dense_layers.is_empty());
+    assert!((m.router_norm_scale - 1.0 / 2816f64.sqrt()).abs() < 1e-12);
+    assert_eq!(m.router_norm.as_deref(), Some("mlp.router.scale"));
+    assert_eq!(m.expert_scale.as_deref(), Some("mlp.router.per_expert_scale"));
+    assert_eq!(m.input_norm.as_deref(), Some("pre_feedforward_layernorm_2.weight"));
+    for phase in [Phase::Prefill, Phase::Decode] {
+        let plan = Plan::build(&spec, phase, true);
+        for block in [Block::Sliding, Block::Full] {
+            let ops = plan.layer_of(block, true);
+            let route = ops.iter().position(|o| *o == Op::MoeRoute).unwrap();
+            let down = ops.iter().position(|o| matches!(o, Op::Linear { weight: Weight::Down, .. })).unwrap();
+            assert!(down < route, "{block:?}: the dense mlp runs before the router");
+            let adds: Vec<(NormKind, Buf, Buf)> = ops.iter().filter_map(|o| match *o { Op::NormAdd { which, from, into } => Some((which, from, into)), _ => None }).collect();
+            assert_eq!(
+                adds,
+                vec![
+                    (NormKind::PostAttention, Buf::Branch, Buf::X),
+                    (NormKind::PostDense, Buf::Branch, Buf::Merged),
+                    (NormKind::PostExperts, Buf::Branch, Buf::Merged),
+                    (NormKind::PostMlp, Buf::Merged, Buf::X),
+                ]
+            );
+            assert!(ops.contains(&Op::MoeCombineInto { into: Buf::Branch }));
+            assert!(!ops.contains(&Op::MoeCombine));
+        }
+        specrt::signature::validate_plan(&plan, &spec).unwrap();
+    }
+    specrt::codegen::Module::generate(&spec, 256).unwrap();
+}
+
+#[test]
+fn the_26b_quantised_copies_are_held_back_only_by_their_quant_tile_sizes() {
+    let fp8 = Spec::from_hf_config_serving(&popular("RedHatAI__gemma-4-26B-A4B-it-FP8-dynamic")).unwrap_err().to_string();
+    assert!(fp8.contains("multiples of 128"), "{fp8}");
+    let nvfp4 = Spec::from_hf_config_serving(&popular("nvidia__Gemma-4-26B-A4B-NVFP4")).unwrap_err().to_string();
+    assert!(nvfp4.contains("multiples of 256"), "{nvfp4}");
 }
 
 #[test]
@@ -158,7 +199,95 @@ fn the_kv_cache_holds_each_layer_kind_at_its_own_width() {
 }
 
 #[test]
-fn the_tiny_e_fixture_builds_every_kernel() {
+fn the_tiny_fixture_has_a_spec_that_builds_every_kernel() {
+    let spec = tiny();
+    specrt::codegen::Module::generate(&spec, 256).unwrap();
+    let states: Vec<(&str, usize)> = spec.state.iter().map(|s| (s.name.as_str(), s.layer_count(&spec))).collect();
+    assert_eq!(states, vec![("k_s", 4), ("v_s", 4), ("k_g", 2), ("v_g", 2)]);
+    assert_eq!((param(&spec, "hd_s"), param(&spec, "hd_g"), param(&spec, "kvh_g"), param(&spec, "angles_g")), (32.0, 64.0, 1.0, 8.0));
+}
+
+fn tiny() -> Spec {
+    tiny_named("tiny-gemma4")
+}
+
+fn tiny_named(name: &str) -> Spec {
+    let dir = fixture(name);
+    let json = std::fs::read_to_string(dir.join("config.json")).unwrap();
+    let mut spec = Spec::from_hf_config(&json).unwrap();
+    spec.name = name.into();
+    spec.repo = dir.display().to_string();
+    spec.runtime.split_activations = Some(true);
+    spec
+}
+
+#[test]
+fn the_tiny_moe_fixture_routes_every_layer_beside_its_dense_mlp() {
+    let spec = tiny_named("tiny-gemma4-moe");
+    let m = spec.moe.as_ref().unwrap();
+    assert_eq!((m.experts, m.top_k(), m.expert_intermediate), (4, 2, 64));
+    assert!(spec.parallel_moe() && (0..6).all(|l| m.is_sparse(l)));
+    let module = specrt::codegen::Module::generate(&spec, 256).unwrap();
+    for k in ["moe_route_logits(const float* x, const float* ln, const float* xn_ln,", "const float* bias, const float* expert_scale,", "moe_mma_up_b16", "moe_up_bf16"] {
+        assert!(module.source.contains(k), "{k}");
+    }
+    let target = kir::Target::sm_120();
+    for phase in [Phase::Prefill, Phase::Decode] {
+        specrt::compile::compile(&spec, Plan::build(&spec, phase, true), &target, &specrt::compile::Options::planes(256)).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "needs nvrtc, no GPU"]
+fn the_moe_modules_compile_to_ptx() {
+    let big = Spec::from_hf_config_serving(&popular("google__gemma-4-26B-A4B-it")).unwrap();
+    for spec in [tiny_named("tiny-gemma4-moe"), big] {
+        let m = specrt::codegen::Module::generate_kv(&spec, 256, 1, &kir::Target::sm_120()).unwrap();
+        assert!(m.source.contains("const float* expert_scale,"));
+        let opts = cudarc::nvrtc::CompileOptions { arch: Some("compute_120a"), options: vec!["--std=c++17".to_string()], ..Default::default() };
+        cudarc::nvrtc::compile_ptx_with_opts(m.source.as_str(), opts).unwrap_or_else(|e| panic!("{}: {e:?}", spec.name));
+    }
+}
+
+#[test]
+fn the_tiny_moe_layer_loads_router_scales_and_fused_experts_from_the_checkpoint() {
+    let spec = tiny_named("tiny-gemma4-moe");
+    let ck = specrt::weights::Checkpoint::for_repo(&spec.repo).unwrap().renamed(&spec.tensors);
+    let layer = ck.layer(&spec, 1).unwrap();
+    let moe = layer.moe.as_ref().unwrap();
+    let n = moe.norms.as_ref().unwrap();
+    let raw = |name: &str| -> Vec<f32> {
+        let st = safetensors::SafeTensors::deserialize(Box::leak(std::fs::read(fixture("tiny-gemma4-moe").join("model.safetensors")).unwrap().into_boxed_slice())).unwrap();
+        st.tensor(name).unwrap().data().as_chunks::<2>().0.iter().map(|b| f32::from_bits((u16::from_le_bytes(*b) as u32) << 16)).collect()
+    };
+    let scale = raw("model.layers.1.router.scale");
+    for (a, b) in n.router.iter().zip(&scale) {
+        assert!((a - b / 128f32.sqrt()).abs() < 1e-6);
+    }
+    assert_eq!(n.expert_scale, raw("model.layers.1.router.per_expert_scale"));
+    assert_eq!(n.input, raw("model.layers.1.pre_feedforward_layernorm_2.weight"));
+    assert_eq!(n.post_experts, raw("model.layers.1.post_feedforward_layernorm_2.weight"));
+    let fused = raw("model.layers.1.experts.gate_up_proj");
+    let specrt::weights::Stacked::Bf16(up) = &moe.up else { panic!("bf16 experts") };
+    let (h, i) = (128, 64);
+    let up_e2_r3 = &fused[(2 * 2 * i + i + 3) * h..(2 * 2 * i + i + 4) * h];
+    let got: Vec<f32> = up[(2 * i + 3) * h..(2 * i + 4) * h].iter().map(|b| f32::from_bits((*b as u32) << 16)).collect();
+    assert_eq!(got, up_e2_r3);
+    assert!(matches!(layer.gate_up, specrt::weights::Matrix::Bf16(ref w) if w.len() == 2 * 256 * h));
+}
+
+fn tiny_e() -> Spec {
+    let dir = fixture("tiny-gemma4-e");
+    let json = std::fs::read_to_string(dir.join("config.json")).unwrap();
+    let mut spec = Spec::from_hf_config_serving_in(&unrefused(), &json).unwrap();
+    spec.name = "tiny-gemma4-e".into();
+    spec.repo = dir.display().to_string();
+    spec.runtime.split_activations = Some(true);
+    spec
+}
+
+#[test]
+fn the_tiny_e_fixture_has_a_spec_that_builds_every_kernel() {
     let spec = tiny_e();
     specrt::codegen::Module::generate(&spec, 256).unwrap();
     let states: Vec<(&str, usize)> = spec.state.iter().map(|s| (s.name.as_str(), s.layer_count(&spec))).collect();
@@ -170,50 +299,11 @@ fn the_tiny_e_fixture_builds_every_kernel() {
     assert_eq!(spec.max_intermediate(), 512);
 }
 
-fn tiny_e() -> Spec {
-    let dir = fixture(&std::env::var("G4_E_DIR").unwrap_or_else(|_| "tiny-gemma4-e".into()));
-    let json = std::fs::read_to_string(dir.join("config.json")).unwrap();
-    let mut spec = Spec::from_hf_config_serving_in(&unrefused(), &json).unwrap();
-    spec.name = "tiny-gemma4-e".into();
-    spec.repo = dir.display().to_string();
-    spec.runtime.split_activations = Some(true);
-    spec
-}
-
-#[test]
-fn the_tiny_e_fixture_has_a_spec_that_builds_every_kernel() {
-    let spec = tiny();
-    specrt::codegen::Module::generate(&spec, 256).unwrap();
-    let states: Vec<(&str, usize)> = spec.state.iter().map(|s| (s.name.as_str(), s.layer_count(&spec))).collect();
-    assert_eq!(states, vec![("k_s", 4), ("v_s", 4), ("k_g", 2), ("v_g", 2)]);
-    assert_eq!((param(&spec, "hd_s"), param(&spec, "hd_g"), param(&spec, "kvh_g"), param(&spec, "angles_g")), (32.0, 64.0, 1.0, 8.0));
-}
-
-fn tiny() -> Spec {
-    let dir = fixture("tiny-gemma4");
-    let json = std::fs::read_to_string(dir.join("config.json")).unwrap();
-    let mut spec = Spec::from_hf_config(&json).unwrap();
-    spec.name = "tiny-gemma4".into();
-    spec.repo = dir.display().to_string();
-    spec.runtime.split_activations = Some(true);
-    spec
-}
-
-fn reference() -> (Vec<u32>, Vec<u32>, usize, Vec<f32>) {
-    let dir = std::env::var_os("SPECRT_REF_DIR").map(PathBuf::from).expect("SPECRT_REF_DIR holds scripts/tiny_gemma4.py output");
-    let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("tiny-gemma4.ref.json")).unwrap()).unwrap();
-    let ids = |k: &str| -> Vec<u32> { meta[k].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect() };
-    let bytes = std::fs::read(dir.join("tiny-gemma4.ref.bin")).unwrap();
-    let logits = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
-    (ids("tokens"), ids("greedy"), meta["vocab"].as_u64().unwrap() as usize, logits)
-}
-
 fn e_reference() -> (Vec<u32>, Vec<u32>, usize, Vec<f32>) {
     let dir = std::env::var_os("SPECRT_REF_DIR_E").map(PathBuf::from).expect("SPECRT_REF_DIR_E holds scripts/tiny_gemma4.py output for the E fixture");
-    let name = std::env::var("G4_E_NAME").unwrap_or_else(|_| "tiny-gemma4-e".into());
-    let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join(format!("{name}.ref.json"))).unwrap()).unwrap();
+    let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("tiny-gemma4-e.ref.json")).unwrap()).unwrap();
     let ids = |k: &str| -> Vec<u32> { meta[k].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect() };
-    let bytes = std::fs::read(dir.join(format!("{name}.ref.bin"))).unwrap();
+    let bytes = std::fs::read(dir.join("tiny-gemma4-e.ref.bin")).unwrap();
     let logits = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
     (ids("tokens"), ids("greedy"), meta["vocab"].as_u64().unwrap() as usize, logits)
 }
@@ -255,7 +345,7 @@ fn gemma4_e_logits_and_greedy_match_transformers() {
 fn gemma4_e_layer_states_match_transformers() {
     let (tokens, _, _, _) = e_reference();
     let dir = std::env::var_os("SPECRT_REF_DIR_E").map(PathBuf::from).unwrap();
-    let bytes = std::fs::read(dir.join(format!("{}.layers.bin", std::env::var("G4_E_NAME").unwrap_or_else(|_| "tiny-gemma4-e".into())))).unwrap();
+    let bytes = std::fs::read(dir.join("tiny-gemma4-e.layers.bin")).unwrap();
     let want: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
     let mut rt = specrt::runtime::Runtime::load(&tiny_e(), 256).unwrap();
     let trace = rt.trace_prefill(&tokens).unwrap();
@@ -280,34 +370,93 @@ fn e_kv_cache_is_smaller_by_the_shared_layers() {
     assert!(owners < full);
 }
 
+fn reference(name: &str) -> (Vec<u32>, Vec<u32>, usize, Vec<f32>) {
+    let dir = std::env::var_os("SPECRT_REF_DIR").map(PathBuf::from).expect("SPECRT_REF_DIR holds scripts/tiny_gemma4.py output");
+    let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join(format!("{name}.ref.json"))).unwrap()).unwrap();
+    let ids = |k: &str| -> Vec<u32> { meta[k].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect() };
+    let bytes = std::fs::read(dir.join(format!("{name}.ref.bin"))).unwrap();
+    let logits = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+    (ids("tokens"), ids("greedy"), meta["vocab"].as_u64().unwrap() as usize, logits)
+}
+
 #[test]
 #[ignore = "needs a CUDA GPU and scripts/tiny_gemma4.py output in SPECRT_REF_DIR"]
 fn gemma4_layer_states_match_transformers() {
-    let (tokens, _, _, _) = reference();
+    layer_states_match("tiny-gemma4");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/tiny_gemma4.py output in SPECRT_REF_DIR"]
+fn gemma4_logits_and_greedy_match_transformers() {
+    logits_and_greedy_match("tiny-gemma4");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/tiny_gemma4.py output in SPECRT_REF_DIR"]
+fn gemma4_served_two_slots_match_transformers_greedy() {
+    served_two_slots_match("tiny-gemma4");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and G4_MOE=1 scripts/tiny_gemma4.py output in SPECRT_REF_DIR"]
+fn gemma4_moe_layer_states_match_transformers() {
+    layer_states_match("tiny-gemma4-moe");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and G4_MOE=1 scripts/tiny_gemma4.py output in SPECRT_REF_DIR"]
+fn gemma4_moe_logits_and_greedy_match_transformers() {
+    logits_and_greedy_match("tiny-gemma4-moe");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and G4_MOE=1 scripts/tiny_gemma4.py output in SPECRT_REF_DIR"]
+fn gemma4_moe_served_two_slots_match_transformers_greedy() {
+    served_two_slots_match("tiny-gemma4-moe");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and G4_MOE=1 scripts/tiny_gemma4.py output in SPECRT_REF_DIR"]
+fn gemma4_moe_router_fed_the_normed_input_misses_transformers() {
+    let name = "tiny-gemma4-moe";
+    let (tokens, _, vocab, want) = reference(name);
+    let mut spec = tiny_named(name);
+    let m = spec.moe.as_mut().unwrap();
+    m.router_norm = m.input_norm.clone();
+    m.router_norm_scale = 1.0;
+    let mut rt = specrt::runtime::Runtime::load(&spec, 256).unwrap();
+    let ours = rt.prompt_logits(&tokens).unwrap();
+    let max_abs = ours.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    let row = |v: &[f32], r: usize| v[r * vocab..(r + 1) * vocab].iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+    let missed = (0..tokens.len()).filter(|&r| row(&ours, r) != row(&want, r)).count();
+    eprintln!("{name} router on the normed input: max_abs {max_abs}, {missed} of {} argmax rows differ", tokens.len());
+    assert!(max_abs >= 5e-2, "the logit bound must catch a router that reads the normed input, max abs {max_abs}");
+}
+
+fn layer_states_match(name: &str) {
+    let (tokens, _, _, _) = reference(name);
     let dir = std::env::var_os("SPECRT_REF_DIR").map(PathBuf::from).unwrap();
-    let bytes = std::fs::read(dir.join("tiny-gemma4.layers.bin")).unwrap();
+    let bytes = std::fs::read(dir.join(format!("{name}.layers.bin"))).unwrap();
     let want: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
-    let mut rt = specrt::runtime::Runtime::load(&tiny(), 256).unwrap();
+    let mut rt = specrt::runtime::Runtime::load(&tiny_named(name), 256).unwrap();
     let trace = rt.trace_prefill(&tokens).unwrap();
     let per = tokens.len() * 128;
     for layer in 0..6 {
         let (a, b) = (&trace.layers[layer * per..(layer + 1) * per], &want[layer * per..(layer + 1) * per]);
         let max_abs = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
         let size = b.iter().map(|y| y.abs()).fold(0f32, f32::max);
-        eprintln!("layer {layer} max_abs {max_abs} of {size}");
-        assert!(max_abs < 2e-2 * size.max(1.0), "layer {layer} max abs diff {max_abs}");
+        eprintln!("{name} layer {layer} max_abs {max_abs} of {size}");
+        assert!(max_abs < 2e-2 * size.max(1.0), "{name} layer {layer} max abs diff {max_abs}");
     }
 }
 
-#[test]
-#[ignore = "needs a CUDA GPU and scripts/tiny_gemma4.py output in SPECRT_REF_DIR"]
-fn gemma4_logits_and_greedy_match_transformers() {
-    let (tokens, greedy, vocab, want) = reference();
-    let mut rt = specrt::runtime::Runtime::load(&tiny(), 256).unwrap();
+fn logits_and_greedy_match(name: &str) {
+    let (tokens, greedy, vocab, want) = reference(name);
+    let mut rt = specrt::runtime::Runtime::load(&tiny_named(name), 256).unwrap();
     let ours = rt.prompt_logits(&tokens).unwrap();
     assert_eq!(ours.len(), want.len());
     let max_abs = ours.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-    eprintln!("max_abs {max_abs}");
+    eprintln!("{name} max_abs {max_abs}");
     assert!(max_abs < 5e-2, "max abs diff {max_abs}");
     for r in 0..tokens.len() {
         let row = |v: &[f32]| v[r * vocab..(r + 1) * vocab].iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
@@ -317,15 +466,13 @@ fn gemma4_logits_and_greedy_match_transformers() {
     assert_eq!(got.tokens, greedy);
 }
 
-#[test]
-#[ignore = "needs a CUDA GPU and scripts/tiny_gemma4.py output in SPECRT_REF_DIR"]
-fn gemma4_served_two_slots_match_transformers_greedy() {
+fn served_two_slots_match(name: &str) {
     use specrt::runtime::{DecodeRow, Layout, Runtime, Sampling};
-    let (tokens, greedy, _, _) = reference();
+    let (tokens, greedy, _, _) = reference(name);
     let max_ctx = 256;
     let pages = max_ctx / specrt::codegen::PAGE;
     let layout = Layout { max_ctx, slots: 2, kv_blocks: 2 * pages, prefill_chunk: 64, kv_planes: 1, kv_headroom: 0, state_on_demand: false };
-    let mut rt = Runtime::load_layout(&tiny(), layout).unwrap();
+    let mut rt = Runtime::load_layout(&tiny_named(name), layout).unwrap();
     rt.set_block_table(0, &(0..pages as u32).rev().collect::<Vec<_>>()).unwrap();
     rt.set_block_table(1, &(pages as u32..2 * pages as u32).collect::<Vec<_>>()).unwrap();
     let mut st = rt.stepper().unwrap();

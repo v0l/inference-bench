@@ -9,8 +9,11 @@ import torch
 SEED = 0
 PROMPT = 96
 GREEDY = 32
-FIXTURE = Path(__file__).parent.parent / "tests/fixtures" / os.environ.get("G4_FIXTURE", "tiny-gemma4")
+MOE = os.environ.get("G4_MOE") == "1"
 E_STYLE = os.environ.get("G4_STYLE") == "e"
+NAME = "tiny-gemma4-moe" if MOE else ("tiny-gemma4-e" if E_STYLE else "tiny-gemma4")
+FIXTURE = Path(__file__).parent.parent / "tests/fixtures" / os.environ.get("G4_FIXTURE", NAME)
+MOE_FIELDS = {"enable_moe_block": True, "num_experts": 4, "top_k_experts": 2, "moe_intermediate_size": 64}
 
 
 def config():
@@ -47,6 +50,7 @@ def config():
         bos_token_id=None,
         pad_token_id=None,
         attn_implementation="eager",
+        **(MOE_FIELDS if MOE else {"enable_moe_block": False}),
     )
     if E_STYLE:
         cfg.attention_k_eq_v = False
@@ -73,12 +77,16 @@ def weights(model):
             continue
         if name.endswith("layer_scalar"):
             v = torch.full(p.shape, 1.0) if E_STYLE else 0.5 + torch.rand(p.shape, generator=g)
+        elif name.endswith("per_expert_scale"):
+            v = 0.5 + torch.rand(p.shape, generator=g)
         elif p.dim() == 1:
             v = 1.0 + 0.2 * torch.randn(p.shape, generator=g)
         elif "embed_tokens" in name:
             v = torch.randn(p.shape, generator=g) * 0.5
+        elif "router.proj" in name:
+            v = torch.randn(p.shape, generator=g) * 2.0
         else:
-            v = torch.randn(p.shape, generator=g) / p.shape[1] ** 0.5
+            v = torch.randn(p.shape, generator=g) / p.shape[-1] ** 0.5
         out[name] = v.to(torch.bfloat16).contiguous()
     return out
 
@@ -119,23 +127,21 @@ def main(out_dir):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     model = build()
-    name = FIXTURE.name
     g = torch.Generator().manual_seed(SEED + 3)
     ids = torch.randint(0, 512, (PROMPT,), generator=g)
     with torch.inference_mode():
         logits = model(ids[None]).logits[0]
         greedy = model.generate(ids[None], max_new_tokens=GREEDY, do_sample=False)[0, PROMPT:]
-    logits.float().numpy().astype(np.float32).tofile(out / f"{name}.ref.bin")
+    logits.float().numpy().astype(np.float32).tofile(out / f"{FIXTURE.name}.ref.bin")
     meta = {"tokens": ids.tolist(), "greedy": greedy.tolist(), "vocab": 512}
-    (out / f"{name}.ref.json").write_text(json.dumps(meta))
-    print(name, "->", out)
+    (out / f"{FIXTURE.name}.ref.json").write_text(json.dumps(meta))
+    print(FIXTURE.name, "->", out)
 
 
 def layer_states(out_dir):
     out = Path(out_dir)
-    name = FIXTURE.name
     model = build()
-    meta = json.loads((out / f"{name}.ref.json").read_text())
+    meta = json.loads((out / f"{FIXTURE.name}.ref.json").read_text())
     ids = torch.tensor(meta["tokens"])
     seen = []
     hooks = [l.register_forward_hook(lambda _m, _i, o: seen.append(o[0] if isinstance(o, tuple) else o)) for l in model.model.layers]
@@ -148,7 +154,7 @@ def layer_states(out_dir):
     for layer, s in zip(model.model.layers, seen):
         scale *= float(layer.layer_scalar)
         rows.append(s[0] / scale)
-    torch.stack(rows).float().numpy().astype(np.float32).tofile(out / f"{name}.layers.bin")
+    torch.stack(rows).float().numpy().astype(np.float32).tofile(out / f"{FIXTURE.name}.layers.bin")
 
 
 if __name__ == "__main__":

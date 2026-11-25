@@ -7,12 +7,15 @@ excluded = [
   "bigscience/bloomz-560m",
 ]
 
+[parked."model_type llada"]
+issue = 1336
+reason = "masked diffusion LM: every step re-runs the whole block bidirectionally, so no KV reuse and a separate scheduler loop; not on the main-lab list and vLLM does not serve it. The forward pass is the llama family with a non-causal mask"
+
 [issues]
 "chat template: syntax error: unknown statement generation" = 1193
 "chat template: syntax error: unknown statement break" = 1193
 "model_type gemma4" = 1194
 "model_type gemma4_unified" = 1194
-"Gemma 4 mixture-of-experts layers (enable_moe_block) are not supported yet" = 1238
 "Gemma 4 per-layer input embeddings (hidden_size_per_layer_input) are not supported yet" = 1239
 "vision_config not read" = 1237
 "vision_config and audio_config not read" = 1237
@@ -51,6 +54,7 @@ excluded = [
 "layer N mlp.gate_proj is in two groups" = 1207
 "fp8 weights need hidden, intermediate, head_dim and the linear value dim to be multiples of N" = 1207
 "nvfp4_g16 is supported for [mlp] quant only" = 1207
+"nvfp4_g16 needs hidden and intermediate to be multiples of N" = 1207
 "mixture-of-experts with Fp8Channel expert weights is not supported yet (bf16, nvfp4_g16 and fp8_block128 are)" = 1207
 "model_type moondream1" = 1208
 "model_type smolvlm" = 1208
@@ -68,8 +72,15 @@ excluded = [
 "config.json has no num_attention_heads" = 1213
 "model_type kimi_k3" = 1214
 "model_type kimi_k31" = 1214
-"model_type gemma3n" = 1214
-"model_type llada" = 1214
+"Kimi K3 block attention residuals (attn_res_block_size) are not supported yet" = 1340
+"Kimi K3 latent experts (routed_expert_hidden_size) are not supported yet" = 1340
+"Kimi K3 MLA output gate (mla_use_output_gate) is not supported yet" = 1340
+"Kimi K3 MLA query LoRA (q_lora_rank) is not supported yet" = 1340
+"Kimi K3 full rank KDA output gate (use_full_rank_gate) is not supported yet" = 1340
+"Kimi K3 SiTU activation (hidden_act situ) is not supported yet" = 1340
+"model_type gemma3n" = 1341
+"Gemma 3n AltUp residual streams (altup_num_inputs) are not supported yet" = 1341
+"model_type llada" = 1336
 "modelopt_fp4 weights" = 1320
 "modelopt FP8 weights" = 1320
 "layer N mixer.experts.N.down_proj is Nvfp4G16 but other attention projections are Some(Fp8Channel)" = 1321

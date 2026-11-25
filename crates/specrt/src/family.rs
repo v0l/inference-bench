@@ -91,6 +91,7 @@ pub struct FamilyAttention {
     pub params: std::collections::BTreeMap<String, ParamSource>,
     pub projection: Vec<crate::spec::Projection>,
     pub o_cols: Option<String>,
+    pub head_dim: Option<String>,
     pub o_cols_by: Vec<crate::spec::OCols>,
     pub scratch: std::collections::BTreeMap<String, String>,
     pub int_scratch: std::collections::BTreeMap<String, String>,
@@ -210,6 +211,7 @@ impl Default for FamilyAttention {
             params: Default::default(),
             projection: Vec::new(),
             o_cols: None,
+            head_dim: None,
             o_cols_by: Vec::new(),
             scratch: Default::default(),
             int_scratch: Default::default(),
@@ -306,6 +308,11 @@ pub struct FamilyMoe {
     pub experts_transposed: bool,
     pub quantized_experts: bool,
     pub hash_table: Option<String>,
+    pub parallel_dense: bool,
+    pub router_norm: Option<String>,
+    pub router_norm_scale: Option<String>,
+    pub input_norm: Option<String>,
+    pub expert_scale: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -376,6 +383,7 @@ pub struct FamilyBlocks {
     pub sliding_period_key: Option<String>,
     pub shared_tail_key: Option<String>,
     pub attention_indices_key: Option<String>,
+    pub attention_indices_base: usize,
     pub types_key: Option<String>,
     pub sparse_types: Vec<String>,
     pub sparse_layers_key: Option<String>,

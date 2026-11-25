@@ -25,6 +25,8 @@ fn shape(input_norm: bool) -> MoeShape {
         mapped: false,
         input_scaled: false,
         input_norm,
+        split_input: false,
+        expert_scale: false,
     }
 }
 

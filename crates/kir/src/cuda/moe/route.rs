@@ -1,7 +1,24 @@
 use super::prim;
 use crate::cuda::attention::prim::{Reduce, block_reduce, warp_reduce};
 
-fn logits_norm() -> String {
+fn logits_norm(split: bool) -> String {
+    let store = if split {
+        "        float inv = rsqrtf(total / HIDDEN + EPS);
+        for (int i = tid; i < HIDDEN; i += 256) {
+            float v = xr[i] * inv;
+            xs[j * HIDDEN + i] = v * ln[i];
+            if (blockIdx.x == 0) xn[(size_t)t * HIDDEN + i] = v * xn_ln[i];
+        }
+"
+    } else {
+        "        float inv = MOE_INPUT_NORM ? rsqrtf(total / HIDDEN + EPS) : 1.0f;
+        for (int i = tid; i < HIDDEN; i += 256) {
+            float v = MOE_INPUT_NORM ? xr[i] * inv * ln[i] : xr[i];
+            xs[j * HIDDEN + i] = v;
+            if (blockIdx.x == 0) xn[(size_t)t * HIDDEN + i] = v;
+        }
+"
+    };
     format!(
         r##"    extern __shared__ __align__(16) float xs[];
     __shared__ float red[32];
@@ -19,16 +36,10 @@ fn logits_norm() -> String {
             ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
         }}
         float total = {total};
-        float inv = MOE_INPUT_NORM ? rsqrtf(total / HIDDEN + EPS) : 1.0f;
-        for (int i = tid; i < HIDDEN; i += 256) {{
-            float v = MOE_INPUT_NORM ? xr[i] * inv * ln[i] : xr[i];
-            xs[j * HIDDEN + i] = v;
-            if (blockIdx.x == 0) xn[(size_t)t * HIDDEN + i] = v;
-        }}
-    }}
+{store}    }}
     __syncthreads();
 "##,
-        total = block_reduce(Reduce::Sum, "ss", "red")
+        total = block_reduce(Reduce::Sum, "ss", "red"),
     )
 }
 
@@ -81,15 +92,16 @@ fn logits_dot() -> String {
     )
 }
 
-pub fn route_logits() -> String {
+pub fn route_logits(split: bool) -> String {
     use crate::moe::{EXPERT_WARPS, LOGIT_PER_WARP, LOGIT_TOKENS};
+    let ln = if split { "const float* ln, const float* xn_ln" } else { "const float* ln" };
     format!(
         "constexpr int MOE_LOGIT_PER_WARP = {LOGIT_PER_WARP};\nconstexpr int MOE_LOGIT_ROWS = {EXPERT_WARPS} * MOE_LOGIT_PER_WARP;\nconstexpr int MOE_LOGIT_TOKENS = {LOGIT_TOKENS};\n\n{}",
         prim::global(
             Some(crate::moe::EXPERT_THREADS),
             "moe_route_logits",
-            "const float* x, const float* ln, const bf16_t* router, const float* shared_gate, const float* router_bias, float* xn, float* logits, int n",
-            &format!("{}{}", logits_norm(), logits_dot())
+            &format!("const float* x, {ln}, const bf16_t* router, const float* shared_gate, const float* router_bias, float* xn, float* logits, int n"),
+            &format!("{}{}", logits_norm(split), logits_dot())
         )
     )
 }
@@ -167,32 +179,34 @@ fn top_k() -> String {
     crate::cuda::topk::warp_top_k(&crate::cuda::topk::TopK { sel: "sel", vals: "probs", count: "MOE_E", k: "MOE_K", out_v: "top_v", out_i: "top_i", sum: "picked", floor: "-3.0e30f", taken: "-2.0e30f" })
 }
 
-fn emit_pairs() -> &'static str {
-    r##"    for (int k = lane; k < MOE_K; k += 32) {
+fn emit_pairs(expert_scale: bool) -> String {
+    let scaled = if expert_scale { " * expert_scale[top_i[k]]" } else { "" };
+    format!(r##"    for (int k = lane; k < MOE_K; k += 32) {{
         int local = top_i[k] - first;
         bool mine = local >= 0 && local < MOE_LOCAL;
         idx[t * MOE_PAIRS + k] = mine ? local : -1;
-        coef[t * MOE_PAIRS + k] = mine ? (MOE_NORM_TOPK ? top_v[k] / picked : top_v[k]) * MOE_ROUTED_SCALE : 0.0f;
-    }
-    if (MOE_SHARED == 1 && lane == 0) {
+        coef[t * MOE_PAIRS + k] = mine ? (MOE_NORM_TOPK ? top_v[k] / picked : top_v[k]) * MOE_ROUTED_SCALE{scaled} : 0.0f;
+    }}
+    if (MOE_SHARED == 1 && lane == 0) {{
         bool mine = !MOE_PARALLEL || first == 0;
         idx[t * MOE_PAIRS + MOE_K] = mine ? MOE_LOCAL : -1;
         coef[t * MOE_PAIRS + MOE_K] = !mine ? 0.0f : MOE_SHARED_GATE ? 1.0f / (1.0f + expf(-gate_logit)) : 1.0f;
-    }
-    if (MOE_SHARED > 1) {
-        for (int s = lane; s < MOE_SHARED; s += 32) {
+    }}
+    if (MOE_SHARED > 1) {{
+        for (int s = lane; s < MOE_SHARED; s += 32) {{
             bool mine = !MOE_PARALLEL || first == 0;
             idx[t * MOE_PAIRS + MOE_K + s] = mine ? MOE_LOCAL + s : -1;
             coef[t * MOE_PAIRS + MOE_K + s] = !mine ? 0.0f : MOE_SHARED_GATE ? 1.0f / (1.0f + expf(-gate_logit)) : 1.0f;
-        }
-    }
-"##
+        }}
+    }}
+"##)
 }
 
-pub fn route() -> String {
+pub fn route(expert_scale: bool) -> String {
+    let scale = if expert_scale { "const float* expert_scale, " } else { "" };
     format!(
         "constexpr bool MOE_PARALLEL = MOE_LOCAL != MOE_E;\n\n{}",
-        prim::global(Some(crate::moe::ROUTE_THREADS), "moe_route", "const float* logits, const float* bias, const int* table, const int* tokens, int hashed, int* idx, float* coef, int first", &format!("{}{}{}", probabilities(), top_k(), emit_pairs()))
+        prim::global(Some(crate::moe::ROUTE_THREADS), "moe_route", &format!("const float* logits, const float* bias, {scale}const int* table, const int* tokens, int hashed, int* idx, float* coef, int first"), &format!("{}{}{}", probabilities(), top_k(), emit_pairs(expert_scale)))
     )
 }
 

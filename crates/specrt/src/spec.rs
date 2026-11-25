@@ -769,6 +769,16 @@ pub struct Moe {
     pub hash_table: Option<String>,
     #[serde(default, skip_serializing_if = "TpSplit::is_auto")]
     pub tp_split: TpSplit,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub parallel_dense: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_norm: Option<String>,
+    #[serde(default = "default_routed_scale", skip_serializing_if = "is_default_routed_scale")]
+    pub router_norm_scale: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_norm: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert_scale: Option<String>,
     #[serde(skip)]
     pub local: Option<ExpertRange>,
 }
@@ -1713,6 +1723,14 @@ impl Spec {
         ensure!(m.expert_intermediate.is_multiple_of(256) || experts_quant == Quant::Bf16, "nvfp4 experts need an intermediate size that is a multiple of 256");
         ensure!(m.expert_intermediate.is_multiple_of(16) && m.shared_intermediate.is_multiple_of(16), "expert intermediate sizes must be multiples of 16");
         ensure!(
+            m.parallel_dense || (m.router_norm.is_none() && m.input_norm.is_none() && m.expert_scale.is_none() && m.router_norm_scale == 1.0),
+            "[moe] router_norm, router_norm_scale, input_norm and expert_scale take parallel_dense = true"
+        );
+        ensure!(
+            !m.parallel_dense || (self.norm.sandwich && self.dims.intermediate > 0 && m.dense_layers.is_empty() && m.sparse_step <= 1),
+            "[moe] parallel_dense needs sandwich norms, a dense intermediate size and experts on every layer"
+        );
+        ensure!(
             m.shared_intermediate == 0 || m.shared_intermediate.is_multiple_of(m.expert_intermediate),
             "the shared experts ({} wide) must be a whole number of routed expert widths ({})",
             m.shared_intermediate,
@@ -1870,13 +1888,21 @@ impl Spec {
         };
         let (qkv_bias, o_bias, qk_norm, output_gate) = attn_flags;
         let multiplier = |key: &Option<String>| key.as_deref().and_then(|k| value.get(k)).and_then(|v| v.as_f64());
-        let head_dim = hf.head_dim.filter(|d| *d > 0).unwrap_or(hf.hidden_size / hf.num_attention_heads);
+        let head_dim = match family.attention.head_dim.as_deref() {
+            Some(expr) => {
+                let e = kir::expr::Expr::parse(expr).map_err(anyhow::Error::msg).with_context(|| format!("[attention] head_dim {expr:?}"))?;
+                let env = |k: &str| k.split('.').try_fold(&value, |v, p| v.get(p)).and_then(|v| v.as_f64());
+                e.eval(&env).with_context(|| format!("[attention] head_dim {expr:?} reads a missing config key"))? as usize
+            }
+            None => hf.head_dim.filter(|d| *d > 0).unwrap_or(hf.hidden_size / hf.num_attention_heads),
+        };
         let keyed_rotary = family.rope.rotary_dim_key.as_deref().and_then(|k| value.get(k)?.as_u64()).map(|d| d as usize);
         let rotary_dim = keyed_rotary.or_else(|| {
             hf.partial_rotary_factor.or(param("partial_rotary_factor")).filter(|f| *f != 1.0).map(|f| (head_dim as f64 * f).round() as usize)
         });
-        let indexed = family.blocks.attention_indices_key.as_deref().and_then(|k| value.get(k)).and_then(|v| v.as_array()).map(|a| {
-            let full: Vec<u64> = a.iter().filter_map(|v| v.as_u64()).collect();
+        let indexed = family.blocks.attention_indices_key.as_deref().and_then(|k| k.split('.').try_fold(&value, |v, p| v.get(p))).and_then(|v| v.as_array()).map(|a| {
+            let base = family.blocks.attention_indices_base as u64;
+            let full: Vec<u64> = a.iter().filter_map(|v| v.as_u64()?.checked_sub(base)).collect();
             (0..hf.num_hidden_layers).map(|i| if full.contains(&(i as u64)) { "full_attention" } else { "linear_attention" }.to_string()).collect::<Vec<_>>()
         });
         let keyed: Option<Vec<String>> = family.blocks.types_key.as_deref().and_then(|k| value.get(k)).and_then(|v| match v {
@@ -1972,6 +1998,14 @@ impl Spec {
                     hash_layers: if family.moe.hash_table.is_some() { hf.num_hash_layers.unwrap_or(0) } else { 0 },
                     hash_table: family.moe.hash_table.clone(),
                     tp_split: TpSplit::Auto,
+                    parallel_dense: family.moe.parallel_dense,
+                    router_norm: family.moe.router_norm.clone(),
+                    router_norm_scale: match &family.moe.router_norm_scale {
+                        Some(expr) => crate::family::ParamSource::Expr { expr: expr.clone() }.read("router_norm_scale", &value)?,
+                        None => 1.0,
+                    },
+                    input_norm: family.moe.input_norm.clone(),
+                    expert_scale: family.moe.expert_scale.clone(),
                     local: None,
                 })
             }
@@ -2401,6 +2435,10 @@ impl Spec {
             }
         }
         Ok(())
+    }
+
+    pub fn parallel_moe(&self) -> bool {
+        self.moe.as_ref().is_some_and(|m| m.parallel_dense)
     }
 
     pub fn weight_len(&self, symbol: &str) -> Result<usize> {

@@ -70,6 +70,8 @@ pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::Mo
         mapped: spec.mlp.mapped.is_some(),
         input_scaled: m.input_scaled,
         input_norm: spec.gated_residual().is_none(),
+        split_input: m.parallel_dense,
+        expert_scale: m.expert_scale.is_some(),
     };
     let mut out = vec![kir::moe::MoeKernel::new(target, kir::moe::Family::Experts, shape.clone()).map_err(anyhow::Error::msg)?];
     if spec.runtime.offload.pointer_table && spec.runtime.offload.enabled() {

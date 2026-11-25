@@ -10,8 +10,8 @@ mod route;
 fn experts(k: &MoeKernel) -> String {
     let mut out = prim::constants(&k.shape);
     out.push_str(&gemv::gemv());
-    out.push_str(&route::route_logits());
-    out.push_str(&route::route());
+    out.push_str(&route::route_logits(k.shape.split_input));
+    out.push_str(&route::route(k.shape.expert_scale));
     out.push_str(&gemv::pair_entries());
     out.push_str(&route::combine());
     out.push_str(&route::scale_inputs());

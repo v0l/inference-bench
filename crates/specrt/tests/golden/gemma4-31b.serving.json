@@ -517,5 +517,11 @@
       ]
     }
   ],
+  "tensors": {
+    ".experts.": ".mlp.experts.",
+    ".router.": ".mlp.router.",
+    "mlp.experts.down_proj": "mlp.experts.down_proj.weight",
+    "mlp.experts.gate_up_proj": "mlp.experts.gate_up_proj.weight"
+  },
   "plain_activations": true
 }

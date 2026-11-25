@@ -1,0 +1,466 @@
+{
+  "name": "kimi_linear",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 128,
+    "intermediate": 256,
+    "vocab": 512,
+    "tie_embeddings": false
+  },
+  "layers": {
+    "count": 4,
+    "pattern": [
+      "linear",
+      "linear",
+      "linear",
+      "full"
+    ]
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 0.00001
+  },
+  "attention": {
+    "kind": "mla",
+    "heads": 4,
+    "kv_heads": 4,
+    "head_dim": 64,
+    "qkv_bias": false,
+    "qk_norm": false,
+    "node": [
+      {
+        "op": "kernel",
+        "kernel": "mla_latent_norm",
+        "grid": [
+          "rows"
+        ],
+        "bind": {
+          "out": {
+            "buffer": "qkv"
+          },
+          "weight": {
+            "weight": "kv_a_layernorm.weight",
+            "len": "kv_lora_rank"
+          },
+          "x": {
+            "buffer": "qkv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "mla_latent_write",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "dst": {
+            "state": "latent"
+          },
+          "src": {
+            "buffer": "qkv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "mla_absorb_q",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "kv_b_proj.weight",
+            "len": "heads * (qk_nope_head_dim + v_head_dim) * kv_lora_rank"
+          },
+          "x": {
+            "buffer": "qkv"
+          },
+          "y": {
+            "buffer": "q_latent"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "mla_attention",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "k_cache": {
+            "state": "latent"
+          },
+          "out": {
+            "buffer": "o_latent"
+          },
+          "q_latent": {
+            "buffer": "q_latent"
+          },
+          "softmax_scale": "softmax_scale",
+          "v_cache": {
+            "state": "latent"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "mla_expand_v",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "kv_b_proj.weight",
+            "len": "heads * (qk_nope_head_dim + v_head_dim) * kv_lora_rank"
+          },
+          "x": {
+            "buffer": "o_latent"
+          }
+        }
+      }
+    ],
+    "params": {
+      "kv_lora_rank": 64.0,
+      "qk_nope_head_dim": 48.0,
+      "qk_rope_head_dim": 16.0,
+      "softmax_scale": 0.125,
+      "v_head_dim": 32.0
+    },
+    "projection": [
+      {
+        "tensor": "q_proj",
+        "rows": "heads * (qk_nope_head_dim + qk_rope_head_dim)"
+      },
+      {
+        "tensor": "kv_a_proj_with_mqa",
+        "rows": "kv_lora_rank + qk_rope_head_dim"
+      }
+    ],
+    "o_cols": "heads * v_head_dim",
+    "scratch": {
+      "o_latent": "heads * kv_lora_rank",
+      "q_latent": "heads * kv_lora_rank"
+    }
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 10000.0,
+    "nope_layers": [
+      0,
+      1,
+      2,
+      3
+    ]
+  },
+  "mlp": {
+    "activation": "swiglu"
+  },
+  "moe": {
+    "experts": 8,
+    "active": 2,
+    "expert_intermediate": 32,
+    "shared_intermediate": 32,
+    "dense_layers": [
+      0
+    ],
+    "router": "sigmoid",
+    "shared_module": "shared_experts",
+    "routed_scale": 2.446,
+    "score_bias": true
+  },
+  "mixer": {
+    "module": "self_attn",
+    "projection": [
+      {
+        "tensor": "q_proj",
+        "rows": "kda_qkv"
+      },
+      {
+        "tensor": "k_proj",
+        "rows": "kda_qkv"
+      },
+      {
+        "tensor": "v_proj",
+        "rows": "kda_qkv"
+      },
+      {
+        "tensor": "f_a_proj",
+        "rows": "kda_head_dim"
+      },
+      {
+        "tensor": "g_a_proj",
+        "rows": "kda_head_dim"
+      },
+      {
+        "tensor": "b_proj",
+        "rows": "kda_heads"
+      }
+    ],
+    "out_tensor": "o_proj",
+    "out_cols": "kda_qkv",
+    "params": {
+      "kda_beta_offset": 512.0,
+      "kda_beta_row": 514.0,
+      "kda_conv_blocks": 1.0,
+      "kda_f_offset": 384.0,
+      "kda_g_offset": 448.0,
+      "kda_gate_offset": 0.0,
+      "kda_gate_row": 128.0,
+      "kda_head_dim": 64.0,
+      "kda_heads": 2.0,
+      "kda_qkv": 128.0,
+      "kda_row": 384.0,
+      "kda_taps": 4.0
+    },
+    "scratch": {
+      "conv": "3 * kda_qkv",
+      "core": "kda_qkv",
+      "gate": "kda_qkv",
+      "ogate": "kda_qkv"
+    },
+    "node": [
+      {
+        "op": "kernel",
+        "kernel": "kda_conv_q",
+        "grid": [
+          "kda_conv_blocks",
+          "seqs"
+        ],
+        "bind": {
+          "state": {
+            "state": "conv_q"
+          },
+          "w": {
+            "weight": "q_conv1d.weight",
+            "len": "kda_qkv * kda_taps"
+          },
+          "x": {
+            "buffer": "mix"
+          },
+          "y": {
+            "buffer": "conv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "kda_conv_k",
+        "grid": [
+          "kda_conv_blocks",
+          "seqs"
+        ],
+        "bind": {
+          "state": {
+            "state": "conv_k"
+          },
+          "w": {
+            "weight": "k_conv1d.weight",
+            "len": "kda_qkv * kda_taps"
+          },
+          "x": {
+            "buffer": "mix"
+          },
+          "y": {
+            "buffer": "conv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "kda_conv_v",
+        "grid": [
+          "kda_conv_blocks",
+          "seqs"
+        ],
+        "bind": {
+          "state": {
+            "state": "conv_v"
+          },
+          "w": {
+            "weight": "v_conv1d.weight",
+            "len": "kda_qkv * kda_taps"
+          },
+          "x": {
+            "buffer": "mix"
+          },
+          "y": {
+            "buffer": "conv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "kda_forget_up",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "f_b_proj.weight",
+            "len": "kda_qkv * kda_head_dim"
+          },
+          "x": {
+            "buffer": "mix"
+          },
+          "y": {
+            "buffer": "gate"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "kda_out_gate_up",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "g_b_proj.weight",
+            "len": "kda_qkv * kda_head_dim"
+          },
+          "x": {
+            "buffer": "mix"
+          },
+          "y": {
+            "buffer": "ogate"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "kda_softplus_recurrence",
+        "grid": [
+          "kda_heads",
+          "seqs"
+        ],
+        "bind": {
+          "a_log": {
+            "weight": "A_log",
+            "len": "kda_heads"
+          },
+          "betas": {
+            "buffer": "mix"
+          },
+          "dt_bias": {
+            "weight": "dt_bias",
+            "len": "kda_qkv"
+          },
+          "gates": {
+            "buffer": "gate"
+          },
+          "kda": {
+            "state": "kda"
+          },
+          "mix": {
+            "buffer": "conv"
+          },
+          "y": {
+            "buffer": "core"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "kda_gated_norm",
+        "grid": [
+          "kda_heads",
+          "rows"
+        ],
+        "bind": {
+          "g": {
+            "buffer": "ogate"
+          },
+          "w": {
+            "weight": "o_norm.weight",
+            "len": "kda_head_dim"
+          },
+          "x": {
+            "buffer": "core"
+          }
+        }
+      }
+    ]
+  },
+  "state": [
+    {
+      "name": "latent",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "1",
+        "kv_lora_rank + qk_rope_head_dim"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional"
+    },
+    {
+      "name": "conv_q",
+      "per": "sequence",
+      "layers": "linear",
+      "shape": [
+        "kda_qkv",
+        "kda_taps - 1"
+      ],
+      "dtype": "f32",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "checkpoint"
+    },
+    {
+      "name": "conv_k",
+      "per": "sequence",
+      "layers": "linear",
+      "shape": [
+        "kda_qkv",
+        "kda_taps - 1"
+      ],
+      "dtype": "f32",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "checkpoint"
+    },
+    {
+      "name": "conv_v",
+      "per": "sequence",
+      "layers": "linear",
+      "shape": [
+        "kda_qkv",
+        "kda_taps - 1"
+      ],
+      "dtype": "f32",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "checkpoint"
+    },
+    {
+      "name": "kda",
+      "per": "sequence",
+      "layers": "linear",
+      "shape": [
+        "kda_heads",
+        "kda_head_dim",
+        "kda_head_dim"
+      ],
+      "dtype": "f32",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "checkpoint"
+    }
+  ],
+  "tensors": {
+    ".block_sparse_moe.": ".mlp.",
+    ".w1.weight": ".gate_proj.weight",
+    ".w2.weight": ".down_proj.weight",
+    ".w3.weight": ".up_proj.weight"
+  }
+}
