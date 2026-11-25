@@ -6,6 +6,17 @@ All notable changes to Inference Bench are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-25
+
+v0.2.0 was not published: the release did not build on aarch64 Linux, macOS or Windows. This release carries the same changes as 0.2.0 plus these fixes.
+
+### Fixed
+- aarch64 Linux: `cpubench` has a portable read loop where AVX-512 is not available.
+- macOS: direct reads use `F_NOCACHE` instead of `O_DIRECT`, stale page files are found without `/proc`, and the wgpu backend refuses prelude, DiT, block residual and latent norm ops by name instead of failing to compile.
+- Windows: the NVMe page file tier reads with positioned reads, direct reads fall back to buffered reads with a log line, and the RDMA link checks its peer with a portable peek.
+- The hub chat template test pins the date it renders, so it no longer fails on the day after its fixture was made.
+- CI builds aarch64 Linux, macOS and Windows on every pull request and master push.
+
 ## [0.2.0] - 2026-11-25
 
 ### Added

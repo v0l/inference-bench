@@ -1,7 +1,6 @@
 use anyhow::{Result, anyhow};
 use std::fs::File;
 use std::io;
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
@@ -33,11 +32,67 @@ pub fn remove_stale(dir: &Path, prefix: &str) -> usize {
             continue;
         }
         let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else { continue };
-        if !Path::new(&format!("/proc/{pid}")).exists() && std::fs::remove_file(e.path()).is_ok() {
+        if !pid_alive(pid) && std::fs::remove_file(e.path()).is_ok() {
             removed += 1;
         }
     }
     removed
+}
+
+#[cfg(target_os = "linux")]
+fn pid_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn pid_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
+    let alive = unsafe { libc::kill(pid, 0) == 0 };
+    alive || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn pread(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+fn pread(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buf, offset)
+}
+
+#[cfg(target_os = "linux")]
+fn open_direct(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(path)
+}
+
+#[cfg(target_os = "macos")]
+fn open_direct(path: &Path) -> io::Result<File> {
+    use std::os::fd::AsRawFd;
+    let file = File::open(path)?;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn open_direct(_path: &Path) -> io::Result<File> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "direct reads are only on Linux and macOS"))
+}
+
+fn create_private(path: &Path) -> io::Result<File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    opts.open(path)
 }
 
 pub fn round_up(n: usize) -> usize {
@@ -55,7 +110,7 @@ pub struct DirectFile {
 
 impl DirectFile {
     pub fn open(path: &Path) -> Result<Self> {
-        match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(path) {
+        match open_direct(path) {
             Ok(file) => Ok(DirectFile { file, direct: true }),
             Err(e) => {
                 static ONCE: std::sync::Once = std::sync::Once::new();
@@ -107,7 +162,7 @@ impl ReadAt for DirectFile {
             let mut tmp = vec![0u8; len + BLOCK];
             let skew = tmp.as_ptr() as usize % BLOCK;
             let start = if skew == 0 { 0 } else { BLOCK - skew };
-            let n = self.file.read_at(&mut tmp[start..start + len], aligned_off)?;
+            let n = pread(&self.file, &mut tmp[start..start + len], aligned_off)?;
             if n < head + buf.len() {
                 return Err(io::ErrorKind::UnexpectedEof.into());
             }
@@ -116,7 +171,7 @@ impl ReadAt for DirectFile {
         }
         let mut done = 0;
         while done < buf.len() {
-            let n = self.file.read_at(&mut buf[done..], offset + done as u64)?;
+            let n = pread(&self.file, &mut buf[done..], offset + done as u64)?;
             if n == 0 {
                 if self.direct && done > 0 && done % BLOCK != 0 {
                     return Ok(());
@@ -239,7 +294,7 @@ pub struct Appender {
 
 impl Appender {
     pub fn create(path: PathBuf) -> Result<Self> {
-        let file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
+        let file = create_private(&path)?;
         Ok(Appender { file, path, at: 0 })
     }
 

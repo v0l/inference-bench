@@ -160,6 +160,8 @@ fn the_gpt_oss_template_renders_with_tools_and_a_date() {
     assert!(text.ends_with("<|start|>assistant"), "{text}");
 }
 
+const HUB_FIXTURE_DATE: i64 = 1795521600;
+
 #[test]
 fn hub_templates_render_the_same_text_as_transformers() {
     let hub = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/templates/hub");
@@ -171,7 +173,7 @@ fn hub_templates_render_the_same_text_as_transformers() {
             continue;
         }
         let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap();
-        let t = ChatTemplate::from_files(&read("tokenizer_config.json"), Some(&read("chat_template.jinja"))).unwrap().unwrap();
+        let t = ChatTemplate::from_files(&read("tokenizer_config.json"), Some(&read("chat_template.jinja"))).unwrap().unwrap().with_now(HUB_FIXTURE_DATE);
         let want: serde_json::Value = serde_json::from_str(&read("expected.json")).unwrap();
         for (name, case) in cases.as_object().unwrap() {
             let text = t.render_with(case["messages"].as_array().unwrap(), &case["vars"]).unwrap();

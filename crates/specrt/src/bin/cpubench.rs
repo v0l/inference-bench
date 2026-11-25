@@ -121,6 +121,11 @@ unsafe fn read_sum(buf: &[u8]) -> u64 {
     }
 }
 
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn read_sum(buf: &[u8]) -> u64 {
+    buf.chunks_exact(8).fold(0, |acc, c| acc ^ u64::from_ne_bytes(c.try_into().unwrap()))
+}
+
 fn timed<F: Fn(usize) + Sync>(threads: usize, seconds: f64, f: F) -> (f64, usize) {
     let start = Instant::now();
     let iters: usize = std::thread::scope(|s| {

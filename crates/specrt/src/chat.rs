@@ -43,6 +43,7 @@ pub struct ChatTemplate {
     source: String,
     bos_token: String,
     eos_token: String,
+    now: Option<i64>,
 }
 
 fn token_text(v: &Value) -> String {
@@ -80,7 +81,13 @@ impl ChatTemplate {
             source,
             bos_token: token_text(&config["bos_token"]),
             eos_token: token_text(&config["eos_token"]),
+            now: None,
         }))
+    }
+
+    pub fn with_now(mut self, unix_secs: i64) -> Self {
+        self.now = Some(unix_secs);
+        self
     }
 
     pub fn skips_special_tokens(&self) -> bool {
@@ -182,7 +189,8 @@ impl ChatTemplate {
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        env.add_function("strftime_now", |format: String| -> String { strftime_now(&format) });
+        let now = self.now;
+        env.add_function("strftime_now", move |format: String| -> String { strftime_at(&format, now.unwrap_or_else(unix_now)) });
         env.add_function("raise_exception", |msg: String| -> Result<String, minijinja::Error> {
             Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
         });
@@ -226,8 +234,11 @@ fn generation_blocks_as_ifs(source: &str) -> std::borrow::Cow<'_, str> {
     })
 }
 
-fn strftime_now(format: &str) -> String {
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+fn unix_now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+fn strftime_at(format: &str, secs: i64) -> String {
     let days = secs.div_euclid(86400);
     let rem = secs.rem_euclid(86400);
     let z = days + 719468;
