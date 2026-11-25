@@ -1,0 +1,25 @@
+kind = "kir-kernel"
+family = "block_res"
+name = "block_res_push"
+threads = 256
+
+[args]
+hidden = "hidden"
+blocks = "res_blocks"
+mode = "push"
+
+[[param]]
+name = "stack"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "prefix"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "slot"
+type = "i32"
+role = "value"
+access = "read"

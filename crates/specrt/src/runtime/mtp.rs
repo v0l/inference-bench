@@ -46,6 +46,9 @@ impl DeviceMtp {
             prelude_stored: Default::default(),
             ple: crate::runtime::PleWeights::new(),
             ple_at: -1,
+            residual: Vec::new(),
+            latent: None,
+            global: spec.layers.count,
             mixer: DeviceMixer::Attention(DeviceAttn {
                 qkv: DeviceMatrix::upload(stream, &a.qkv)?,
                 qkv_bias: up(&a.qkv_bias)?,

@@ -1,0 +1,19 @@
+kind = "kir-kernel"
+family = "block_res"
+name = "block_res_out"
+threads = 256
+
+[args]
+hidden = "hidden"
+blocks = "res_blocks"
+mode = "out"
+
+[[param]]
+name = "x"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "prefix"
+role = "activation"
+access = "write"

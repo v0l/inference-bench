@@ -12,6 +12,7 @@ ignore = true
 
 [fields]
 kda_full_rank_gate = ["linear_attn_config.use_full_rank_gate"]
+dsa_index_topk = ["dsa_config.index_topk"]
 
 [activation.map]
 situ = "swiglu"
@@ -48,10 +49,11 @@ v_out = "heads * v_head_dim"
 q_lora_rank = { config = "q_lora_rank" }
 mla_output_gate = { config = "mla_use_output_gate" }
 mla_gate_offset = { expr = "q_lora_rank + kv_lora_rank + qk_rope_head_dim" }
+mla_lora_eps = 0.000001
 
 [[attention.node]]
 op = "kernel"
-kernel = "mla_q_lora_norm"
+kernel = "mla_q_lora_norm_e6"
 grid = ["rows"]
 
 [attention.node.bind]
@@ -61,7 +63,7 @@ weight = { weight = "q_a_layernorm.weight", len = "q_lora_rank" }
 
 [[attention.node]]
 op = "kernel"
-kernel = "mla_kv_lora_norm"
+kernel = "mla_kv_lora_norm_e6"
 grid = ["rows"]
 
 [attention.node.bind]
@@ -231,9 +233,17 @@ x = { buffer = "core" }
 g = { buffer = "mix" }
 w = { weight = "o_norm.weight", len = "kda_head_dim" }
 
-[[refuse]]
-when = "attn_res_block_size > 0"
-message = "Kimi K3 block attention residuals (attn_res_block_size) are not supported yet"
+[moe.latent]
+width = "routed_expert_hidden_size"
+down = "routed_expert_down_proj"
+up = "routed_expert_up_proj"
+norm = "routed_expert_norm"
+norm_key = "latent_moe_use_norm"
+
+[block_residual]
+size = "attn_res_block_size"
+sites = ["self_attention_res", "mlp_res"]
+output = "output_attn_res"
 
 [[refuse]]
 when = "mla_use_output_gate == 0"
@@ -244,5 +254,5 @@ when = "kda_full_rank_gate == 0"
 message = "the kimi_k3 family describes the full rank KDA output gate; this config turns use_full_rank_gate off"
 
 [[refuse]]
-when = "routed_expert_hidden_size > 0"
-message = "Kimi K3 latent experts (routed_expert_hidden_size) are not supported yet"
+when = "dsa_index_topk > 0"
+message = "Kimi K3.1 sparse attention (dsa_config) on the MLA layers is not supported yet"

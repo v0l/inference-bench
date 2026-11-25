@@ -1,0 +1,10 @@
+kind = "kir-kernel"
+family = "rmsnorm_segment"
+name = "mla_q_lora_norm_e6"
+threads = 256
+
+[args]
+width = "q_lora_rank"
+stride = "qkv_row"
+start = 0
+eps = "mla_lora_eps"

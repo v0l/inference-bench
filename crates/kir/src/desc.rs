@@ -10,7 +10,7 @@ use toml::Value;
 
 pub const KIND: &str = "kir-kernel";
 
-pub const ROW_FAMILIES: [&str; 14] = ["span_rope", "state_write", "head_matvec", "index_topk", "layernorm_segment", "head_rms", "block_pool", "hyper_pre", "hyper_post", "hyper_expand", "hyper_mean", "pool_topk", "group_pool", "group_topk"];
+pub const ROW_FAMILIES: [&str; 15] = ["span_rope", "state_write", "head_matvec", "index_topk", "layernorm_segment", "head_rms", "block_pool", "hyper_pre", "hyper_post", "hyper_expand", "hyper_mean", "pool_topk", "group_pool", "group_topk", "block_res"];
 
 pub const SEQ_FAMILIES: [&str; 7] = ["recurrence", "seq_conv", "group_norm", "token_hash", "group_map", "group_sum", "group_update"];
 
@@ -1001,6 +1001,13 @@ impl Description {
             "head_rms" => {
                 let n = self.sizes(shape, &self.args, &["row", "head", "offset", "width"], "[args]")?;
                 RowBody::HeadRms { row: n["row"], head: n["head"], offset: n["offset"], width: n["width"], eps: self.number(shape, "eps")? as f32 }
+            }
+            "block_res" => {
+                let n = self.sizes_except(shape, &self.args, &["hidden", "blocks"], &["eps", "mode"], "[args]")?;
+                let word = self.args.get("mode").and_then(|v| v.as_str()).ok_or_else(|| format!("{}: block_res needs a mode", self.name))?;
+                let mode = crate::rows::ResMode::parse(word).ok_or_else(|| format!("{}: block_res mode {word:?} is not mix, push, add or set", self.name))?;
+                let eps = if self.args.contains_key("eps") { self.number(shape, "eps")? as f32 } else { 0.0 };
+                RowBody::BlockRes { hidden: n["hidden"], blocks: n["blocks"], eps, mode }
             }
             "block_pool" => {
                 let n = self.sizes(shape, &self.args, &["dim", "rot", "layers", "raw_width", "gate_offset"], "[args]")?;

@@ -166,8 +166,11 @@ impl MoeKernel {
         if self.family == Family::Experts && route_logits_smem(s.hidden) > t.smem_limit {
             return bad(format!("moe_route_logits needs {} bytes of shared memory, the target allows {}", route_logits_smem(s.hidden), t.smem_limit));
         }
-        if self.family == Family::ExpertsGgml && !(s.hidden.is_multiple_of(crate::ggml::SUPER_BLOCK) && s.inter.is_multiple_of(crate::ggml::SUPER_BLOCK)) {
-            return bad(format!("ggml expert rows need hidden {} and intermediate {} to be multiples of {}", s.hidden, s.inter, crate::ggml::SUPER_BLOCK));
+        if self.family == Family::ExpertsGgml && !(s.width.is_multiple_of(crate::ggml::SUPER_BLOCK) && s.inter.is_multiple_of(crate::ggml::SUPER_BLOCK)) {
+            return bad(format!("ggml expert rows need width {} and intermediate {} to be multiples of {}", s.width, s.inter, crate::ggml::SUPER_BLOCK));
+        }
+        if s.width == 0 || s.width > s.hidden || (s.width != s.hidden && (s.input_scaled || s.split_input)) {
+            return bad(format!("expert width {} must be positive, at most hidden {}, and equal to it with scaled or split inputs", s.width, s.hidden));
         }
         if matches!(self.family, Family::GroupedMma | Family::GroupedMx | Family::GroupedMmaFp8 | Family::GroupedMmaBf16) {
             if !s.inter.is_multiple_of(MMA_BN) {

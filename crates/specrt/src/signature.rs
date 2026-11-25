@@ -185,7 +185,8 @@ fn class_of(body: &kir::Body) -> Class {
         kir::Body::Compose(_) => Class::Elementwise,
         kir::Body::Scan(_) => Class::Attention,
         kir::Body::Rows(r) => match r {
-            RowBody::HeadRms { .. } | RowBody::LayerNorm { .. } => Class::RowReduce,
+            RowBody::HeadRms { .. } | RowBody::LayerNorm { .. } | RowBody::BlockRes { mode: kir::rows::ResMode::Mix, .. } => Class::RowReduce,
+            RowBody::BlockRes { .. } => Class::Elementwise,
             RowBody::SpanRope { .. } => Class::Elementwise,
             RowBody::StateWrite { .. } | RowBody::BlockPool { .. } | RowBody::IndexTopk { .. } | RowBody::PoolTopk { .. } | RowBody::GroupPool { .. } | RowBody::GroupTopk { .. } => Class::Gather,
             RowBody::HeadMatvec { .. } => Class::Gemm,
@@ -542,6 +543,7 @@ impl<'a> Signer<'a> {
             }
             _ => {
                 let target = match op {
+                    Op::MoeCombineInto { into: Buf::Latent } => Tensor::buf(Buf::Latent, Rows::Tokens, m.width(h)),
                     Op::MoeCombineInto { into } => Tensor::buf(*into, Rows::Tokens, h),
                     _ if self.ranked => Tensor::buf(Buf::Partial, Rows::Tokens, h),
                     _ => self.x(),
@@ -646,6 +648,24 @@ impl<'a> Signer<'a> {
                 }
             }
             Op::Dit(_) => bail!("{} is a denoiser op; sign it with denoiser::Signer", op.label()),
+            Op::BlockRes { stage } => {
+                use crate::plan::ResStage;
+                let blocks = spec.block_residual.as_ref().map_or(1, |r| r.blocks(spec.layers.count));
+                let prefix = Tensor::new(Place::Local("residual prefix".into()), Rows::Tokens, h, Form::F32);
+                let stack = Tensor::new(Place::Local("residual stack".into()), Rows::Tokens, blocks * h, Form::F32);
+                let score = Tensor::weight("block residual score", 1, h, Form::F32);
+                match stage {
+                    ResStage::Enter if layer == 0 => sig(Class::RowReduce, vec![self.x()], vec![prefix, stack, self.x()]),
+                    ResStage::Enter => sig(Class::RowReduce, vec![self.x(), prefix.clone(), stack.clone(), score], vec![prefix, stack, self.x()]),
+                    ResStage::Mixed => sig(Class::RowReduce, vec![self.x(), prefix.clone(), stack, score], vec![prefix, self.x()]),
+                    ResStage::Tail => sig(Class::RowReduce, vec![prefix, stack, score], vec![self.x()]),
+                    ResStage::Done => sig(Class::Elementwise, vec![self.x(), prefix.clone()], vec![prefix, self.x()]),
+                }
+            }
+            Op::LatentNorm => {
+                let w = spec.moe.as_ref().map_or(h, |m| m.width(h));
+                sig(Class::RowReduce, vec![Tensor::buf(Buf::Latent, Rows::Tokens, w), Tensor::weight("latent norm", 1, w, Form::F32)], vec![Tensor::buf(Buf::LatentPlanes, Rows::Tokens, w)])
+            }
         })
     }
 }

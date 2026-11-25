@@ -4,6 +4,8 @@ use kir::Target;
 fn shape(input_norm: bool) -> MoeShape {
     MoeShape {
         hidden: 128,
+        width: 128,
+        assign: false,
         experts: 8,
         local: 8,
         top_k: 2,

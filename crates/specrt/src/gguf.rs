@@ -580,6 +580,7 @@ impl Gguf {
                     router_norm_scale: 1.0,
                     input_norm: None,
                     expert_scale: None,
+                    latent: None,
                     local: None,
                 })
             }
@@ -630,6 +631,7 @@ impl Gguf {
             prelude: None,
             refused: Vec::new(),
             per_layer: None,
+            block_residual: None,
             tensors: Default::default(),
             mtp: (family.mtp && nextn > 0).then(|| crate::spec::Mtp { head_quant: Some(Quant::Bf16), ..crate::spec::Mtp::new(nextn) }),
             vision: None,

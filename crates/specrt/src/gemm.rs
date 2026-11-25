@@ -13,6 +13,8 @@ pub const MIX_LINEARS: [&str; 2] = ["mix_in", "mix_out"];
 pub const FP8_ACT_LINEARS: [&str; 6] = ["qkv", "o", "gate_up", "down", "lin_in", "lin_out"];
 pub const FP4_LINEARS: [&str; 2] = ["gate_up", "down"];
 
+pub const LATENT_LINEARS: [&str; 4] = ["latent_down", "latent_up", "shared_gate_up", "shared_down"];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WeightKind {
     Bf16,
@@ -136,6 +138,10 @@ pub fn linear_shape(spec: &Spec, linear: &str) -> GemmShape {
         "mtp_o" => (d.hidden, spec.q_dim(), Epilogue::Residual, false),
         "mtp_gate_up" => (2 * d.intermediate, d.hidden, Epilogue::Act, false),
         "mtp_down" => (d.hidden, d.intermediate, Epilogue::Residual, false),
+        "latent_down" => (spec.moe.as_ref().map_or(0, |m| m.width(d.hidden)), d.hidden, Epilogue::Store, false),
+        "latent_up" => (d.hidden, spec.moe.as_ref().map_or(0, |m| m.width(d.hidden)), Epilogue::Residual, false),
+        "shared_gate_up" => (2 * spec.moe.as_ref().map_or(0, |m| m.shared_intermediate), d.hidden, Epilogue::Act, false),
+        "shared_down" => (d.hidden, spec.moe.as_ref().map_or(0, |m| m.shared_intermediate), Epilogue::Residual, false),
         _ => (spec.head_rows().len(), d.hidden, Epilogue::Store, false),
     };
     GemmShape::new(n, k, epi, bias).with_act(act(spec))
@@ -376,7 +382,7 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
     if !mma && !dequant {
         return Ok(set);
     }
-    for linear in wide_of(spec, &MMA_LINEARS).into_iter().chain(gdn.iter().copied()) {
+    for linear in wide_of(spec, &MMA_LINEARS).into_iter().chain(gdn.iter().copied()).chain(if spec.moe.as_ref().is_some_and(|m| m.latent.is_some()) { &LATENT_LINEARS[..] } else { &[] }.iter().copied()).collect::<Vec<_>>() {
         let wf = match linear {
             "lm_head" => head_format(spec),
             "lin_ba" => WeightFormat::Bf16,

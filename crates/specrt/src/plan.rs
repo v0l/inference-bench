@@ -119,6 +119,8 @@ pub enum Buf {
     Gdn,
     Streams,
     Merged,
+    Latent,
+    LatentPlanes,
 }
 
 impl Buf {
@@ -146,11 +148,13 @@ impl Buf {
             Buf::Gdn => "gdn",
             Buf::Streams => "streams",
             Buf::Merged => "merged",
+            Buf::Latent => "latent",
+            Buf::LatentPlanes => "latent planes",
         }
     }
 
     pub fn is_planes(self) -> bool {
-        matches!(self, Buf::XnPlanes | Buf::AttnPlanes | Buf::ActPlanes | Buf::GdnPlanes | Buf::MixPlanes | Buf::FcPlanes)
+        matches!(self, Buf::XnPlanes | Buf::AttnPlanes | Buf::ActPlanes | Buf::GdnPlanes | Buf::MixPlanes | Buf::FcPlanes | Buf::LatentPlanes)
     }
 
     pub fn holds_activation(self) -> bool {
@@ -178,6 +182,10 @@ pub enum Weight {
     MtpGateUp,
     MtpDown,
     MtpHead,
+    LatentDown,
+    LatentUp,
+    SharedGateUp,
+    SharedDown,
 }
 
 impl Weight {
@@ -201,6 +209,10 @@ impl Weight {
             Weight::MtpGateUp => "mtp_gate_up",
             Weight::MtpDown => "mtp_down",
             Weight::MtpHead => "mtp_head",
+            Weight::LatentDown => "latent_down",
+            Weight::LatentUp => "latent_up",
+            Weight::SharedGateUp => "shared_gate_up",
+            Weight::SharedDown => "shared_down",
         }
     }
 
@@ -217,6 +229,9 @@ impl Weight {
             Weight::MixIn => spec.mix_in_rows(),
             Weight::MixOut => spec.dims.hidden,
             Weight::LmHead | Weight::MtpHead => spec.head_rows().len(),
+            Weight::LatentDown => spec.moe.as_ref().map_or(0, |m| m.width(spec.dims.hidden)),
+            Weight::LatentUp | Weight::SharedDown => spec.dims.hidden,
+            Weight::SharedGateUp => 2 * spec.moe.as_ref().map_or(0, |m| m.shared_intermediate),
         }
     }
 
@@ -254,6 +269,9 @@ impl Weight {
             Weight::LmHead if spec.dims.tie_embeddings => vec![w("embed_tokens")],
             Weight::LmHead => vec![w("lm_head")],
             Weight::MtpFc | Weight::MtpQkv | Weight::MtpO | Weight::MtpGateUp | Weight::MtpDown | Weight::MtpHead => Vec::new(),
+            Weight::LatentDown | Weight::LatentUp => spec.moe.iter().flat_map(|m| m.latent.as_ref()).map(|l| format!("mlp.{}.weight", if self == Weight::LatentDown { &l.down } else { &l.up })).collect(),
+            Weight::SharedGateUp => spec.moe.iter().flat_map(|m| ["gate_proj", "up_proj"].map(|p| format!("mlp.{}.{p}.weight", m.shared_module))).collect(),
+            Weight::SharedDown => spec.moe.iter().map(|m| format!("mlp.{}.down_proj.weight", m.shared_module)).collect(),
         }
     }
 }
@@ -360,6 +378,27 @@ pub enum Op {
     HyperMean,
     PerLayer { node: u8, stage: u8 },
     Dit(DitOp),
+    BlockRes { stage: ResStage },
+    LatentNorm,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResStage {
+    Enter,
+    Mixed,
+    Done,
+    Tail,
+}
+
+impl ResStage {
+    pub fn name(self) -> &'static str {
+        match self {
+            ResStage::Enter => "enter",
+            ResStage::Mixed => "mixed",
+            ResStage::Done => "done",
+            ResStage::Tail => "tail",
+        }
+    }
 }
 
 pub const PLE_HEAD: u8 = 0;
@@ -431,6 +470,8 @@ impl Op {
             Op::PerLayer { stage: PLE_HEAD, .. } => "per layer inputs".into(),
             Op::PerLayer { .. } => "per layer residual".into(),
             Op::Dit(d) => d.label(),
+            Op::BlockRes { stage } => format!("block residual {}", stage.name()),
+            Op::LatentNorm => "latent expert norm".into(),
         }
     }
 
@@ -475,6 +516,9 @@ impl Op {
             Op::PerLayer { stage: PLE_HEAD, .. } => "tokens and hidden to per layer inputs".into(),
             Op::PerLayer { .. } => "x and per layer inputs into x".into(),
             Op::Dit(d) => d.flow(),
+            Op::BlockRes { stage: ResStage::Done } => "prefix added to x".into(),
+            Op::BlockRes { .. } => "x, prefix and block stack to x".into(),
+            Op::LatentNorm => "latent to latent planes".into(),
         }
     }
 
@@ -541,6 +585,10 @@ impl Op {
                 crate::graph::Bind::Weight { weight, .. } => Some(weight.clone()),
                 _ => None,
             }).collect(),
+            Op::BlockRes { stage: ResStage::Enter } => spec.block_residual.iter().flat_map(|r| ["norm", "proj"].map(|t| format!("{}_{t}.weight", r.sites[0]))).collect(),
+            Op::BlockRes { stage: ResStage::Mixed } => spec.block_residual.iter().flat_map(|r| ["norm", "proj"].map(|t| format!("{}_{t}.weight", r.sites[1]))).collect(),
+            Op::BlockRes { stage: ResStage::Tail } => spec.block_residual.iter().flat_map(|r| ["norm", "proj"].map(|t| format!("{}_{t}.weight", r.output))).collect(),
+            Op::LatentNorm => spec.moe.iter().flat_map(|m| m.latent.as_ref()).flat_map(|l| l.norm.as_ref()).map(|n| format!("mlp.{n}.weight")).collect(),
             _ => Vec::new(),
         }
     }
@@ -646,6 +694,11 @@ impl Op {
             Op::HyperMean => names(&["hyper_mean"]),
             Op::PerLayer { node, .. } => spec.per_layer.as_ref().and_then(|p| p.node.get(*node as usize)).and_then(|n| n.kernel.clone()).into_iter().collect(),
             Op::Dit(d) => names(&[d.kernel()]),
+            Op::BlockRes { stage: ResStage::Enter } => names(&["block_res_set", "block_res_mix", "block_res_push"]),
+            Op::BlockRes { stage: ResStage::Mixed } => names(&["block_res_add", "block_res_mix"]),
+            Op::BlockRes { stage: ResStage::Done } => names(&["block_res_out"]),
+            Op::BlockRes { stage: ResStage::Tail } => names(&["block_res_mix"]),
+            Op::LatentNorm => names(&["latent_norm"]),
         }
     }
 }

@@ -379,6 +379,40 @@ pub struct FamilyMoe {
     pub router_norm_scale: Option<String>,
     pub input_norm: Option<String>,
     pub expert_scale: Option<String>,
+    pub latent: Option<FamilyLatent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FamilyLatent {
+    pub width: String,
+    pub down: String,
+    pub up: String,
+    pub norm: String,
+    pub norm_key: String,
+}
+
+impl FamilyLatent {
+    pub fn read(&self, config: &serde_json::Value) -> Option<crate::spec::LatentExperts> {
+        let width = dotted(config, &self.width).and_then(|v| v.as_u64()).filter(|w| *w > 0)? as usize;
+        let normed = dotted(config, &self.norm_key).and_then(|v| v.as_bool()).unwrap_or(false);
+        Some(crate::spec::LatentExperts { width, down: self.down.clone(), up: self.up.clone(), norm: normed.then(|| self.norm.clone()) })
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyBlockResidual {
+    pub size: Option<String>,
+    pub sites: Vec<String>,
+    pub output: String,
+}
+
+impl FamilyBlockResidual {
+    pub fn read(&self, config: &serde_json::Value) -> Option<crate::spec::BlockResidual> {
+        let size = dotted(config, self.size.as_deref()?).and_then(|v| v.as_u64()).filter(|s| *s > 0)? as usize;
+        Some(crate::spec::BlockResidual { size, sites: self.sites.clone(), output: self.output.clone() })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -731,6 +765,8 @@ pub struct Family {
     #[serde(default)]
     pub per_layer: FamilyPerLayer,
     #[serde(default)]
+    pub block_residual: FamilyBlockResidual,
+    #[serde(default)]
     pub tensors: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub refuse: Vec<FamilyRefuse>,
@@ -817,8 +853,12 @@ impl Family {
         if let Some(k) = self.rope.nope_zero_key.as_deref() {
             push(k, &mut out);
         }
-        for k in self.hyper.keys().chain(self.gated_residual.streams.as_deref()).chain(self.per_layer.dim.as_deref()) {
+        for k in self.hyper.keys().chain(self.gated_residual.streams.as_deref()).chain(self.per_layer.dim.as_deref()).chain(self.block_residual.size.as_deref()) {
             push(k, &mut out);
+        }
+        if let Some(l) = &self.moe.latent {
+            push(&l.width, &mut out);
+            push(&l.norm_key, &mut out);
         }
         if let Some(i) = &self.attention.indexer {
             for k in [Some(&i.heads), Some(&i.head_dim), Some(&i.topk), i.kpool.as_ref()].into_iter().flatten() {

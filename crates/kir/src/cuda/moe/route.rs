@@ -219,8 +219,8 @@ pub fn scale_inputs() -> String {
     int t = pair / MOE_PAIRS;
     int s = pair % MOE_PAIRS;
     int i = blockIdx.x * 256 + threadIdx.x;
-    if (i >= HIDDEN || idx[pair] < 0) return;
-    xp[(size_t)pair * HIDDEN + i] = xn[(size_t)t * HIDDEN + i] * (s < MOE_K ? coef[pair] : 1.0f);
+    if (i >= MOE_WIDTH || idx[pair] < 0) return;
+    xp[(size_t)pair * MOE_WIDTH + i] = xn[(size_t)t * MOE_WIDTH + i] * (s < MOE_K ? coef[pair] : 1.0f);
 "##,
     )
 }
@@ -232,13 +232,14 @@ pub fn combine() -> String {
         "float* x, const float* out, const float* coef",
         r##"    int t = blockIdx.y;
     int i = blockIdx.x * 256 + threadIdx.x;
-    if (i >= HIDDEN) return;
+    if (i >= MOE_WIDTH) return;
     float acc = 0.0f;
     for (int s = 0; s < MOE_PAIRS; s++) {
         float c = coef[t * MOE_PAIRS + s];
-        if (c != 0.0f) acc += (MOE_INPUT_SCALED && s < MOE_K ? 1.0f : c) * out[((size_t)t * MOE_PAIRS + s) * HIDDEN + i];
+        if (c != 0.0f) acc += (MOE_INPUT_SCALED && s < MOE_K ? 1.0f : c) * out[((size_t)t * MOE_PAIRS + s) * MOE_WIDTH + i];
     }
-    x[(size_t)t * HIDDEN + i] += MOE_OUT_SCALE * acc;
+    if (MOE_ASSIGN) x[(size_t)t * MOE_WIDTH + i] = MOE_OUT_SCALE * acc;
+    else x[(size_t)t * MOE_WIDTH + i] += MOE_OUT_SCALE * acc;
 "##,
     )
 }

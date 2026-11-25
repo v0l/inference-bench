@@ -581,6 +581,26 @@ impl Prelude {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockResidual {
+    pub size: usize,
+    pub sites: Vec<String>,
+    pub output: String,
+}
+
+pub const MAX_RESIDUAL_BLOCKS: usize = 16;
+
+impl BlockResidual {
+    pub fn blocks(&self, layers: usize) -> usize {
+        layers.div_ceil(self.size)
+    }
+
+    pub fn opens(&self, layer: usize) -> bool {
+        layer.is_multiple_of(self.size)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatedStage {
     Expand,
@@ -835,8 +855,20 @@ pub struct Moe {
     pub input_norm: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expert_scale: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latent: Option<LatentExperts>,
     #[serde(skip)]
     pub local: Option<ExpertRange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LatentExperts {
+    pub width: usize,
+    pub down: String,
+    pub up: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub norm: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -938,11 +970,15 @@ impl Moe {
     }
 
     pub fn shared_slots(&self) -> usize {
-        if self.shared_intermediate == 0 { 0 } else { (self.shared_intermediate / self.expert_intermediate.max(1)).max(1) }
+        if self.shared_intermediate == 0 || self.latent.is_some() { 0 } else { (self.shared_intermediate / self.expert_intermediate.max(1)).max(1) }
     }
 
     pub fn pairs(&self) -> usize {
         self.top_k() + self.shared_slots()
+    }
+
+    pub fn width(&self, hidden: usize) -> usize {
+        self.latent.as_ref().map_or(hidden, |l| l.width)
     }
 }
 
@@ -1162,6 +1198,8 @@ pub struct Spec {
     pub prelude: Option<Prelude>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_layer: Option<PerLayer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_residual: Option<BlockResidual>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtp: Option<Mtp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2088,6 +2126,7 @@ impl Spec {
                     },
                     input_norm: family.moe.input_norm.clone(),
                     expert_scale: family.moe.expert_scale.clone(),
+                    latent: family.moe.latent.as_ref().and_then(|l| l.read(&value)),
                     local: None,
                 })
             }
@@ -2181,6 +2220,7 @@ impl Spec {
             gated_residual: family.gated_residual.read(&value)?,
             prelude: family.prelude.read(&value)?,
             per_layer: family.per_layer.read(&value)?,
+            block_residual: family.block_residual.read(&value),
             tensors: family.tensors.clone(),
             vision: if strict { crate::vision::Vision::from_hf_config(json)? } else { None },
             state: if family.state.is_empty() { crate::state::stock() } else { family.state.clone() },
@@ -2210,6 +2250,7 @@ impl Spec {
         self.validate_hyper()?;
         self.validate_prelude()?;
         self.validate_per_layer()?;
+        self.validate_block_residual()?;
         crate::state::validate(self)?;
         match self.head_quant {
             None | Some(Quant::Bf16) => {}
@@ -2577,6 +2618,16 @@ impl Spec {
 
     pub fn prelude_slot(&self, layer: usize) -> Option<usize> {
         self.prelude.as_ref().and_then(|p| p.slot(layer))
+    }
+
+    fn validate_block_residual(&self) -> Result<()> {
+        let Some(r) = &self.block_residual else { return Ok(()) };
+        ensure!(r.size > 0 && r.sites.len() == 2 && !r.output.is_empty(), "[block_residual] needs a block size, two sites (before the mixer, before the mlp) and an output module");
+        ensure!(r.blocks(self.layers.count) <= MAX_RESIDUAL_BLOCKS, "[block_residual] keeps {} blocks, more than the {MAX_RESIDUAL_BLOCKS} the kernel holds", r.blocks(self.layers.count));
+        ensure!(self.hyper.is_none() && self.gated_residual.is_none() && !self.uses_branch() && !self.layers.split && self.norm.pre, "[block_residual] replaces the plain pre-norm residual and takes no hyper, gated, sandwich, scaled or split layers");
+        ensure!(self.speculative().is_none(), "[block_residual] cannot be combined with [mtp] yet");
+        ensure!(self.moe.as_ref().is_none_or(|m| m.latent.is_some() && !m.parallel_dense && !m.input_scaled && m.shared_gate == false), "[block_residual] runs mixture-of-experts layers with [moe] latent experts and an ungated shared expert only");
+        Ok(())
     }
 
     pub fn parallel_moe(&self) -> bool {

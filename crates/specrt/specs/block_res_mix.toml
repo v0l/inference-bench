@@ -1,0 +1,36 @@
+kind = "kir-kernel"
+family = "block_res"
+name = "block_res_mix"
+threads = 256
+
+[args]
+hidden = "hidden"
+blocks = "res_blocks"
+eps = "norm_eps"
+mode = "mix"
+
+[[param]]
+name = "stack"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "prefix"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "w"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "y"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "count"
+type = "i32"
+role = "value"
+access = "read"

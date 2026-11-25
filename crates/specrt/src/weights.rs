@@ -158,6 +158,16 @@ pub struct Layer<'a> {
     pub gated: Vec<Vec<(String, Vec<f32>)>>,
     pub prelude: Vec<(String, Vec<f32>)>,
     pub ple: Vec<(String, Vec<f32>)>,
+    pub residual: Vec<Vec<f32>>,
+    pub latent: Option<LatentWeights<'a>>,
+}
+
+pub struct LatentWeights<'a> {
+    pub down: Matrix<'a>,
+    pub up: Matrix<'a>,
+    pub norm: Vec<f32>,
+    pub shared_gate_up: Matrix<'a>,
+    pub shared_down: Matrix<'a>,
 }
 
 pub struct Outside<'a> {
@@ -1417,6 +1427,45 @@ impl Checkpoint {
             gated: self.gated_sites(spec, &p)?,
             prelude: self.prelude_weights(spec, i, &p)?,
             ple: self.ple_layer(spec, &p, ple_factor)?,
+            residual: match &spec.block_residual {
+                Some(r) => r.sites.iter().map(|s| self.residual_score(spec, &format!("{p}.{s}"))).collect::<Result<_>>()?,
+                None => Vec::new(),
+            },
+            latent: if sparse && spec.moe.as_ref().is_some_and(|m| m.latent.is_some()) { Some(self.latent(spec, &p)?) } else { None },
+        })
+    }
+
+    pub fn residual_score(&self, spec: &Spec, module: &str) -> Result<Vec<f32>> {
+        let h = spec.dims.hidden;
+        let norm = self.f32(&format!("{module}_norm.weight"), h)?;
+        let proj = self.floats(&format!("{module}_proj.weight"), &[1, h])?;
+        Ok(norm.iter().zip(&proj).map(|(a, b)| a * b).collect())
+    }
+
+    pub fn residual_head(&self, spec: &Spec) -> Result<Vec<f32>> {
+        match &spec.block_residual {
+            Some(r) => self.residual_score(spec, &format!("{}.{}", self.root(), r.output)),
+            None => Ok(vec![0.0]),
+        }
+    }
+
+    fn latent(&self, spec: &Spec, p: &str) -> Result<LatentWeights<'_>> {
+        let m = spec.moe.as_ref().context("no [moe]")?;
+        let l = m.latent.as_ref().context("no [moe] latent")?;
+        let (h, w, s) = (spec.dims.hidden, l.width, m.shared_intermediate);
+        let q = spec.quant;
+        let shared = format!("{p}.mlp.{}", m.shared_module);
+        let gate = self.raw(&format!("{shared}.gate_proj.weight"), s, h)?;
+        let up = self.raw(&format!("{shared}.up_proj.weight"), s, h)?;
+        Ok(LatentWeights {
+            down: self.raw(&format!("{p}.mlp.{}.weight", l.down), w, h)?.into_matrix(q, &format!("{p}.mlp.{}", l.down))?,
+            up: self.raw(&format!("{p}.mlp.{}.weight", l.up), h, w)?.into_matrix(q, &format!("{p}.mlp.{}", l.up))?,
+            norm: match &l.norm {
+                Some(n) => self.norm(spec, &format!("{p}.mlp.{n}.weight"), w)?,
+                None => vec![1.0; w],
+            },
+            shared_gate_up: Raw::interleave(gate, up)?.into_matrix(q, &format!("{shared}.gate_up"))?,
+            shared_down: self.raw(&format!("{shared}.down_proj.weight"), h, s)?.into_matrix(q, &format!("{shared}.down_proj"))?,
         })
     }
 
@@ -1570,7 +1619,8 @@ impl Checkpoint {
             return self.gguf_moe_layer(g, spec, global);
         }
         let m = spec.moe.as_ref().context("no [moe]")?;
-        let (h, inter, e) = (spec.dims.hidden, m.expert_intermediate, m.experts);
+        let (h, inter, e) = (m.width(spec.dims.hidden), m.expert_intermediate, m.experts);
+        let router_cols = spec.dims.hidden;
         let (local, first) = (m.local_experts(), m.first_expert());
         let shared_slots = m.shared_slots();
         let total = local + shared_slots;
@@ -1629,7 +1679,7 @@ impl Checkpoint {
                 Ok(Stacked::Bf16(w))
             }
         };
-        let shared_gate = if m.shared_gate { Some(self.floats(&format!("{shared_module}_gate.weight"), &[1, h])?) } else { None };
+        let shared_gate = if m.shared_gate { Some(self.floats(&format!("{shared_module}_gate.weight"), &[1, router_cols])?) } else { None };
         let (gate, up, down) = match &m.expert_block {
             Some(format) => {
                 ensure!(shared_slots == 0 && local == e, "block quantised experts support neither shared experts nor an expert split yet");
@@ -1689,7 +1739,7 @@ impl Checkpoint {
             None => (stack("gate", inter, h)?, stack("up", inter, h)?, stack("down", h, inter)?),
         };
         Ok(MoeWeights {
-            router: self.bf16(&format!("{p}.mlp.{}.weight", m.router_module), &[e, h])?.into_owned(),
+            router: self.bf16(&format!("{p}.mlp.{}.weight", m.router_module), &[e, router_cols])?.into_owned(),
             shared_gate,
             score_bias: if m.score_bias { Some(self.floats(&format!("{p}.mlp.{}.e_score_correction_bias", m.router_module), &[e])?) } else { None },
             router_bias: if m.router_bias { Some(self.floats(&format!("{p}.mlp.{}.bias", m.router_module), &[e])?) } else { None },
@@ -1904,6 +1954,8 @@ impl Checkpoint {
                 gated: Vec::new(),
                 prelude: Vec::new(),
                 ple: Vec::new(),
+                residual: Vec::new(),
+                latent: None,
             },
             norm: self.norm(spec, &lay.norm, h)?,
         })

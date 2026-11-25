@@ -1,7 +1,7 @@
 use crate::spec::{Block, GatedStage, Spec};
 use crate::vision::VisionConfig;
 use crate::vision_encoder::VisionOp;
-use crate::plan::{Buf, GATED_MODULE, QuantSource, NormKind, Op, Phase, Plan, PlanBlock, Weight};
+use crate::plan::{Buf, GATED_MODULE, QuantSource, NormKind, Op, Phase, Plan, PlanBlock, ResStage, Weight};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
@@ -102,6 +102,8 @@ fn buffer(name: &str) -> Result<Buf> {
         "merged" => Buf::Merged,
         "fc_planes" => Buf::FcPlanes,
         "mtp_logits" => Buf::MtpLogits,
+        "latent" => Buf::Latent,
+        "latent_planes" => Buf::LatentPlanes,
         other => bail!("unknown buffer {other}"),
     })
 }
@@ -126,6 +128,10 @@ fn weight(name: &str) -> Result<Weight> {
         "mtp_gate_up" => Weight::MtpGateUp,
         "mtp_down" => Weight::MtpDown,
         "mtp_head" => Weight::MtpHead,
+        "latent_down" => Weight::LatentDown,
+        "latent_up" => Weight::LatentUp,
+        "shared_gate_up" => Weight::SharedGateUp,
+        "shared_down" => Weight::SharedDown,
         other => bail!("unknown weight {other}"),
     })
 }
@@ -224,6 +230,16 @@ impl Node {
             "hyper_pre" => Op::HyperPre { site: field(&self.weight, "weight")?.parse().with_context(|| format!("hyper_pre weight is a site index, not {:?}", self.weight))? },
             "hyper_post" => Op::HyperPost,
             "hyper_mean" => Op::HyperMean,
+            "block_res" => Op::BlockRes {
+                stage: match field(&self.weight, "weight")?.as_str() {
+                    "enter" => ResStage::Enter,
+                    "mixed" => ResStage::Mixed,
+                    "done" => ResStage::Done,
+                    "tail" => ResStage::Tail,
+                    other => bail!("block_res weight {other:?} is not enter, mixed, done or tail"),
+                },
+            },
+            "latent_norm" => Op::LatentNorm,
             "flash" => Op::Flash,
             "decode_attention" => Op::DecodeAttention,
             other => bail!("unknown op {other}"),
@@ -244,7 +260,10 @@ fn holds(when: Option<&str>, tensor_core: bool, spec: &Spec, tail: bool) -> bool
             "nopre" => !spec.norm.pre,
             "qk_norm_full" => spec.attention.qk_norm_full,
             "branch" => spec.uses_branch() && !spec.layers.split && spec.hyper.is_none(),
-            "plain" => !spec.uses_branch() && !spec.layers.split && spec.hyper.is_none() && spec.gated_residual().is_none(),
+            "plain" => !spec.uses_branch() && !spec.layers.split && spec.hyper.is_none() && spec.gated_residual().is_none() && spec.block_residual.is_none(),
+            "blockres" => spec.block_residual.is_some(),
+            "latent" => spec.moe.as_ref().is_some_and(|m| m.latent.is_some()),
+            "flatmoe" => spec.moe.as_ref().is_some_and(|m| m.latent.is_none()),
             "hyper" => spec.hyper.is_some(),
             "gated" => spec.gated_residual().is_some(),
             "flat" => spec.gated_residual().is_none(),

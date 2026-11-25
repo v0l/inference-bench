@@ -49,6 +49,8 @@ pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::Mo
     let Some(m) = &spec.moe else { return Ok(Vec::new()) };
     let shape = kir::moe::MoeShape {
         hidden: spec.dims.hidden,
+        width: m.width(spec.dims.hidden),
+        assign: m.latent.is_some(),
         experts: m.experts,
         local: m.local_experts(),
         top_k: m.top_k(),
@@ -339,6 +341,31 @@ pub fn hyper_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::Kerne
         .collect()
 }
 
+pub fn residual_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::Kernel>> {
+    let mut names: Vec<&str> = Vec::new();
+    if spec.block_residual.is_some() {
+        names.extend(["block_res_mix", "block_res_push", "block_res_add", "block_res_set", "block_res_out"]);
+    }
+    if spec.moe.as_ref().is_some_and(|m| m.latent.is_some()) {
+        names.push("latent_norm");
+    }
+    let mut symbols = kir_shape(spec);
+    if let Some(r) = &spec.block_residual {
+        symbols = symbols.num("res_blocks", r.blocks(spec.layers.count) as f64);
+    }
+    if let Some(m) = &spec.moe {
+        symbols = symbols.num("moe_width", m.width(spec.dims.hidden) as f64);
+    }
+    let registry = crate::kir_kernel::Registry::active();
+    names
+        .into_iter()
+        .map(|n| {
+            let d = registry.get(n).ok_or_else(|| anyhow::anyhow!("no kernel description provides {n}"))?;
+            d.build(target, &symbols).map_err(anyhow::Error::msg)
+        })
+        .collect()
+}
+
 pub fn gated_symbols(spec: &Spec) -> kir::desc::Shape {
     let mut symbols = kir_shape(spec);
     if let Some(h) = spec.gated_residual() {
@@ -552,7 +579,7 @@ pub fn kir_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::Kernel>
     let mut names = vec!["rmsnorm", "swiglu"];
     if spec.uses_branch() {
         names.extend(["norm_add", "clear_branch"]);
-    } else if spec.gated_residual().is_some() {
+    } else if spec.gated_residual().is_some() || spec.block_residual.is_some() {
         names.push("clear_branch");
     }
     if spec.norm.residual_scale.is_some() || spec.gated_residual().is_some() {
@@ -700,7 +727,7 @@ impl Module {
         let gemms = crate::gemm::gemm_kernels(spec, target)?;
         let described = described_kernels(spec, kv_planes, max_ctx, target)?;
         let mut distinct: Vec<kir::Kernel> = Vec::new();
-        for k in described.into_iter().flatten().chain(mixer_kernels(spec, kv_planes, max_ctx, target)?).chain(hyper_kernels(spec, target)?).chain(gated_kernels(spec, target)?).chain(per_layer_kernels(spec, target)?).chain(prelude_kernels(spec, max_ctx, target)?) {
+        for k in described.into_iter().flatten().chain(mixer_kernels(spec, kv_planes, max_ctx, target)?).chain(hyper_kernels(spec, target)?).chain(gated_kernels(spec, target)?).chain(per_layer_kernels(spec, target)?).chain(prelude_kernels(spec, max_ctx, target)?).chain(residual_kernels(spec, target)?) {
             if !distinct.iter().any(|d| d.name == k.name) {
                 distinct.push(k);
             }

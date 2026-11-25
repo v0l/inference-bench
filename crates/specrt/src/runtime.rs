@@ -131,6 +131,8 @@ fn upload_stored(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, i: usiz
     Ok(out)
 }
 
+const RES_HEAD: &str = "block residual output";
+
 fn upload_gated(stream: &Arc<CudaStream>, weights: &[(String, Vec<f32>)]) -> Result<GatedWeights> {
     weights.iter().map(|(n, v)| Ok((n.clone(), stream.clone_htod(v)?))).collect()
 }
@@ -189,7 +191,10 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, store: &
             slot: before(true),
         }),
     };
-    let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, ln_pre_mlp: up_opt(&l.ln_pre_mlp)?, ln_post_mlp: up_opt(&l.ln_post_mlp)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)?, moe: l.moe.as_ref().map(|m| moe::DeviceMoe::upload(stream, m, i, cached.as_ref().map(|(p, n)| (*p, *n)))).transpose()?, hyper: l.hyper.iter().map(|v| Ok(stream.clone_htod(v)?)).collect::<Result<_>>()?, gated: l.gated.iter().map(|s| upload_gated(stream, s)).collect::<Result<_>>()?, prelude: spec.prelude_slot(i).map(|s| Ok::<_, anyhow::Error>((s as i32, upload_gated(stream, &l.prelude)?))).transpose()?, prelude_stored: upload_stored(stream, ck, spec, i, global)?, ple: upload_ple(stream, &l.ple)?, ple_at: i as i32 };
+    let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, ln_pre_mlp: up_opt(&l.ln_pre_mlp)?, ln_post_mlp: up_opt(&l.ln_post_mlp)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)?, moe: l.moe.as_ref().map(|m| moe::DeviceMoe::upload(stream, m, i, cached.as_ref().map(|(p, n)| (*p, *n)))).transpose()?, hyper: l.hyper.iter().map(|v| Ok(stream.clone_htod(v)?)).collect::<Result<_>>()?, gated: l.gated.iter().map(|s| upload_gated(stream, s)).collect::<Result<_>>()?, prelude: spec.prelude_slot(i).map(|s| Ok::<_, anyhow::Error>((s as i32, upload_gated(stream, &l.prelude)?))).transpose()?, prelude_stored: upload_stored(stream, ck, spec, i, global)?, ple: upload_ple(stream, &l.ple)?, ple_at: i as i32, residual: l.residual.iter().map(|v| Ok(stream.clone_htod(v)?)).collect::<Result<_>>()?, latent: match &l.latent {
+        Some(w) => Some(DeviceLatent { down: up_m(&w.down)?, up: up_m(&w.up)?, norm: stream.clone_htod(&w.norm)?, shared_gate_up: up_m(&w.shared_gate_up)?, shared_down: up_m(&w.shared_down)? }),
+        None => None,
+    }, global };
     copied(stream)?;
     Ok(layer)
 }
@@ -274,7 +279,13 @@ fn upload_head(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, role: Sta
         norm: stream.clone_htod(&norm)?,
         lm_head: DeviceMatrix::upload(stream, &head)?,
         embed,
-        gated: upload_gated(stream, &ck.gated_head(spec)?)?,
+        gated: {
+            let mut g = upload_gated(stream, &ck.gated_head(spec)?)?;
+            if spec.block_residual.is_some() {
+                g.insert(RES_HEAD.into(), stream.clone_htod(&ck.residual_head(spec)?)?);
+            }
+            g
+        },
         ple: upload_ple(stream, &ck.ple_head(spec)?)?,
         draft: match spec.draft_head_quant() {
             Some(q) => {
@@ -646,6 +657,25 @@ struct DeviceLayer {
     prelude_stored: StoredWeights,
     ple: PleWeights,
     ple_at: i32,
+    residual: Vec<CudaSlice<f32>>,
+    latent: Option<DeviceLatent>,
+    global: usize,
+}
+
+struct DeviceLatent {
+    down: DeviceMatrix,
+    up: DeviceMatrix,
+    norm: CudaSlice<f32>,
+    shared_gate_up: DeviceMatrix,
+    shared_down: DeviceMatrix,
+}
+
+struct ResidualBuffers {
+    stack: CudaSlice<f32>,
+    prefix: CudaSlice<f32>,
+    head: CudaSlice<f32>,
+    latent: CudaSlice<f32>,
+    latent_planes: Planes,
 }
 
 type PleWeights = std::collections::BTreeMap<String, CudaSlice<f32>>;
@@ -688,6 +718,8 @@ impl DeviceLayer {
             + self.gated.iter().flat_map(|g| g.values()).chain(self.prelude.iter().flat_map(|(_, w)| w.values())).map(|v| v.num_bytes() as u64).sum::<u64>()
             + self.prelude_stored.values().map(|v| v.num_bytes() as u64).sum::<u64>()
             + self.ple.values().map(|v| v.num_bytes() as u64).sum::<u64>()
+            + self.residual.iter().map(|v| v.num_bytes() as u64).sum::<u64>()
+            + self.latent.as_ref().map_or(0, |l| l.down.bytes() + l.up.bytes() + l.shared_gate_up.bytes() + l.shared_down.bytes() + l.norm.num_bytes() as u64)
     }
 }
 
@@ -944,6 +976,7 @@ pub struct Runtime {
     gated: Option<GatedBuffers>,
     prelude: Option<PreludeBuffers>,
     ple: Option<PleBuffers>,
+    residual: Option<ResidualBuffers>,
     moe: Option<moe::MoeBuffers>,
     fp8_act: Option<Fp8Act>,
     fp4_act: Option<Fp4Act>,
@@ -1212,8 +1245,9 @@ impl Runtime {
         };
         checkpoint.check_quant_layout(&checkpoint.quant_map()?.renamed(&spec.tensors))?;
         let weights_started = Instant::now();
-        let Weights { mut layers, embed, norm, lm_head, mtp: mtp_weights, direct: weights_direct, gated: gated_head, ple: ple_head } =
+        let Weights { mut layers, embed, norm, lm_head, mtp: mtp_weights, direct: weights_direct, gated: mut gated_head, ple: ple_head } =
             load_weights(&ctx, &stream, &checkpoint, spec, range, role)?;
+        let res_head = gated_head.remove(RES_HEAD);
         let weight_secs = weights_started.elapsed().as_secs_f64();
         let weight_bytes = layers.iter().map(DeviceLayer::bytes).sum::<u64>()
             + (embed.num_bytes() + norm.num_bytes()) as u64
@@ -1342,6 +1376,19 @@ impl Runtime {
             gdn,
             mixer,
             mixer_launch,
+            residual: match (&spec.block_residual, res_head) {
+                (Some(r), Some(head)) => {
+                    let width = spec.moe.as_ref().map_or(1, |m| m.width(d.hidden));
+                    Some(ResidualBuffers {
+                        stack: stream.alloc_zeros(chunk * r.blocks(spec.layers.count) * d.hidden)?,
+                        prefix: stream.alloc_zeros(chunk * d.hidden)?,
+                        head,
+                        latent: stream.alloc_zeros(chunk * width)?,
+                        latent_planes: Planes::new(&stream, chunk * width)?,
+                    })
+                }
+                _ => None,
+            },
             gated: match spec.gated_residual() {
                 Some(h) => Some(GatedBuffers {
                     streams: stream.alloc_zeros(chunk * h.width(d.hidden))?,
@@ -1530,7 +1577,7 @@ impl Runtime {
     }
 
     fn kernel(&self, name: &str) -> &CudaFunction {
-        &self.kernels[name]
+        self.kernels.get(name).unwrap_or_else(|| panic!("kernel {name} is not in the module"))
     }
 
     fn slot_table(&self, slot: usize) -> CudaView<'_, i32> {

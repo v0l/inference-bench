@@ -22,6 +22,29 @@ pub enum RowBody {
     HyperExpand { streams: u32, hidden: u32 },
     HyperMean { streams: u32, hidden: u32 },
     PoolTopk { heads: u32, dim: u32, pool: u32, pick: u32, max_pools: u32, q_row: u32, q_offset: u32, w_row: u32, w_offset: u32, out_row: u32, layers: u32, tail: bool },
+    BlockRes { hidden: u32, blocks: u32, eps: f32, mode: ResMode },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResMode {
+    Mix,
+    Push,
+    Add,
+    Set,
+    Out,
+}
+
+impl ResMode {
+    pub fn parse(word: &str) -> Option<ResMode> {
+        Some(match word {
+            "mix" => ResMode::Mix,
+            "push" => ResMode::Push,
+            "add" => ResMode::Add,
+            "set" => ResMode::Set,
+            "out" => ResMode::Out,
+            _ => return None,
+        })
+    }
 }
 
 const MAX_STREAMS: u32 = 8;
@@ -58,6 +81,7 @@ impl RowBody {
             RowBody::PoolTopk { .. } => "pool_topk",
             RowBody::GroupPool { .. } => "group_pool",
             RowBody::GroupTopk { .. } => "group_topk",
+            RowBody::BlockRes { .. } => "block_res",
         }
     }
 
@@ -181,6 +205,26 @@ impl RowBody {
                     out.push(("y", Scalar::F32, Role::Activation, Access::Write));
                 }
             }
+            RowBody::BlockRes { mode: ResMode::Push, .. } => {
+                out.push(("stack", Scalar::F32, Role::Activation, Access::Write));
+                out.push(("prefix", Scalar::F32, Role::Activation, Access::Read));
+                out.push(("slot", Scalar::I32, Role::Value, Access::Read));
+            }
+            RowBody::BlockRes { mode: ResMode::Mix, .. } => {
+                out.push(("stack", Scalar::F32, Role::Activation, Access::Read));
+                out.push(("prefix", Scalar::F32, Role::Activation, Access::Read));
+                out.push(("w", Scalar::F32, Role::Weight, Access::Read));
+                out.push(("y", Scalar::F32, Role::Activation, Access::Write));
+                out.push(("count", Scalar::I32, Role::Value, Access::Read));
+            }
+            RowBody::BlockRes { mode: ResMode::Add | ResMode::Set, .. } => {
+                out.push(("x", Scalar::F32, Role::Activation, Access::Read));
+                out.push(("prefix", Scalar::F32, Role::Activation, Access::Write));
+            }
+            RowBody::BlockRes { mode: ResMode::Out, .. } => {
+                out.push(("x", Scalar::F32, Role::Activation, Access::Write));
+                out.push(("prefix", Scalar::F32, Role::Activation, Access::Write));
+            }
         }
         out
     }
@@ -243,6 +287,7 @@ impl RowBody {
             }
             RowBody::PoolTopk { max_pools, .. } if *max_pools > 12288 => Err("pool_topk scores live in shared memory, at most 12288 pools".into()),
             RowBody::PoolTopk { pick, pool, out_row, .. } if *out_row < pick * pool + pool - 1 => Err("pool_topk out_row must hold the picked pools and the open tail".into()),
+            RowBody::BlockRes { hidden, blocks, eps, .. } if *hidden == 0 || *blocks == 0 || *blocks > 64 || !eps.is_finite() || *eps < 0.0 => Err("block_res needs a positive hidden size, 1 to 64 blocks and a finite eps".into()),
             _ => Ok(()),
         }
     }
@@ -853,6 +898,48 @@ impl RowBody {
 "
                 )
             }
+            RowBody::BlockRes { hidden, blocks, eps, mode } => match mode {
+                ResMode::Mix => format!(
+                    "    constexpr int H = {hidden};
+    constexpr int BLOCKS = {blocks};
+    __shared__ float scratch[32];
+    __shared__ float score[BLOCKS + 1];
+    const int row = blockIdx.y;
+    const float* st = stack + (size_t)row * BLOCKS * H;
+    const float* pf = prefix + (size_t)row * H;
+    for (int j = 0; j <= count; j++) {{
+        const float* v = j < count ? st + (size_t)j * H : pf;
+        float ss = 0.0f, dot = 0.0f;
+        for (int i = threadIdx.x; i < H; i += blockDim.x) {{
+            ss += v[i] * v[i];
+            dot += v[i] * w[i];
+        }}
+        const float total = kir_block_sum(ss, scratch);
+        const float d = kir_block_sum(dot, scratch);
+        if (threadIdx.x == 0) score[j] = d * rsqrtf(total / H + {eps}f);
+    }}
+    __syncthreads();
+    float m = score[0];
+    for (int j = 1; j <= count; j++) m = fmaxf(m, score[j]);
+    float z = 0.0f;
+    for (int j = 0; j <= count; j++) z += expf(score[j] - m);
+    for (int i = threadIdx.x; i < H; i += blockDim.x) {{
+        float acc = 0.0f;
+        for (int j = 0; j <= count; j++) acc += expf(score[j] - m) / z * (j < count ? st[(size_t)j * H + i] : pf[i]);
+        y[(size_t)row * H + i] = acc;
+    }}
+",
+                    eps = crate::lit(*eps),
+                ),
+                ResMode::Push => format!(
+                    "    const int row = blockIdx.y;
+    for (int i = threadIdx.x; i < {hidden}; i += blockDim.x) stack[((size_t)row * {blocks} + slot) * {hidden} + i] = prefix[(size_t)row * {hidden} + i];
+"
+                ),
+                ResMode::Add => format!("    const int row = blockIdx.y;\n    for (int i = threadIdx.x; i < {hidden}; i += blockDim.x) prefix[(size_t)row * {hidden} + i] += x[(size_t)row * {hidden} + i];\n"),
+                ResMode::Set => format!("    const int row = blockIdx.y;\n    for (int i = threadIdx.x; i < {hidden}; i += blockDim.x) prefix[(size_t)row * {hidden} + i] = x[(size_t)row * {hidden} + i];\n"),
+                ResMode::Out => format!("    const int row = blockIdx.y;\n    for (int i = threadIdx.x; i < {hidden}; i += blockDim.x) {{\n        const size_t at = (size_t)row * {hidden} + i;\n        prefix[at] += x[at];\n        x[at] = prefix[at];\n    }}\n"),
+            },
         };
         Ok(format!("{head}{body}}}\n\n"))
     }

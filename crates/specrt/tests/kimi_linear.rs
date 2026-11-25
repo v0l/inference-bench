@@ -155,31 +155,6 @@ fn the_real_kimi_linear_48b_config_serves() {
 }
 
 #[test]
-fn kimi_k3_configs_name_each_missing_piece() {
-    for (dir, model_type) in [("moonshotai__Kimi-K3", "kimi_k3"), ("moonshotai__Kimi-K3.1-Pro", "kimi_k31")] {
-        let path = std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/specrt-popular/files").join(dir).join("config.json");
-        let Ok(json) = std::fs::read_to_string(&path) else {
-            eprintln!("{} missing, skipped", path.display());
-            continue;
-        };
-        let err = format!("{:#}", Spec::from_hf_config_serving(&json).unwrap_err());
-        assert!(!err.contains(&format!("model_type {model_type} is not supported")), "{err}");
-        assert!(err.contains("Kimi K3"), "{err}");
-        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let t = v["text_config"].as_object_mut().unwrap();
-        for k in ["attn_res_block_size", "routed_expert_hidden_size", "mla_use_output_gate", "q_lora_rank", "activation_situ_beta"] {
-            t.remove(k);
-        }
-        t.insert("hidden_act".into(), "silu".into());
-        t["linear_attn_config"].as_object_mut().unwrap().remove("use_full_rank_gate");
-        let stripped = Spec::from_hf_config_serving(&v.to_string()).unwrap_or_else(|e| panic!("{model_type} without the K3 pieces: {e:#}"));
-        stripped.runnable().unwrap_or_else(|e| panic!("{e:#}"));
-        assert_eq!(stripped.layers.count, 93);
-        assert_eq!(stripped.attention.head_dim, 192);
-    }
-}
-
-#[test]
 #[ignore = "needs a CUDA GPU"]
 fn the_engine_matches_transformers_on_hidden_states_prefill_and_four_decode_steps() {
     use specrt::runtime::{DecodeRow, Runtime, Sampling};
