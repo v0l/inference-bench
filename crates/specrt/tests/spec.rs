@@ -744,6 +744,21 @@ fn glm4_5_air_reads_partial_rotary_sigmoid_routing_shared_expert_and_mtp_layer()
 }
 
 #[test]
+fn glm4_5_air_nvfp4_serves_the_narrow_dense_layer_in_bf16_and_the_experts_in_fp4() {
+    let json = std::fs::read_to_string(root().join("tests/fixtures/popular/Firworks__GLM-4.5-Air-nvfp4/config.json")).unwrap();
+    let spec = Spec::from_hf_config_serving(&json).unwrap_or_else(|e| panic!("{e:#}"));
+    assert_eq!((spec.quant, spec.mlp.quant), (Quant::Bf16, Some(Quant::Nvfp4G16)));
+    assert_eq!(spec.dims.intermediate, 10944);
+    assert_eq!(spec.mlp_quant(0), Quant::Bf16, "10944 is not a multiple of 256, so the dense layer runs bf16");
+    assert!((1..46).all(|l| spec.mlp_quant(l) == Quant::Nvfp4G16));
+    spec.runnable().unwrap();
+    specrt::codegen::Module::generate(&spec, 2048).unwrap_or_else(|e| panic!("{e:#}"));
+    let mut wide = spec.clone();
+    wide.dims.intermediate = 11008;
+    assert_eq!(wide.mlp_quant(0), Quant::Nvfp4G16);
+}
+
+#[test]
 fn a_plain_attention_mtp_block_validates_only_with_a_layout() {
     let mut s = derived("glm4.5-air.config.json");
     assert!(s.linear_attention.is_none() && !s.attention.output_gate);

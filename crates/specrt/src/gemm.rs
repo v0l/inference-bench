@@ -399,7 +399,7 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
         set.tiles(t, &format!("{linear}_mma"), linear_shape(spec, linear), wf, split(spec, linear, wf), false, &tuning)?;
     }
     if dequant {
-        if spec.mlp.quant == Some(Quant::Nvfp4G16) {
+        if spec.mlp.quant == Some(Quant::Nvfp4G16) && spec.dense_fp4_fits() {
             for linear in wide_of(spec, &FP4_LINEARS) {
                 let shape = linear_shape(spec, linear);
                 set.tiles(t, &format!("{linear}_f4w"), shape, WeightFormat::Fp4, true, false, &tuning)?;
@@ -457,7 +457,7 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
             set.push(KernelInstance::batch_reduce(t, &format!("{linear}_f8b_reduce"), shape, WeightFormat::Fp8))?;
         }
     }
-    let fp4_mlp = spec.mlp.quant == Some(Quant::Nvfp4G16) || spec.serves_fp4_mlp();
+    let fp4_mlp = (spec.mlp.quant == Some(Quant::Nvfp4G16) || spec.serves_fp4_mlp()) && spec.dense_fp4_fits();
     if fp4_mlp {
         let (gu, dn) = (linear_shape(spec, "gate_up"), linear_shape(spec, "down"));
         set.push_fused(normed_fp4(t, "gate_up_act_f4", gu, true))?;

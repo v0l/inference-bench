@@ -537,3 +537,27 @@ fn chunked_tile_decode_matches_transformers_at_batch_1_and_3() {
     decode_through_tile_scan(CHUNKED, 1);
     decode_through_tile_scan(CHUNKED, 3);
 }
+
+#[test]
+fn a_checkpoint_without_its_nextn_layer_loads_with_speculation_off() {
+    use safetensors::SafeTensors;
+    let full = spec(GLM);
+    let ck = specrt::weights::Checkpoint::for_repo(&full.repo).unwrap();
+    let mut kept = full.clone();
+    assert!(!ck.drop_absent_mtp(&mut kept) && kept.mtp.is_some(), "the tiny fixture carries model.layers.4");
+    let bytes = std::fs::read(fixture(GLM).join("model.safetensors")).unwrap();
+    let st = SafeTensors::deserialize(&bytes).unwrap();
+    let views: Vec<_> = st.tensors().into_iter().filter(|(n, _)| !n.starts_with("model.layers.4.")).collect();
+    let dir = std::env::temp_dir().join(format!("specrt-glm-no-nextn-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    safetensors::serialize_to_file(views, None, &dir.join("model.safetensors")).unwrap();
+    std::fs::copy(fixture(GLM).join("config.json"), dir.join("config.json")).unwrap();
+    let mut stripped = full.clone();
+    stripped.repo = dir.display().to_string();
+    let ck = specrt::weights::Checkpoint::for_repo(&stripped.repo).unwrap();
+    assert!(ck.mtp(&stripped).is_err());
+    assert!(ck.drop_absent_mtp(&mut stripped) && stripped.mtp.is_none());
+    let resolved = specrt::engine::resolve_spec(&dir.display().to_string()).unwrap();
+    assert!(resolved.mtp.is_none(), "the engine serves it without speculation");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

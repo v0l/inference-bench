@@ -84,6 +84,9 @@ pub fn resolve_spec(model: &str) -> Result<Spec> {
         .with_context(|| model.to_string())?;
     spec.repo = model.to_string();
     spec.name = model.rsplit('/').next().unwrap_or(model).to_lowercase();
+    if spec.mtp.is_some() && let Ok(ck) = crate::weights::Checkpoint::for_repo(model) {
+        ck.renamed(&spec.tensors).drop_absent_mtp(&mut spec);
+    }
     Ok(spec)
 }
 

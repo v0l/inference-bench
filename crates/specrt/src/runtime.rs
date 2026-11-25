@@ -1190,6 +1190,9 @@ impl Runtime {
         if staged.prelude.is_some() {
             Checkpoint::for_repo(&staged.repo)?.renamed(&staged.tensors).complete_prelude(&mut staged, range.start)?;
         }
+        if staged.mtp.is_some() && Checkpoint::for_repo(&staged.repo)?.renamed(&staged.tensors).drop_absent_mtp(&mut staged) {
+            tracing::info!(repo = %staged.repo, "the checkpoint has no MTP layer, speculation is off");
+        }
         let spec = &staged;
         ensure!(layout.slots >= 1, "need at least one slot");
         let layout = if spec.runtime.kv_dtype.is_fp8() { Layout { kv_planes: 1, ..layout } } else { layout };
