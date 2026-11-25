@@ -90,7 +90,8 @@ fn mla_q_lora_and_the_output_gate_are_attention_nodes() {
     assert_eq!(spec.qkv_rows(), 64 + 64 + 16 + 4 * 32, "q_a, kv_a and g_proj share the qkv GEMM");
     assert_eq!(spec.o_dim(), 4 * 32);
     let kernels: Vec<&str> = spec.attention.node.iter().filter_map(|n| n.kernel.as_deref()).collect();
-    assert_eq!(kernels, ["mla_q_lora_norm", "mla_kv_lora_norm", "dsa_q_b", "dsa_latent_write", "dsa_absorb_q", "mla_lora_attention", "mla_expand_v_rows", "mla_out_gate"]);
+    assert_eq!(kernels, ["mla_q_lora_norm_e6", "mla_kv_lora_norm_e6", "dsa_q_b", "dsa_latent_write", "dsa_absorb_q", "mla_lora_attention", "mla_expand_v_rows", "mla_out_gate"]);
+    assert_eq!(spec.attention.params["mla_lora_eps"], 1e-6, "q_a_layernorm and kv_a_layernorm keep KimiRMSNorm's default eps");
     let mixer = spec.mixer.as_ref().unwrap();
     let projections: Vec<&str> = mixer.projection.iter().map(|p| p.tensor.as_str()).collect();
     assert_eq!(projections, ["q_proj", "k_proj", "v_proj", "f_a_proj", "g_proj", "b_proj"]);
@@ -263,5 +264,30 @@ fn the_engine_matches_the_remote_code_on_hidden_states_prefill_and_four_decode_s
     let g = gap(&wrong.layers[..per], &saved[..per]);
     eprintln!("silu in place of situ: layer 0 hidden max abs {g}");
     assert!(g > 100.0 * TOLERANCE, "plain silu still matches the SiTU reference ({g})");
+    drop(rt);
+    let mut softplus = engine_spec();
+    for n in softplus.mixer.as_mut().unwrap().node.iter_mut().filter(|n| n.kernel.as_deref() == Some("kda_recurrence")) {
+        n.kernel = Some("kda_softplus_recurrence".into());
+    }
+    let mut rt = Runtime::load_batched(&softplus, 256, 1).unwrap();
+    let g = gap(&rt.trace_prefill(&tokens).unwrap().layers[..per], &saved[..per]);
+    eprintln!("softplus gate in place of the lower bounded gate: layer 0 hidden max abs {g}");
+    assert!(g > 100.0 * TOLERANCE, "the softplus gate still matches the lower bounded reference ({g})");
+    drop(rt);
+    let mut unnormed = engine_spec();
+    unnormed.moe.as_mut().unwrap().latent.as_mut().unwrap().norm = None;
+    let mut rt = Runtime::load_batched(&unnormed, 256, 1).unwrap();
+    let g = gap(&rt.trace_prefill(&tokens).unwrap().layers[per..2 * per], &saved[per..2 * per]);
+    eprintln!("latent experts without routed_expert_norm: layer 1 hidden max abs {g}");
+    assert!(g > 100.0 * TOLERANCE, "the latent experts match without their norm ({g})");
+    drop(rt);
+    let mut ungated = engine_spec();
+    let last = ungated.attention.node.len() - 1;
+    ungated.attention.node[last] = specrt::graph::Node { kernel: Some("mla_expand_v".into()), grid: vec!["heads".into(), "rows".into()], bind: ungated.attention.node[last - 1].bind.iter().filter(|(k, _)| *k != "y").map(|(k, v)| (k.clone(), v.clone())).collect(), ..ungated.attention.node[last].clone() };
+    ungated.attention.node.remove(last - 1);
+    let mut rt = Runtime::load_batched(&ungated, 256, 1).unwrap();
+    let g = gap(&rt.trace_prefill(&tokens).unwrap().layers[3 * per..4 * per], &saved[3 * per..4 * per]);
+    eprintln!("MLA without the output gate: layer 3 hidden max abs {g}");
+    assert!(g > 100.0 * TOLERANCE, "MLA matches without its output gate ({g})");
     assert!(failed.is_empty(), "{failed:?}");
 }
