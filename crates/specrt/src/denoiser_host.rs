@@ -13,6 +13,7 @@ pub struct Inputs<'a> {
     pub text_rows: usize,
     pub patch_h: usize,
     pub patch_w: usize,
+    pub frames: usize,
 }
 
 pub struct HostDenoiser<'a> {
@@ -40,8 +41,14 @@ impl<'a> HostDenoiser<'a> {
             for op in ops {
                 let Op::Dit(d) = op else { continue };
                 let ws: Vec<String> = match d {
-                    DitOp::Linear { weight, .. } => weight_names(weight, None).into_iter().map(|(n, _)| n).collect(),
+                    DitOp::Linear { weight, bias, .. } => weight_names(weight, None).into_iter().flat_map(|(n, _)| {
+                        let b = n.strip_suffix(".weight").map(|s| format!("{s}.bias"));
+                        std::iter::once(n).chain(b.filter(|_| *bias))
+                    }).collect(),
                     DitOp::AxisRope { text, image, .. } => [text, image].iter().flat_map(|w| ["q", "k"].map(|q| format!("{w}_{q}.weight"))).collect(),
+                    DitOp::TableAdd { table, .. } => vec![table.to_string()],
+                    DitOp::LayerNorm { weight, .. } => vec![format!("{weight}.weight"), format!("{weight}.bias")],
+                    DitOp::Pack { norms, .. } => crate::denoiser::pack_parts(norms).into_iter().filter(|n| !n.is_empty()).map(|n| format!("{n}.weight")).collect(),
                     _ => Vec::new(),
                 };
                 for w in ws {
@@ -72,6 +79,19 @@ impl<'a> HostDenoiser<'a> {
         self.weights.get(name).map(|v| v.as_slice()).with_context(|| format!("weight {name} is not loaded"))
     }
 
+    fn block_weight(&self, name: &str, block: Option<usize>) -> Result<&[f32]> {
+        self.weight(&name.replace("{i}", &block.unwrap_or(0).to_string()))
+    }
+
+    fn rows_in(&self, rows: Stream, x: &Inputs) -> usize {
+        match rows {
+            Stream::Text => x.text_rows,
+            Stream::Image | Stream::Latent => x.image,
+            Stream::Joint => x.text_rows + x.image,
+            Stream::Seqs => 1,
+        }
+    }
+
     pub fn forward(&self, x: &Inputs, trace: &mut Trace) -> Result<Vec<f32>> {
         let mut bufs: BTreeMap<&str, Vec<f32>> = BTreeMap::new();
         let width = |name: &str| -> Result<usize> { self.spec.size(&self.graph.decl(name).with_context(|| format!("no buffer {name}"))?.cols) };
@@ -88,8 +108,7 @@ impl<'a> HostDenoiser<'a> {
         bufs.insert("latent", x.latent.to_vec());
         bufs.insert("text", x.text.to_vec());
         bufs.insert("timestep", vec![x.timestep]);
-        let mut planes = vec![0f32; total * 3 * self.spec.hidden()];
-        let run = |ops: &[Op], block: Option<usize>, bufs: &mut BTreeMap<&str, Vec<f32>>, planes: &mut Vec<f32>| -> Result<()> {
+        let mut planes = vec![0f32; total * 3 * self.spec.hidden()];        let run = |ops: &[Op], block: Option<usize>, bufs: &mut BTreeMap<&str, Vec<f32>>, planes: &mut Vec<f32>| -> Result<()> {
             for op in ops {
                 let Op::Dit(d) = op else { bail!("{} is not a denoiser op", op.label()) };
                 self.op(d, block, x, bufs, planes)?;
@@ -108,7 +127,7 @@ impl<'a> HostDenoiser<'a> {
     }
 
     fn patch_dims(&self, x: &Inputs) -> Result<(usize, usize, usize, usize)> {
-        Ok((self.spec.size("grid_channels")?, self.spec.size("latent_patch")?, x.patch_h, x.patch_w))
+        Ok((self.spec.size("grid_channels")?, self.spec.size("latent_patch")?, x.patch_h * x.frames.max(1), x.patch_w))
     }
 
     fn span(&self, rows: Stream, x: &Inputs) -> (usize, usize) {
@@ -137,9 +156,9 @@ impl<'a> HostDenoiser<'a> {
                 let v = patchify(&bufs[from], c, p, ph, pw).into_iter().map(act_round).collect();
                 bufs.insert(into, v);
             }
-            DitOp::Unpatchify { from, into } => {
+            DitOp::Unpatchify { from, into, channels_last } => {
                 let (c, p, ph, pw) = self.patch_dims(x)?;
-                let v = unpatchify(&bufs[from], c, p, ph, pw);
+                let v = if channels_last { unpatchify_last(&bufs[from], c, p, ph, pw) } else { unpatchify(&bufs[from], c, p, ph, pw) };
                 bufs.insert(into, v);
             }
             DitOp::Split { from, into, rows, act } => {
@@ -164,13 +183,17 @@ impl<'a> HostDenoiser<'a> {
                 let t = x.timestep * self.spec.get("time_scale")? as f32;
                 bufs.insert(into, timestep_embedding(t, freq).into_iter().map(act_round).collect());
             }
-            DitOp::Linear { weight, input, output, rows, add } => {
+            DitOp::Linear { weight, input, output, rows, add, bias, act } => {
                 let signer = Signer { graph: self.graph, spec: self.spec };
                 let (n, k) = signer.linear_shape(weight, input, output)?;
                 let parts = weight_names(weight, block);
                 let mut w = Vec::with_capacity(n * k);
+                let mut bv: Vec<f32> = Vec::new();
                 for (name, range) in &parts {
                     let full = self.weight(name)?;
+                    if bias {
+                        bv.extend_from_slice(self.weight(&format!("{}.bias", name.strip_suffix(".weight").unwrap_or(name)))?);
+                    }
                     match range {
                         Some((a, b)) => {
                             let (a, b) = (self.spec.size(a)?, self.spec.size(b)?);
@@ -183,6 +206,7 @@ impl<'a> HostDenoiser<'a> {
                     }
                 }
                 ensure!(w.len() == n * k, "{weight}: {} values, expected {n} x {k}", w.len());
+                ensure!(!bias || bv.len() == n, "{weight}: {} bias values, expected {n}", bv.len());
                 let iw = width(input)?;
                 let ow = width(output)?;
                 let (ia, ib) = self.local_span(input, rows, x);
@@ -195,6 +219,10 @@ impl<'a> HostDenoiser<'a> {
                         for c in 0..k {
                             acc += src[(ia + r) * iw + c] * w[o * k + c];
                         }
+                        if bias {
+                            acc += bv[o];
+                        }
+                        acc = activate(acc, act);
                         let at = (oa + r) * ow + o;
                         dst[at] = if add { dst[at] + acc } else { acc };
                     }
@@ -202,7 +230,7 @@ impl<'a> HostDenoiser<'a> {
             }
             DitOp::Modulate { from, into, rows, set, shift, scale } => {
                 let m = bufs[set].clone();
-                let (a, b) = self.span(rows, x);
+                let (a, b) = self.local_span(from, rows, x);
                 let src = bufs[from].clone();
                 let dst = bufs.get_mut(into).unwrap();
                 for r in a..b {
@@ -215,9 +243,90 @@ impl<'a> HostDenoiser<'a> {
                     }
                 }
             }
+            DitOp::LayerNorm { from, into, rows, weight } => {
+                let g = self.block_weight(&format!("{weight}.weight"), block)?.to_vec();
+                let be = self.block_weight(&format!("{weight}.bias"), block)?.to_vec();
+                let (a, b) = self.local_span(from, rows, x);
+                let src = bufs[from].clone();
+                let dst = bufs.get_mut(into).unwrap();
+                for r in a..b {
+                    let row = &src[r * h..(r + 1) * h];
+                    let mean = row.iter().sum::<f32>() / h as f32;
+                    let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / h as f32;
+                    let inv = 1.0 / (var + eps).sqrt();
+                    for c in 0..h {
+                        dst[r * h + c] = (row[c] - mean) * inv * g[c] + be[c];
+                    }
+                }
+            }
+            DitOp::TableAdd { table, from, into } => {
+                let t = self.block_weight(table, block)?.to_vec();
+                let src = bufs[from].clone();
+                let dst = bufs.get_mut(into).unwrap();
+                ensure!(t.len() == dst.len() && dst.len().is_multiple_of(src.len()), "{table}: {} values for {} outputs from {} inputs", t.len(), dst.len(), src.len());
+                for (j, d) in dst.iter_mut().enumerate() {
+                    *d = t[j] + src[j % src.len()];
+                }
+            }
+            DitOp::Pack { from, into, rows, norms, rope, .. } => {
+                let parts = crate::denoiser::pack_parts(norms);
+                let n = self.rows_in(rows, x);
+                let fw = width(from)?;
+                let (a, _) = self.local_span(from, rows, x);
+                let hd = self.spec.size("head_dim")?;
+                let (cos, sin) = if rope { rope_tables(&self.spec.axes, x.ids, self.spec.get("rope_theta")?) } else { (Vec::new(), Vec::new()) };
+                let src = bufs[from].clone();
+                let mut out = vec![0f32; parts.len() * n * h];
+                for (pi, norm) in parts.iter().enumerate() {
+                    let w = if norm.is_empty() { None } else { Some(self.block_weight(&format!("{norm}.weight"), block)?) };
+                    for t in 0..n {
+                        let s = &src[(a + t) * fw + pi * h..(a + t) * fw + (pi + 1) * h];
+                        let o = &mut out[(pi * n + t) * h..(pi * n + t + 1) * h];
+                        let inv = 1.0 / (s.iter().map(|v| v * v).sum::<f32>() / h as f32 + eps).sqrt();
+                        let normed: Vec<f32> = (0..h).map(|i| w.map_or(s[i], |w| s[i] * inv * w[i])).collect();
+                        for i in 0..h {
+                            let d = i % hd;
+                            o[i] = if rope && pi < 2 {
+                                let other = normed[i ^ 1];
+                                let (c, sn) = (cos[t * hd + d], sin[t * hd + d]);
+                                if i & 1 == 1 { normed[i] * c + other * sn } else { normed[i] * c - other * sn }
+                            } else {
+                                normed[i]
+                            };
+                        }
+                    }
+                }
+                if self.graph.decl(into).is_some() {
+                    bufs.insert(into, out);
+                } else {
+                    planes[..out.len()].copy_from_slice(&out);
+                }
+            }
+            DitOp::CrossAttention { into, rows, kv } => {
+                let hd = self.spec.size("head_dim")?;
+                let n = self.rows_in(rows, x);
+                let m = x.text_rows;
+                let scale = 1.0 / (hd as f32).sqrt();
+                let kvb = bufs[kv].clone();
+                let (oa, _) = self.local_span(into, rows, x);
+                let dst = bufs.get_mut(into).unwrap();
+                for hh in 0..h / hd {
+                    for q in 0..n {
+                        let qv = &planes[q * h + hh * hd..q * h + (hh + 1) * hd];
+                        let scores: Vec<f32> = (0..m).map(|k| (0..hd).map(|i| qv[i] * kvb[k * h + hh * hd + i]).sum::<f32>() * scale).collect();
+                        let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let e: Vec<f32> = scores.iter().map(|s| (s - mx).exp()).collect();
+                        let z: f32 = e.iter().sum();
+                        for i in 0..hd {
+                            let v: f32 = (0..m).map(|k| e[k] * kvb[(m + k) * h + hh * hd + i]).sum();
+                            dst[(oa + q) * h + hh * hd + i] = v / z;
+                        }
+                    }
+                }
+            }
             DitOp::GatedAdd { from, into, rows, set, gate } => {
                 let m = bufs[set].clone();
-                let (a, b) = self.span(rows, x);
+                let (a, b) = self.local_span(into, rows, x);
                 let src = bufs[from].clone();
                 let dst = bufs.get_mut(into).unwrap();
                 for r in a..b {
@@ -230,7 +339,7 @@ impl<'a> HostDenoiser<'a> {
                 let fw = width(from)?;
                 let mw = width(into)?;
                 let off = self.spec.size(offset)?;
-                let (a, b) = self.span(rows, x);
+                let (a, b) = self.local_span(from, rows, x);
                 let src = bufs[from].clone();
                 let dst = bufs.get_mut(into).unwrap();
                 for r in a..b {
@@ -270,10 +379,11 @@ impl<'a> HostDenoiser<'a> {
                     }
                 }
             }
-            DitOp::Step { .. } => bail!("the host denoiser runs the network; the scheduler step is sampler::Pipeline::step_host"),
-            DitOp::JointAttention { into } => {
+            DitOp::Step { .. } | DitOp::MultiStep { .. } => bail!("the host denoiser runs the network; the scheduler step is sampler::Pipeline::step_host"),
+            DitOp::JointAttention { into, rows } => {
                 let hd = self.spec.size("head_dim")?;
-                let total = x.text_rows + x.image;
+                let total = self.rows_in(rows, x);
+                let (oa, _) = self.local_span(into, rows, x);
                 let scale = 1.0 / (hd as f32).sqrt();
                 let dst = bufs.get_mut(into).unwrap();
                 for hh in 0..h / hd {
@@ -285,7 +395,7 @@ impl<'a> HostDenoiser<'a> {
                         let z: f32 = e.iter().sum();
                         for i in 0..hd {
                             let v: f32 = (0..total).map(|k| e[k] * planes[(2 * total + k) * h + hh * hd + i]).sum();
-                            dst[q * h + hh * hd + i] = act_round(v / z);
+                            dst[(oa + q) * h + hh * hd + i] = act_round(v / z);
                         }
                     }
                 }
@@ -323,6 +433,40 @@ pub fn unpatchify(tokens: &[f32], channels: usize, p: usize, ph: usize, pw: usiz
         }
     }
     out
+}
+
+pub fn unpatchify_last(tokens: &[f32], channels: usize, p: usize, ph: usize, pw: usize) -> Vec<f32> {
+    let width = channels * p * p;
+    let mut out = vec![0f32; tokens.len()];
+    for c in 0..channels {
+        for y in 0..ph * p {
+            for xx in 0..pw * p {
+                let token = (y / p) * pw + xx / p;
+                let col = ((y % p) * p + xx % p) * channels + c;
+                out[(c * ph * p + y) * pw * p + xx] = tokens[token * width + col];
+            }
+        }
+    }
+    out
+}
+
+fn activate(v: f32, act: u8) -> f32 {
+    match act {
+        1 => 0.5 * v * (1.0 + (0.797_884_6 * (v + 0.044715 * v * v * v)).tanh()),
+        _ => v,
+    }
+}
+
+pub fn video_ids(frames: usize, side_h: usize, side_w: usize) -> Vec<i32> {
+    let mut ids = Vec::with_capacity(frames * side_h * side_w * 3);
+    for f in 0..frames {
+        for y in 0..side_h {
+            for xx in 0..side_w {
+                ids.extend([f as i32, y as i32, xx as i32]);
+            }
+        }
+    }
+    ids
 }
 
 pub fn timestep_embedding(t: f32, channels: usize) -> Vec<f32> {

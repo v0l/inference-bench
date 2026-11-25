@@ -113,7 +113,7 @@ fn the_engine_agrees_with_the_host_plan() {
     let ids = specrt::denoiser_host::grid_ids(16, 8, 8, d.spec.axes.len());
     let latent = step_input(0);
     let text = pipeline("text.embeds");
-    let want = host.forward(&specrt::denoiser_host::Inputs { latent: &latent, text: &text, timestep: sigma(0), ids: &ids, image: 64, text_rows: 16, patch_h: 8, patch_w: 8 }, &mut specrt::denoiser_host::Trace::default()).unwrap();
+    let want = host.forward(&specrt::denoiser_host::Inputs { latent: &latent, text: &text, timestep: sigma(0), ids: &ids, image: 64, text_rows: 16, patch_h: 8, patch_w: 8, frames: 1 }, &mut specrt::denoiser_host::Trace::default()).unwrap();
     let mut arena = d.arena().unwrap();
     d.prepare(&mut arena, &[&text]).unwrap();
     let got = d.forward(&mut arena, &latent, sigma(0), None).unwrap();

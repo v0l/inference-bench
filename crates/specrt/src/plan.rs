@@ -37,17 +37,22 @@ fn short(weight: &str) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DitOp {
     Patchify { from: &'static str, into: &'static str },
-    Unpatchify { from: &'static str, into: &'static str },
+    Unpatchify { from: &'static str, into: &'static str, channels_last: bool },
     Split { from: &'static str, into: &'static str, rows: Stream, act: bool },
     Copy { from: &'static str, into: &'static str, rows: Stream },
     TimestepEmbed { from: &'static str, into: &'static str },
-    Linear { weight: &'static str, input: &'static str, output: &'static str, rows: Stream, add: bool },
+    Linear { weight: &'static str, input: &'static str, output: &'static str, rows: Stream, add: bool, bias: bool, act: u8 },
     Modulate { from: &'static str, into: &'static str, rows: Stream, set: &'static str, shift: u8, scale: u8 },
     GatedAdd { from: &'static str, into: &'static str, rows: Stream, set: &'static str, gate: u8 },
     Glu { from: &'static str, into: &'static str, rows: Stream, offset: &'static str },
     AxisRope { from: &'static str, text: &'static str, image: &'static str },
-    JointAttention { into: &'static str },
+    JointAttention { into: &'static str, rows: Stream },
+    TableAdd { table: &'static str, from: &'static str, into: &'static str },
+    LayerNorm { from: &'static str, into: &'static str, rows: Stream, weight: &'static str },
+    Pack { from: &'static str, into: &'static str, rows: Stream, norms: &'static str, wide: bool, rope: bool },
+    CrossAttention { into: &'static str, rows: Stream, kv: &'static str },
     Step { from: &'static str, into: &'static str, rule: &'static str, guided: bool },
+    MultiStep { from: &'static str, into: &'static str, rule: &'static str, state: &'static str, scalars: &'static str, guided: bool },
 }
 
 impl DitOp {
@@ -64,28 +69,37 @@ impl DitOp {
             DitOp::GatedAdd { rows, from, set, gate, .. } => format!("{} gated add {from} {set}[{gate}]", rows.label()),
             DitOp::Glu { from, rows, .. } => format!("{} swiglu {from}", rows.label()),
             DitOp::AxisRope { .. } => "qk norm and axis rope".into(),
-            DitOp::JointAttention { .. } => "joint attention".into(),
-            DitOp::Step { guided: true, .. } => "guided scheduler step".into(),
-            DitOp::Step { .. } => "scheduler step".into(),
+            DitOp::JointAttention { rows: Stream::Joint, .. } => "joint attention".into(),
+            DitOp::JointAttention { rows, .. } => format!("{} self attention", rows.label()),
+            DitOp::TableAdd { table, from, .. } => format!("{} plus {from}", short(table)),
+            DitOp::LayerNorm { weight, rows, .. } => format!("{} ({})", short(weight), rows.label()),
+            DitOp::Pack { rope: true, rows, .. } => format!("{} qk norm, rope and pack", rows.label()),
+            DitOp::Pack { into, rows, .. } => format!("{} norm and pack into {into}", rows.label()),
+            DitOp::CrossAttention { rows, kv, .. } => format!("{} cross attention to {kv}", rows.label()),
+            DitOp::Step { guided: true, .. } | DitOp::MultiStep { guided: true, .. } => "guided scheduler step".into(),
+            DitOp::Step { .. } | DitOp::MultiStep { .. } => "scheduler step".into(),
         }
     }
 
     pub fn flow(&self) -> String {
         match self {
-            DitOp::Patchify { from, into } | DitOp::Unpatchify { from, into } | DitOp::TimestepEmbed { from, into } => format!("{from} to {into}"),
+            DitOp::Patchify { from, into } | DitOp::Unpatchify { from, into, .. } | DitOp::TimestepEmbed { from, into } | DitOp::TableAdd { from, into, .. } => format!("{from} to {into}"),
             DitOp::Glu { from, into, rows, .. } => format!("{from} to {into} ({})", rows.label()),
-            DitOp::Split { from, into, rows, .. } | DitOp::Copy { from, into, rows } | DitOp::Modulate { from, into, rows, .. } => format!("{from} to {into} ({})", rows.label()),
+            DitOp::Split { from, into, rows, .. } | DitOp::Copy { from, into, rows } | DitOp::Modulate { from, into, rows, .. } | DitOp::LayerNorm { from, into, rows, .. } => format!("{from} to {into} ({})", rows.label()),
             DitOp::Linear { input, output, rows, add, .. } => format!("{input} to {output} ({}{})", rows.label(), if *add { ", added" } else { "" }),
             DitOp::GatedAdd { from, into, rows, .. } => format!("{from} gated into {into} ({})", rows.label()),
             DitOp::AxisRope { from, .. } => format!("{from} to attention planes"),
-            DitOp::JointAttention { into } => format!("attention planes to {into}"),
-            DitOp::Step { from, into, .. } => format!("{into} and {from} to {into}"),
+            DitOp::Pack { from, into, .. } => format!("{from} to {into}"),
+            DitOp::JointAttention { into, .. } => format!("attention planes to {into}"),
+            DitOp::CrossAttention { into, kv, .. } => format!("attention planes and {kv} to {into}"),
+            DitOp::Step { from, into, .. } | DitOp::MultiStep { from, into, .. } => format!("{into} and {from} to {into}"),
         }
     }
 
     pub fn kernel(&self) -> &'static str {
         match self {
             DitOp::Patchify { .. } => "dit_patchify",
+            DitOp::Unpatchify { channels_last: true, .. } => "dit_unpatchify_last",
             DitOp::Unpatchify { .. } => "dit_unpatchify",
             DitOp::Split { act: true, .. } => "dit_silu_split",
             DitOp::Split { .. } => "dit_split",
@@ -97,7 +111,11 @@ impl DitOp {
             DitOp::Glu { .. } => "dit_glu",
             DitOp::AxisRope { .. } => "vis_axis_rope",
             DitOp::JointAttention { .. } => "vis_flash",
-            DitOp::Step { .. } => "dit_step",
+            DitOp::TableAdd { .. } => "dit_table_add",
+            DitOp::LayerNorm { .. } => "dit_layernorm",
+            DitOp::Pack { .. } => "vis_qk_pack",
+            DitOp::CrossAttention { .. } => "vis_flash_kv",
+            DitOp::Step { .. } | DitOp::MultiStep { .. } => "dit_step",
         }
     }
 }

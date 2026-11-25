@@ -482,7 +482,7 @@ impl Denoiser {
                 b.arg(&src).arg(&hi).arg(&lo);
                 unsafe { b.launch(Self::row_grid(a.bufs[into].cols, a.seqs)) }?;
             }
-            DitOp::Patchify { from, into } | DitOp::Unpatchify { from, into } => {
+            DitOp::Patchify { from, into } | DitOp::Unpatchify { from, into, .. } => {
                 let n = a.shapes.image * self.spec.size("in_channels")?;
                 let src = self.ptr_f32(a, from, 0)?;
                 let mut b = s.launch_builder(self.compose_fn(d)?);
@@ -493,7 +493,7 @@ impl Denoiser {
                 }
                 unsafe { b.launch(Self::row_grid(n, 1)) }?;
             }
-            DitOp::Linear { weight, input, output, rows, add } => {
+            DitOp::Linear { weight, input, output, rows, add, .. } => {
                 let key = match block {
                     Some(i) => weight.replace("{i}", &i.to_string()),
                     None => weight.to_string(),
@@ -551,7 +551,7 @@ impl Denoiser {
                 b.arg(&src).arg(&qt).arg(&kt).arg(&qi).arg(&ki).arg(&a.cos).arg(&a.sin).arg(&mut a.planes).arg(&t32).arg(&h32).arg(&hd32).arg(&stride).arg(&text_rows).arg(&eps).arg(&seq_rows);
                 unsafe { b.launch(LaunchConfig { grid_dim: (rows as u32, heads as u32, 1), block_dim: (kir::vision::head_pad(self.head_dim).max(32) as u32, 1, 1), shared_mem_bytes: 0 }) }?;
             }
-            DitOp::JointAttention { into } => {
+            DitOp::JointAttention { into, .. } => {
                 let rows = a.seqs * a.shapes.joint();
                 let heads = h / self.head_dim;
                 let (hi, lo) = self.ptr_planes(a, into, 0)?;
@@ -579,6 +579,7 @@ impl Denoiser {
                 }
                 unsafe { b.launch(Self::row_grid(a.bufs[into].cols, rows)) }?;
             }
+            other => bail!("{} has no kernel in the joint denoiser runtime", other.label()),
         }
         Ok(())
     }

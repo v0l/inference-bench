@@ -61,7 +61,7 @@ fn run_host(bf16: bool, step: usize, plan: &specrt::plan::Plan) -> (Vec<f32>, Tr
     let text = pipeline("text.embeds");
     let ids = ids(&spec);
     let mut trace = Trace::default();
-    let grid = host.forward(&Inputs { latent: &latent, text: &text, timestep: sigma(step), ids: &ids, image: 64, text_rows: 16, patch_h: 8, patch_w: 8 }, &mut trace).unwrap();
+    let grid = host.forward(&Inputs { latent: &latent, text: &text, timestep: sigma(step), ids: &ids, image: 64, text_rows: 16, patch_h: 8, patch_w: 8, frames: 1 }, &mut trace).unwrap();
     let v = grid;
     (v, trace)
 }

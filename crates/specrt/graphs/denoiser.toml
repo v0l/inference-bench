@@ -1,5 +1,6 @@
 name = "denoiser"
 kind = "denoiser-graph"
+classes = ["Flux2Transformer2DModel"]
 
 [fields]
 heads = ["transformer.num_attention_heads"]

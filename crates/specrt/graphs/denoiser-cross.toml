@@ -1,0 +1,430 @@
+name = "cross-dit"
+kind = "denoiser-graph"
+classes = ["WanTransformer3DModel"]
+checks = ["frame_patch == 1", "latent_patch == 2"]
+
+[fields]
+heads = ["transformer.num_attention_heads"]
+head_dim = ["transformer.attention_head_dim"]
+grid_channels = ["transformer.in_channels"]
+out_grid = ["transformer.out_channels", "transformer.in_channels"]
+text_dim = ["transformer.text_dim"]
+freq = ["transformer.freq_dim"]
+ffn = ["transformer.ffn_dim"]
+norm_eps = ["transformer.eps"]
+layers = ["transformer.num_layers"]
+latent_patch = ["transformer.patch_size.1"]
+frame_patch = ["transformer.patch_size.0"]
+
+[symbols]
+hidden = "heads * head_dim"
+qkv = "3 * hidden"
+kv = "2 * hidden"
+mod6 = "6 * hidden"
+mod2 = "2 * hidden"
+in_channels = "grid_channels * latent_patch * latent_patch"
+out_channels = "out_grid * latent_patch * latent_patch"
+time_scale = "1"
+rope_theta = "10000"
+axis_1 = "2 * floor(head_dim / 6)"
+axis_2 = "2 * floor(head_dim / 6)"
+axis_0 = "head_dim - 4 * floor(head_dim / 6)"
+
+[[input]]
+name = "latent"
+rows = "latent"
+cols = "in_channels"
+
+[[input]]
+name = "text"
+rows = "text"
+cols = "text_dim"
+
+[[input]]
+name = "timestep"
+rows = "seqs"
+cols = "1"
+
+[[input]]
+name = "step"
+rows = "seqs"
+cols = "32"
+
+[[buffer]]
+name = "x"
+rows = "image"
+cols = "hidden"
+
+[[buffer]]
+name = "xn"
+rows = "image"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "qkv"
+rows = "image"
+cols = "qkv"
+
+[[buffer]]
+name = "q"
+rows = "image"
+cols = "hidden"
+
+[[buffer]]
+name = "attn"
+rows = "image"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "branch"
+rows = "image"
+cols = "hidden"
+
+[[buffer]]
+name = "act"
+rows = "image"
+cols = "ffn"
+planes = true
+
+[[buffer]]
+name = "tokens"
+rows = "image"
+cols = "in_channels"
+planes = true
+
+[[buffer]]
+name = "text_planes"
+rows = "text"
+cols = "text_dim"
+planes = true
+
+[[buffer]]
+name = "text_act"
+rows = "text"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "context"
+rows = "text"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "text_kv"
+rows = "text"
+cols = "kv"
+
+[[buffer]]
+name = "cross_kv"
+rows = "text"
+cols = "kv"
+attention = true
+per_block = "layers"
+
+[[buffer]]
+name = "tproj"
+rows = "seqs"
+cols = "freq"
+planes = true
+
+[[buffer]]
+name = "t1"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "t1_act"
+rows = "seqs"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "temb"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "temb_act"
+rows = "seqs"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "tmod"
+rows = "seqs"
+cols = "mod6"
+
+[[buffer]]
+name = "mod"
+rows = "seqs"
+cols = "mod6"
+
+[[buffer]]
+name = "mod_out"
+rows = "seqs"
+cols = "mod2"
+
+[[buffer]]
+name = "velocity_tokens"
+rows = "image"
+cols = "out_channels"
+
+[[buffer]]
+name = "velocity"
+rows = "image"
+cols = "out_channels"
+
+[[head]]
+op = "patchify"
+in = "latent"
+out = "tokens"
+
+[[head]]
+op = "linear"
+weight = "patch_embedding"
+bias = true
+in = "tokens"
+out = "x"
+rows = "image"
+
+[[head]]
+op = "split"
+in = "text"
+out = "text_planes"
+rows = "text"
+
+[[head]]
+op = "linear"
+weight = "condition_embedder.text_embedder.linear_1"
+bias = true
+act = "gelu_tanh"
+in = "text_planes"
+out = "text_act"
+rows = "text"
+
+[[head]]
+op = "linear"
+weight = "condition_embedder.text_embedder.linear_2"
+bias = true
+in = "text_act"
+out = "context"
+rows = "text"
+
+[[head]]
+op = "timestep"
+in = "timestep"
+out = "tproj"
+
+[[head]]
+op = "linear"
+weight = "condition_embedder.time_embedder.linear_1"
+bias = true
+in = "tproj"
+out = "t1"
+rows = "seqs"
+
+[[head]]
+op = "silu_split"
+in = "t1"
+out = "t1_act"
+rows = "seqs"
+
+[[head]]
+op = "linear"
+weight = "condition_embedder.time_embedder.linear_2"
+bias = true
+in = "t1_act"
+out = "temb"
+rows = "seqs"
+
+[[head]]
+op = "silu_split"
+in = "temb"
+out = "temb_act"
+rows = "seqs"
+
+[[head]]
+op = "linear"
+weight = "condition_embedder.time_proj"
+bias = true
+in = "temb_act"
+out = "tmod"
+rows = "seqs"
+
+[[block]]
+name = "dit"
+prefix = "blocks"
+count = "layers"
+
+[[block.node]]
+op = "table_add"
+table = "scale_shift_table"
+in = "tmod"
+out = "mod"
+
+[[block.node]]
+op = "modulate"
+in = "x"
+out = "xn"
+rows = "image"
+set = "mod"
+shift = 0
+scale = 1
+
+[[block.node]]
+op = "linear"
+weight = "attn1.to_q+attn1.to_k+attn1.to_v"
+bias = true
+in = "xn"
+out = "qkv"
+rows = "image"
+
+[[block.node]]
+op = "pack"
+in = "qkv"
+out = "planes"
+rows = "image"
+norms = ["attn1.norm_q", "attn1.norm_k", ""]
+rope = true
+
+[[block.node]]
+op = "attention"
+out = "attn"
+rows = "image"
+
+[[block.node]]
+op = "linear"
+weight = "attn1.to_out.0"
+bias = true
+in = "attn"
+out = "branch"
+rows = "image"
+
+[[block.node]]
+op = "gated_add"
+in = "branch"
+rows = "image"
+set = "mod"
+gate = 2
+
+[[block.node]]
+op = "layer_norm"
+weight = "norm2"
+in = "x"
+out = "xn"
+rows = "image"
+
+[[block.node]]
+op = "linear"
+weight = "attn2.to_q"
+bias = true
+in = "xn"
+out = "q"
+rows = "image"
+
+[[block.node]]
+op = "pack"
+in = "q"
+out = "planes"
+rows = "image"
+norms = ["attn2.norm_q"]
+
+[[block.node]]
+op = "linear"
+weight = "attn2.to_k+attn2.to_v"
+bias = true
+in = "context"
+out = "text_kv"
+rows = "text"
+
+[[block.node]]
+op = "pack"
+in = "text_kv"
+out = "cross_kv"
+rows = "text"
+norms = ["attn2.norm_k", ""]
+
+[[block.node]]
+op = "cross_attention"
+out = "attn"
+rows = "image"
+kv = "cross_kv"
+
+[[block.node]]
+op = "linear"
+weight = "attn2.to_out.0"
+bias = true
+add = true
+in = "attn"
+out = "x"
+rows = "image"
+
+[[block.node]]
+op = "modulate"
+in = "x"
+out = "xn"
+rows = "image"
+set = "mod"
+shift = 3
+scale = 4
+
+[[block.node]]
+op = "linear"
+weight = "ffn.net.0.proj"
+bias = true
+act = "gelu_tanh"
+in = "xn"
+out = "act"
+rows = "image"
+
+[[block.node]]
+op = "linear"
+weight = "ffn.net.2"
+bias = true
+in = "act"
+out = "branch"
+rows = "image"
+
+[[block.node]]
+op = "gated_add"
+in = "branch"
+rows = "image"
+set = "mod"
+gate = 5
+
+[[tail]]
+op = "table_add"
+table = "scale_shift_table"
+in = "temb"
+out = "mod_out"
+
+[[tail]]
+op = "modulate"
+in = "x"
+out = "xn"
+rows = "image"
+set = "mod_out"
+shift = 0
+scale = 1
+
+[[tail]]
+op = "linear"
+weight = "proj_out"
+bias = true
+in = "xn"
+out = "velocity_tokens"
+rows = "image"
+
+[[tail]]
+op = "unpatchify"
+in = "velocity_tokens"
+out = "velocity"
+channels_last = true
+
+[[step]]
+op = "scheduler_step"
+in = "velocity"
+out = "latent"

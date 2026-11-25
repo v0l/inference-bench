@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 pub const DENOISER: &str = include_str!("../graphs/denoiser.toml");
+pub const DENOISER_CROSS: &str = include_str!("../graphs/denoiser-cross.toml");
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -17,6 +18,10 @@ pub struct BufferDecl {
     pub planes: bool,
     #[serde(default)]
     pub int: bool,
+    #[serde(default)]
+    pub attention: bool,
+    #[serde(default)]
+    pub per_block: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -47,6 +52,20 @@ pub struct DitNode {
     pub offset: Option<String>,
     #[serde(default)]
     pub add: bool,
+    #[serde(default)]
+    pub bias: bool,
+    #[serde(default)]
+    pub act: Option<String>,
+    #[serde(default)]
+    pub table: Option<String>,
+    #[serde(default)]
+    pub norms: Vec<String>,
+    #[serde(default)]
+    pub rope: bool,
+    #[serde(default)]
+    pub kv: Option<String>,
+    #[serde(default)]
+    pub channels_last: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -64,6 +83,10 @@ pub struct DitBlock {
 pub struct DenoiserGraph {
     pub name: String,
     pub kind: String,
+    #[serde(default)]
+    pub classes: Vec<String>,
+    #[serde(default)]
+    pub checks: Vec<String>,
     #[serde(default)]
     pub fields: BTreeMap<String, Vec<String>>,
     #[serde(default)]
@@ -182,7 +205,15 @@ impl DenoiserSpec {
                 bail!("symbol {name} = {text:?} names a field the configs do not give");
             }
         }
-        let spec = DenoiserSpec { values, axes };
+        let mut spec = DenoiserSpec { values, axes };
+        if spec.axes.is_empty() {
+            spec.axes = (0..).map_while(|i| spec.values.get(&format!("axis_{i}")).map(|v| *v as usize)).collect();
+            spec.values.insert("axes_count".into(), spec.axes.len() as f64);
+        }
+        for c in &graph.checks {
+            let e = kir::expr::Expr::parse(c).map_err(anyhow::Error::msg)?;
+            ensure!(e.eval(&|n| spec.values.get(n).copied()).is_some_and(|v| v != 0.0), "the {} denoiser graph needs {c}", graph.name);
+        }
         ensure!(spec.size("head_dim")? == spec.axes.iter().sum::<usize>(), "rope axes {:?} do not add up to head_dim {}", spec.axes, spec.size("head_dim")?);
         ensure!(spec.axes.iter().all(|a| a % 2 == 0), "rope axes {:?} must be even", spec.axes);
         Ok(spec)
@@ -196,18 +227,23 @@ impl DenoiserSpec {
     }
 
     pub fn from_pipeline(dir: &Path) -> Result<DenoiserSpec> {
-        let mut configs = BTreeMap::new();
-        let read = |p: &Path| -> Result<serde_json::Value> { Ok(serde_json::from_str(&std::fs::read_to_string(p).with_context(|| p.display().to_string())?)?) };
-        configs.insert("pipeline".to_string(), read(&dir.join("model_index.json"))?);
-        for part in ["transformer", "vae", "scheduler"] {
-            let file = if part == "scheduler" { "scheduler_config.json" } else { "config.json" };
-            let p = dir.join(part).join(file);
-            if p.exists() {
-                configs.insert(part.to_string(), read(&p)?);
-            }
-        }
-        DenoiserSpec::from_configs(DenoiserGraph::embedded(), &configs)
+        let configs = pipeline_configs(dir)?;
+        DenoiserSpec::from_configs(DenoiserGraph::for_configs(&configs)?, &configs)
     }
+}
+
+pub fn pipeline_configs(dir: &Path) -> Result<BTreeMap<String, serde_json::Value>> {
+    let mut configs = BTreeMap::new();
+    let read = |p: &Path| -> Result<serde_json::Value> { Ok(serde_json::from_str(&std::fs::read_to_string(p).with_context(|| p.display().to_string())?)?) };
+    configs.insert("pipeline".to_string(), read(&dir.join("model_index.json"))?);
+    for part in ["transformer", "vae", "scheduler"] {
+        let file = if part == "scheduler" { "scheduler_config.json" } else { "config.json" };
+        let p = dir.join(part).join(file);
+        if p.exists() {
+            configs.insert(part.to_string(), read(&p)?);
+        }
+    }
+    Ok(configs)
 }
 
 fn stream(name: &str) -> Result<Stream> {
@@ -245,9 +281,15 @@ impl DitNode {
         let from = || self.need(&self.input, "in");
         let into = || self.need(&self.out, "out");
         let set = || self.need(&self.set, "set");
+        let act = match self.act.as_deref() {
+            None => 0,
+            Some("gelu_tanh") => 1,
+            Some("gelu") => 2,
+            Some(other) => bail!("linear act {other:?} is not gelu_tanh or gelu"),
+        };
         Ok(match self.op.as_str() {
             "patchify" => DitOp::Patchify { from: from()?, into: into()? },
-            "unpatchify" => DitOp::Unpatchify { from: from()?, into: into()? },
+            "unpatchify" => DitOp::Unpatchify { from: from()?, into: into()?, channels_last: self.channels_last },
             "split" => DitOp::Split { from: from()?, into: into()?, rows: self.rows()?, act: false },
             "silu_split" => DitOp::Split { from: from()?, into: into()?, rows: self.rows()?, act: true },
             "copy" => DitOp::Copy { from: from()?, into: into()?, rows: self.rows()? },
@@ -255,17 +297,30 @@ impl DitNode {
             "linear" => {
                 let w = self.need(&self.weight, "weight")?;
                 let weight = intern(&w.split('+').map(|part| full(part)).collect::<Vec<_>>().join("+"));
-                DitOp::Linear { weight, input: from()?, output: into()?, rows: self.rows()?, add: self.add }
+                DitOp::Linear { weight, input: from()?, output: into()?, rows: self.rows()?, add: self.add, bias: self.bias, act }
             }
             "modulate" => DitOp::Modulate { from: from()?, into: into()?, rows: self.rows()?, set: set()?, shift: self.shift.context("modulate needs shift")?, scale: self.scale.context("modulate needs scale")? },
             "gated_add" => DitOp::GatedAdd { from: from()?, into: intern("x"), rows: self.rows()?, set: set()?, gate: self.gate.context("gated_add needs gate")? },
             "glu" => DitOp::Glu { from: from()?, into: into()?, rows: self.rows()?, offset: intern(self.offset.as_deref().unwrap_or("0")) },
             "axis_rope" => DitOp::AxisRope { from: from()?, text: intern(&full(self.need(&self.text, "text")?)), image: intern(&full(self.need(&self.image, "image")?)) },
-            "joint_attention" => DitOp::JointAttention { into: into()? },
+            "joint_attention" => DitOp::JointAttention { into: into()?, rows: Stream::Joint },
+            "attention" => DitOp::JointAttention { into: into()?, rows: self.rows()? },
+            "table_add" => DitOp::TableAdd { table: intern(&full(self.need(&self.table, "table")?)), from: from()?, into: into()? },
+            "layer_norm" => DitOp::LayerNorm { from: from()?, into: into()?, rows: self.rows()?, weight: intern(&full(self.need(&self.weight, "weight")?)) },
+            "pack" => {
+                ensure!((1..=3).contains(&self.norms.len()), "pack names one norm per part (q, k, v), an empty name for none");
+                let norms = self.norms.iter().map(|n| if n.is_empty() { String::new() } else { full(n) }).collect::<Vec<_>>().join(",");
+                DitOp::Pack { from: from()?, into: into()?, rows: self.rows()?, norms: intern(&norms), wide: true, rope: self.rope }
+            }
+            "cross_attention" => DitOp::CrossAttention { into: into()?, rows: self.rows()?, kv: self.need(&self.kv, "kv")? },
             "scheduler_step" => bail!("the scheduler step is lowered with the pipeline rule (DenoiserGraph::sampling_plan)"),
             other => bail!("unknown denoiser op {other:?}"),
         })
     }
+}
+
+pub fn pack_parts(norms: &str) -> Vec<&str> {
+    norms.split(',').collect()
 }
 
 impl DenoiserGraph {
@@ -276,8 +331,32 @@ impl DenoiserGraph {
     }
 
     pub fn embedded() -> &'static DenoiserGraph {
-        static GRAPH: std::sync::OnceLock<DenoiserGraph> = std::sync::OnceLock::new();
-        GRAPH.get_or_init(|| DenoiserGraph::parse(DENOISER).expect("the embedded denoiser graph parses"))
+        &Self::all()[0]
+    }
+
+    pub fn all() -> &'static [DenoiserGraph] {
+        static GRAPHS: std::sync::OnceLock<Vec<DenoiserGraph>> = std::sync::OnceLock::new();
+        GRAPHS.get_or_init(|| [DENOISER, DENOISER_CROSS].iter().map(|t| DenoiserGraph::parse(t).expect("an embedded denoiser graph parses")).collect())
+    }
+
+    pub fn for_class(class: &str) -> Result<&'static DenoiserGraph> {
+        Self::all().iter().find(|g| g.classes.iter().any(|c| c == class)).with_context(|| format!("no denoiser graph runs {class}"))
+    }
+
+    pub fn for_configs(configs: &BTreeMap<String, serde_json::Value>) -> Result<&'static DenoiserGraph> {
+        let class = configs.get("transformer").and_then(|t| t["_class_name"].as_str()).or_else(|| configs.get("pipeline").and_then(|p| p["transformer"][1].as_str()));
+        match class {
+            Some(c) => Self::for_class(c),
+            None => Ok(Self::embedded()),
+        }
+    }
+
+    pub fn for_pipeline(dir: &Path) -> Result<&'static DenoiserGraph> {
+        Self::for_configs(&pipeline_configs(dir)?)
+    }
+
+    pub fn per_block(&self, name: &str) -> Option<&str> {
+        self.decl(name).and_then(|d| d.per_block.as_deref())
     }
 
     pub fn plan(&self) -> Result<Plan> {
@@ -394,14 +473,17 @@ impl Signer<'_> {
         let weight = |name: &str, rows: usize, cols: usize| Tensor::new(Place::Weight(name.to_string()), Rows::Fixed(rows), cols, Form::Weight(crate::spec::Quant::Bf16));
         let sig = |class, reads, writes, flops| DitSignature { class, reads, writes, flops };
         Ok(match *op {
-            DitOp::Patchify { from, into } | DitOp::Unpatchify { from, into } => sig(Class::Gather, vec![self.t(from, None)?], vec![self.t(into, None)?], 0),
+            DitOp::Patchify { from, into } | DitOp::Unpatchify { from, into, .. } => sig(Class::Gather, vec![self.t(from, None)?], vec![self.t(into, None)?], 0),
             DitOp::Split { from, into, rows, .. } | DitOp::Copy { from, into, rows } => sig(Class::Elementwise, vec![self.t(from, Some(rows))?], vec![self.t(into, Some(rows))?], 0),
             DitOp::TimestepEmbed { from, into } => sig(Class::Elementwise, vec![self.t(from, None)?], vec![self.t(into, None)?], 0),
-            DitOp::Linear { weight: w, input, output, rows, add } => {
+            DitOp::Linear { weight: w, input, output, rows, add, bias, .. } => {
                 let (n, k) = self.linear_shape(w, input, output)?;
                 let input_t = Tensor { cols: k, ..self.t(input, Some(rows))? };
                 let out = self.t(output, Some(rows))?;
                 let mut reads = vec![input_t, weight(w, n, k)];
+                if bias {
+                    reads.push(weight(&format!("{w} bias"), 1, n));
+                }
                 if add {
                     reads.push(out.clone());
                 }
@@ -423,7 +505,35 @@ impl Signer<'_> {
                 }
                 sig(Class::RowReduce, reads, vec![Tensor::new(Place::Local("attention planes".into()), Rows::Joint, 3 * h, Form::Planes)], 0)
             }
-            DitOp::JointAttention { into } => sig(Class::Attention, vec![Tensor::new(Place::Local("attention planes".into()), Rows::Joint, 3 * h, Form::Planes)], vec![self.t(into, None)?], 0),
+            DitOp::JointAttention { into, rows } => sig(Class::Attention, vec![Tensor::new(Place::Local("attention planes".into()), rows_of(rows), 3 * h, Form::Planes)], vec![self.t(into, Some(rows))?], 0),
+            DitOp::TableAdd { table, from, into } => {
+                let out = self.t(into, None)?;
+                sig(Class::Elementwise, vec![weight(table, 1, out.cols), self.t(from, None)?], vec![out], 0)
+            }
+            DitOp::LayerNorm { from, into, rows, weight: w } => sig(Class::RowReduce, vec![self.t(from, Some(rows))?, weight(&format!("{w}.weight"), 1, h), weight(&format!("{w}.bias"), 1, h)], vec![self.t(into, Some(rows))?], 0),
+            DitOp::Pack { from, into, rows, norms, .. } => {
+                let parts = pack_parts(norms);
+                let mut reads = vec![Tensor { cols: parts.len() * h, ..self.t(from, Some(rows))? }];
+                reads.extend(parts.iter().filter(|n| !n.is_empty()).map(|n| weight(&format!("{n}.weight"), 1, h)));
+                let out = if self.graph.decl(into).is_some() { self.t(into, Some(rows))? } else { Tensor::new(Place::Local("attention planes".into()), rows_of(rows), parts.len() * h, Form::Planes) };
+                sig(Class::RowReduce, reads, vec![out], 0)
+            }
+            DitOp::CrossAttention { into, rows, kv } => {
+                let q = Tensor::new(Place::Local("attention planes".into()), rows_of(rows), h, Form::Planes);
+                sig(Class::Attention, vec![q, self.t(kv, None)?], vec![self.t(into, Some(rows))?], 0)
+            }
+            DitOp::MultiStep { from, into, state, guided, .. } => {
+                let latent = self.t(into, None)?;
+                let velocity = self.t(from, guided.then_some(Stream::Latent))?;
+                ensure!(velocity.cols == latent.cols, "the step reads {from} ({} wide) into {into} ({} wide)", velocity.cols, latent.cols);
+                let mut reads = vec![velocity.clone()];
+                if guided {
+                    reads.push(velocity);
+                }
+                let st = Tensor::new(Place::State(state.to_string()), latent.rows, latent.cols, Form::F32);
+                reads.extend([latent.clone(), st.clone(), self.t("step", None)?]);
+                sig(Class::Elementwise, reads, vec![latent, st], 0)
+            }
             DitOp::Step { from, into, guided, .. } => {
                 let latent = self.t(into, None)?;
                 let velocity = self.t(from, guided.then_some(Stream::Latent))?;
@@ -445,9 +555,13 @@ impl Signer<'_> {
 
     pub fn flops(&self, op: &DitOp, count: &Count) -> Result<u64> {
         let s = self.sign(op)?;
+        let h = self.spec.hidden() as u64;
+        let seqs = count.seqs.max(1) as u64;
         Ok(match op {
             DitOp::Linear { .. } => s.flops * count.rows(s.writes[0].rows) as u64,
-            DitOp::JointAttention { .. } => self.attention_flops(count),
+            DitOp::JointAttention { rows: Stream::Joint, .. } => self.attention_flops(count),
+            DitOp::JointAttention { .. } => 4 * (count.image as u64).pow(2) * h * seqs,
+            DitOp::CrossAttention { .. } => 4 * count.image as u64 * count.text as u64 * h * seqs,
             _ => 0,
         })
     }
@@ -533,6 +647,43 @@ pub fn invariant_in(graph: &DenoiserGraph, spec: &DenoiserSpec, ops: &[Op], late
 pub fn hoisted(graph: &DenoiserGraph, spec: &DenoiserSpec, plan: &Plan) -> Result<Vec<bool>> {
     let later: Vec<&[Op]> = plan.blocks.iter().map(|b| b.ops.as_slice()).chain([plan.tail.as_slice()]).collect();
     invariant_in(graph, spec, &plan.head, &later, &["latent", "timestep"])
+}
+
+pub fn block_invariant(graph: &DenoiserGraph, spec: &DenoiserSpec, plan: &Plan) -> Result<Vec<Vec<bool>>> {
+    let signer = Signer { graph, spec };
+    let head = hoisted(graph, spec, plan)?;
+    let mut moving: BTreeSet<Place> = ["latent", "timestep"].iter().map(|n| Place::Input(intern(n))).collect();
+    for (op, h) in plan.head.iter().zip(&head) {
+        if let (Op::Dit(d), false) = (op, h) {
+            moving.extend(signer.sign(d)?.writes.into_iter().map(|w| w.place));
+        }
+    }
+    let mut out = Vec::new();
+    for b in &plan.blocks {
+        let sigs: Vec<DitSignature> = b.ops.iter().map(|op| match op {
+            Op::Dit(d) => signer.sign(d),
+            other => bail!("{} is not a denoiser op", other.label()),
+        }).collect::<Result<_>>()?;
+        let writers = |p: &Place| sigs.iter().filter(|s| s.writes.iter().any(|w| &w.place == p)).count();
+        let mut block_moving = moving.clone();
+        let mut flags: Vec<bool> = Vec::new();
+        for sig in &sigs {
+            let inv = !sig.reads.iter().any(|r| block_moving.contains(&r.place)) && sig.writes.iter().all(|w| writers(&w.place) == 1);
+            if !inv {
+                block_moving.extend(sig.writes.iter().map(|w| w.place.clone()));
+            }
+            flags.push(inv);
+        }
+        for (i, sig) in sigs.iter().enumerate() {
+            let scratch = sig.writes.iter().any(|w| !matches!(&w.place, Place::Local(n) if graph.per_block(n).is_some()));
+            let read_by_moving = sigs.iter().zip(&flags).any(|(s, f)| !f && s.reads.iter().any(|r| sig.writes.iter().any(|w| w.place == r.place)));
+            if flags[i] && scratch && read_by_moving {
+                flags[i] = false;
+            }
+        }
+        out.push(flags);
+    }
+    Ok(out)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -664,9 +815,16 @@ pub fn kernel_key(op: &DitOp, graph: &DenoiserGraph, spec: &DenoiserSpec) -> Res
         DitOp::GatedAdd { .. } => ("dit_gated_add".into(), "dit_gated_add".into(), Vec::new()),
         DitOp::TimestepEmbed { .. } => ("dit_timestep".into(), "dit_timestep".into(), Vec::new()),
         DitOp::Patchify { .. } => ("dit_patchify".into(), "dit_patchify".into(), Vec::new()),
-        DitOp::Unpatchify { .. } => ("dit_unpatchify".into(), "dit_unpatchify".into(), Vec::new()),
+        DitOp::Unpatchify { channels_last: false, .. } => ("dit_unpatchify".into(), "dit_unpatchify".into(), Vec::new()),
+        DitOp::Unpatchify { channels_last: true, .. } => ("dit_unpatchify_last".into(), "dit_unpatchify_last".into(), Vec::new()),
         DitOp::Step { guided, .. } => (if guided { "dit_step_cfg" } else { "dit_step" }.into(), "dit_step".into(), Vec::new()),
-        DitOp::Linear { .. } | DitOp::AxisRope { .. } | DitOp::JointAttention { .. } => return Ok(None),
+        DitOp::MultiStep { guided, .. } => (if guided { "dit_multistep_cfg" } else { "dit_multistep" }.into(), "dit_step".into(), Vec::new()),
+        DitOp::TableAdd { from, into, .. } => {
+            let (a, b) = (width(from)?, width(into)?);
+            (format!("dit_table_add_{a}_{b}"), "dit_table_add".into(), vec![("table_in".into(), a), ("table_out".into(), b), ("table_rep".into(), b / a)])
+        }
+        DitOp::LayerNorm { .. } => ("dit_layernorm".into(), "dit_layernorm".into(), Vec::new()),
+        DitOp::Linear { .. } | DitOp::AxisRope { .. } | DitOp::JointAttention { .. } | DitOp::Pack { .. } | DitOp::CrossAttention { .. } => return Ok(None),
     }))
 }
 
