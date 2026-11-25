@@ -450,6 +450,10 @@ AtomicChat/Unlimited-OCR-2-GGUF	REFUSED	GGUF architecture unlimited-ocr2	GGUF ar
 bigscience/bloomz-560m	REFUSED	model_type bloom	model_type bloom is not supported
 liodon-ai/bloomz-560m-FP8	REFUSED	model_type bloom	model_type bloom is not supported
 mradermacher/bloomz-560m-GGUF	REFUSED	GGUF architecture bloom	GGUF architecture bloom is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe, qwen3vl, qwen3vlmoe are)
+black-forest-labs/FLUX.2-klein-4B	LOADS		flow-euler image pipeline, family flux2_klein, 4 steps; weights 16.0 GB (text encoder 8.0, resident 7.9); peak 16.0 GB on 1 card with the text encoder released after encoding, 0 GB host RAM
+rockerBOO/flux2-klein-4b-nvfp4-convrot	UNCHECKED		no config.json
+abhishekchohan/flux2-klein-4b-fp8	UNKNOWN-QUANT	FP8 diffusion weights	Flux2KleinPipeline weights are FP8; the denoiser reads bf16 today
+unsloth/FLUX.2-klein-4B-GGUF	REFUSED	GGUF architecture flux	GGUF architecture flux is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe, qwen3vl, qwen3vlmoe are)
 culturerevolt/gemma-4-12b-heretic-abliterated	UNCHECKED		the hub reports the vision projector's architecture (clip), not the model's
 datalab-to/chandra-ocr-2	LOADS		32 layers (full+linear), hidden 2560, mtp, vision, bf16
 dangvansam/chandra-ocr-2-NVFP4	UNKNOWN-QUANT	nvfp4_g16 is supported for [mlp] quant only	nvfp4_g16 is supported for [mlp] quant only (32 layers (full+linear), hidden 2560, mtp, bf16)

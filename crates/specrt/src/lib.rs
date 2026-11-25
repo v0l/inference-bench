@@ -33,6 +33,7 @@ pub mod jit;
 pub mod launch;
 pub mod link;
 pub mod loops;
+pub mod media;
 pub mod loader;
 pub mod logprobs;
 pub mod media_encode;

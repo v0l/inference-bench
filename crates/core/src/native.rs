@@ -52,6 +52,42 @@ pub trait Model {
     ) -> anyhow::Result<(Reply, usize)> {
         anyhow::bail!("the model does not accept image or video input")
     }
+
+    fn media_info(&self) -> Option<specrt::media::MediaInfo> {
+        None
+    }
+
+    fn generate_media(&mut self, _job: &specrt::media::MediaJob, _on_event: &mut dyn FnMut(specrt::media::MediaEvent) -> bool) -> anyhow::Result<specrt::media::MediaOutput> {
+        anyhow::bail!(specrt::media::InvalidJob("this is a text model; image and video jobs need an image or video model".into()))
+    }
+}
+
+pub struct MediaModel(pub specrt::media::ImageModel);
+
+fn not_text(kind: specrt::media::ModelKind) -> anyhow::Error {
+    anyhow::anyhow!(specrt::media::InvalidJob(format!("this is an {} model: send it to /v1/images/generations, not a text route", kind.label())))
+}
+
+impl Model for MediaModel {
+    fn generate(&mut self, _: &str, _: usize, _: Sampling) -> anyhow::Result<Reply> {
+        Err(not_text(self.0.info.kind))
+    }
+
+    fn chat(&mut self, _: &[Value], _: Option<&Value>, _: usize, _: Sampling, _: &mut dyn FnMut(&str) -> bool) -> anyhow::Result<Reply> {
+        Err(not_text(self.0.info.kind))
+    }
+
+    fn logits(&mut self, _: &str) -> anyhow::Result<PromptLogits> {
+        Err(not_text(self.0.info.kind))
+    }
+
+    fn media_info(&self) -> Option<specrt::media::MediaInfo> {
+        Some(self.0.info.clone())
+    }
+
+    fn generate_media(&mut self, job: &specrt::media::MediaJob, on_event: &mut dyn FnMut(specrt::media::MediaEvent) -> bool) -> anyhow::Result<specrt::media::MediaOutput> {
+        self.0.run(job, on_event)
+    }
 }
 
 impl Model for specrt::Engine {
@@ -111,7 +147,12 @@ pub fn specrt_factory() -> Factory {
 }
 
 pub fn specrt_factory_with(runtime: Option<specrt::spec::RuntimeOptions>) -> Factory {
-    Arc::new(move |model, max_ctx| Ok(Box::new(specrt::Engine::load_with(model, max_ctx, runtime.as_ref())?) as Box<dyn Model>))
+    Arc::new(move |model, max_ctx| {
+        if specrt::media::resolve_dir(model).is_some() {
+            return Ok(Box::new(MediaModel(specrt::media::ImageModel::load(model, runtime.as_ref())?)) as Box<dyn Model>);
+        }
+        Ok(Box::new(specrt::Engine::load_with(model, max_ctx, runtime.as_ref())?) as Box<dyn Model>)
+    })
 }
 
 type Job = Box<dyn FnOnce(&mut dyn Model) + Send>;
@@ -139,6 +180,8 @@ pub struct Native {
     thinking: specrt::chat::Thinking,
     tools: specrt::chat::ToolFormat,
     progress: Option<specrt::progress::Sink>,
+    media: Option<specrt::media::MediaInfo>,
+    device: Option<usize>,
 }
 
 impl Native {
@@ -151,7 +194,12 @@ impl Native {
     }
 
     pub fn with_factory(max_ctx: Option<usize>, factory: Factory) -> Self {
-        Self { max_ctx, factory, worker: None, vision: false, thinking: Default::default(), tools: Default::default(), progress: None }
+        Self { max_ctx, factory, worker: None, vision: false, thinking: Default::default(), tools: Default::default(), progress: None, media: None, device: None }
+    }
+
+    pub fn on_device(mut self, device: Option<usize>) -> Self {
+        self.device = device;
+        self
     }
 
     fn send(&mut self, job: Job) -> Result<(), BackendError> {
@@ -195,6 +243,12 @@ fn panic_text(payload: &(dyn Any + Send)) -> String {
 
 pub fn engine_error(err: &anyhow::Error) -> BackendError {
     let message = format!("{err:#}");
+    if err.downcast_ref::<specrt::media::InvalidJob>().is_some() {
+        return BackendError::new(ErrorKind::InvalidRequest, message);
+    }
+    if err.downcast_ref::<specrt::generate::Cancelled>().is_some() {
+        return BackendError::new(ErrorKind::Cancelled, message);
+    }
     let lower = message.to_lowercase();
     if lower.contains("out_of_memory") || lower.contains("out of memory") {
         return BackendError::failed(format!("the GPU ran out of memory: {message}"));
@@ -233,11 +287,12 @@ fn run_engine(
     max_ctx: Option<usize>,
     factory: Factory,
     progress: Option<specrt::progress::Sink>,
-    loaded: Sender<Result<(bool, specrt::chat::Thinking, specrt::chat::ToolFormat), BackendError>>,
+    device: Option<usize>,
+    loaded: Sender<Result<Opened, BackendError>>,
     jobs: std::sync::mpsc::Receiver<Job>,
     panic: Arc<Mutex<Option<String>>>,
 ) {
-    let mut engine = match catch_unwind(AssertUnwindSafe(|| specrt::progress::with_sink(progress, || factory(&model, max_ctx)))) {
+    let mut engine = match catch_unwind(AssertUnwindSafe(|| specrt::media::with_device(device, || specrt::progress::with_sink(progress, || factory(&model, max_ctx))))) {
         Ok(Ok(e)) => e,
         Ok(Err(e)) => {
             let _ = loaded.send(Err(engine_error(&e)));
@@ -250,7 +305,7 @@ fn run_engine(
             return;
         }
     };
-    let _ = loaded.send(Ok((engine.accepts_media(), engine.thinking(), engine.tool_format())));
+    let _ = loaded.send(Ok((engine.accepts_media(), engine.thinking(), engine.tool_format(), engine.media_info())));
     while let Ok(job) = jobs.recv() {
         if let Err(p) = catch_unwind(AssertUnwindSafe(|| job(engine.as_mut()))) {
             let why = panic_text(p.as_ref());
@@ -267,13 +322,48 @@ enum Streamed {
     Done(Result<Generation, BackendError>),
 }
 
+type Opened = (bool, specrt::chat::Thinking, specrt::chat::ToolFormat, Option<specrt::media::MediaInfo>);
+
+enum MediaStreamed {
+    Event(specrt::media::MediaEvent, Sender<bool>),
+    Done(Result<specrt::media::MediaOutput, BackendError>),
+}
+
 impl Target for Native {
     fn name(&self) -> &str {
         "specrt"
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { streaming: true, logits: true, memory: true, vision: self.vision, thinking: self.thinking, tools: self.tools, ..Capabilities::default() }
+        Capabilities { streaming: true, logits: true, memory: true, vision: self.vision, thinking: self.thinking, tools: self.tools, kind: self.media.as_ref().map(|m| m.kind).unwrap_or_default(), ..Capabilities::default() }
+    }
+
+    fn media_info(&self) -> Option<specrt::media::MediaInfo> {
+        self.media.clone()
+    }
+
+    fn generate_media(&mut self, job: &specrt::media::MediaJob, on_event: &mut dyn FnMut(specrt::media::MediaEvent) -> bool) -> Result<specrt::media::MediaOutput, BackendError> {
+        let job = job.clone();
+        let (tx, rx) = channel();
+        let work: Job = Box::new(move |m: &mut dyn Model| {
+            let events = tx.clone();
+            let mut forward = |e: specrt::media::MediaEvent| {
+                let (back, wait) = channel();
+                events.send(MediaStreamed::Event(e, back)).is_ok() && wait.recv().unwrap_or(false)
+            };
+            let out = m.generate_media(&job, &mut forward).map_err(|e| engine_error(&e));
+            let _ = tx.send(MediaStreamed::Done(out));
+        });
+        self.send(work)?;
+        loop {
+            match rx.recv() {
+                Ok(MediaStreamed::Event(e, back)) => {
+                    let _ = back.send(on_event(e));
+                }
+                Ok(MediaStreamed::Done(out)) => return out,
+                Err(_) => return Err(self.stopped()),
+            }
+        }
     }
 
     fn set_progress(&mut self, sink: Option<specrt::progress::Sink>) {
@@ -285,20 +375,21 @@ impl Target for Native {
         let (jobs, inbox) = channel();
         let (loaded_tx, loaded_rx) = channel();
         let panic = Arc::new(Mutex::new(None));
-        let (name, max_ctx, factory, shared, progress) =
-            (model.to_string(), self.max_ctx, self.factory.clone(), panic.clone(), self.progress.clone());
+        let (name, max_ctx, factory, shared, progress, device) =
+            (model.to_string(), self.max_ctx, self.factory.clone(), panic.clone(), self.progress.clone(), self.device);
         let thread = std::thread::Builder::new()
             .name("native-engine".into())
-            .spawn(move || run_engine(name, max_ctx, factory, progress, loaded_tx, inbox, shared))
+            .spawn(move || run_engine(name, max_ctx, factory, progress, device, loaded_tx, inbox, shared))
             .map_err(|e| BackendError::failed(format!("cannot start the engine thread: {e}")))?;
         let worker = Worker { jobs: Some(jobs), thread: Some(thread), panic };
         let outcome = loaded_rx.recv().unwrap_or_else(|_| Err(BackendError::failed("the native engine stopped while loading")));
         match outcome {
-            Ok((vision, thinking, tools)) => {
+            Ok((vision, thinking, tools, media)) => {
                 self.worker = Some(worker);
                 self.vision = vision;
                 self.thinking = thinking;
                 self.tools = tools;
+                self.media = media;
                 Ok(())
             }
             Err(e) => {

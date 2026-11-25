@@ -21843,6 +21843,181 @@
    "files": {}
   },
   {
+   "repo": "black-forest-labs/FLUX.2-klein-4B",
+   "role": "base",
+   "base": "black-forest-labs/FLUX.2-klein-4B",
+   "lists": [
+    "lab"
+   ],
+   "downloads": 448575,
+   "likes": 1155,
+   "trending": 19,
+   "created": "2026-01-14",
+   "pipeline": "image-to-image",
+   "gated": false,
+   "model_type": "Flux2KleinPipeline",
+   "architectures": [
+    "Flux2KleinPipeline"
+   ],
+   "format": "BF16",
+   "quant": "none",
+   "size_gb": 16.0,
+   "params_b": 3.88,
+   "gguf_arch": null,
+   "gguf_labels": [],
+   "tokenizer_json": false,
+   "group_downloads": 448575,
+   "lab": "bfl",
+   "pipeline_parts_gb": {
+    "text_encoder": 8.04,
+    "transformer": 7.75,
+    "vae": 0.17
+   },
+   "files": {
+    "model_index.json": {
+     "bytes": 446,
+     "sha256": "51a76cb1cf3ed37423a1128c79c22faee8e6fbe7f5aaeb737f0a258930dbaac0",
+     "committed": true
+    },
+    "scheduler/scheduler_config.json": {
+     "bytes": 486,
+     "sha256": "067afb012cef64553a763447d1efd93daeffcc0123ca7e25b09f8de20b90762e",
+     "committed": true
+    },
+    "text_encoder/config.json": {
+     "bytes": 1536,
+     "sha256": "214b4c29a0d975e9fddf9994a5673f22cb2c4c5750352f9227c2c3251ebeab40",
+     "committed": true
+    },
+    "transformer/config.json": {
+     "bytes": 541,
+     "sha256": "09733c74a3da6d17dd0a0472a091a8950c7c6935889c32c16cc800ede05029de",
+     "committed": true
+    },
+    "vae/config.json": {
+     "bytes": 821,
+     "sha256": "0d6dfb69ae95a5e2ac9836284bbb63d8b38ce67b25ba2dff380752b2a10ab948",
+     "committed": true
+    }
+   }
+  },
+  {
+   "repo": "rockerBOO/flux2-klein-4b-nvfp4-convrot",
+   "role": "nvfp4",
+   "base": "black-forest-labs/FLUX.2-klein-4B",
+   "lists": [],
+   "downloads": 107,
+   "likes": 6,
+   "trending": 0,
+   "created": "2026-08-04",
+   "pipeline": null,
+   "gated": false,
+   "model_type": null,
+   "architectures": [],
+   "format": "NVFP4",
+   "quant": "none",
+   "size_gb": null,
+   "params_b": null,
+   "gguf_arch": null,
+   "gguf_labels": [],
+   "tokenizer_json": false,
+   "group_downloads": 0,
+   "lab": "bfl",
+   "files": {}
+  },
+  {
+   "repo": "abhishekchohan/flux2-klein-4b-fp8",
+   "role": "fp8",
+   "base": "black-forest-labs/FLUX.2-klein-4B",
+   "lists": [],
+   "downloads": 44,
+   "likes": 0,
+   "trending": 0,
+   "created": "2026-08-08",
+   "pipeline": "text-to-image",
+   "gated": false,
+   "model_type": "Flux2KleinPipeline",
+   "architectures": [
+    "Flux2KleinPipeline"
+   ],
+   "format": "FP8",
+   "quant": "none",
+   "size_gb": null,
+   "params_b": null,
+   "gguf_arch": null,
+   "gguf_labels": [],
+   "tokenizer_json": false,
+   "group_downloads": 0,
+   "lab": "bfl",
+   "files": {
+    "model_index.json": {
+     "bytes": 493,
+     "sha256": "1f68fca9b8ed8ba953d7360ee12d264431cb36e3ea13af91cead0b3a3a88acbc",
+     "committed": true
+    },
+    "scheduler/scheduler_config.json": {
+     "bytes": 481,
+     "sha256": "5d5af7e00dad78642b2bd51ddad2ba0f2758dbef9fb441a3dbee5ceb2fbcb8e3",
+     "committed": true
+    },
+    "text_encoder/config.json": {
+     "bytes": 1593,
+     "sha256": "855a4a562e47f29d00ff0c06e244cd27319c381abff813d8461d1184894e97f5",
+     "committed": true
+    },
+    "transformer/config.json": {
+     "bytes": 609,
+     "sha256": "45ed68ac9ef62777e200abba683bc004767d8f26a3e2789b40276abae7898f7c",
+     "committed": true
+    },
+    "vae/config.json": {
+     "bytes": 942,
+     "sha256": "8b725e3e5d83da67a0456bf4da8eebc15c29111ff2810e2bd1dfca66260d3b68",
+     "committed": true
+    }
+   }
+  },
+  {
+   "repo": "unsloth/FLUX.2-klein-4B-GGUF",
+   "role": "gguf",
+   "base": "black-forest-labs/FLUX.2-klein-4B",
+   "lists": [],
+   "downloads": 520203,
+   "likes": 247,
+   "trending": 1,
+   "created": "2026-01-15",
+   "pipeline": "image-to-image",
+   "gated": false,
+   "model_type": "flux",
+   "architectures": [],
+   "format": "GGUF",
+   "quant": "gguf",
+   "size_gb": 7.8,
+   "params_b": 3.88,
+   "gguf_arch": "flux",
+   "gguf_labels": [
+    "BF16",
+    "F16",
+    "Q2_K",
+    "Q3_K_M",
+    "Q3_K_S",
+    "Q4_0",
+    "Q4_1",
+    "Q4_K_M",
+    "Q4_K_S",
+    "Q5_0",
+    "Q5_1",
+    "Q5_K_M",
+    "Q5_K_S",
+    "Q6_K",
+    "Q8_0"
+   ],
+   "tokenizer_json": false,
+   "group_downloads": 0,
+   "lab": "bfl",
+   "files": {}
+  },
+  {
    "repo": "culturerevolt/gemma-4-12b-heretic-abliterated",
    "role": "base",
    "base": "culturerevolt/gemma-4-12b-heretic-abliterated",
@@ -37055,6 +37230,7 @@
    "role": "base",
    "base": "moonshotai/Kimi-K3",
    "lists": [
+    "disk",
     "lab",
     "vision"
    ],

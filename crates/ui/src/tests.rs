@@ -12,7 +12,7 @@ fn dir(name: &str) -> PathBuf {
     d
 }
 
-fn shots_dir() -> PathBuf {
+pub(crate) fn shots_dir() -> PathBuf {
     match std::env::var_os("SHOTS") {
         Some(d) => PathBuf::from(d),
         None => dir("shots"),
@@ -70,7 +70,7 @@ fn harness_sized(name: &str, tab: Tab, height: f32) -> Harness<'static, App> {
     harness_at(name, tab, egui::vec2(1280.0, height))
 }
 
-fn harness_at(name: &str, tab: Tab, size: egui::Vec2) -> Harness<'static, App> {
+pub(crate) fn harness_at(name: &str, tab: Tab, size: egui::Vec2) -> Harness<'static, App> {
     let d = dir(name);
     Harness::builder().with_size(size).with_max_steps(100).with_accessibility_check(false).allow_missing_glyphs().build_eframe(move |cc| {
         egui_bench::install(&cc.egui_ctx);
@@ -243,7 +243,7 @@ fn click_settled(h: &mut Harness<'static, App>, label: &str) {
     h.get_by_label_contains(label).click();
 }
 
-fn with_gpu(h: &mut Harness<'static, App>, used: u64, total: u64) {
+pub(crate) fn with_gpu(h: &mut Harness<'static, App>, used: u64, total: u64) {
     let app = h.state_mut();
     app.gpu = vec![inference_bench_core::gpu::GpuStats { name: "test".into(), used_bytes: used, total_bytes: total, util_percent: None, uuid: String::new(), own_bytes: 0, display: false, index: None }];
     app.gpu_at = Some(Instant::now() + Duration::from_secs(600));
@@ -1423,7 +1423,7 @@ fn spec_updates_off_in_settings_makes_no_request() {
     assert!(server.requests.lock().unwrap().is_empty());
 }
 
-fn pump_until(h: &mut Harness<'static, App>, secs: u64, what: &str, done: impl Fn(&App) -> bool) {
+pub(crate) fn pump_until(h: &mut Harness<'static, App>, secs: u64, what: &str, done: impl Fn(&App) -> bool) {
     let start = Instant::now();
     while !done(h.state()) {
         assert!(start.elapsed() < Duration::from_secs(secs.max(60)), "{what}: {:?}", h.state().notice);

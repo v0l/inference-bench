@@ -17,7 +17,9 @@ const TABS: [(Tab, &str); 5] = [
 fn rail(app: &mut App, ui: &mut egui::Ui) {
     ui.spacing_mut().item_spacing.y = 0.0;
     ui.add_space(6.0);
+    let generating = app.generating();
     for (tab, label) in TABS {
+        let label = if tab == Tab::Chat && generating { "generate" } else { label };
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(RAIL_W, RAIL_ITEM_H), Sense::click());
         let on = app.tab == tab;
         let p = ui.painter();
@@ -37,6 +39,7 @@ fn rail(app: &mut App, ui: &mut egui::Ui) {
         );
         if resp.clicked() {
             app.load = None;
+            app.image_load = None;
             app.tab = tab;
         }
         resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
@@ -170,7 +173,11 @@ pub fn draw(app: &mut App, root: &mut egui::Ui) {
             crate::load::draw(app, ui);
             return;
         }
+        if crate::imagegen::load_page(app, ui) {
+            return;
+        }
         match app.tab {
+            Tab::Chat if app.generating() => crate::imagegen::draw(app, ui),
             Tab::Chat => crate::chat::draw(app, ui),
             Tab::Models => crate::models::draw(app, ui),
             Tab::Server => crate::server::draw(app, ui),

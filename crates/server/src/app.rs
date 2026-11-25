@@ -39,6 +39,7 @@ pub struct AppState {
     running: AtomicUsize,
     access_log: Option<Mutex<std::fs::File>>,
     pub started: Instant,
+    pub images: Arc<crate::images::Gate>,
 }
 
 impl AppState {
@@ -63,11 +64,12 @@ impl AppState {
             manager: Arc::new(Manager::new(config.clone(), factory, probe, total, metrics.clone(), source)),
             keys: config.resolved_keys(),
             metrics,
-            config,
             admitted: AtomicUsize::new(0),
             running: AtomicUsize::new(0),
             access_log,
             started: Instant::now(),
+            images: Arc::new(crate::images::Gate::new(config.images.jobs_per_gpu, config.images.queue_depth)),
+            config,
         }))
     }
 
@@ -80,6 +82,8 @@ impl AppState {
             loaded_models: self.manager.loaded_snapshot(),
             gpu_used_bytes: self.manager.gpu_used(),
             engine: self.manager.engine_metrics(),
+            image_queue: self.images.waiting(),
+            image_running: self.images.running(),
         }
     }
 
@@ -159,6 +163,8 @@ fn api_routes() -> Vec<(ApiRoute, MethodRouter<Arc<AppState>>)> {
         (r("GET", "/v1/capabilities", "Routes, the request fields each accepts, and loaded and loadable models with spec features"), get(capabilities)),
         (r("POST", "/v1/chat/completions", "Chat completions, streaming, tools"), post(chat_completions)),
         (r("POST", "/v1/completions", "Text completions"), post(completions)),
+        (r("POST", "/v1/images/generations", "Image generation (OpenAI), b64_json or url, stream for step progress"), post(crate::images::generations)),
+        (r("GET", "/v1/images/files/{name}", "A generated image served for a short time after a url response"), get(crate::images::file)),
         (r("POST", "/v1/messages", "Anthropic Messages, streaming, tools, thinking"), post(crate::dialects::messages)),
         (r("POST", "/v1/responses", "OpenAI Responses (stateless), streaming, function tools"), post(crate::dialects::responses)),
         (r("POST", "/v1/messages/count_tokens", "Anthropic token estimate"), post(crate::dialects::count_tokens)),
@@ -266,6 +272,8 @@ fn endpoint_label(path: &str) -> &'static str {
         "/v1/models" => "models",
         "/v1/chat/completions" => "chat_completions",
         "/v1/completions" => "completions",
+        "/v1/images/generations" => "images_generations",
+        p if p.starts_with("/v1/images/files/") => "images_files",
         "/v1/messages" => "messages",
         "/v1/messages/count_tokens" => "count_tokens",
         "/v1/responses" => "responses",
@@ -380,6 +388,7 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
                     json!({
                         "id": m.id,
                         "state": if m.loaded { "loaded" } else if m.loading.is_some() { "loading" } else { "loadable" },
+                        "type": m.kind.label(),
                         "loaded": m.loaded,
                         "max_ctx": cfg.and_then(|c| c.max_ctx),
                         "vram_bytes": m.vram_bytes,
@@ -437,7 +446,7 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
         .manager
         .status()
         .into_iter()
-        .map(|m| json!({"id": m.id, "object": "model", "created": 0, "owned_by": "inference-bench", "loaded": m.loaded, "status": if m.loaded { "loaded" } else if m.loading.is_some() { "loading" } else { "unloaded" }}))
+        .map(|m| json!({"id": m.id, "object": "model", "created": 0, "owned_by": "inference-bench", "type": m.kind.label(), "loaded": m.loaded, "status": if m.loaded { "loaded" } else if m.loading.is_some() { "loading" } else { "unloaded" }}))
         .collect();
     Json(json!({"object": "list", "data": data}))
 }
@@ -887,6 +896,12 @@ pub(crate) enum Gen {
 }
 
 pub(crate) struct CancelOnDrop(Arc<AtomicBool>);
+
+impl CancelOnDrop {
+    pub(crate) fn new(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+}
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {

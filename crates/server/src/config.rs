@@ -173,6 +173,29 @@ pub struct ServerConfig {
     pub reasoning_wrapup: String,
     pub anthropic_thinking_on_request: bool,
     pub media: inference_bench_core::media::MediaLimits,
+    pub images: ImagesSection,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ImagesSection {
+    pub jobs_per_gpu: usize,
+    pub queue_depth: usize,
+    pub file_dir: Option<PathBuf>,
+    pub file_ttl_secs: u64,
+    pub partial_images: usize,
+}
+
+impl Default for ImagesSection {
+    fn default() -> Self {
+        Self { jobs_per_gpu: 1, queue_depth: 4, file_dir: None, file_ttl_secs: 3600, partial_images: 0 }
+    }
+}
+
+impl ImagesSection {
+    pub fn dir(&self) -> PathBuf {
+        self.file_dir.clone().unwrap_or_else(|| std::env::temp_dir().join(format!("inference-bench-images-{}", std::process::id())))
+    }
 }
 
 impl Default for ServerConfig {
@@ -237,6 +260,7 @@ impl Default for ServerConfig {
             reasoning_wrapup: "\n\nI have thought about this long enough and will answer now.\n".into(),
             anthropic_thinking_on_request: true,
             media: Default::default(),
+            images: Default::default(),
         }
     }
 }

@@ -26,6 +26,8 @@ TRENDING_TOP = 20
 VISION_TOP = 30
 CARD_GB = 96
 FILES = ["config.json", "generation_config.json", "hf_quant_config.json", "tokenizer_config.json", "chat_template.jinja"]
+PIPELINE_FILES = ["model_index.json", "scheduler/scheduler_config.json", "text_encoder/config.json", "transformer/config.json", "vae/config.json"]
+PIPELINE_PARTS = ["text_encoder", "transformer", "vae"]
 INDEX = "model.safetensors.index.json"
 LABS = tomllib.loads((OUT / "labs.toml").read_text())
 EXPAND = ["downloads", "likes", "trendingScore", "gated", "tags", "safetensors", "gguf", "pipeline_tag", "createdAt", "siblings", "config", "cardData"]
@@ -332,6 +334,8 @@ def tensor_formats(index):
 
 
 def fetch_files(entry, m, config_repo, local):
+    if has(m, "model_index.json") and not has(m, "config.json"):
+        return fetch_pipeline(entry, m)
     files = {}
     dest = OUT / slug(entry["repo"])
     cache = CACHE / "files" / slug(entry["repo"])
@@ -368,6 +372,35 @@ def fetch_files(entry, m, config_repo, local):
             dest.mkdir(parents=True, exist_ok=True)
             (dest / name).write_bytes(body)
         files[name] = {"bytes": len(body), "sha256": hashlib.sha256(body).hexdigest(), "committed": keep}
+    return files
+
+
+def fetch_pipeline(entry, m):
+    files = {}
+    dest = OUT / slug(entry["repo"])
+    cache = CACHE / "files" / slug(entry["repo"])
+    for name in PIPELINE_FILES:
+        if not has(m, name):
+            continue
+        status, body = get(f"{HF}/{entry['repo']}/resolve/main/{name}")
+        if status != 200 or body is None:
+            continue
+        for root in (cache, dest):
+            (root / name).parent.mkdir(parents=True, exist_ok=True)
+            (root / name).write_bytes(body)
+        files[name] = {"bytes": len(body), "sha256": hashlib.sha256(body).hexdigest(), "committed": True}
+    blobs = api(f"models/{entry['repo']}", {"blobs": "true"}) or {}
+    parts = {}
+    for s in blobs.get("siblings") or []:
+        top, _, rest = s["rfilename"].partition("/")
+        if top in PIPELINE_PARTS and rest.endswith(".safetensors"):
+            parts[top] = parts.get(top, 0) + (s.get("size") or 0)
+    if parts:
+        entry["pipeline_parts_gb"] = {k: round(v / 1e9, 2) for k, v in sorted(parts.items())}
+        entry["size_gb"] = round(sum(parts.values()) / 1e9, 1)
+    index = json.loads((cache / "model_index.json").read_text()) if "model_index.json" in files else {}
+    entry["model_type"] = index.get("_class_name") or entry["model_type"]
+    entry["architectures"] = [index["_class_name"]] if index.get("_class_name") else entry["architectures"]
     return files
 
 

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use kir as kir;
 
-pub const SPEC_FORMAT: u32 = 19;
+pub const SPEC_FORMAT: u32 = 20;
 
 pub fn modelopt_verified() -> bool {
     include_str!("../modelopt-verified.txt").trim() == "pass"
@@ -2584,6 +2584,11 @@ impl Spec {
         }
         if !s.layers.pattern.iter().any(|b| b.is_linear()) {
             s.linear_attention = None;
+        }
+        if !s.layers.pattern.iter().any(|b| b.is_attention()) {
+            s.attention.node.clear();
+            s.attention.projection.clear();
+            s.attention.o_cols = None;
         }
         s.mtp = None;
         if self.runtime.kv_dtype.is_fp8() {

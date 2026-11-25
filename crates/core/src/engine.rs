@@ -55,6 +55,8 @@ pub struct Loaded {
     pub tools: specrt::chat::ToolFormat,
     pub vram_bytes: Option<u64>,
     pub landed: Vec<(String, u64)>,
+    pub kind: specrt::media::ModelKind,
+    pub media: Option<specrt::media::MediaInfo>,
 }
 
 impl Loaded {
@@ -72,7 +74,15 @@ pub enum Command {
     Suspend { model: Option<String>, done: Sender<bool> },
     Resume { model: Option<String>, done: Sender<Result<(), BackendError>> },
     Chat { model: Option<String>, request: ChatRequest, events: Sender<ChatEvent>, queued: Instant, meter: Arc<Meter> },
+    Media { model: Option<String>, job: specrt::media::MediaJob, events: Sender<MediaUpdate>, cancel: Arc<AtomicBool> },
     Shutdown,
+}
+
+#[derive(Debug, Clone)]
+pub enum MediaUpdate {
+    Event(specrt::media::MediaEvent),
+    Done(specrt::media::MediaOutput),
+    Failed(BackendError),
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +186,14 @@ impl Handle {
 
     pub fn chat(&self, request: ChatRequest) -> Receiver<ChatEvent> {
         self.chat_on(None, request)
+    }
+
+    pub fn generate_media(&self, model: Option<&str>, job: specrt::media::MediaJob, cancel: Arc<AtomicBool>) -> Receiver<MediaUpdate> {
+        let (tx, rx) = channel();
+        if self.commands.send(Command::Media { model: model.map(str::to_string), job, events: tx.clone(), cancel }).is_err() {
+            let _ = tx.send(MediaUpdate::Failed(BackendError::failed("the engine has stopped")));
+        }
+        rx
     }
 
     pub fn chat_on(&self, model: Option<&str>, request: ChatRequest) -> Receiver<ChatEvent> {
@@ -418,6 +436,13 @@ enum Backend {
 }
 
 impl Backend {
+    fn media(&self) -> Option<specrt::media::MediaInfo> {
+        match self {
+            Backend::Single(n) => n.media_info(),
+            Backend::Batched { target, .. } => target.media_info(),
+        }
+    }
+
     fn stop(self) {
         if let Backend::Batched { running, .. } = self {
             for r in &running {
@@ -466,6 +491,14 @@ fn open(
     serving: &ServingFactory,
     progress: &specrt::progress::Sink,
 ) -> Result<Opened, BackendError> {
+    if specrt::media::resolve_dir(model_id).is_some() {
+        let device = engine.overrides.get(specrt::media::DEVICE_KEY).and_then(|v| v.as_u64()).map(|d| d as usize);
+        let mut native = Native::with_factory(max_ctx, factory.clone()).on_device(device);
+        native.set_progress(Some(progress.clone()));
+        native.load(model_id)?;
+        let caps = native.capabilities();
+        return Ok(Opened { backend: Backend::Single(native), vision: caps.vision, thinking: caps.thinking, tools: caps.tools, seqs: 1, note: None, speculation: None, share: None });
+    }
     serve_options(max_ctx, seqs, kv_cache_bytes, engine)?;
     if let Some(solved) = &engine.solved
         && let Some(mut target) = serving(serve_options(max_ctx, solved.slots, None, engine)?)
@@ -684,6 +717,8 @@ fn run(
                             tools: o.tools,
                             vram_bytes,
                             landed,
+                            kind: o.backend.media().map(|m| m.kind).unwrap_or_default(),
+                            media: o.backend.media(),
                         };
                         if let Some(share) = o.share {
                             shared.stats.lock().unwrap().push((model_id.clone(), share));
@@ -698,6 +733,34 @@ fn run(
                     }
                     Err(e) => reply_failure(e, &mut resume_reply),
                 }
+            }
+            Command::Media { model, job, events: out, cancel } => {
+                let send = |out: &Sender<MediaUpdate>, u: MediaUpdate| {
+                    let _ = out.send(u);
+                    wake();
+                };
+                let Some(at) = slot_index(&slots, model.as_deref()) else {
+                    let message = match &model {
+                        Some(name) => format!("model {name} is not loaded"),
+                        None => "no model is loaded".to_string(),
+                    };
+                    send(&out, MediaUpdate::Failed(BackendError::new(ErrorKind::ModelNotFound, message)));
+                    continue;
+                };
+                let result = match &mut slots[at].backend {
+                    Backend::Single(b) => b.generate_media(&job, &mut |e| {
+                        send(&out, MediaUpdate::Event(e));
+                        !cancel.load(Ordering::SeqCst)
+                    }),
+                    Backend::Batched { target, .. } => target.generate_media(&job, &mut |e| {
+                        send(&out, MediaUpdate::Event(e));
+                        !cancel.load(Ordering::SeqCst)
+                    }),
+                };
+                send(&out, match result {
+                    Ok(o) => MediaUpdate::Done(o),
+                    Err(e) => MediaUpdate::Failed(e),
+                });
             }
             Command::Chat { model, mut request, events: out, queued, meter } => {
                 let send = {
@@ -813,6 +876,83 @@ mod tests {
 
     fn wait_event(e: &Engine) -> EngineEvent {
         e.events.recv_timeout(Duration::from_secs(10)).unwrap()
+    }
+
+    fn image_engine(step_ms: u64) -> (Engine, Arc<std::sync::atomic::AtomicUsize>) {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let f = crate::fake::FakeImage::factory(step_ms, runs.clone(), Some(ScriptedModel::factory(script())));
+        (Engine::with_factories_sampled(Arc::new(|| {}), f, Arc::new(|_| None), no_gpu_sampler()), runs)
+    }
+
+    #[test]
+    fn an_image_model_loads_as_its_own_kind_and_streams_step_progress() {
+        let (e, _) = image_engine(1);
+        let dir = crate::fake::tiny_pipeline().display().to_string();
+        e.send(load(&dir, "tiny-klein"));
+        assert!(matches!(wait_event(&e), EngineEvent::Loading(_)));
+        let EngineEvent::Loaded(l) = wait_event(&e) else { panic!("not loaded") };
+        assert_eq!(l.kind, specrt::media::ModelKind::Image);
+        assert_eq!(l.media.as_ref().unwrap().family, "flux2_klein");
+        let job = specrt::media::MediaJob { n: 2, steps: Some(3), ..specrt::media::MediaJob::image("a fox", 32, 32, 5) };
+        let rx = e.handle().generate_media(None, job, Default::default());
+        let mut steps = Vec::new();
+        let out = loop {
+            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                MediaUpdate::Event(specrt::media::MediaEvent::Progress { image, step, steps: n }) => steps.push((image, step, n)),
+                MediaUpdate::Event(_) => {}
+                MediaUpdate::Done(o) => break o,
+                MediaUpdate::Failed(err) => panic!("{err}"),
+            }
+        };
+        assert_eq!(steps, vec![(0, 1, 3), (0, 2, 3), (0, 3, 3), (1, 1, 3), (1, 2, 3), (1, 3, 3)]);
+        assert_eq!(out.images.iter().map(|p| p.seed).collect::<Vec<_>>(), [5, 6]);
+        let text = ask(&e.handle(), "hi");
+        assert!(text.2.unwrap().kind == ErrorKind::InvalidRequest, "a chat request to an image model is a 400");
+    }
+
+    #[test]
+    fn cancelling_a_media_job_stops_it_between_steps() {
+        let (e, _) = image_engine(20);
+        e.send(load(&crate::fake::tiny_pipeline().display().to_string(), "tiny-klein"));
+        wait_event(&e);
+        wait_event(&e);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let rx = e.handle().generate_media(None, specrt::media::MediaJob { steps: Some(50), ..specrt::media::MediaJob::image("a fox", 32, 32, 1) }, cancel.clone());
+        let mut seen = 0;
+        let failed = loop {
+            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                MediaUpdate::Event(_) => {
+                    seen += 1;
+                    if seen == 2 {
+                        cancel.store(true, Ordering::SeqCst);
+                    }
+                }
+                MediaUpdate::Done(_) => panic!("ran to the end"),
+                MediaUpdate::Failed(err) => break err,
+            }
+        };
+        assert_eq!(failed.kind, ErrorKind::Cancelled);
+        assert!(seen < 10, "{seen} steps ran after the cancel");
+    }
+
+    #[test]
+    fn an_invalid_media_job_fails_as_an_invalid_request_and_a_text_model_refuses_one() {
+        let (e, runs) = image_engine(1);
+        e.send(load(&crate::fake::tiny_pipeline().display().to_string(), "tiny-klein"));
+        wait_event(&e);
+        wait_event(&e);
+        let rx = e.handle().generate_media(None, specrt::media::MediaJob::image("a fox", 30, 32, 1), Default::default());
+        let MediaUpdate::Failed(err) = rx.recv_timeout(Duration::from_secs(10)).unwrap() else { panic!("not refused") };
+        assert_eq!(err.kind, ErrorKind::InvalidRequest);
+        assert!(err.message.contains("multiple of 4"), "{}", err.message);
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "refused before any step");
+        e.send(load("m", "m"));
+        wait_event(&e);
+        let EngineEvent::Loaded(l) = wait_event(&e) else { panic!() };
+        assert_eq!(l.kind, specrt::media::ModelKind::Text);
+        let rx = e.handle().generate_media(None, specrt::media::MediaJob::image("a fox", 32, 32, 1), Default::default());
+        let MediaUpdate::Failed(err) = rx.recv_timeout(Duration::from_secs(10)).unwrap() else { panic!() };
+        assert_eq!(err.kind, ErrorKind::InvalidRequest);
     }
 
     fn ask(h: &Handle, text: &str) -> (String, Option<Generation>, Option<BackendError>) {

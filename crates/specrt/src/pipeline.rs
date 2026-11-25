@@ -159,6 +159,14 @@ impl Pipeline {
         &mut self.stages[i]
     }
 
+    pub fn logits_of(&self, decode_row: Option<usize>) -> Result<Vec<f32>> {
+        let last = self.stages.len() - 1;
+        match decode_row {
+            Some(i) => self.stages[last].step_logits(&self.steppers[last], i, 1),
+            None => self.stages[last].prefill_logits(),
+        }
+    }
+
     pub fn stats(&self) -> HopStats {
         self.stats
     }
