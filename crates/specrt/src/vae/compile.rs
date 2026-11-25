@@ -335,7 +335,7 @@ fn versions(units: &[Unit]) -> (Vec<ValueInfo>, Vec<Vec<usize>>, Vec<Vec<usize>>
 pub fn schedule(plan: &VaePlan, low: &Lowered, fused: &SectionFusion) -> Result<Schedule> {
     let units = &low.units;
     let (values, reads, writes) = versions(units);
-    let output = *writes.iter().flatten().filter(|&&v| values[v].place == Place::Local("x".into())).last().unwrap_or(&0);
+    let output = *writes.iter().flatten().rfind(|&&v| values[v].place == Place::Local("x".into())).unwrap_or(&0);
     let group_of: Vec<usize> = {
         let mut g = vec![usize::MAX; units.len()];
         for (gi, grp) in fused.groups.iter().enumerate() {

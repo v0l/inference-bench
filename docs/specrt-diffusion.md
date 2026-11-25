@@ -303,6 +303,19 @@ Filed as #1282 to #1286 by the supervisor; the order and the done test of each:
 5. **#1285 serving**: family file for FLUX.2 klein, the routes below, the load and Generate pages, `arena` driving admission. Done: the tiny fixture served end to end through `POST /v1/images/generations` (byte compare of the PNG decoded pixels against `image` within one 8 bit level), the real klein 4B loaded through the load dialog in headless sway with `nvidia-smi` showing it on the chosen GPU and the screenshots at 1280 x 800 and 390 x 844 read.
 6. **#1286 video**: UMT5 family, Wan DiT (cross attention, table modulation, 3 axis rope), UniPC as `[pipeline]` state, 3D causal VAE with the frame cache and temporal chunks, the video route. Done: `tiny-wan21` velocities, latents and `video` within the same tolerances, then Wan 2.1 1.3B at 480p on GPU1.
 
+## 7a. VAE decoder (#1283, landed)
+
+The VAE decoder is a plan, compiled by the same fusion engine as the decoder graph:
+
+- `graphs/vae.toml` holds one decoder graph per family (`kl` for `AutoencoderKL` and `AutoencoderKLFlux2`, `causal3d` for `AutoencoderKLWan` and `AutoencoderKLQwenImage`), written as macros over the diffusers config fields (`block_out_channels`, `layers_per_block`, `dim_mult`, `temperal_downsample`). `specrt::vae::graph::plan` expands it into `VaeOp`s (`conv`, `group_norm`, `rms_norm`, `upsample`, `time_up`, `attention`, `add`, `clamp`) and checks every tensor shape against the checkpoint. A new VAE family is a graph entry, no Rust.
+- Plan IR: `Rows::Grid(level)` and `Count::grids` size each resolution level; group norm lowers to a `GridReduce` stats unit and an elementwise apply unit; the fusion engine refuses to fuse a grid reduction with its reader (`Reason::GridBarrier`) and folds the nearest upsample only into an implicit GEMM load (`Reason::Layout`).
+- Rediscovered by the pass on the plain plan, no hand arrangement: group norm apply (with SiLU) as the next conv's prologue, the next group norm's statistics in the conv epilogue, residual adds into `conv2` and `to_out`, the upsample into the next conv's load, the clamp into `conv_out`. Tiny KL VAE: 56 launches to 21. Tiny Wan VAE: 56 to 44 (its channel RMS norm is a row reduction over channels that a conv tile does not own).
+- kir `conv`: `ConvKernel` is an implicit GEMM over NHWC (M output pixels, N Cout, K taps x Cin) with the tile from a formula: an 8 x 16 output patch (1 x 128 for 1x1), `bn = min(128, round_up(Cout, 32))`, `bk = min(32, Cin)` per tap, stages from shared memory (at most 2). Convs with under 8 input or output channels go to the direct family. The causal 3D variant reads the earlier frames from a per conv frame cache; `time_up` is the (3, 1, 1) causal conv to 2C with the interleave in the store.
+- Mid attention is one head over the pixels of a frame, any head dim (384 and 512 included): one block per query row with the scores in shared memory, so the key count is bounded by shared memory, not the head dim.
+- Memory: `vae::compile::arena` walks the fused schedule, takes the peak of live bytes and assigns offsets by interval colouring; `vae::tiled::choose` picks the largest tile (steps of 8 latent pixels) whose arena fits the budget, and `decode_tiled` blends overlapping tiles with linear ramps. Tiled against untiled on the tiny fixture (tile 12, overlap 8): 25.1 dB PSNR, against 18.1 dB for diffusers' own tiled decode at its tile 24.
+- Proof: host decode against `vae.decoded` 2.8e-6 (KL) and 2.2e-7 (Wan) max abs; fused and unfused schedules bit identical on the host; every conv shape against numpy (`fixtures/conv-cases`). GPU tests in `tests/vae_gpu.rs`.
+- Counts: `inference-bench kernels --plan --graph vae --spec <diffusers folder> --size 1024x1024 [--compiled] [--fusion]`.
+
 ## 8. API shape
 
 Images, OpenAI compatible, all additions optional with defaults:

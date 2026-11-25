@@ -343,7 +343,7 @@ pub fn emit_vae(kernels: &[ConvKernel]) -> Result<crate::KirSource, ConvError> {
     let mut seen = Vec::new();
     for k in kernels {
         k.validate()?;
-        if THREAD_ROWS * k.tile.tm != k.tile.bm || THREAD_COLS * k.tile.tn != k.tile.bn || (THREAD_ROWS * THREAD_COLS) as u32 != THREADS || ROW_THREADS % 32 != 0 {
+        if THREAD_ROWS * k.tile.tm != k.tile.bm || THREAD_COLS * k.tile.tn != k.tile.bn || (THREAD_ROWS * THREAD_COLS) as u32 != THREADS || !ROW_THREADS.is_multiple_of(32) {
             return Err(ConvError(format!("{}: the tile {:?} does not map onto {THREADS} threads", k.name(), k.tile)));
         }
         if !seen.contains(&k.name()) {

@@ -116,19 +116,19 @@ impl ConvKernel {
         if self.target.language != Language::Cuda {
             return bad(format!("has no {:?} lowering", self.target.language));
         }
-        if s.cin == 0 || s.cout == 0 || s.k % 2 == 0 || s.kt == 0 {
+        if s.cin == 0 || s.cout == 0 || s.k.is_multiple_of(2) || s.kt == 0 {
             return bad("needs channels, an odd spatial kernel and at least one frame tap".into());
         }
-        if s.interleave && (s.cout % 2 != 0 || s.upsample) {
+        if s.interleave && (!s.cout.is_multiple_of(2) || s.upsample) {
             return bad("an interleaved output splits an even channel count and does not upsample".into());
         }
         if let Prologue::GroupApply { groups, .. } = self.prologue
-            && (groups == 0 || groups > MAX_GROUPS || s.cin % groups != 0 || s.kt > 1)
+            && (groups == 0 || groups > MAX_GROUPS || !s.cin.is_multiple_of(groups) || s.kt > 1)
         {
             return bad(format!("a group norm prologue over {groups} groups needs whole groups, at most {MAX_GROUPS}, and a spatial conv"));
         }
         if let Some(g) = self.epilogue.stats
-            && (g == 0 || g > MAX_GROUPS || s.cout % g != 0 || s.interleave)
+            && (g == 0 || g > MAX_GROUPS || !s.cout.is_multiple_of(g) || s.interleave)
         {
             return bad(format!("group statistics over {g} groups need whole groups, at most {MAX_GROUPS}"));
         }
