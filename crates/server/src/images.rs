@@ -120,6 +120,8 @@ pub fn parse(body: &Value, partial_default: usize) -> Result<ImageRequest, ApiEr
         sampler: body["sampler"].as_str().map(String::from),
         frames: None,
         offload_text_encoder: None,
+        sequential_cfg: None,
+        tiled_vae: None,
         fps: None,
         preview_every: int(&body["partial_images"], "partial_images")?.map(|k| k as usize).or((partial_default > 0).then_some(partial_default)),
     };

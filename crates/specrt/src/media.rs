@@ -63,11 +63,15 @@ pub struct MediaJob {
     pub offload_text_encoder: Option<bool>,
     #[serde(default)]
     pub fps: Option<u32>,
+    #[serde(default)]
+    pub sequential_cfg: Option<bool>,
+    #[serde(default)]
+    pub tiled_vae: Option<bool>,
 }
 
 impl MediaJob {
     pub fn image(prompt: &str, width: usize, height: usize, seed: u64) -> MediaJob {
-        MediaJob { kind: ModelKind::Image, prompt: prompt.into(), negative_prompt: String::new(), n: 1, width, height, seed, steps: None, guidance: None, sampler: None, frames: None, preview_every: None, offload_text_encoder: None, fps: None }
+        MediaJob { kind: ModelKind::Image, prompt: prompt.into(), negative_prompt: String::new(), n: 1, width, height, seed, steps: None, guidance: None, sampler: None, frames: None, preview_every: None, offload_text_encoder: None, fps: None, sequential_cfg: None, tiled_vae: None }
     }
 
     pub fn video(prompt: &str, width: usize, height: usize, frames: usize, seed: u64) -> MediaJob {
@@ -474,12 +478,17 @@ impl ImageModel {
         a.weights = weights;
         let o = p.options;
         let mut plan = plan;
-        if o.sequential_cfg && guided && !plan.sequential_cfg {
+        if job.sequential_cfg.unwrap_or(o.sequential_cfg) && guided && !plan.sequential_cfg {
             plan.sequential_cfg = true;
             a.sequential_cfg = true;
             a.denoiser_arena = (budget.denoiser_arena)(1)?;
         }
-        if let Some(t) = o.vae_tile.filter(|t| *t > 0 && plan.vae_tile.is_none_or(|p| p.tile > *t)) {
+        let tile = match job.tiled_vae {
+            Some(true) => Some(o.vae_tile.filter(|t| *t > 0).unwrap_or_else(|| (d.h.max(d.w) / 2).next_multiple_of(VAE_TILE_ALIGN).max(VAE_TILE_ALIGN))),
+            Some(false) => None,
+            None => o.vae_tile,
+        };
+        if let Some(t) = tile.filter(|t| *t > 0 && plan.vae_tile.is_none_or(|p| p.tile > *t)) {
             plan.vae_tile = Some(Tiling { tile: t, overlap: ((t as f64 * VAE_TILE_OVERLAP).round() as usize).min(t - 1) });
             a.vae_tile = Some(t);
             a.vae_arena = (budget.vae_arena)(t.min(d.h), t.min(d.w))?;

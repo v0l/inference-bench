@@ -125,6 +125,20 @@ fn progress_rises_by_step_then_by_decoded_frame_and_delete_cancels() {
 }
 
 #[test]
+fn memory_options_are_accepted_and_a_queued_job_reports_its_position() {
+    let (rig, _) = rig(40, "[images]\njobs_per_gpu = 1\nqueue_depth = 2\n");
+    let body = json!({"prompt": "a fox", "size": "32x32", "frames": 5, "steps": 10, "sequential_cfg": true, "tiled_vae": false});
+    let (a, va, _) = create(&rig, body.clone());
+    let (b, vb, _) = create(&rig, body);
+    assert_eq!((a, b), (200, 200), "{va} {vb}");
+    let queued = status_of(&rig, vb["id"].as_str().unwrap());
+    assert_eq!(queued["status"], "queued", "{queued}");
+    assert_eq!(queued["queue_position"], 1, "{queued}");
+    assert_eq!(wait_done(&rig, vb["id"].as_str().unwrap())["status"], "completed");
+    rig.stop();
+}
+
+#[test]
 fn the_models_list_and_capabilities_name_the_video_route() {
     let (rig, _) = rig(1, "");
     let (_, models, _) = rig.get("/v1/models", None);
