@@ -135,6 +135,44 @@ fn the_generate_page_stacks_on_a_phone_and_nothing_spills_sideways() {
 }
 
 #[test]
+#[ignore = "needs a GPU: SHOTS=dir ~/.agents/bin/gpu-run 1 -- <ui test binary> tests_images::the_real_engine --ignored"]
+fn the_real_engine_loads_the_tiny_pipeline_through_the_page_and_generates() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    let mut h = harness_at("img-real", Tab::Models, egui::vec2(1280.0, 800.0));
+    with_gpu(&mut h, 0, 96 << 30);
+    let wake = h.state().wake.clone();
+    h.state_mut().engine = inference_bench_core::engine::Engine::with_factories_sampled(wake, inference_bench_core::native::specrt_factory(), Arc::new(|_| None), inference_bench_core::engine::no_gpu_sampler());
+    let m = image_model();
+    h.state_mut().library.push(m.clone());
+    h.state_mut().open_load_dialog(&m);
+    h.run();
+    h.get_by_label("load model").click();
+    h.run();
+    pump_until(&mut h, 120, "real load", |a| a.loaded().is_some());
+    h.run();
+    h.state_mut().generate.prompt = "w176 w476 w100".into();
+    h.state_mut().generate.size = "32x32".into();
+    h.run();
+    h.get_by_label("generate image").click();
+    h.run();
+    pump_until(&mut h, 120, "real generation", |a| !a.generate.busy());
+    h.run();
+    let g = &h.state().generate;
+    assert!(g.error.is_none(), "{:?}", g.error);
+    assert_eq!(g.results.len(), 1);
+    let row = &g.rows[0];
+    eprintln!("real run: {} steps, {:.2} steps/s, {:.2} s", row.steps, row.steps_per_sec, row.total_secs);
+    assert!(row.steps == 4 && row.steps_per_sec > 0.0);
+    let smi = std::process::Command::new("nvidia-smi").args(["--query-compute-apps=pid,used_memory", "--format=csv,noheader"]).output().unwrap();
+    let me = std::process::id().to_string();
+    let text = String::from_utf8_lossy(&smi.stdout).to_string();
+    eprintln!("nvidia-smi compute apps:\n{text}");
+    assert!(text.lines().any(|l| l.starts_with(&me)), "this process holds GPU memory while the model is loaded");
+    h.render().unwrap().save(out.join("image-generate-real-engine-1280x800.png")).unwrap();
+}
+
+#[test]
 #[ignore = "renders with wgpu; run with SHOTS=dir"]
 fn screenshots_of_the_image_load_page_and_generate_page_at_desktop_and_phone_width() {
     let out = shots_dir();
