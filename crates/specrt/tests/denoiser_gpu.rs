@@ -108,7 +108,8 @@ fn the_engine_agrees_with_the_host_plan() {
     let d = denoiser();
     let graph = DenoiserGraph::embedded();
     let ck = specrt::weights::Checkpoint::open(&fixture().join("transformer")).unwrap();
-    let host = specrt::denoiser_host::HostDenoiser::load(graph, &d.spec, &d.plan, &ck, true).unwrap();
+    let network = graph.plan().unwrap();
+    let host = specrt::denoiser_host::HostDenoiser::load(graph, &d.spec, &network, &ck, true).unwrap();
     let ids = specrt::denoiser_host::grid_ids(16, 8, 8, d.spec.axes.len());
     let latent = step_input(0);
     let text = pipeline("text.embeds");

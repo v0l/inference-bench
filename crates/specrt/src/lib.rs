@@ -19,6 +19,7 @@ pub mod denoiser;
 pub mod denoiser_host;
 pub mod denoiser_cuda;
 pub mod gemm;
+pub mod generate;
 pub mod engine;
 pub mod executor;
 pub mod family;

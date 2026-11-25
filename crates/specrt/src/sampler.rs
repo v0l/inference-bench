@@ -68,6 +68,8 @@ struct PipelineDecl {
     #[serde(default)]
     defaults: BTreeMap<String, f64>,
     #[serde(default)]
+    symbols: Vec<(String, String)>,
+    #[serde(default)]
     tensors: BTreeMap<String, String>,
     schedule: ScheduleDecl,
     step: StepDecl,
@@ -196,8 +198,13 @@ impl Pipeline {
             let Some(v) = paths.iter().find_map(|p| lookup(configs, p)) else { continue };
             let v = match v {
                 serde_json::Value::Bool(b) => f64::from(u8::from(*b)),
+                serde_json::Value::Array(a) => a.len() as f64,
                 v => v.as_f64().with_context(|| format!("{name} is {v}, not a number"))?,
             };
+            values.insert(name.clone(), v);
+        }
+        for (name, text) in &d.symbols {
+            let v = eval(&parse(text)?, &values)?;
             values.insert(name.clone(), v);
         }
         let text_layers = d.text_layers.iter().map(|n| number(n, &values).map(|v| v as usize)).collect::<Result<Vec<_>>>()?;

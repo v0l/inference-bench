@@ -12,6 +12,11 @@ max_length = 512
 steps = "select(distilled, 4, 50)"
 guidance = "select(distilled, 1, 4)"
 cfg = "guidance > 1 && distilled == 0"
+symbols = [
+  ["vae_scale", "floor(exp((vae_levels - 1) * log(2)) + 0.5)"],
+  ["pixel_step", "vae_scale * latent_patch"],
+  ["token_channels", "latent_channels * latent_patch * latent_patch"],
+]
 
 [pipeline.fields]
 distilled = ["pipeline.is_distilled"]
@@ -22,6 +27,7 @@ static_shift = ["scheduler.shift"]
 bn_eps = ["vae.batch_norm_eps"]
 latent_patch = ["vae.patch_size.0"]
 latent_channels = ["vae.latent_channels"]
+vae_levels = ["vae.block_out_channels"]
 
 [pipeline.defaults]
 distilled = 0
@@ -29,6 +35,8 @@ dynamic = 0
 static_shift = 1
 bn_eps = 0.0001
 latent_patch = 1
+vae_levels = 1
+
 
 [pipeline.tensors]
 bn_var = "bn.running_var"
