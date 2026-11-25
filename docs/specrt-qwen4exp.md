@@ -139,6 +139,41 @@ Tests (`tests/qwen4_exp_checkpoint.rs`): CPU, the real header names join into th
 
 The real load itself needs both cards and a window (#1353).
 
+## Real checkpoint
+
+NVFP4 copy (`RadixArk/Qwen3.8-Flash-Next-NVFP4`, 206 shards, all present in the index), loaded across both desktop cards by the planner, text only. Engine commit 18a8755e (branch issue-1353). Numbers were taken on quiet GPUs: nothing else ran on either card, the user's app was stopped.
+
+```
+export CARGO_TARGET_DIR=/mnt/data/cargo-target/inference-bench-qwen4exp-real
+cargo build --release -p inference-bench-cli
+B=$CARGO_TARGET_DIR/release/inference-bench
+hf download RadixArk/Qwen3.8-Flash-Next-NVFP4 --local-dir ~/models/Qwen3.8-Flash-Next-NVFP4
+$B spec --model ~/models/Qwen3.8-Flash-Next-NVFP4 --out /tmp/q48-nvfp4.toml
+$B plan --spec /tmp/q48-nvfp4.toml --config docs/qwen4exp-real/server.toml --objective latency
+~/.agents/bin/gpu-run all -- $B serve --config docs/qwen4exp-real/server.toml --bind 127.0.0.1:18480
+curl -s localhost:18480/v1/completions -H 'content-type: application/json' -d '{"model":"qwen3.8-flash-next","prompt":"The capital of France is","max_tokens":32,"temperature":0,"logprobs":20}'
+```
+
+`docs/qwen4exp-real/server.toml` is 4 slots x 32 K context, 2 x 89.4 GiB, 2 GiB reserve, 9.9 GiB host offload per card.
+
+Placement (planner, matches the run): gpu0 layers 0..2 (51.82 GiB of weights, includes the 51 GB fp8 n-gram table), gpu1 layers 2..48 (67.66 GiB), planned 36.5 ms per decode step. Measured memory per card with the model resident and the KV pool allocated: gpu0 55.7 GB (weights 55.8 GB), gpu1 95.9 GB (weights 74.2 GB plus the KV pool and scratch).
+
+Load: 21.3 s for stage 0, 20.3 s for stage 1, 42 to 46 s from the first request to a loaded model (JIT cache warm; the server listens after 2 s and loads on the first request).
+
+Speed, greedy, 64 new tokens with `ignore_eos`, one request at a time (time to first token from the server log, decode tok/s from the log):
+
+| prompt tokens | prefill (time to first token) | prefill tok/s | decode tok/s |
+| --- | --- | --- | --- |
+| 20 | 0.29 s | 70 | 3.7 |
+| 200 | 0.60 s | 330 | 3.7 |
+| 2000 | 4.24 s | 470 | 3.5 |
+
+Decode is 270 ms a step against the planned 36.5 ms: the pipelined path runs the single stream through both stages one row at a time and the MoE experts are read from the host mmap path, not a tuned decode. That gap is the next speed item, not a correctness problem.
+
+Text check: "The capital of France is" gives " Paris. Paris is the capital of France. The capital of Germany is Berlin. Berlin is the capital of Germany. The capital of Italy is Rome. Rome is" (32 tokens). The 32 greedy tokens and the top 20 logprobs per step are saved for the vLLM comparison in `docs/qwen4exp-real/nvfp4-france.json` and, for a 200 token plain text prompt (`docs/qwen4exp-real/prompt200.json`), `docs/qwen4exp-real/nvfp4-prompt200.json` (OpenAI `logprobs.tokens` and `logprobs.top_logprobs`). The long one stopped after 20 tokens on a natural end of text. The same request against vLLM `/v1/completions` with `"logprobs":20`, `temperature` 0 gives the files to diff.
+
+Stages cannot start in front of a prelude layer (the PLE layer reads the token history only the first stage keeps): `StageRange::check` and the planner refuse it by name.
+
 ## History: why the family came last
 
 A family file makes `from_hf_config_serving` accept the model, so the coverage script would call the real config TOO-BIG while the engine cannot run it. The family file goes in last, after these engine pieces each have a kir description and a test against `tiny-qwen4-exp`:
