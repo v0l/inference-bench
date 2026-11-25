@@ -101,7 +101,19 @@ The expert GEMMs were refused at an expert width of 640 by an old `% 256` rule; 
 
 Coverage (`model_coverage.sh`): Qwen/Qwen3.8-Flash-Next (360 GB bf16) 2 cards plus 21 GB host plus 166 GB NVMe, the planner models cards and host only; Qwen/Qwen3.8-Flash-Next-FP8 (185.5 GB) 2 cards plus 13 GB host, planner accepts; RadixArk/Qwen3.8-Flash-Next-NVFP4 (135.2 GB) 2 cards, planner accepts. All three SUPPORTED-WITH-OFFLOAD. The GGUF copy waits on #1204 (the GGUF spec is built in Rust and has none of these tables); the MXFP4 GPTQ copy on its quant format.
 
-The real checkpoints still need loader work before a real load (#1349): the n-gram table is 128 `shard_N` tensors in bf16 or fp8 (205 GB as f32, so it must stay in its stored dtype on the host tier), and the bf16 repo fuses experts as `experts.gate_up_proj` [512, 1280, 2560] without a `.weight` suffix. The real load itself needs both cards and a window (parked issue, `needs-both-gpus`).
+## Real checkpoint tensors (#1349)
+
+Read from the three repos' shard headers (no download); names, dtypes, shapes, the fp8 scale and the three I64 buffers are in `tests/fixtures/qwen4-exp-real/headers.json`.
+
+- The n-gram table is 128 `ple_embedding.ngram_embedding.shard_N.weight` tensors of [2500012, 160]: bf16 in the base repo, F8_E4M3 in the FP8 and NVFP4 repos with one bf16 `ngram_embedding.weight_scale` (1.99e-4). `Checkpoint` joins any complete `X.shard_0..N.leaf` run into `X.leaf` along rows (`has`, `shape_of`, `dtype_of`, `parts`), so the family still binds `ple_embedding.ngram_embedding.weight`.
+- `[prelude.stored]` names prelude weights that stay in their stored dtype: `ple_table = "ple_embedding.ngram_embedding.weight"`. At load `complete_prelude` reads the dtype from the checkpoint into `[prelude.words]` (`ple_table_dtype` = f32, bf16 or fp8) and the fp8 scale into `ple_table_scale`. The gather's `table` param carries `stored = "ple_table"`, so kir types it `bf16_t` or `unsigned char` and decodes each element (bf16 by shift, e4m3 times the scale) in the `group_map` load. The table is copied part by part from the mmap into one device buffer (fp8 51 GB, bf16 102 GB) and kept out of the staged prefetch groups. The bf16 copy needs the host tier (#1355).
+- The bf16 repo fuses experts as `mlp.experts.gate_up_proj` [512, 1280, 2560] (gate rows first) and `mlp.experts.down_proj` [512, 2560, 640] with no `.weight` suffix; `[moe] fused_experts = true` loads both spellings, with the per matrix `shared_expert` appended. The FP8 and NVFP4 repos use per expert names.
+- `layer_multipliers`, `ngram_heads_offsets` and `ngram_heads_vocab_sizes` are not loaded: the folded `ple_ngram_hash` constants equal them (checked on CPU against the real values).
+- The QSA select keeps group scores in shared memory, so `max_context` stops at 47104 on the real model (#1356).
+
+Tests (`tests/qwen4_exp_checkpoint.rs`): CPU, the real header names join into the table the family reads with the folded `ngram_rows`; the hash constants equal the real buffers; an fp8 sharded copy of the tiny table loads through the name map in its stored bytes; bad `[prelude.stored]` or dtype words are refused; fused bf16 experts load identical stacks to the per expert copy. GPU1: the fp8 gather equals the f32 gather of the decoded table, and the bf16 gather reads the table bit for bit; the engine on bf16 shards and on fused experts gives logits identical to the original fixture, and on fp8 shards identical to the decoded f32 table.
+
+The real load itself needs both cards and a window (#1353).
 
 ## History: why the family came last
 
