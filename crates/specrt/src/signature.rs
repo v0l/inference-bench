@@ -45,6 +45,7 @@ pub enum Rows {
     Image,
     Text,
     Joint,
+    Latent,
     Grid(usize),
 }
 
@@ -113,9 +114,10 @@ impl Count {
             Rows::Pairs(p) => self.tokens * p,
             Rows::Experts { total, top_k } => total.min(self.tokens * top_k),
             Rows::Fixed(n) => n,
-            Rows::Image => self.image,
-            Rows::Text => self.text,
-            Rows::Joint => self.image + self.text,
+            Rows::Image => self.image * self.seqs,
+            Rows::Text => self.text * self.seqs,
+            Rows::Joint => (self.image + self.text) * self.seqs,
+            Rows::Latent => self.image,
             Rows::Grid(l) => self.grid.get(l).copied().unwrap_or(0),
         }
     }

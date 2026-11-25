@@ -452,6 +452,20 @@ impl Expr {
     }
 }
 
+impl std::fmt::Display for Expr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let child = |e: &Expr, paren: bool| if paren { format!("({e})") } else { e.to_string() };
+        match self {
+            Expr::Lit(t) | Expr::Raw(t) | Expr::Name(t) => f.write_str(t),
+            Expr::Const(n, _) => f.write_str(n),
+            Expr::Width => f.write_str("width"),
+            Expr::Neg(e) => write!(f, "-{}", child(e, e.prec() < 6)),
+            Expr::Bin(op, a, b) => write!(f, "{} {} {}", child(a, a.prec() < op.prec()), op.text(), child(b, b.prec() <= op.prec())),
+            Expr::Call(name, args) => write!(f, "{name}({})", args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")),
+        }
+    }
+}
+
 fn fold(op: Op, a: Expr, b: Expr, consts: &[Const]) -> Expr {
     let is = |e: &Expr, v: f32| matches!(e, Expr::Const(n, c) if *c == v && consts.iter().any(|k| k.name == *n && k.fold));
     match op {

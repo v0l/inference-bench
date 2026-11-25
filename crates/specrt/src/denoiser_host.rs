@@ -76,10 +76,10 @@ impl<'a> HostDenoiser<'a> {
         let mut bufs: BTreeMap<&str, Vec<f32>> = BTreeMap::new();
         let width = |name: &str| -> Result<usize> { self.spec.size(&self.graph.decl(name).with_context(|| format!("no buffer {name}"))?.cols) };
         let total = x.image + x.text_rows;
-        for b in &self.graph.buffer {
+        for b in self.graph.buffer.iter().chain(&self.graph.output) {
             let rows = match b.rows.as_str() {
                 "joint" => total,
-                "image" => x.image,
+                "image" | "latent" => x.image,
                 "text" => x.text_rows,
                 _ => 1,
             };
@@ -117,12 +117,13 @@ impl<'a> HostDenoiser<'a> {
             Stream::Image => (x.text_rows, x.text_rows + x.image),
             Stream::Joint => (0, x.text_rows + x.image),
             Stream::Seqs => (0, 1),
+            Stream::Latent => (0, x.image),
         }
     }
 
     fn local_span(&self, name: &str, rows: Stream, x: &Inputs) -> (usize, usize) {
         let decl = self.graph.decl(name).map(|d| d.rows.as_str()).unwrap_or("joint");
-        if decl == "joint" { self.span(rows, x) } else { (0, match rows { Stream::Image => x.image, Stream::Text => x.text_rows, Stream::Joint => x.image + x.text_rows, Stream::Seqs => 1 }) }
+        if decl == "joint" { self.span(rows, x) } else { (0, match rows { Stream::Image | Stream::Latent => x.image, Stream::Text => x.text_rows, Stream::Joint => x.image + x.text_rows, Stream::Seqs => 1 }) }
     }
 
     fn op(&self, d: &DitOp, block: Option<usize>, x: &Inputs, bufs: &mut BTreeMap<&str, Vec<f32>>, planes: &mut Vec<f32>) -> Result<()> {
@@ -269,6 +270,7 @@ impl<'a> HostDenoiser<'a> {
                     }
                 }
             }
+            DitOp::Step { .. } => bail!("the host denoiser runs the network; the scheduler step is sampler::Pipeline::step_host"),
             DitOp::JointAttention { into } => {
                 let hd = self.spec.size("head_dim")?;
                 let total = x.text_rows + x.image;

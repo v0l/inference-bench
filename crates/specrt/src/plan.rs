@@ -15,6 +15,7 @@ pub enum Stream {
     Text,
     Joint,
     Seqs,
+    Latent,
 }
 
 impl Stream {
@@ -24,6 +25,7 @@ impl Stream {
             Stream::Text => "text",
             Stream::Joint => "joint",
             Stream::Seqs => "seqs",
+            Stream::Latent => "latent",
         }
     }
 }
@@ -45,6 +47,7 @@ pub enum DitOp {
     Glu { from: &'static str, into: &'static str, rows: Stream, offset: &'static str },
     AxisRope { from: &'static str, text: &'static str, image: &'static str },
     JointAttention { into: &'static str },
+    Step { from: &'static str, into: &'static str, rule: &'static str, guided: bool },
 }
 
 impl DitOp {
@@ -62,6 +65,8 @@ impl DitOp {
             DitOp::Glu { from, rows, .. } => format!("{} swiglu {from}", rows.label()),
             DitOp::AxisRope { .. } => "qk norm and axis rope".into(),
             DitOp::JointAttention { .. } => "joint attention".into(),
+            DitOp::Step { guided: true, .. } => "guided scheduler step".into(),
+            DitOp::Step { .. } => "scheduler step".into(),
         }
     }
 
@@ -74,6 +79,7 @@ impl DitOp {
             DitOp::GatedAdd { from, into, rows, .. } => format!("{from} gated into {into} ({})", rows.label()),
             DitOp::AxisRope { from, .. } => format!("{from} to attention planes"),
             DitOp::JointAttention { into } => format!("attention planes to {into}"),
+            DitOp::Step { from, into, .. } => format!("{into} and {from} to {into}"),
         }
     }
 
@@ -91,6 +97,7 @@ impl DitOp {
             DitOp::Glu { .. } => "dit_glu",
             DitOp::AxisRope { .. } => "vis_axis_rope",
             DitOp::JointAttention { .. } => "vis_flash",
+            DitOp::Step { .. } => "dit_step",
         }
     }
 }

@@ -137,14 +137,9 @@ name = "mod_out"
 rows = "seqs"
 cols = "mod0"
 
-[[buffer]]
-name = "out"
-rows = "image"
-cols = "out_channels"
-
 [[input]]
 name = "latent"
-rows = "image"
+rows = "latent"
 cols = "in_channels"
 
 [[input]]
@@ -163,15 +158,21 @@ rows = "joint"
 cols = "axes_count"
 int = true
 
-[[output]]
+[[input]]
+name = "step"
+rows = "seqs"
+cols = "3"
+
+[[buffer]]
 name = "velocity"
 rows = "image"
 cols = "out_channels"
 
 [[head]]
-op = "patchify"
+op = "split"
 in = "latent"
 out = "tokens"
+rows = "image"
 
 [[head]]
 op = "split"
@@ -480,10 +481,10 @@ scale = 0
 op = "linear"
 weight = "proj_out"
 in = "xn"
-out = "out"
+out = "velocity"
 rows = "image"
 
-[[tail]]
-op = "unpatchify"
-in = "out"
-out = "velocity"
+[[step]]
+op = "scheduler_step"
+in = "velocity"
+out = "latent"

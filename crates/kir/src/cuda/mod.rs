@@ -22,7 +22,7 @@ pub use attention::emit_attention;
 pub(crate) use attention::scan_tile::{TileScan, decode as scan_tile_decode, prefill as scan_tile_prefill};
 pub use linear::emit_linear;
 pub use ggml::emit_ggml;
-pub use vision::emit_vision;
+pub use vision::{emit_vision, emit_vision_step};
 pub use conv::emit_vae;
 pub use ops::emit_ops;
 pub use moe::emit_moe;

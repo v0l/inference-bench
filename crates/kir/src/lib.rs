@@ -525,6 +525,10 @@ impl fmt::Display for Kernel {
     }
 }
 
+pub fn fnv_hash(text: &str) -> String {
+    fnv(text.bytes())
+}
+
 pub fn module_hash(kernels: &[Kernel]) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
     for k in kernels {

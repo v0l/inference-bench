@@ -1,7 +1,6 @@
 use cudarc::driver::CudaContext;
 use specrt::denoiser::{DenoiserGraph, Shapes};
 use specrt::denoiser_cuda::{Denoiser, Trace};
-use specrt::denoiser_host::{patchify, unpatchify};
 use specrt::jit::Jit;
 use std::path::{Path, PathBuf};
 
@@ -62,12 +61,11 @@ fn the_engine_denoiser_matches_diffusers_on_every_recorded_step() {
     let d = denoiser();
     let mut arena = d.arena().unwrap();
     eprintln!("arena {} bytes", arena.bytes);
-    d.prepare(&mut arena, &pipeline("text.embeds")).unwrap();
+    d.prepare(&mut arena, &[&pipeline("text.embeds")]).unwrap();
     let h = d.spec.hidden();
     for step in 0..3 {
         let mut trace = Trace::default();
-        let grid = d.forward(&mut arena, &unpatchify(&step_input(step), 4, 2, 8, 8), sigma(step), Some(&mut trace)).unwrap();
-        let v = patchify(&grid, 4, 2, 8, 8);
+        let v = d.forward(&mut arena, &step_input(step), sigma(step), Some(&mut trace)).unwrap();
         let to_f32 = max_diff(&v, &pipeline(&format!("step{step}.velocity")));
         let to_bf16 = max_diff(&v, &reference(&format!("bf16.step{step}.velocity")));
         eprintln!("step {step}: velocity max diff {to_f32:e} to the f32 reference, {to_bf16:e} to the bf16 weight reference");
@@ -92,13 +90,13 @@ fn the_engine_denoiser_matches_diffusers_on_every_recorded_step() {
 #[ignore = "needs a GPU: ~/.agents/bin/gpu-run 1 -- cargo test --test denoiser_gpu -- --ignored"]
 fn hoisting_the_text_projection_out_of_the_step_changes_nothing() {
     let d = denoiser();
-    let latent = unpatchify(&step_input(1), 4, 2, 8, 8);
+    let latent = step_input(1);
     let mut once = d.arena().unwrap();
-    d.prepare(&mut once, &pipeline("text.embeds")).unwrap();
+    d.prepare(&mut once, &[&pipeline("text.embeds")]).unwrap();
     let first = d.forward(&mut once, &latent, sigma(0), None).unwrap();
     let again = d.forward(&mut once, &latent, sigma(1), None).unwrap();
     let mut fresh = d.arena().unwrap();
-    d.prepare(&mut fresh, &pipeline("text.embeds")).unwrap();
+    d.prepare(&mut fresh, &[&pipeline("text.embeds")]).unwrap();
     let alone = d.forward(&mut fresh, &latent, sigma(1), None).unwrap();
     assert_eq!(again, alone, "a step after another step must equal the same step on a fresh arena");
     assert_ne!(first, again);
@@ -110,13 +108,14 @@ fn the_engine_agrees_with_the_host_plan() {
     let d = denoiser();
     let graph = DenoiserGraph::embedded();
     let ck = specrt::weights::Checkpoint::open(&fixture().join("transformer")).unwrap();
-    let host = specrt::denoiser_host::HostDenoiser::load(graph, &d.spec, &d.plan, &ck, true).unwrap();
+    let network = graph.plan().unwrap();
+    let host = specrt::denoiser_host::HostDenoiser::load(graph, &d.spec, &network, &ck, true).unwrap();
     let ids = specrt::denoiser_host::grid_ids(16, 8, 8, d.spec.axes.len());
-    let latent = unpatchify(&step_input(0), 4, 2, 8, 8);
+    let latent = step_input(0);
     let text = pipeline("text.embeds");
     let want = host.forward(&specrt::denoiser_host::Inputs { latent: &latent, text: &text, timestep: sigma(0), ids: &ids, image: 64, text_rows: 16, patch_h: 8, patch_w: 8 }, &mut specrt::denoiser_host::Trace::default()).unwrap();
     let mut arena = d.arena().unwrap();
-    d.prepare(&mut arena, &text).unwrap();
+    d.prepare(&mut arena, &[&text]).unwrap();
     let got = d.forward(&mut arena, &latent, sigma(0), None).unwrap();
     let diff = max_diff(&got, &want);
     eprintln!("engine against the bf16 host plan: {diff:e}");

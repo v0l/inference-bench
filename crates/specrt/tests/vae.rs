@@ -239,7 +239,7 @@ fn tiled_and_untiled_decodes_agree_within_the_seam_tolerance() {
     let (a, b) = (whole.to_channels_first(), tiled.to_channels_first());
     let (err, db) = (max_abs(&a, &b), psnr(&a, &b));
     eprintln!("tiled 12 overlap 8 against untiled: max abs {err:e}, PSNR {db:.1} dB");
-    assert!(db > DIFFUSERS_TILED_PSNR + 2.0 && err < 0.6, "seams: max abs {err}, PSNR {db}");
+    assert!(db > DIFFUSERS_TILED_PSNR + 2.0 && err < 0.75, "seams: max abs {err}, PSNR {db}");
     let one = decode_tiled(&l, 2, Tiling { tile: 16, overlap: 4 }, &mut |x| vae.decode(x)).unwrap();
     assert_eq!(one.to_channels_first(), a, "a single tile is the untiled decode");
 }

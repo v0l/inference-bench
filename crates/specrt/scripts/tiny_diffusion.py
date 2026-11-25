@@ -18,6 +18,30 @@ def floats(t):
     return t.detach().float().contiguous().numpy().astype(np.float32)
 
 
+def engine_noise(seed, shape):
+    n = int(np.prod(shape))
+    pairs = (n + 1) // 2
+    with np.errstate(over="ignore"):
+        i = np.arange(1, 2 * pairs + 1, dtype=np.uint64)
+        z = np.uint64(seed) + i * np.uint64(0x9E3779B97F4A7C15)
+        z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+        z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+        z = z ^ (z >> np.uint64(31))
+    u = (z >> np.uint64(11)).astype(np.float64) * (1.0 / float(1 << 53))
+    r = np.sqrt(-2.0 * np.log1p(-u[0::2]))
+    angle = 2.0 * np.pi * u[1::2]
+    out = np.empty(2 * pairs, dtype=np.float64)
+    out[0::2] = r * np.cos(angle)
+    out[1::2] = r * np.sin(angle)
+    return torch.from_numpy(out[:n].astype(np.float32).reshape(shape))
+
+
+def round_bf16(module):
+    with torch.no_grad():
+        for p in module.parameters():
+            p.copy_(p.to(torch.bfloat16).float())
+
+
 class Reference:
     def __init__(self, fixture, name):
         self.out = fixture / "reference"
@@ -74,9 +98,9 @@ def flux2_klein():
         hidden_size=32,
         intermediate_size=64,
         num_hidden_layers=4,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=8,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=32,
         max_position_embeddings=256,
         rope_theta=1000000.0,
         rms_norm_eps=1e-6,
@@ -111,6 +135,7 @@ def flux2_klein():
     ).eval()
     for m in (text_encoder, transformer, vae):
         randomise(m, g)
+    round_bf16(text_encoder)
     with torch.no_grad():
         vae.bn.running_mean.copy_(0.1 * torch.randn(vae.bn.running_mean.shape, generator=g))
         vae.bn.running_var.copy_(0.5 + torch.rand(vae.bn.running_var.shape, generator=g))
@@ -141,7 +166,7 @@ def flux2_klein():
     hidden, prompt_embeds = embed(ids, mask)
     _, negative_embeds = embed(neg_ids, neg_mask)
     height = width = 32
-    latents = torch.randn((1, 16, 8, 8), generator=torch.Generator().manual_seed(SEED))
+    latents = engine_noise(SEED, (1, 16, 8, 8))
 
     def run(guidance, negative):
         steps = []
@@ -206,9 +231,20 @@ def flux2_klein():
     ref.put("cfg.image", cfg_image)
     for i in range(STEPS):
         ref.put(f"cfg.step{i}.latent", cfg_steps[i])
+    round_bf16(reload.transformer)
+    bf16_steps, _, bf16_image = run(1.0, None)
+    reload.register_to_config(is_distilled=False)
+    bf16_cfg_steps, _, bf16_cfg_image = run(4.0, negative_embeds)
+    reload.register_to_config(is_distilled=True)
+    ref.put("bf16.image", bf16_image)
+    ref.put("bf16.cfg.image", bf16_cfg_image)
+    for i in range(STEPS):
+        ref.put(f"bf16.step{i}.latent", bf16_steps[i])
+        ref.put(f"bf16.cfg.step{i}.latent", bf16_cfg_steps[i])
     ref.finish(
         pipeline="Flux2KleinPipeline",
         seed=SEED,
+        noise="splitmix64 counter, Box-Muller pairs",
         steps=STEPS,
         height=height,
         width=width,

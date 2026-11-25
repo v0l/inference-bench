@@ -57,12 +57,12 @@ fn run_host(bf16: bool, step: usize, plan: &specrt::plan::Plan) -> (Vec<f32>, Tr
     let spec = spec();
     let ck = Checkpoint::open(&fixture().join("transformer")).unwrap();
     let host = HostDenoiser::load(graph, &spec, plan, &ck, bf16).unwrap();
-    let latent = specrt::denoiser_host::unpatchify(&step_input(step), 4, 2, 8, 8);
+    let latent = step_input(step);
     let text = pipeline("text.embeds");
     let ids = ids(&spec);
     let mut trace = Trace::default();
     let grid = host.forward(&Inputs { latent: &latent, text: &text, timestep: sigma(step), ids: &ids, image: 64, text_rows: 16, patch_h: 8, patch_w: 8 }, &mut trace).unwrap();
-    let v = specrt::denoiser_host::patchify(&grid, 4, 2, 8, 8);
+    let v = grid;
     (v, trace)
 }
 
@@ -112,23 +112,73 @@ fn the_timestep_embedding_matches_numpy() {
     }
 }
 
+fn sampling_plan(guided: bool) -> specrt::plan::Plan {
+    let p = specrt::sampler::Pipeline::from_dir(&fixture()).unwrap();
+    DenoiserGraph::embedded().sampling_plan(&p.step_rule(guided).unwrap(), guided).unwrap()
+}
+
 #[test]
 fn every_denoiser_kernel_builds_from_a_description_and_emits() {
     let graph = DenoiserGraph::embedded();
     let s = spec();
-    let plan = graph.plan().unwrap();
     let shapes = denoiser::Shapes { image: 64, text: 16, patch_h: 8, patch_w: 8 };
-    let kernels = denoiser::described_kernels(graph, &s, &plan, &shapes, &kir::Target::sm_120()).unwrap();
-    let names: Vec<&str> = kernels.iter().map(|k| k.name).collect();
-    for want in ["dit_modulate", "dit_gated_add", "dit_timestep", "dit_patchify", "dit_unpatchify", "dit_glu_192_0", "dit_glu_288_96", "dit_split_96", "dit_silu_split_32", "dit_copy_32"] {
-        assert!(names.contains(&want), "{want} missing from {names:?}");
+    let mut src = String::new();
+    for guided in [false, true] {
+        let kernels = denoiser::described_kernels(graph, &s, &sampling_plan(guided), &shapes, &kir::Target::sm_120()).unwrap();
+        let names: Vec<&str> = kernels.iter().map(|k| k.name).collect();
+        let step = if guided { "dit_step_cfg" } else { "dit_step" };
+        for want in ["dit_modulate", "dit_gated_add", "dit_timestep", step, "dit_glu_192_0", "dit_glu_288_96", "dit_split_96", "dit_split_16", "dit_silu_split_32", "dit_copy_32"] {
+            assert!(names.contains(&want), "{want} missing from {names:?}");
+        }
+        src.push_str(&kir::cuda::emit_module(&kernels).unwrap());
     }
-    let src = kir::cuda::emit_module(&kernels).unwrap();
     if std::env::var_os("DIT_DUMP").is_some() {
         eprintln!("{src}");
     }
     assert!(src.contains("void __launch_bounds__(256) dit_modulate("), "{src}");
     assert!(src.contains("cosf(") && src.contains("sinf("), "{src}");
+    assert!(src.contains("dit_step(") && src.contains("dit_step_cfg("), "{src}");
+}
+
+#[test]
+fn the_step_rule_lowers_into_the_step_kernel_and_a_foreign_name_is_refused() {
+    let graph = DenoiserGraph::embedded();
+    let p = specrt::sampler::Pipeline::from_dir(&fixture()).unwrap();
+    let guided = p.step_rule(true).unwrap().to_string();
+    assert_eq!(guided, "x + (s1 - s0) * (u + g * (c - u))");
+    assert_eq!(kir::expr::Expr::parse(&guided).unwrap(), p.step_rule(true).unwrap());
+    let plan = sampling_plan(true);
+    let step = plan.tail.iter().find_map(|o| if let Op::Dit(d @ DitOp::Step { .. }) = o { Some(*d) } else { None }).unwrap();
+    let text = denoiser::step_description(&step, graph).unwrap();
+    assert!(text.contains(&format!("expr = \"{guided}\"")), "{text}");
+    let bad = kir::expr::Expr::parse("x + w * v").unwrap();
+    let e = graph.sampling_plan(&bad, false).unwrap_err().to_string();
+    assert!(e.contains("\"w\""), "{e}");
+    denoiser::validate(graph, &spec(), &plan).unwrap();
+}
+
+#[test]
+fn the_euler_step_fuses_into_proj_out_only_without_guidance() {
+    let graph = DenoiserGraph::embedded();
+    let s = klein();
+    let costs = specrt::fusion::Costs::for_target(&kir::Target::sm_120()).with_compute(400.0, 1600.0);
+    let tail = |guided: bool| {
+        let count = if guided { denoiser::guided_count(4096, 512) } else { denoiser::count(4096, 512) };
+        let f = specrt::fusion::denoiser_fusion(graph, &s, &sampling_plan(guided), count, &costs, false).unwrap();
+        f.into_iter().find(|x| x.name == "tail").unwrap()
+    };
+    let plain = tail(false);
+    for g in &plain.groups {
+        eprintln!("no guidance: [{}]", g.units.join(" + "));
+    }
+    assert!(grouped(&plain, "proj_out (image)", "scheduler step"), "the Euler update joins the proj_out epilogue");
+    let cfg = tail(true);
+    for d in &cfg.rejected {
+        eprintln!("guided kept apart {}", d.describe());
+    }
+    assert!(!grouped(&cfg, "proj_out (image)", "guided scheduler step"), "with guidance the step reads both sequences' rows");
+    assert!(cfg.rejected.iter().any(|d| d.involves("proj_out (image)", "guided scheduler step") && d.verdict == Err(specrt::fusion::Reason::Rows)));
+    assert_eq!(plain.launches_after + 1, plain.launches_before);
 }
 
 #[test]
@@ -144,13 +194,15 @@ fn the_patchify_layout_matches_the_pipeline_unpatchify() {
 fn the_denoiser_modules_compile_with_nvrtc_for_sm_120() {
     let graph = DenoiserGraph::embedded();
     let s = spec();
-    let plan = graph.plan().unwrap();
+    let plan = sampling_plan(true);
     let shapes = denoiser::Shapes { image: 64, text: 16, patch_h: 8, patch_w: 8 };
     let t = kir::Target::sm_120();
     let kernels = denoiser::described_kernels(graph, &s, &plan, &shapes, &t).unwrap();
     let compose = kir::cuda::emit_module(&kernels).unwrap();
     let vk = kir::vision::VisionKernel::new(&t, s.size("head_dim").unwrap(), true).unwrap().joint();
-    let vision = kir::cuda::emit_vision(&vk).unwrap();
+    let rule = specrt::sampler::Pipeline::from_dir(&fixture()).unwrap().step_rule(false).unwrap();
+    let vision = kir::cuda::emit_vision_step(&vk, &rule).unwrap();
+    assert!(vision.contains("vis_mma_step(") && vision.contains("return st_x + (st_s1 - st_s0) * st_v;"), "the Euler rule is the step GEMM's epilogue");
     for (name, src) in [("compose", compose), ("vision", vision)] {
         let cubin = specrt::jit::cubin_for(&src, "sm_120", 1).unwrap_or_else(|e| panic!("{name}: {e:#}"));
         assert!(!cubin.is_empty(), "{name}");

@@ -80,6 +80,8 @@ pub struct DenoiserGraph {
     pub block: Vec<DitBlock>,
     #[serde(default)]
     pub tail: Vec<DitNode>,
+    #[serde(default)]
+    pub step: Vec<DitNode>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -214,7 +216,8 @@ fn stream(name: &str) -> Result<Stream> {
         "text" => Stream::Text,
         "joint" => Stream::Joint,
         "seqs" => Stream::Seqs,
-        other => bail!("rows {other:?} is not image, text, joint or seqs"),
+        "latent" => Stream::Latent,
+        other => bail!("rows {other:?} is not image, text, joint, seqs or latent"),
     })
 }
 
@@ -224,6 +227,7 @@ pub fn rows_of(s: Stream) -> Rows {
         Stream::Text => Rows::Text,
         Stream::Joint => Rows::Joint,
         Stream::Seqs => Rows::Seqs,
+        Stream::Latent => Rows::Latent,
     }
 }
 
@@ -258,6 +262,7 @@ impl DitNode {
             "glu" => DitOp::Glu { from: from()?, into: into()?, rows: self.rows()?, offset: intern(self.offset.as_deref().unwrap_or("0")) },
             "axis_rope" => DitOp::AxisRope { from: from()?, text: intern(&full(self.need(&self.text, "text")?)), image: intern(&full(self.need(&self.image, "image")?)) },
             "joint_attention" => DitOp::JointAttention { into: into()? },
+            "scheduler_step" => bail!("the scheduler step is lowered with the pipeline rule (DenoiserGraph::sampling_plan)"),
             other => bail!("unknown denoiser op {other:?}"),
         })
     }
@@ -282,6 +287,29 @@ impl DenoiserGraph {
             blocks.push(PlanBlock { layers: vec![b.name.clone()], sparse: false, tail: false, ops: lower(&b.node, &format!("{}.{{i}}", b.prefix))? });
         }
         Ok(Plan { phase: Phase::Forward, tensor_core: true, head: lower(&self.head, "")?, blocks, per_layer: Vec::new(), tail: lower(&self.tail, "")?, mtp: Vec::new(), mtp_head: Vec::new() })
+    }
+
+    pub fn sampling_plan(&self, rule: &kir::expr::Expr, guided: bool) -> Result<Plan> {
+        let mut plan = self.plan()?;
+        ensure!(!self.step.is_empty(), "the denoiser graph has no [[step]] node");
+        let text = rule.to_string();
+        let mut names = Vec::new();
+        rule.names(&mut names);
+        let inputs: &[&str] = if guided { &["x", "c", "u", "g", "s0", "s1"] } else { &["x", "v", "s0", "s1"] };
+        if let Some(n) = names.iter().find(|n| !inputs.contains(&n.as_str())) {
+            bail!("the step rule names {n:?}; a {} step reads {}", if guided { "guided" } else { "plain" }, inputs.join(", "));
+        }
+        for n in &self.step {
+            ensure!(n.op == "scheduler_step", "[[step]] holds scheduler_step nodes, not {}", n.op);
+            let from = n.need(&n.input, "in")?;
+            let into = n.need(&n.out, "out")?;
+            plan.tail.push(Op::Dit(DitOp::Step { from, into, rule: intern(&text), guided }));
+        }
+        Ok(plan)
+    }
+
+    pub fn latent(&self) -> Result<&str> {
+        self.step.first().and_then(|n| n.out.as_deref()).context("the denoiser graph has no [[step]] node")
     }
 
     pub fn decl(&self, name: &str) -> Option<&BufferDecl> {
@@ -396,12 +424,23 @@ impl Signer<'_> {
                 sig(Class::RowReduce, reads, vec![Tensor::new(Place::Local("attention planes".into()), Rows::Joint, 3 * h, Form::Planes)], 0)
             }
             DitOp::JointAttention { into } => sig(Class::Attention, vec![Tensor::new(Place::Local("attention planes".into()), Rows::Joint, 3 * h, Form::Planes)], vec![self.t(into, None)?], 0),
+            DitOp::Step { from, into, guided, .. } => {
+                let latent = self.t(into, None)?;
+                let velocity = self.t(from, guided.then_some(Stream::Latent))?;
+                ensure!(velocity.cols == latent.cols, "the step reads {from} ({} wide) into {into} ({} wide)", velocity.cols, latent.cols);
+                let mut reads = vec![velocity.clone()];
+                if guided {
+                    reads.push(velocity);
+                }
+                reads.extend([latent.clone(), self.t("step", None)?]);
+                sig(Class::Elementwise, reads, vec![latent], 0)
+            }
         })
     }
 
     pub fn attention_flops(&self, count: &Count) -> u64 {
         let s = (count.image + count.text) as u64;
-        4 * s * s * self.spec.hidden() as u64
+        4 * s * s * self.spec.hidden() as u64 * count.seqs.max(1) as u64
     }
 
     pub fn flops(&self, op: &DitOp, count: &Count) -> Result<u64> {
@@ -415,7 +454,7 @@ impl Signer<'_> {
 }
 
 fn covers(written: &BTreeSet<Rows>, read: Rows) -> bool {
-    written.contains(&read) || written.contains(&Rows::Joint) && matches!(read, Rows::Image | Rows::Text) || read == Rows::Joint && written.contains(&Rows::Image) && written.contains(&Rows::Text)
+    written.contains(&read) || matches!(read, Rows::Latent | Rows::Image) && (written.contains(&Rows::Image) || written.contains(&Rows::Latent)) || written.contains(&Rows::Joint) && matches!(read, Rows::Image | Rows::Text) || read == Rows::Joint && written.contains(&Rows::Image) && written.contains(&Rows::Text)
 }
 
 type Defined = BTreeMap<Place, (Tensor, BTreeSet<Rows>)>;
@@ -586,6 +625,10 @@ pub fn count(image: usize, text: usize) -> Count {
     Count { tokens: image + text, out: image, seqs: 1, context: image + text, image, text, ..Count::default() }
 }
 
+pub fn guided_count(image: usize, text: usize) -> Count {
+    Count { seqs: 2, ..count(image, text) }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Shapes {
     pub image: usize,
@@ -622,9 +665,37 @@ pub fn kernel_key(op: &DitOp, graph: &DenoiserGraph, spec: &DenoiserSpec) -> Res
         DitOp::TimestepEmbed { .. } => ("dit_timestep".into(), "dit_timestep".into(), Vec::new()),
         DitOp::Patchify { .. } => ("dit_patchify".into(), "dit_patchify".into(), Vec::new()),
         DitOp::Unpatchify { .. } => ("dit_unpatchify".into(), "dit_unpatchify".into(), Vec::new()),
+        DitOp::Step { guided, .. } => (if guided { "dit_step_cfg" } else { "dit_step" }.into(), "dit_step".into(), Vec::new()),
         DitOp::Linear { .. } | DitOp::AxisRope { .. } | DitOp::JointAttention { .. } => return Ok(None),
     }))
 }
+
+pub fn step_description(op: &DitOp, graph: &DenoiserGraph) -> Result<String> {
+    let DitOp::Step { from, into, rule, guided } = *op else { bail!("{} is not a scheduler step", op.label()) };
+    let width = &graph.decl(into).with_context(|| format!("no buffer {into}"))?.cols;
+    graph.decl(from).with_context(|| format!("no buffer {from}"))?;
+    let rule = kir::expr::Expr::parse(rule).map_err(anyhow::Error::msg)?;
+    let rows: &[&str] = if guided { &["c", "u"] } else { &["v"] };
+    let scalars: &[&str] = if guided { &["s0", "s1", "g"] } else { &["s0", "s1"] };
+    let mut names = Vec::new();
+    rule.names(&mut names);
+    let mut t = format!("kind = \"kir-kernel\"\nfamily = \"compose\"\nname = \"dit_step\"\nthreads = 256\n\n[args]\nwidth = \"{width}\"\n\n[rows]\niter = \"grid\"\naddress = \"advance\"\nper_row = [\"p_x\", {}]\n", rows.iter().map(|r| format!("\"p_{r}\"")).collect::<Vec<_>>().join(", "));
+    t.push_str("\n[[param]]\nname = \"p_x\"\nrole = \"activation\"\naccess = \"write\"\n");
+    for p in rows.iter().chain(scalars) {
+        t.push_str(&format!("\n[[param]]\nname = \"p_{p}\"\nrole = \"activation\"\naccess = \"read\"\n"));
+    }
+    t.push_str("\n[[stage]]\nop = \"tile_load\"\nname = \"x\"\nsrc = \"p_x\"\n");
+    for r in rows.iter().filter(|r| names.iter().any(|n| n == *r)) {
+        t.push_str(&format!("\n[[stage]]\nop = \"tile_load\"\nname = \"{r}\"\nsrc = \"p_{r}\"\n"));
+    }
+    for s in scalars.iter().filter(|s| names.iter().any(|n| n == *s)) {
+        t.push_str(&format!("\n[[stage]]\nop = \"tile_load\"\nname = \"{s}\"\nsrc = \"p_{s}\"\nlayout = \"(width):(0)\"\nat = [\"i\"]\n"));
+    }
+    t.push_str(&format!("\n[[stage]]\nop = \"epilogue\"\nname = \"next\"\nexpr = \"{rule}\"\n\n[[stage]]\nop = \"tile_store\"\ndst = \"p_x\"\nvalue = \"next\"\n"));
+    Ok(t)
+}
+
+pub const STEP_SCALARS: [&str; 3] = ["s0", "s1", "g"];
 
 pub fn described_kernels(graph: &DenoiserGraph, spec: &DenoiserSpec, plan: &Plan, shapes: &Shapes, target: &kir::Target) -> Result<Vec<kir::Kernel>> {
     let registry = crate::kir_kernel::Registry::active();
@@ -639,6 +710,12 @@ pub fn described_kernels(graph: &DenoiserGraph, spec: &DenoiserSpec, plan: &Plan
         let mut shape = base.clone();
         for (k, v) in &extra {
             shape = shape.num(k, *v);
+        }
+        if desc == "dit_step" {
+            let text = step_description(d, graph)?;
+            let k = kir::desc::Description::parse(&text).map_err(anyhow::Error::msg)?.build(target, &shape).map_err(anyhow::Error::msg)?.renamed(&name);
+            out.insert(name, k);
+            continue;
         }
         let d = registry.get(&desc).with_context(|| format!("no kernel description {desc}"))?;
         let k = d.build(target, &shape).map_err(anyhow::Error::msg)?.renamed(&name);
