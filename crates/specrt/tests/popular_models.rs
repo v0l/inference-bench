@@ -475,7 +475,57 @@ fn sized(v: Verdict, row: &Row, m: &Machine, config: Option<&str>) -> Verdict {
     }
 }
 
+fn classify_pipeline(row: &Row, m: &Machine, committed_only: bool) -> Option<Verdict> {
+    let names = ["model_index.json", "scheduler/scheduler_config.json", "text_encoder/config.json", "transformer/config.json", "vae/config.json"];
+    let dir = std::env::temp_dir().join(format!("popular-pipeline-{}-{}", std::process::id(), slug(row.repo())));
+    for n in names {
+        let text = if committed_only { committed(row.repo(), n) } else { fetched(row.repo(), n) };
+        let Some(text) = text else { continue };
+        let p = dir.join(n);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+    if !dir.join("model_index.json").exists() {
+        return if committed_only { None } else { Some(Verdict::new(Class::Unchecked, "no model_index.json", None)) };
+    }
+    let class = specrt::media::pipeline_class(&dir).unwrap_or_default();
+    let checked = specrt::media::family_for(&dir).and_then(|f| {
+        let p = specrt::sampler::Pipeline::from_dir(&dir)?;
+        specrt::denoiser::DenoiserSpec::from_pipeline(&dir)?;
+        specrt::vae::graph::load_plan(&dir.join("vae"))?;
+        let te = std::fs::read_to_string(dir.join("text_encoder/config.json"))?;
+        Spec::from_hf_config(&te)?;
+        Ok((f, p))
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    let (family, pipeline) = match checked {
+        Ok(x) => x,
+        Err(e) => {
+            let msg = error_text(e);
+            return Some(Verdict::new(Class::Refused, msg.clone(), Some(Gap { kind: Kind::Family, key: format!("pipeline {class}") })));
+        }
+    };
+    if row.s("quant") != "none" || row.s("format") != "BF16" {
+        return Some(Verdict::new(Class::UnknownQuant, format!("{class} weights are {}; the denoiser reads bf16 today", row.s("format")), Some(Gap { kind: Kind::Quant, key: format!("{} diffusion weights", row.s("format")) })));
+    }
+    let parts = row.m["pipeline_parts_gb"].as_object();
+    let part = |n: &str| parts.and_then(|p| p.get(n)).and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let resident: f64 = family.pipeline.resident.iter().map(|c| part(c)).sum();
+    let encoder = part("text_encoder");
+    let peak = resident + encoder;
+    let usable = m.card_gb * CARD_SHARE;
+    let what = format!("{} image pipeline, family {}, {} steps; weights {:.1} GB (text encoder {encoder:.1}, resident {resident:.1}); peak {peak:.1} GB on 1 card with the text encoder released after encoding, 0 GB host RAM", family.pipeline.graph, family.name, pipeline.steps, row.size().unwrap_or(0.0));
+    if peak <= usable {
+        return Some(Verdict::new(Class::Loads, what, None));
+    }
+    let need = offload_need(peak, m, None);
+    Some(Verdict { class: if need.short_gb > 0.0 { Class::NoFit } else { Class::Offload }, why: format!("{}; {what}", need.text()), gap: None, offload: Some(need) })
+}
+
 fn classify(row: &Row, m: &Machine, committed_only: bool) -> Option<Verdict> {
+    if row.has_file("model_index.json") {
+        return classify_pipeline(row, m, committed_only);
+    }
     let mut config_text = None;
     let v = if row.is_gguf() {
         classify_gguf(row)
@@ -495,6 +545,9 @@ fn classify(row: &Row, m: &Machine, committed_only: bool) -> Option<Verdict> {
 }
 
 fn chat(row: &Row) -> (String, Option<Gap>) {
+    if row.has_file("model_index.json") {
+        return ("image pipeline, prompt template in tokenizer/".into(), None);
+    }
     if row.is_gguf() {
         return ("in the GGUF".into(), None);
     }
@@ -1043,6 +1096,20 @@ fn the_offload_numbers_follow_the_machine_block() {
     assert!(refused.why.contains("then offload"));
     let loads = sized(Verdict::new(Class::Loads, "ok", None), &Row { m: &probe }, &mach, None);
     assert_eq!(loads.class, Class::NoFit);
+}
+
+#[test]
+fn flux2_klein_4b_loads_on_one_card_through_its_family_file() {
+    let doc = report().doc;
+    let main = section(&doc, "Main labs");
+    let line = main.lines().find(|l| l.starts_with("| black-forest-labs/FLUX.2-klein-4B |")).expect("FLUX.2-klein-4B row");
+    assert!(line.contains("| LOADS |"), "{line}");
+    let man = manifest();
+    let mach = machine(&man);
+    let m = man["models"].as_array().unwrap().iter().find(|m| m["repo"] == "black-forest-labs/FLUX.2-klein-4B").unwrap();
+    let v = classify(&Row { m }, &mach, true).unwrap();
+    assert_eq!(v.class, Class::Loads, "{}", v.why);
+    assert!(v.why.contains("family flux2_klein") && v.why.contains("on 1 card") && v.why.contains("0 GB host RAM") && v.why.contains("weights 16.0 GB"), "{}", v.why);
 }
 
 #[test]

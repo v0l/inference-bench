@@ -340,6 +340,16 @@ Quantised copies under this lab: 34, of which 3 load or load text only.
 
 Gemma 3 dense (1B, 4B, 12B, 27B, 270m) loads today and Gemma 3n is the `model_type gemma3n` gap on #1214. Gemma 2 is still documented and downloadable from Google (gemma.ai/models/gemma-2/, listed under Previous Gemma models beside Gemma 3), so its `model_type gemma2` gap is split out of #1203 into its own issue; opt, gpt_neox and bloom stay parked in #1203.
 
+### Black Forest Labs (image) (GREEN: every model loads)
+
+| model | released | size GB | arch | class | gap | issue |
+|---|---|---|---|---|---|---|
+| black-forest-labs/FLUX.2-klein-4B | 2026-01-14 | 16 | Flux2KleinPipeline | LOADS |  |  |
+
+Quantised copies under this lab: 3, of which 0 load or load text only.
+
+Image pipelines (diffusers `model_index.json`), classified by the family file that matches the pipeline class (`family-flux2_klein.toml`, #1285). Size is the sum of the text encoder, denoiser and VAE safetensors; one image job runs per card and the text encoder is released after encoding. The FP8 and NVFP4 klein copies and the 9B are not listed until the denoiser reads those weights.
+
 ### inclusionAI (secondary) (8 of 8 models are blocked, the rest load)
 
 | model | released | size GB | arch | class | gap | issue |
@@ -498,14 +508,14 @@ Selection: every model of the labs in labs.toml released since 2026-02-24 or sti
 
 | class | base models | all rows |
 |---|---|---|
-| LOADS | 82 | 225 |
+| LOADS | 83 | 226 |
 | LOADS-TEXT-ONLY | 5 | 15 |
 | SUPPORTED-WITH-OFFLOAD | 18 | 46 |
 | DOES-NOT-FIT | 9 | 14 |
-| UNKNOWN-QUANT | 10 | 248 |
-| REFUSED | 141 | 484 |
-| UNCHECKED | 13 | 35 |
-| total | 278 | 1067 |
+| UNKNOWN-QUANT | 10 | 249 |
+| REFUSED | 141 | 485 |
+| UNCHECKED | 13 | 36 |
+| total | 279 | 1071 |
 
 ## Ranked gaps
 
@@ -561,102 +571,104 @@ Gaps over the threshold with no issue yet: nvfp4_g16 needs hidden to be a multip
 | 44 | new family spec | model_type llava | 0.64 M | 1 | llava-hf/llava-1.5-7b-hf | #1208 |
 | 45 | new family spec | model_type mistral3 (wraps qwen3, which specrt runs) | 0.62 M | 2 | lightonai/LightOnOCR-2-1B, switzerchees/LightOnOCR-2-1B-NVFP4 | #1208 |
 | 46 | new family spec | model_type minimax_m3_vl | 0.57 M | 7 | MiniMaxAI/MiniMax-M3, nvidia/MiniMax-M3-NVFP4, MiniMaxAI/MiniMax-M3-MXFP8, cyankiwi/MiniMax-M3-AWQ-INT4 and 3 more | #1298 |
-| 47 | quant format | layer N mixer.experts.N.up_proj is Nvfp4G16 but other attention projections are Some(Fp8Channel) | 0.50 M | 1 | nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 | #1321 |
-| 48 | new family spec | model_type bailing_hybrid | 0.48 M | 7 | inclusionAI/Ling-3.0-tiny, inclusionAI/Ling-3.1-flash, Hikari07jp/Ling-3.1-flash-NVFP4-Ablitrated-MTP-RTX-PRO-6000-TP4, inclusionAI/Ling-3.1-flash-1019 and 3 more | #1315 |
-| 49 | new family spec | model_type nemotron_h_omni | 0.41 M | 6 | nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16, nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4, RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-FP8, nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB and 2 more | #1307 |
-| 50 | new family spec | model_type hy_v4_flash | 0.40 M | 7 | tencent/Hy4-flash, Avifenesh/Hy4-flash-NVFP4, leoncca/Hy4-flash-AWQ-g32, peasantsmith/Hy4-Flash-Maya-GGUF and 3 more | #1289 |
-| 51 | new family spec | GGUF architecture glm-dsa | 0.36 M | 5 | unsloth/GLM-5-GGUF, unsloth/GLM-5.1-GGUF, unsloth/GLM-5.2-GGUF, unsloth/GLM-5.3-GGUF and 1 more |  |
-| 52 | quant format | compressed-tensors float-quantized w8f-block a8 weights | 0.34 M | 4 | Nanbeige/Nanbeige4.3-33B-FP8, Etelis/DeepSeek-V2-Lite-FP8-BLOCK-padded, RedHatAI/gemma-4-31B-it-FP8-block, RedHatAI/Kimi-K3-FP8-BLOCK |  |
-| 53 | new family spec | model_type minimax_m2 | 0.33 M | 7 | MiniMaxAI/MiniMax-M2, gauravmm/MiniMax-M2.5-REAP-139B-A10B-NVFP4, unsloth/MiniMax-M2-GGUF, MiniMaxAI/MiniMax-M2.7 and 3 more | #1299 |
-| 54 | new family spec | model_type nemotron_labs_diffusion | 0.32 M | 4 | nvidia/Nemotron-Labs-Diffusion-14B, nvidia/Nemotron-Labs-Diffusion-14B-Base, nvidia/Nemotron-Labs-Diffusion-3B, nvidia/Nemotron-Labs-Diffusion-8B | #1308 |
-| 55 | new family spec | model_type mistral3 (wraps mistral, which specrt runs) | 0.28 M | 5 | mistralai/Mistral-Small-3.2-24B-Instruct-2506, gratex/mistral-small-3.2-24b-Instruct-2506-NVFP4A16, jeffcookio/Mistral-Small-3.2-24B-Instruct-2506-awq-sym, gratex/mistral-small-3.2-24b-Instruct-GPTQ-W4A16 and 1 more | #1303 |
-| 56 | quant format | the quantisation config covers no attention projection | 0.26 M | 1 | nvidia/GLM-5.3-NVFP4 |  |
-| 57 | new family spec | GGUF architecture bailingmoe3 | 0.26 M | 4 | bloomer010/Ling-3.0-tiny-GGUF, bartowski/Ling-3.1-flash-GGUF, bartowski/Ling-3.1-flash-1019-GGUF, mradermacher/LingSante-3.1-air-VL-i1-GGUF |  |
-| 58 | quant format | the quantisation config has no groups | 0.24 M | 4 | AEON-7/Gemma-4-12B-it-AEON-Abliterated-K4-FP8, AEON-7/Gemma-4-E4B-DECKARD-HERETIC-NVFP4, BareMetalAI/Llama-3.1-Nemotron-Nano-8B-W4A16-AWQ, nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark |  |
-| 59 | new family spec | model_type mimo_v2 | 0.23 M | 21 | XiaomiMiMo/MiMo-V2.5, lukealonso/MiMo-V2.5-NVFP4, spectator2026/MiMo-V2.5-AWQ-int4, huihui-ai/Huihui-MiMo-V2.5-abliterated-GGUF and 17 more | #1296 |
-| 60 | quant format | compressed-tensors naive-quantized w8f-tensor a8 weights | 0.21 M | 2 | RedHatAI/Meta-Llama-3.1-70B-Instruct-FP8, RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8 |  |
-| 61 | attention, block or MoE variant | Gemma 3n AltUp residual streams (altup_num_inputs) are not supported yet | 0.20 M | 3 | google/gemma-3n-E2B-it, RedHatAI/gemma-3n-E2B-it-FP8-dynamic, google/gemma-3n-E4B-it | #1341 |
-| 62 | new family spec | model_type NemotronH_Nano_Omni_Reasoning_V3 | 0.14 M | 4 | nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16, nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4, nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8, feanors/nemotron-3-nano-omni-30b-a3b-awq | #1309 |
-| 63 | new family spec | model_type nemotron_h_puzzle | 0.12 M | 3 | nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4, nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-FP8, nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-BF16 | #1310 |
-| 64 | new family spec | model_type lfm3_omni | 0.10 M | 2 | LiquidAI/LFM3-Omni-2B, MichaelAnthony/LFM3-Omni-2B-98K-V2-FP8 |  |
-| 65 | new family spec | model_type hy_v3 | 0.10 M | 4 | tencent/Hy-Memory-30B-A3B, tencent/Hy-Memory-30B-A3B-FP8, vinnipukh/Hy-Memory-30B-A3B-AWQ, rapatsky/Hy-Memory-30B-A3B-GGUF | #1290 |
-| 66 | attention, block or MoE variant | Kimi K3.1 sparse attention (dsa_config) on the MLA layers is not supported yet (#1361) | 0.08 M | 3 | moonshotai/Kimi-K3.1-Pro, nvidia/Kimi-K3.1-Pro-NVFP4, manifoldlabs/Kimi-K3.1-Pro-Quark-MXFP4-AttnFP8 | #1361 |
-| 67 | new family spec | GGUF architecture controlvector | 0.08 M | 1 | peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF |  |
-| 68 | new family spec | model_type olala | 0.08 M | 3 | OVHaiLLM/Olala-v1.0-mini-7A1B, solfird/Olala-v1.0-mini-7A1B-NVFP4-experts, OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF |  |
-| 69 | new family spec | model_type hunyuan_v1_moe | 0.08 M | 1 | tencent/Hunyuan-A13B-Instruct | #1291 |
-| 70 | new family spec | model_type dory | 0.07 M | 4 | nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16, cloudnathan5/Dory1.0-4B-GGUF, nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-MXFP8, nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4 | #1311 |
-| 71 | quant format | quantisation {"quant_algo":"FP8"} is not supported | 0.07 M | 1 | nvidia/Qwen3.5-397B-A17B-NVFP4-V2 |  |
-| 72 | new family spec | model_type inkling2 | 0.07 M | 4 | thinkingmachines/Inkling-2-Small, btbtyler09/Inkling-2-Small-NVFP4, thinkingmachines/Inkling-2-Small-MXFP8, local-inference-lab/Inkling-2-Small-NVFP4-CSF | #1305 |
-| 73 | new family spec | model_type hy_v4 | 0.06 M | 5 | AngelSlim/Hy4-GGUF, tencent/Hy4-preview, Oxmiq/Hy4-preview-NVFP4-W4A16, 6block/Hy4-preview-GGUF and 1 more | #1292 |
-| 74 | quant format | gptq 8bit weights | 0.05 M | 6 | Qwen/Qwen3-0.6B-GPTQ-Int8, Qwen/Qwen3-1.7B-GPTQ-Int8, JunHowie/Qwen3-4B-Instruct-2507-GPTQ-Int8, QuantTrio/Qwen3-Coder-30B-A3B-Instruct-GPTQ-Int8 and 2 more |  |
-| 75 | quant format | mixture-of-experts with Fp8Channel expert weights is not supported yet (bf16, nvfp4_g16 and fp8_block128 are) | 0.05 M | 4 | InternScience/Sage-A1.5-FP8, debackerl/KAT-Coder-V2.5-Dev-FP8, RedHatAI/Qwen3-Coder-Next-FP8-dynamic, lflare/Ornith-1.0-35B-FP8 | #1207 |
-| 76 | new family spec | model_type mistral_large4 | 0.05 M | 2 | mistralai/Mistral-Large-4-1T-A52B, unsloth/Mistral-Large-4-1T-A52B-GGUF | #1304 |
-| 77 | new family spec | GGUF architecture inkling | 0.05 M | 2 | unsloth/inkling-GGUF, unsloth/Inkling-Small-GGUF |  |
-| 78 | new family spec | GGUF architecture mistral4 | 0.03 M | 2 | GZGavinZhao/Leanstral-1.5-119B-A6B-GGUF, unsloth/Mistral-Small-4-119B-2603-GGUF |  |
-| 79 | new family spec | model_type mimo | 0.03 M | 1 | XiaomiMiMo/MiMo-7B-RL | #1297 |
-| 80 | new family spec | model_type raon1_nano | 0.02 M | 3 | KRAFTON/Raon-1-nano, Pilcothink/Raon-1-nano-NVFP4, KRAFTON/Raon-1-nano-gguf |  |
-| 81 | quant format | compressed-tensors float-quantized w8f-tensor a8 weights | 0.02 M | 2 | RedHatAI/Llama-3.2-1B-FP8, JongYeop/Mistral-7B-Instruct-v0.2-FP8-W8A8 |  |
-| 82 | quant format | modelopt FP8 weights | 0.02 M | 2 | daeunj/DeepSeek-V2-Lite-FP8-GPTQ, nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8 | #1320 |
-| 83 | new family spec | GGUF architecture inkling2_vq | 0.02 M | 1 | Baekpica/Inkling-2-Small-VQ-GGUF |  |
-| 84 | new family spec | model_type beam | 0.02 M | 4 | reflection/Beam-1.0-501B-A23B, Bespoke-Intelligence/Beam-1.0-501B-A23B-NVFP4-TP3-3x-DGX-Spark, reflection/Beam-1.0-501B-A23B-FP8, reflection/Beam-1.0-501B-A23B-NVFP4 | #1318 |
-| 85 | new family spec | model_type maxwell_moe | 0.02 M | 3 | maxwell-model/Maxwell-V1-Flash, maxwell-model/Maxwell-V1-Flash-FP8, AtomicChat/Maxwell-V1-Flash-GGUF |  |
-| 86 | new family spec | GGUF architecture unlimited-ocr2 | 0.02 M | 1 | AtomicChat/Unlimited-OCR-2-GGUF |  |
-| 87 | new family spec | GGUF architecture minimax-m3 | 0.01 M | 1 | unsloth/MiniMax-M3-GGUF |  |
-| 88 | new family spec | GGUF architecture deepseek2-ocr | 0.01 M | 2 | sahilchachra/Unlimited-OCR-GGUF, sabafallah/DeepSeek-OCR-GGUF |  |
-| 89 | new family spec | model_type kimi_k2 | 0.01 M | 1 | moonshotai/Kimi-K2-Instruct-0905 | #1288 |
-| 90 | quant format | gptq 2bit weights | 0.01 M | 1 | lilmeaty/SmolLM2-135M-Instruct-GPTQ |  |
-| 91 | quant format | modelopt_fp4 weights | 0.01 M | 2 | nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr, nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr | #1320 |
-| 92 | new family spec | model_type nemotron-nas | 0.01 M | 4 | nvidia/Llama-3_1-Nemotron-Ultra-253B-v1, nvidia/Llama-3_3-Nemotron-Super-49B-v1_5, Ithanil/Llama-3_3-Nemotron-Super-49B-v1_5-FP8-Dynamic, etsien/Llama-3_3-Nemotron-Super-49B-v1_5-GPTQ-w4a8 | #1312 |
-| 93 | new family spec | GGUF architecture hunyuan-dense | 0.01 M | 1 | bartowski/tencent_Hunyuan-7B-Instruct-GGUF |  |
-| 94 | new family spec | GGUF architecture phi2 | 0.01 M | 1 | ggml-org/moondream2-20250414-GGUF |  |
-| 95 | quant format | compressed-tensors mxfp4-pack-quantized w4f-group, mxfp4-pack-quantized w8f-block a8 weights | 0.01 M | 1 | tcclaviger/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ |  |
-| 96 | attention, block or MoE variant | no_rope_layers names 0 layers but num_hidden_layers is 48 | 0.01 M | 3 | meta-llama/Llama-4-Maverick-17B-128E, RedHatAI/Llama-4-Scout-17B-16E-Instruct-FP8-dynamic, meta-llama/Llama-4-Scout-17B-16E | #1306 |
-| 97 | new family spec | model_type qwen_drive | 0.01 M | 1 | Qwen/Qwen-Drive-1.0-4B | #1301 |
-| 98 | new family spec | model_type hunyuan_v1_dense | 0.01 M | 4 | tencent/Hunyuan-7B-Instruct, tencent/Hunyuan-7B-Instruct-FP8, tencent/Hunyuan-7B-Instruct-AWQ-Int4, tencent/Hunyuan-7B-Instruct-GPTQ-Int4 | #1293 |
-| 99 | new family spec | GGUF architecture beam_vq | 0.01 M | 1 | Baekpica/Beam-1.0-501B-A23B-VQ-GGUF |  |
-| 100 | new family spec | model_type ernie5_5_moe | 0.01 M | 2 | baidu/ERNIE-5.5-Flash-Preview-BF16, baidu/ERNIE-5.5-Flash-Base |  |
-| 101 | new family spec | model_type aion_instruct | 0.00 M | 2 | microsoft/Aion-1.0-Instruct-2.3B, PureTensorAI/Aion-1.0-Instruct-2.3B-NVFP4 |  |
-| 102 | new family spec | model_type hy_v4_vl | 0.00 M | 4 | tencent/Hy4, RedHatAI/Hy4-NVFP4, tencent/Hy4-FP8, tencent/Hy4-base | #1294 |
-| 103 | new family spec | GGUF architecture deci | 0.00 M | 2 | DevQuasar-13/nvidia.Llama-3_1-Nemotron-Ultra-253B-v1-GGUF, unsloth/Llama-3_3-Nemotron-Super-49B-v1_5-GGUF |  |
-| 104 | quant format | quark weights | 0.00 M | 3 | amd/gpt-oss-120b-w-mxfp4-a-fp8, amd/gpt-oss-20b-MoE-Quant-W-MXFP4-A-FP8-KV-FP8, amd/GLM-5-NVFP4 |  |
-| 105 | quant format | quantisation {"quant_algo":"FP8_PB_WO"} is not supported | 0.00 M | 1 | nvidia/Kimi-K3-NVFP4 |  |
-| 106 | new family spec | model_type sarvam_mla | 0.00 M | 4 | sarvamai/sarvam-105b, sarvamai/sarvam-105b-1711, RedHatAI/sarvam-105b-FP8-dynamic, QuantTrio/sarvam-105b-AWQ |  |
-| 107 | new family spec | model_type hunyuan | 0.00 M | 2 | tencent/Hunyuan-A13B-Instruct-GPTQ-Int4, unsloth/Hunyuan-A13B-Instruct-GGUF | #1295 |
-| 108 | new family spec | model_type minimax_m1 | 0.00 M | 1 | MiniMaxAI/MiniMax-M1-80k | #1300 |
-| 109 | new family spec | GGUF architecture aion | 0.00 M | 1 | Xylolabs/Aion-1.0-Instruct-2.3B-GGUF |  |
-| 110 | quant format | quantisation {"quant_algo":"FP8_PER_CHANNEL_PER_TOKEN"} is not supported | 0.00 M | 1 | dealignai/Ornith-1.5-122B-UNCENSORED-NVFP4 |  |
-| 111 | new family spec | model_type grug_moe | 0.00 M | 1 | open-athena/Marin-Mochi-535B-A23B |  |
-| 112 | quant format | fp8 e4m3 block None weights | 0.00 M | 2 | EliovpAI/Deepseek-R1-0528-Qwen3-8B-FP8-KV, RedHatAI/Meta-Llama-3-8B-Instruct-FP8-KV |  |
-| 113 | new family spec | model_type nemotron_labs_audex | 0.00 M | 2 | nvidia/Nemotron-Labs-Audex-2B, nvidia/Nemotron-Labs-Audex-30B-A3B | #1313 |
-| 114 | new family spec | model_type aurora2 | 0.00 M | 1 | AuroraAI-Research/Aurora2-400M-A20M |  |
-| 115 | quant format | None weights | 0.00 M | 1 | NVFP4/Qwen3-30B-A3B-Thinking-2507-FP4 |  |
-| 116 | new family spec | model_type bailing_moe_v3_vl | 0.00 M | 2 | inclusionAI/LingSante-3.1-air-VL, inclusionAI/LingSante-3.1-air-VL-MXFP4 | #1316 |
-| 117 | quant format | layer N mixer.experts.N.down_proj is Nvfp4G16 but other attention projections are Some(Fp8Channel) | 0.00 M | 1 | nvidia/NVIDIA-Nemotron-Labs-3-Competitive-Coding-550B-A55B-NVFP4 | #1321 |
-| 118 | attention, block or MoE variant | config.json has no num_attention_heads | 0.00 M | 1 | gaunernst/gemma-3-4b-it-int4-awq | #1213 |
-| 119 | new family spec | model_type nemotron_labs_diffusion_vlm | 0.00 M | 3 | nvidia/Nemotron-Labs-Diffusion-VLM-8B, yury-kapoyko/nemotron-diff-vlm-8b-fp8, yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq | #1314 |
-| 120 | quant format | compressed-tensors pack-quantized w8i-group weights | 0.00 M | 2 | cyankiwi/Qwen3-4B-Thinking-2507-AWQ-8bit, axteam/MiniCPM5-2B-AWQ-8bit |  |
-| 121 | new family spec | model_type sing_probe_attn | 0.00 M | 1 | inclusionAI/Ling-3.1-flash-1019-singprobe | #1317 |
-| 122 | quant format | w4afp8 weights | 0.00 M | 2 | PhalaCloud/GLM-5.3-W4AFP8, BitdeerAI/GLM-5.3-W4AFP8-AWQ |  |
-| 123 | new family spec | model_type philolm | 0.00 M | 1 | gustavecortal/PhiloLM |  |
-| 124 | quant format | layer N mlp.experts is in two groups | 0.00 M | 1 | kvallespin/Sage-A1.5-NVFP4 |  |
-| 125 | quant format | compressed-tensors pack-quantized w4i-channel, pack-quantized w4i-group, pack-quantized w8i-group weights | 0.00 M | 2 | nchapman/Ornith-1.5-35B-A3B-W4A16-HGPTQ, nchapman/Ornith-1.5-9B-W4A16-HGPTQ | #1200 |
-| 126 | quant format | compressed-tensors float-quantized w8f-tensor a8, nvfp4-pack-quantized w4f-tensor_group a4 weights | 0.00 M | 1 | primitive-ai/Ornith-1.5-35B-A3B-agentic-NVFP4-FP8 |  |
-| 127 | new family spec | model_type nemotron_nas | 0.00 M | 1 | cyankiwi/Llama-3_3-Nemotron-Super-49B-v1_5-AWQ-4bit |  |
-| 128 | attention, block or MoE variant | attention param attn_scale reads config.json key attn_scale, which is missing | 0.00 M | 1 | RedHatAI/Llama-4-Maverick-17B-128E-Instruct-FP8 |  |
-| 129 | quant format | compressed-tensors pack-quantized w4i-channel a8, pack-quantized w4i-group a8 weights | 0.00 M | 1 | open-inference/Kimi-K3-W4A8-K512-DenseChannel-GPTQ-Cal128-v2 |  |
-| 130 | quant format | dgpp_mixed346 weights | 0.00 M | 1 | HawkBearPig/GLM-5.3-Mixed346-GPTQ-H32-A8-g128 |  |
-| 131 | new family spec | model_type mixtral | 0.00 M | 1 | QuantTrio/MiniMax-M2-AWQ |  |
-| 132 | new family spec | GGUF architecture dream | 0.00 M | 2 | suzukimain/Nemotron-Labs-Diffusion-14B-GGUF, suzukimain/Nemotron-Labs-Diffusion-8B-GGUF |  |
-| 133 | new family spec | GGUF architecture kolibri1 | 0.00 M | 1 | Harsha001/Kolibri-1.1-ROCmFPX |  |
-| 134 | quant format | pretensor_nvfp4_weight_only weights | 0.00 M | 1 | PreDoctor/DeepSeek-R1-0528-Qwen3-8B-NVFP4-W4A16-PreTensor |  |
-| 135 | quant format | torchao weights | 0.00 M | 1 | pytorch/Phi-4-mini-instruct-AWQ-INT4 |  |
-| 136 | quant format | gptq_marlin weights | 0.00 M | 1 | QuantTrio/GLM-4.5-Air-GPTQ-Int4-Int8Mix |  |
-| 137 | quant format | compressed-tensors pack-quantized w4i-group, pack-quantized w8i-group weights | 0.00 M | 1 | bot-lab-21/GLM-5.3-Int4-Int8Mix-Pollard-GPTQ | #1200 |
-| 138 | attention, block or MoE variant | model_type  is not supported | 0.00 M | 1 | amd/Phi-3-mini-4k-instruct-awq-g128-int4-asym-fp16-onnx-hybrid |  |
-| 139 | new family spec | model_type nemotron_h_audex | 0.00 M | 1 | Lewfkrad/Nemotron-Labs-Audex-30B-A3B-NVFP4 |  |
-| 140 | new family spec | model_type minimax | 0.00 M | 1 | ModelCloud/MiniMax-M2-GPTQMODEL-W4A16 |  |
-| 141 | quant format | bitsandbytes 4bit weights | 0.00 M | 1 | rautaditya/llama-3.2-1b-4bit-gptq |  |
-| 142 | new family spec | model_type kolibri1_1 | 0.00 M | 1 | Aleph-Alpha/Kolibri-1.1 |  |
+| 47 | new family spec | GGUF architecture flux | 0.52 M | 1 | unsloth/FLUX.2-klein-4B-GGUF |  |
+| 48 | quant format | layer N mixer.experts.N.up_proj is Nvfp4G16 but other attention projections are Some(Fp8Channel) | 0.50 M | 1 | nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 | #1321 |
+| 49 | new family spec | model_type bailing_hybrid | 0.48 M | 7 | inclusionAI/Ling-3.0-tiny, inclusionAI/Ling-3.1-flash, Hikari07jp/Ling-3.1-flash-NVFP4-Ablitrated-MTP-RTX-PRO-6000-TP4, inclusionAI/Ling-3.1-flash-1019 and 3 more | #1315 |
+| 50 | new family spec | model_type nemotron_h_omni | 0.41 M | 6 | nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16, nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4, RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-FP8, nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB and 2 more | #1307 |
+| 51 | new family spec | model_type hy_v4_flash | 0.40 M | 7 | tencent/Hy4-flash, Avifenesh/Hy4-flash-NVFP4, leoncca/Hy4-flash-AWQ-g32, peasantsmith/Hy4-Flash-Maya-GGUF and 3 more | #1289 |
+| 52 | new family spec | GGUF architecture glm-dsa | 0.36 M | 5 | unsloth/GLM-5-GGUF, unsloth/GLM-5.1-GGUF, unsloth/GLM-5.2-GGUF, unsloth/GLM-5.3-GGUF and 1 more |  |
+| 53 | quant format | compressed-tensors float-quantized w8f-block a8 weights | 0.34 M | 4 | Nanbeige/Nanbeige4.3-33B-FP8, Etelis/DeepSeek-V2-Lite-FP8-BLOCK-padded, RedHatAI/gemma-4-31B-it-FP8-block, RedHatAI/Kimi-K3-FP8-BLOCK |  |
+| 54 | new family spec | model_type minimax_m2 | 0.33 M | 7 | MiniMaxAI/MiniMax-M2, gauravmm/MiniMax-M2.5-REAP-139B-A10B-NVFP4, unsloth/MiniMax-M2-GGUF, MiniMaxAI/MiniMax-M2.7 and 3 more | #1299 |
+| 55 | new family spec | model_type nemotron_labs_diffusion | 0.32 M | 4 | nvidia/Nemotron-Labs-Diffusion-14B, nvidia/Nemotron-Labs-Diffusion-14B-Base, nvidia/Nemotron-Labs-Diffusion-3B, nvidia/Nemotron-Labs-Diffusion-8B | #1308 |
+| 56 | new family spec | model_type mistral3 (wraps mistral, which specrt runs) | 0.28 M | 5 | mistralai/Mistral-Small-3.2-24B-Instruct-2506, gratex/mistral-small-3.2-24b-Instruct-2506-NVFP4A16, jeffcookio/Mistral-Small-3.2-24B-Instruct-2506-awq-sym, gratex/mistral-small-3.2-24b-Instruct-GPTQ-W4A16 and 1 more | #1303 |
+| 57 | quant format | the quantisation config covers no attention projection | 0.26 M | 1 | nvidia/GLM-5.3-NVFP4 |  |
+| 58 | new family spec | GGUF architecture bailingmoe3 | 0.26 M | 4 | bloomer010/Ling-3.0-tiny-GGUF, bartowski/Ling-3.1-flash-GGUF, bartowski/Ling-3.1-flash-1019-GGUF, mradermacher/LingSante-3.1-air-VL-i1-GGUF |  |
+| 59 | quant format | the quantisation config has no groups | 0.24 M | 4 | AEON-7/Gemma-4-12B-it-AEON-Abliterated-K4-FP8, AEON-7/Gemma-4-E4B-DECKARD-HERETIC-NVFP4, BareMetalAI/Llama-3.1-Nemotron-Nano-8B-W4A16-AWQ, nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark |  |
+| 60 | new family spec | model_type mimo_v2 | 0.23 M | 21 | XiaomiMiMo/MiMo-V2.5, lukealonso/MiMo-V2.5-NVFP4, spectator2026/MiMo-V2.5-AWQ-int4, huihui-ai/Huihui-MiMo-V2.5-abliterated-GGUF and 17 more | #1296 |
+| 61 | quant format | compressed-tensors naive-quantized w8f-tensor a8 weights | 0.21 M | 2 | RedHatAI/Meta-Llama-3.1-70B-Instruct-FP8, RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8 |  |
+| 62 | attention, block or MoE variant | Gemma 3n AltUp residual streams (altup_num_inputs) are not supported yet | 0.20 M | 3 | google/gemma-3n-E2B-it, RedHatAI/gemma-3n-E2B-it-FP8-dynamic, google/gemma-3n-E4B-it | #1341 |
+| 63 | new family spec | model_type NemotronH_Nano_Omni_Reasoning_V3 | 0.14 M | 4 | nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16, nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4, nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8, feanors/nemotron-3-nano-omni-30b-a3b-awq | #1309 |
+| 64 | new family spec | model_type nemotron_h_puzzle | 0.12 M | 3 | nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4, nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-FP8, nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-BF16 | #1310 |
+| 65 | new family spec | model_type lfm3_omni | 0.10 M | 2 | LiquidAI/LFM3-Omni-2B, MichaelAnthony/LFM3-Omni-2B-98K-V2-FP8 |  |
+| 66 | new family spec | model_type hy_v3 | 0.10 M | 4 | tencent/Hy-Memory-30B-A3B, tencent/Hy-Memory-30B-A3B-FP8, vinnipukh/Hy-Memory-30B-A3B-AWQ, rapatsky/Hy-Memory-30B-A3B-GGUF | #1290 |
+| 67 | attention, block or MoE variant | Kimi K3.1 sparse attention (dsa_config) on the MLA layers is not supported yet (#1361) | 0.08 M | 3 | moonshotai/Kimi-K3.1-Pro, nvidia/Kimi-K3.1-Pro-NVFP4, manifoldlabs/Kimi-K3.1-Pro-Quark-MXFP4-AttnFP8 | #1361 |
+| 68 | new family spec | GGUF architecture controlvector | 0.08 M | 1 | peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF |  |
+| 69 | new family spec | model_type olala | 0.08 M | 3 | OVHaiLLM/Olala-v1.0-mini-7A1B, solfird/Olala-v1.0-mini-7A1B-NVFP4-experts, OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF |  |
+| 70 | new family spec | model_type hunyuan_v1_moe | 0.08 M | 1 | tencent/Hunyuan-A13B-Instruct | #1291 |
+| 71 | new family spec | model_type dory | 0.07 M | 4 | nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16, cloudnathan5/Dory1.0-4B-GGUF, nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-MXFP8, nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4 | #1311 |
+| 72 | quant format | quantisation {"quant_algo":"FP8"} is not supported | 0.07 M | 1 | nvidia/Qwen3.5-397B-A17B-NVFP4-V2 |  |
+| 73 | new family spec | model_type inkling2 | 0.07 M | 4 | thinkingmachines/Inkling-2-Small, btbtyler09/Inkling-2-Small-NVFP4, thinkingmachines/Inkling-2-Small-MXFP8, local-inference-lab/Inkling-2-Small-NVFP4-CSF | #1305 |
+| 74 | new family spec | model_type hy_v4 | 0.06 M | 5 | AngelSlim/Hy4-GGUF, tencent/Hy4-preview, Oxmiq/Hy4-preview-NVFP4-W4A16, 6block/Hy4-preview-GGUF and 1 more | #1292 |
+| 75 | quant format | gptq 8bit weights | 0.05 M | 6 | Qwen/Qwen3-0.6B-GPTQ-Int8, Qwen/Qwen3-1.7B-GPTQ-Int8, JunHowie/Qwen3-4B-Instruct-2507-GPTQ-Int8, QuantTrio/Qwen3-Coder-30B-A3B-Instruct-GPTQ-Int8 and 2 more |  |
+| 76 | quant format | mixture-of-experts with Fp8Channel expert weights is not supported yet (bf16, nvfp4_g16 and fp8_block128 are) | 0.05 M | 4 | InternScience/Sage-A1.5-FP8, debackerl/KAT-Coder-V2.5-Dev-FP8, RedHatAI/Qwen3-Coder-Next-FP8-dynamic, lflare/Ornith-1.0-35B-FP8 | #1207 |
+| 77 | new family spec | model_type mistral_large4 | 0.05 M | 2 | mistralai/Mistral-Large-4-1T-A52B, unsloth/Mistral-Large-4-1T-A52B-GGUF | #1304 |
+| 78 | new family spec | GGUF architecture inkling | 0.05 M | 2 | unsloth/inkling-GGUF, unsloth/Inkling-Small-GGUF |  |
+| 79 | new family spec | GGUF architecture mistral4 | 0.03 M | 2 | GZGavinZhao/Leanstral-1.5-119B-A6B-GGUF, unsloth/Mistral-Small-4-119B-2603-GGUF |  |
+| 80 | new family spec | model_type mimo | 0.03 M | 1 | XiaomiMiMo/MiMo-7B-RL | #1297 |
+| 81 | new family spec | model_type raon1_nano | 0.02 M | 3 | KRAFTON/Raon-1-nano, Pilcothink/Raon-1-nano-NVFP4, KRAFTON/Raon-1-nano-gguf |  |
+| 82 | quant format | compressed-tensors float-quantized w8f-tensor a8 weights | 0.02 M | 2 | RedHatAI/Llama-3.2-1B-FP8, JongYeop/Mistral-7B-Instruct-v0.2-FP8-W8A8 |  |
+| 83 | quant format | modelopt FP8 weights | 0.02 M | 2 | daeunj/DeepSeek-V2-Lite-FP8-GPTQ, nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8 | #1320 |
+| 84 | new family spec | GGUF architecture inkling2_vq | 0.02 M | 1 | Baekpica/Inkling-2-Small-VQ-GGUF |  |
+| 85 | new family spec | model_type beam | 0.02 M | 4 | reflection/Beam-1.0-501B-A23B, Bespoke-Intelligence/Beam-1.0-501B-A23B-NVFP4-TP3-3x-DGX-Spark, reflection/Beam-1.0-501B-A23B-FP8, reflection/Beam-1.0-501B-A23B-NVFP4 | #1318 |
+| 86 | new family spec | model_type maxwell_moe | 0.02 M | 3 | maxwell-model/Maxwell-V1-Flash, maxwell-model/Maxwell-V1-Flash-FP8, AtomicChat/Maxwell-V1-Flash-GGUF |  |
+| 87 | new family spec | GGUF architecture unlimited-ocr2 | 0.02 M | 1 | AtomicChat/Unlimited-OCR-2-GGUF |  |
+| 88 | new family spec | GGUF architecture minimax-m3 | 0.01 M | 1 | unsloth/MiniMax-M3-GGUF |  |
+| 89 | new family spec | GGUF architecture deepseek2-ocr | 0.01 M | 2 | sahilchachra/Unlimited-OCR-GGUF, sabafallah/DeepSeek-OCR-GGUF |  |
+| 90 | new family spec | model_type kimi_k2 | 0.01 M | 1 | moonshotai/Kimi-K2-Instruct-0905 | #1288 |
+| 91 | quant format | gptq 2bit weights | 0.01 M | 1 | lilmeaty/SmolLM2-135M-Instruct-GPTQ |  |
+| 92 | quant format | modelopt_fp4 weights | 0.01 M | 2 | nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr, nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr | #1320 |
+| 93 | new family spec | model_type nemotron-nas | 0.01 M | 4 | nvidia/Llama-3_1-Nemotron-Ultra-253B-v1, nvidia/Llama-3_3-Nemotron-Super-49B-v1_5, Ithanil/Llama-3_3-Nemotron-Super-49B-v1_5-FP8-Dynamic, etsien/Llama-3_3-Nemotron-Super-49B-v1_5-GPTQ-w4a8 | #1312 |
+| 94 | new family spec | GGUF architecture hunyuan-dense | 0.01 M | 1 | bartowski/tencent_Hunyuan-7B-Instruct-GGUF |  |
+| 95 | new family spec | GGUF architecture phi2 | 0.01 M | 1 | ggml-org/moondream2-20250414-GGUF |  |
+| 96 | quant format | compressed-tensors mxfp4-pack-quantized w4f-group, mxfp4-pack-quantized w8f-block a8 weights | 0.01 M | 1 | tcclaviger/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ |  |
+| 97 | attention, block or MoE variant | no_rope_layers names 0 layers but num_hidden_layers is 48 | 0.01 M | 3 | meta-llama/Llama-4-Maverick-17B-128E, RedHatAI/Llama-4-Scout-17B-16E-Instruct-FP8-dynamic, meta-llama/Llama-4-Scout-17B-16E | #1306 |
+| 98 | new family spec | model_type qwen_drive | 0.01 M | 1 | Qwen/Qwen-Drive-1.0-4B | #1301 |
+| 99 | new family spec | model_type hunyuan_v1_dense | 0.01 M | 4 | tencent/Hunyuan-7B-Instruct, tencent/Hunyuan-7B-Instruct-FP8, tencent/Hunyuan-7B-Instruct-AWQ-Int4, tencent/Hunyuan-7B-Instruct-GPTQ-Int4 | #1293 |
+| 100 | new family spec | GGUF architecture beam_vq | 0.01 M | 1 | Baekpica/Beam-1.0-501B-A23B-VQ-GGUF |  |
+| 101 | new family spec | model_type ernie5_5_moe | 0.01 M | 2 | baidu/ERNIE-5.5-Flash-Preview-BF16, baidu/ERNIE-5.5-Flash-Base |  |
+| 102 | new family spec | model_type aion_instruct | 0.00 M | 2 | microsoft/Aion-1.0-Instruct-2.3B, PureTensorAI/Aion-1.0-Instruct-2.3B-NVFP4 |  |
+| 103 | new family spec | model_type hy_v4_vl | 0.00 M | 4 | tencent/Hy4, RedHatAI/Hy4-NVFP4, tencent/Hy4-FP8, tencent/Hy4-base | #1294 |
+| 104 | new family spec | GGUF architecture deci | 0.00 M | 2 | DevQuasar-13/nvidia.Llama-3_1-Nemotron-Ultra-253B-v1-GGUF, unsloth/Llama-3_3-Nemotron-Super-49B-v1_5-GGUF |  |
+| 105 | quant format | quark weights | 0.00 M | 3 | amd/gpt-oss-120b-w-mxfp4-a-fp8, amd/gpt-oss-20b-MoE-Quant-W-MXFP4-A-FP8-KV-FP8, amd/GLM-5-NVFP4 |  |
+| 106 | quant format | quantisation {"quant_algo":"FP8_PB_WO"} is not supported | 0.00 M | 1 | nvidia/Kimi-K3-NVFP4 |  |
+| 107 | new family spec | model_type sarvam_mla | 0.00 M | 4 | sarvamai/sarvam-105b, sarvamai/sarvam-105b-1711, RedHatAI/sarvam-105b-FP8-dynamic, QuantTrio/sarvam-105b-AWQ |  |
+| 108 | new family spec | model_type hunyuan | 0.00 M | 2 | tencent/Hunyuan-A13B-Instruct-GPTQ-Int4, unsloth/Hunyuan-A13B-Instruct-GGUF | #1295 |
+| 109 | new family spec | model_type minimax_m1 | 0.00 M | 1 | MiniMaxAI/MiniMax-M1-80k | #1300 |
+| 110 | new family spec | GGUF architecture aion | 0.00 M | 1 | Xylolabs/Aion-1.0-Instruct-2.3B-GGUF |  |
+| 111 | quant format | quantisation {"quant_algo":"FP8_PER_CHANNEL_PER_TOKEN"} is not supported | 0.00 M | 1 | dealignai/Ornith-1.5-122B-UNCENSORED-NVFP4 |  |
+| 112 | new family spec | model_type grug_moe | 0.00 M | 1 | open-athena/Marin-Mochi-535B-A23B |  |
+| 113 | quant format | fp8 e4m3 block None weights | 0.00 M | 2 | EliovpAI/Deepseek-R1-0528-Qwen3-8B-FP8-KV, RedHatAI/Meta-Llama-3-8B-Instruct-FP8-KV |  |
+| 114 | new family spec | model_type nemotron_labs_audex | 0.00 M | 2 | nvidia/Nemotron-Labs-Audex-2B, nvidia/Nemotron-Labs-Audex-30B-A3B | #1313 |
+| 115 | new family spec | model_type aurora2 | 0.00 M | 1 | AuroraAI-Research/Aurora2-400M-A20M |  |
+| 116 | quant format | None weights | 0.00 M | 1 | NVFP4/Qwen3-30B-A3B-Thinking-2507-FP4 |  |
+| 117 | new family spec | model_type bailing_moe_v3_vl | 0.00 M | 2 | inclusionAI/LingSante-3.1-air-VL, inclusionAI/LingSante-3.1-air-VL-MXFP4 | #1316 |
+| 118 | quant format | layer N mixer.experts.N.down_proj is Nvfp4G16 but other attention projections are Some(Fp8Channel) | 0.00 M | 1 | nvidia/NVIDIA-Nemotron-Labs-3-Competitive-Coding-550B-A55B-NVFP4 | #1321 |
+| 119 | attention, block or MoE variant | config.json has no num_attention_heads | 0.00 M | 1 | gaunernst/gemma-3-4b-it-int4-awq | #1213 |
+| 120 | new family spec | model_type nemotron_labs_diffusion_vlm | 0.00 M | 3 | nvidia/Nemotron-Labs-Diffusion-VLM-8B, yury-kapoyko/nemotron-diff-vlm-8b-fp8, yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq | #1314 |
+| 121 | quant format | compressed-tensors pack-quantized w8i-group weights | 0.00 M | 2 | cyankiwi/Qwen3-4B-Thinking-2507-AWQ-8bit, axteam/MiniCPM5-2B-AWQ-8bit |  |
+| 122 | new family spec | model_type sing_probe_attn | 0.00 M | 1 | inclusionAI/Ling-3.1-flash-1019-singprobe | #1317 |
+| 123 | quant format | w4afp8 weights | 0.00 M | 2 | PhalaCloud/GLM-5.3-W4AFP8, BitdeerAI/GLM-5.3-W4AFP8-AWQ |  |
+| 124 | new family spec | model_type philolm | 0.00 M | 1 | gustavecortal/PhiloLM |  |
+| 125 | quant format | layer N mlp.experts is in two groups | 0.00 M | 1 | kvallespin/Sage-A1.5-NVFP4 |  |
+| 126 | quant format | compressed-tensors pack-quantized w4i-channel, pack-quantized w4i-group, pack-quantized w8i-group weights | 0.00 M | 2 | nchapman/Ornith-1.5-35B-A3B-W4A16-HGPTQ, nchapman/Ornith-1.5-9B-W4A16-HGPTQ | #1200 |
+| 127 | quant format | compressed-tensors float-quantized w8f-tensor a8, nvfp4-pack-quantized w4f-tensor_group a4 weights | 0.00 M | 1 | primitive-ai/Ornith-1.5-35B-A3B-agentic-NVFP4-FP8 |  |
+| 128 | new family spec | model_type nemotron_nas | 0.00 M | 1 | cyankiwi/Llama-3_3-Nemotron-Super-49B-v1_5-AWQ-4bit |  |
+| 129 | attention, block or MoE variant | attention param attn_scale reads config.json key attn_scale, which is missing | 0.00 M | 1 | RedHatAI/Llama-4-Maverick-17B-128E-Instruct-FP8 |  |
+| 130 | quant format | compressed-tensors pack-quantized w4i-channel a8, pack-quantized w4i-group a8 weights | 0.00 M | 1 | open-inference/Kimi-K3-W4A8-K512-DenseChannel-GPTQ-Cal128-v2 |  |
+| 131 | quant format | dgpp_mixed346 weights | 0.00 M | 1 | HawkBearPig/GLM-5.3-Mixed346-GPTQ-H32-A8-g128 |  |
+| 132 | new family spec | model_type mixtral | 0.00 M | 1 | QuantTrio/MiniMax-M2-AWQ |  |
+| 133 | new family spec | GGUF architecture dream | 0.00 M | 2 | suzukimain/Nemotron-Labs-Diffusion-14B-GGUF, suzukimain/Nemotron-Labs-Diffusion-8B-GGUF |  |
+| 134 | new family spec | GGUF architecture kolibri1 | 0.00 M | 1 | Harsha001/Kolibri-1.1-ROCmFPX |  |
+| 135 | quant format | pretensor_nvfp4_weight_only weights | 0.00 M | 1 | PreDoctor/DeepSeek-R1-0528-Qwen3-8B-NVFP4-W4A16-PreTensor |  |
+| 136 | quant format | torchao weights | 0.00 M | 1 | pytorch/Phi-4-mini-instruct-AWQ-INT4 |  |
+| 137 | quant format | gptq_marlin weights | 0.00 M | 1 | QuantTrio/GLM-4.5-Air-GPTQ-Int4-Int8Mix |  |
+| 138 | quant format | compressed-tensors pack-quantized w4i-group, pack-quantized w8i-group weights | 0.00 M | 1 | bot-lab-21/GLM-5.3-Int4-Int8Mix-Pollard-GPTQ | #1200 |
+| 139 | quant format | FP8 diffusion weights | 0.00 M | 1 | abhishekchohan/flux2-klein-4b-fp8 |  |
+| 140 | attention, block or MoE variant | model_type  is not supported | 0.00 M | 1 | amd/Phi-3-mini-4k-instruct-awq-g128-int4-asym-fp16-onnx-hybrid |  |
+| 141 | new family spec | model_type nemotron_h_audex | 0.00 M | 1 | Lewfkrad/Nemotron-Labs-Audex-30B-A3B-NVFP4 |  |
+| 142 | new family spec | model_type minimax | 0.00 M | 1 | ModelCloud/MiniMax-M2-GPTQMODEL-W4A16 |  |
+| 143 | quant format | bitsandbytes 4bit weights | 0.00 M | 1 | rautaditya/llama-3.2-1b-4bit-gptq |  |
+| 144 | new family spec | model_type kolibri1_1 | 0.00 M | 1 | Aleph-Alpha/Kolibri-1.1 |  |
 
 ## Quantisation formats in the safetensors indexes
 
@@ -734,7 +746,7 @@ Quantisation configs, from each `config.json` (`quantization_config`, or `hf_qua
 | modelopt_mixed weights | 4 | 2 |
 | mxfp4 weights | 2 | 2 |
 | mxfp8 weights | 3 | 3 |
-| none weights | 260 | 240 |
+| none weights | 263 | 241 |
 | nvfp4_arvq_hybrid weights | 1 | 1 |
 | pretensor_nvfp4_weight_only weights | 1 | 0 |
 | quark weights | 5 | 2 |
@@ -1273,6 +1285,10 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | unsloth/inkling-GGUF | gguf | 14398 | 1894.3 | inkling | gguf | REFUSED | GGUF architecture inkling is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe, qwen3vl, qwen3vlmoe are); 1894.3 GB of weights, then offload: 2 cards plus 21 GB host plus 1700 GB NVMe; does not fit this mac... |  |  | in the GGUF |  |
 | Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 | base | 991404 | 31.2 | qwen3_moe | fp8 e4m3 block [128, 128] | LOADS | 48 layers (dense), hidden 2048, 128 experts top 8, fp8_block128 | `family-qwen3.toml` | yes | ok, tools XmlFunction |  |
 | ijohn07/Qwen3-Coder-30B-A3B-Instruct-FP8-Q4_K_M-GGUF | gguf | 392 | 18.6 | qwen3moe | gguf | LOADS | GGUF qwen3moe; reads Q4_K_M | `family-qwen3.toml` | yes | in the GGUF |  |
+| black-forest-labs/FLUX.2-klein-4B | base | 448575 | 16 | Flux2KleinPipeline | none | LOADS | flow-euler image pipeline, family flux2_klein, 4 steps; weights 16.0 GB (text encoder 8.0, resident 7.9); peak 16.0 GB on 1 card with the text encoder released after encoding, 0 GB host RAM |  |  | image pipeline, prompt template in tokenizer/ |  |
+| abhishekchohan/flux2-klein-4b-fp8 | fp8 | 44 |  | Flux2KleinPipeline | none | UNKNOWN-QUANT | Flux2KleinPipeline weights are FP8; the denoiser reads bf16 today |  |  | image pipeline, prompt template in tokenizer/ |  |
+| rockerBOO/flux2-klein-4b-nvfp4-convrot | nvfp4 | 107 |  |  | none | UNCHECKED | no config.json |  |  | no tokenizer.json |  |
+| unsloth/FLUX.2-klein-4B-GGUF | gguf | 520203 | 7.8 | flux | gguf | REFUSED | GGUF architecture flux is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe, qwen3vl, qwen3vlmoe are) |  |  | in the GGUF |  |
 | nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16 | base | 798730 | 1121 | nemotron_h | none | REFUSED | config.json has no num_hidden_layers; 1121 GB of weights, then offload: 2 cards plus 21 GB host plus 927 GB NVMe; does not fit this machine, short by 325 GB of NVMe | `family-nemotron_h.toml` |  | ok, tools XmlFunction | #1206 |
 | OpenYourMind/OpenYourMind-NVIDIA-Nemotron-3-Ultra-550B-A55B-abliterated-uncensored-NVFP4 | nvfp4 | 107863 | 352.3 | nemotron_h | modelopt FP8+MIXED_PRECISION+NVFP4 | REFUSED | config.json has no num_hidden_layers; 352.3 GB of weights, then offload: 2 cards plus 21 GB host plus 158 GB NVMe; planner not run until the family exists | `family-nemotron_h.toml` |  | ok, tools XmlFunction | #1206 |
 | RedHatAI/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8-dynamic | fp8 | 538 | 563.3 | nemotron_h | compressed-tensors float-quantized w8f-channel a8 | REFUSED | config.json has no num_hidden_layers; 563.3 GB of weights, then offload: 2 cards plus 21 GB host plus 369 GB NVMe; planner not run until the family exists | `family-nemotron_h.toml` |  | ok, tools XmlFunction | #1206 |
