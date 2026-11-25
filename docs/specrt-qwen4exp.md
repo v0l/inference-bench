@@ -15,7 +15,7 @@ The config adds four things to `family-qwen3_5.toml`. Two of them are not the me
 | 5 | Gated attention output | `q_proj` is 2 x heads x head_dim, sigmoid gate on the attention output | `attn_output_gate` read, qwen3_5 path | exists |
 | 6 | Gated delta-net | same math as qwen3_5 (`linear_*` keys, 16 key and 48 value heads in the real model) | qwen3_5 | exists |
 | 7 | MoE | softmax router, top k, optional renorm, shared expert with sigmoid gate, `silu` | qwen3_5_moe | exists |
-| 8 | MTP | `mtp` object with `hybrid` true and `layer_types ["full_attention"]`, one layer, weights excluded from the NVFP4 quantisation | `[mtp]` on qwen3_5. The MTP layer also carries an indexer and hyper-connection weights are not listed for it | needs a check against a real shard (the HF model ignores `mtp.*`) |
+| 8 | MTP | `mtp` object with `hybrid` true and `layer_types ["full_attention"]`, one layer, weights excluded from the NVFP4 quantisation | `[mtp_layout]` in `family-qwen4_exp.toml` with `fc_hidden` and `mixer` | **done (#1350)**, see below |
 | 9 | Vision tower | `Qwen4ExpVisionModel` | qwen3_5 vision | out of scope for this issue (text first) |
 
 Layer I/O names for the family spec: attention `self_attn.{q,k,v,o}_proj`, `q_norm`, `k_norm`, `self_attn.indexer.{index_qk_proj,q_layernorm,k_layernorm}`, delta-net `linear_attn.*` as qwen3_5, `mlp.gate`, `mlp.experts.N.{gate,up,down}_proj`, `mlp.shared_expert*`, `{attn,mlp}_hyper_connection.{hc_norm,input_mix_weight_down,input_mix_weight_up,block_inject_weight}`, `ple.{ple_embedding.ngram_embedding,key_proj,value_proj,norm_key,norm_query,norm_conv,conv1d}`, model level `hyper_connection_mixer.*`. The NVFP4 copy excludes attention, delta-net, router, shared expert, hyper-connections, `ple` and embeddings, so only routed experts are 4 bit.
@@ -80,7 +80,31 @@ Tests: `crates/kir/tests/ple.rs` (CPU: integer semantics, the hash description a
 - `[gated_residual]` from #1277 (copied from the old test harness, now removed).
 - The QSA indexer from #1278: `[attention.params]` read from the config (`index_groups = indexer_budget / indexer_compress_ratio`, `index_out = indexer_budget + indexer_compress_ratio - 1`, `index_scale = rsqrt(indexer_head_dim)`), the appended `index_qk_proj` projection, the `index_raw` and `index_pool` per token states and the four kernel nodes. No `layers = ["full"]` is needed: attention nodes only run on attention layers.
 - The PLE from #1279 as a `[prelude]`: a new spec table of described kernel nodes that run at the start of each layer named by `ple_layer_ids` (1 based), before the attn gated residual. Its seven nodes are the `specs/ple_*` descriptions in the order of `Qwen4ExpTextPLELayer.forward`: hash, gather, key and value projections, gate, dilated conv, add into the streams. `ngram_history` and `ple_conv` are `layers = "prelude"` per sequence states, zeroed on reset and carried in state snapshots (the slot pending section), swap and sessions. The table row count is an `{ int = ... }` param: `ceil(prime_sum(ngram_vocab_size_base - 1, 1, ngram_heads) / 128) * 128`, 4096 on the tiny config and 320001536 on the real one (128 shards of 2500012).
-- The vision tower is ignored (text only, #1237). The MTP layer is refused by name with `[[refuse]] part = "mtp"` (#1350): the spec drops `[mtp]` and records the message, so text serves and `[speculative] enabled = true` fails with it.
+- The vision tower is ignored (text only, #1237). The MTP layer is served since #1350 (below).
+
+## MTP layer (#1350)
+
+`transformers` ignores `mtp.*`, so the formulation comes from vLLM `vllm/models/qwen4_exp/nvidia/mtp.py`, the shard headers of Qwen/Qwen3.8-Flash-Next and RadixArk/Qwen3.8-Flash-Next-NVFP4 (both list the same 31 `mtp.*` tensors, bf16 in both) and `fused_pre_fc_norms_split`:
+
+```
+e      = fc_embedding(norm_embed(embed(token)))                 [hidden]
+streams = fc_hidden(norm_hidden(previous streams) per stream)  [4, hidden], norm over all 4 x hidden
+x      = streams + e on every stream
+out    = one Qwen4Exp decoder layer (gated residual sites, indexed attention, MoE), no PLE
+logits = lm_head(hyper_connection_mixer(out))                   the mixer has no inject weights
+```
+
+The previous streams are the target's streams after its last layer and before its final mixer on the first draft step, then the draft layer's own output streams on later steps. Norms use `(1 + w)`.
+
+Spec side, as data: `[mtp_layout]` names `fc` (fc_embedding), `fc_hidden`, `norm_embed`, `norm_hidden` and `mixer`, and has no `norm`. `Spec::streamed_mtp` and `draft_width` (4 x hidden) follow from it. The `[[refuse]] part = "mtp"` rule is gone, so `[speculative] enabled = true` works.
+
+Plan: `decoder.toml` has a `gated` copy of the `[[mtp]]` and `[[mtp_head]]` sections (the flat ones are now `+flat` and unchanged for qwen3_5): `mtp_in` (kir `mtp_streams_in`: both norms, embedding planes and the 4 x hidden planes), `mtp_fc` into `x`, `gated_expand` into the streams, `mtp_fc_hidden` added into the streams (residual epilogue over 4 x rows), then the same gated attention plus MoE body as the target layers, using the MTP layer's `attn_hyper_connection` and `mlp_hyper_connection`. The head gathers the wide rows, runs `gated_collapse` with `weight = "draft"` (site `GATED_DRAFT`, the `mtp.hyper_connection_mixer` weights), `split` and the draft head.
+
+Speculation: verify rows run the PLE prelude, whose n-gram history and dilated conv window are per sequence state with no per row log. A round saves those states per sequence before verify, and after acceptance restores them and replays the stateful prelude nodes (hash and conv) one position at a time on the accepted tokens; rejected rows go to the pad slot. Without the replay, greedy diverges at the second token (checked red once).
+
+Tests (`tests/qwen4_exp_mtp.rs`, GPU1 shared with the user's app): draft logits against the reference at 1.4e-4 (k = 2) and 1.2e-4 (k = 3) with equal drafts `[74, 354, 501]`; speculative greedy equals plain greedy over 6 prompts x 40 tokens for k = 1 to 3, batch 1 and 2, with MTP drafts, oracle drafts and rotating wrong drafts. The random tiny MTP weights accept no MTP drafts, which is expected; acceptance on the real model needs its weights. Regenerate the fixture and reference with `~/.venv-vllm/bin/python crates/specrt/scripts/tiny_qwen4_exp.py mtp`.
+
+The real 360 GB model still waits on the loader work in #1349 and a both-card window.
 
 The gated residual has no fused prefill plus decode step and no single row plan, so the scheduler runs prefill and decode as separate steps.
 
