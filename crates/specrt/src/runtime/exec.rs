@@ -583,7 +583,10 @@ impl Runtime {
                     kir::Scalar::F32 => b.arg(float),
                     _ => b.arg(int),
                 },
-                (_, Some(Bind::Weight { weight, .. })) => b.arg(weights.get(weight).with_context(|| format!("layer has no prelude weight {weight}"))?),
+                (_, Some(Bind::Weight { weight, .. })) => match layer.and_then(|l| l.prelude_stored.get(weight)) {
+                    Some(stored) => b.arg(stored),
+                    None => b.arg(weights.get(weight).with_context(|| format!("layer has no prelude weight {weight}"))?),
+                },
                 (_, Some(Bind::Buffer { buffer })) => match buffer.as_str() {
                     "x" => b.arg(&self.pre.x),
                     "streams" => b.arg(&self.gated.as_ref().context("[prelude] streams needs a [gated_residual]")?.streams),

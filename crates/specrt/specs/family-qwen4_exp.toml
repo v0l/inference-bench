@@ -16,6 +16,9 @@ message = "the Qwen4Exp MTP layer (four stream input, fc_embedding and fc_hidden
 [vision]
 ignore = true
 
+[moe]
+fused_experts = true
+
 [norm]
 pre = false
 
@@ -152,6 +155,9 @@ ple_out = "ple_width"
 
 [prelude.int_scratch]
 ple_ids = "ngram_heads"
+
+[prelude.stored]
+ple_table = "ple_embedding.ngram_embedding.weight"
 
 [[prelude.node]]
 op = "kernel"

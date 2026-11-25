@@ -448,7 +448,14 @@ impl<'a> Signer<'a> {
         let mut sig = Signature { class: class_of(&kernel.body), reads: Vec::new(), writes: Vec::new() };
         for q in kernel.params.iter().filter(|q| q.role != kir::Role::Value) {
             let t = match bind.get(q.name) {
-                Some(Bind::Weight { weight, len }) => Tensor::weight(weight.clone(), 1, self.spec.weight_len(len)?, Form::F32),
+                Some(Bind::Weight { weight, len }) => {
+                    let form = match p.stored_as(&weight[p.module.len() + 1..]).map(|(_, d)| d) {
+                        Some("bf16") => Form::Bf16,
+                        Some("fp8") => Form::Weight(crate::spec::Quant::Fp8Block128),
+                        _ => Form::F32,
+                    };
+                    Tensor::weight(weight.clone(), 1, self.spec.weight_len(len)?, form)
+                }
                 Some(Bind::Buffer { buffer }) => match buffer.as_str() {
                     "x" => self.x(),
                     "streams" => Tensor::new(Place::Local("streams".into()), Rows::Tokens, width, Form::F32),

@@ -429,6 +429,9 @@ pub fn prelude_symbols(spec: &Spec, max_ctx: usize) -> kir::desc::Shape {
         for (n, v) in p.symbols(0) {
             symbols = symbols.num(&n, v);
         }
+        for (n, w) in &p.words {
+            symbols = symbols.word(n, w);
+        }
     }
     symbols
 }
