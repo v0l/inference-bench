@@ -14,7 +14,9 @@ INFERENCE_BENCH_API_KEYS=sk-local ./target/release/inference-bench-server \
 
 | Path | Notes |
 | --- | --- |
-| `GET /v1/models` | Configured models, with a `loaded` flag |
+| `GET /v1/models` | Configured models, with a `loaded` flag and `type` (`text`, `image`, later `video`) so clients can filter |
+| `POST /v1/images/generations` | OpenAI images: `prompt`, `n`, `size`, `seed`, `response_format` (`b64_json` default, or `url`), plus `negative_prompt`, `steps`, `guidance`, `sampler`, `partial_images`. `stream: true` sends `image_generation.progress` (`step` of `steps`), `image_generation.partial_image` every `partial_images` steps and `image_generation.completed`. A size off the model's pixel step is a 400 naming the nearest valid size; a full image queue is a 429 with `Retry-After`; a dropped client cancels the job between steps. Image i of n uses `seed + i`; the same seed gives the same bytes. See `[images]` below |
+| `GET /v1/images/files/{id}.png` | The image a `url` response named, behind the same auth, kept `images.file_ttl_secs` |
 | `POST /v1/chat/completions` | Stream (SSE, `stream_options.include_usage`) and non-stream |
 | `POST /v1/completions` | Stream and non-stream |
 | `POST /v1/messages` | Anthropic Messages, stream and non-stream: tool_use/tool_result, thinking blocks, images, `thinking: {type: disabled|enabled, budget_tokens}`, `output_config.effort`, `x-api-key` auth. A request with no `thinking` field gets no thinking (Claude Code helper calls), switch off with `anthropic_thinking_on_request = false` |
@@ -75,7 +77,16 @@ branch = "master"
 tag = ""                             # pin to a tag, e.g. "v0.2.0"
 update_hours = 24                    # 0 checks only at start
 folders = ["/etc/inference-bench/specs"]   # your own specs, they win over downloaded ones
+
+[images]                             # POST /v1/images/generations
+jobs_per_gpu = 1                     # image jobs running at once
+queue_depth = 4                      # waiting image jobs before 429
+file_ttl_secs = 3600                 # how long a response_format=url image is served
+# file_dir = "/var/lib/inference-bench/images"   # default: a folder in the temp dir
+partial_images = 0                   # preview every k steps on stream when the request gives none
 ```
+
+An image model is a diffusers pipeline folder (`model_index.json` at the top), matched to a family file by its pipeline class (`specs/family-flux2_klein.toml`). Point `model` at the folder or a hub repo id. Before a job runs, the engine checks the denoiser weights plus its activation arena against free GPU memory: when the VAE does not fit it decodes in the largest tile that does, when guidance does not fit it runs the two passes one after the other in one arena, otherwise the request is a 400 naming the bytes. The text encoder is loaded per prompt and released before the steps unless the load page or the request keeps it.
 
 A model's `model` can be a spec name such as `qwen3-0.6b`: it is looked up in `[specs].folders`, then the updated cache, then the specs built into the binary.
 
@@ -102,7 +113,7 @@ Parser and rope ids are named by format. Old ids still load and log a deprecatio
 
 ## Metrics
 
-`inference_requests_total{endpoint,status}`, `inference_prompt_tokens_total{model}`, `inference_completion_tokens_total{model}`, `inference_ttft_seconds` (histogram), `inference_decode_tokens_per_second{window="last|mean"}`, `inference_queue_depth`, `inference_in_flight`, `inference_models_loaded`, `inference_model_vram_bytes{model}`, `inference_gpu_memory_used_bytes` (from `nvidia-smi`, falling back to the CUDA driver's free/total memory where nvidia-smi reports N/A, as on the GB10), `inference_requests_cancelled_total`, model load, failure and unload counters, `inference_specs_checks_total{result="updated|unchanged|failed"}` and `inference_specs_last_success_timestamp_seconds`.
+`inference_requests_total{endpoint,status}`, `inference_prompt_tokens_total{model}`, `inference_completion_tokens_total{model}`, `inference_ttft_seconds` (histogram), `inference_decode_tokens_per_second{window="last|mean"}`, `inference_queue_depth`, `inference_in_flight`, `inference_models_loaded`, `inference_model_vram_bytes{model}`, `inference_gpu_memory_used_bytes` (from `nvidia-smi`, falling back to the CUDA driver's free/total memory where nvidia-smi reports N/A, as on the GB10), `inference_requests_cancelled_total`, model load, failure and unload counters, `inference_specs_checks_total{result="updated|unchanged|failed"}` and `inference_specs_last_success_timestamp_seconds`. Image jobs: `inference_image_jobs_total{model}`, `inference_images_total{model}`, `inference_image_steps_total`, `inference_image_step_seconds_total`, `inference_image_job_seconds_total`, `inference_image_steps_per_second` (last job), `inference_image_queue_depth`, `inference_image_jobs_running`; requests count under `endpoint="images_generations"`.
 
 `vllm:` series sit beside ours so vLLM Grafana dashboards work, labelled `engine="0",model_name=...`: `vllm:num_requests_running`, `vllm:num_requests_waiting`, `vllm:kv_cache_usage_perc`, `vllm:num_preemptions_total`, `vllm:prompt_tokens_total`, `vllm:generation_tokens_total`, `vllm:request_success_total{finished_reason}`, `vllm:time_to_first_token_seconds` and `vllm:inter_token_latency_seconds` (histograms), `vllm:request_queue_time_seconds`, `vllm:prefix_cache_queries_total`, `vllm:prefix_cache_hits_total`, `vllm:spec_decode_num_draft_tokens_total` and `vllm:spec_decode_num_accepted_tokens_total`. The vLLM series with no counterpart (per-request token histograms, e2e latency, iteration tokens) are not emitted.
 

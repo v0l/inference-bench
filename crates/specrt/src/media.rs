@@ -306,6 +306,23 @@ pub fn admit(free: u64, resident: u64, guided: bool, latent: (usize, usize), b: 
     Ok((Plan { sequential_cfg: sequential, vae_tile: tile }, a))
 }
 
+pub fn latent_preview(tokens: &[f32], count: usize) -> Vec<u8> {
+    let channels = if count == 0 { 0 } else { tokens.len() / count };
+    let mut out = vec![0u8; count * 3];
+    if channels == 0 {
+        return out;
+    }
+    for c in 0..3 {
+        let vals: Vec<f32> = (0..count).map(|t| tokens[t * channels + c % channels]).collect();
+        let (lo, hi) = vals.iter().fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
+        let span = (hi - lo).max(1e-6);
+        for (t, v) in vals.iter().enumerate() {
+            out[t * 3 + c] = (((v - lo) / span) * 255.0).round() as u8;
+        }
+    }
+    out
+}
+
 pub fn to_rgb(pixels: &[f32], width: usize, height: usize) -> Vec<u8> {
     let plane = width * height;
     let mut out = vec![0u8; plane * 3];
@@ -385,10 +402,17 @@ impl ImageModel {
             let seed = job.seed.wrapping_add(i as u64);
             let req = Request { prompt: prompt.clone(), negative: negative.clone(), height: job.height, width: job.width, steps: job.steps, guidance: job.guidance, seed };
             let mut last = std::time::Instant::now();
-            let mut on_step = |step: usize, steps: usize, _latent: &[f32]| {
+            let (pw, ph) = (job.width / self.info.pixel_step.max(1), job.height / self.info.pixel_step.max(1));
+            let every = job.preview_every.filter(|k| *k > 0);
+            let mut on_step = |step: usize, steps: usize, latent: &[f32]| {
                 step_secs += last.elapsed().as_secs_f64();
                 last = std::time::Instant::now();
-                on_event(MediaEvent::Progress { image: i, step, steps })
+                let go = on_event(MediaEvent::Progress { image: i, step, steps });
+                if go && every.is_some_and(|k| step % k == 0) && pw * ph > 0 {
+                    let picture = Picture { width: pw, height: ph, rgb: latent_preview(latent, pw * ph), seed };
+                    return on_event(MediaEvent::Preview { image: i, step, picture });
+                }
+                go
             };
             let img = match self.generator.generate_with(&req, plan, &mut Hooks { on_step: &mut on_step }) {
                 Ok(img) => img,

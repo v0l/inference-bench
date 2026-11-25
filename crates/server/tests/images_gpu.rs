@@ -72,5 +72,9 @@ fn the_tiny_klein_pipeline_is_served_end_to_end_and_matches_the_reference_image(
     assert_eq!(status, 200, "{guided}");
     let (_, models, _) = rig.get("/v1/models", None);
     assert!(models.contains("\"type\":\"image\""), "{models}");
+    let mut s = rig.raw_post("/v1/images/generations", &json!({"model": "tiny-klein", "prompt": "w7 w9", "size": "32x32", "steps": 3, "stream": true, "partial_images": 1}).to_string());
+    let text = read_until(&mut s, "event: image_generation.completed");
+    assert_eq!(text.matches("event: image_generation.progress").count(), 3, "{text}");
+    assert_eq!(text.matches("event: image_generation.partial_image").count(), 3, "{text}");
     rig.stop();
 }
