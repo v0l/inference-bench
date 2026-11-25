@@ -369,6 +369,14 @@ rows = "text"
 op = "glu"
 in = "gate_up"
 out = "act"
+rows = "image"
+offset = "0"
+
+[[block.node]]
+op = "glu"
+in = "gate_up"
+out = "act"
+rows = "text"
 offset = "0"
 
 [[block.node]]
@@ -434,6 +442,7 @@ out = "attn"
 op = "glu"
 in = "fused"
 out = "act"
+rows = "joint"
 offset = "qkv"
 
 [[block.node]]

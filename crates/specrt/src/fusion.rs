@@ -24,6 +24,7 @@ pub struct Costs {
     pub reread_overlap: f64,
     pub smem_limit: u64,
     pub max_regs: u32,
+    pub peak_flops_per_byte: Option<f64>,
 }
 
 fn us_bytes(us: f64, gbs: f64) -> u64 {
@@ -31,6 +32,21 @@ fn us_bytes(us: f64, gbs: f64) -> u64 {
 }
 
 impl Costs {
+    pub fn with_compute(self, tflops: f64, gbs: f64) -> Costs {
+        Costs { peak_flops_per_byte: Some(tflops * 1e12 / (gbs * 1e9)), ..self }
+    }
+
+    pub fn time_bytes(&self, bytes: u64, flops: u64) -> u64 {
+        match self.peak_flops_per_byte {
+            Some(ridge) => bytes.max((flops as f64 / ridge) as u64),
+            None => bytes,
+        }
+    }
+
+    pub fn compute_bound(&self, bytes: u64, flops: u64) -> bool {
+        self.peak_flops_per_byte.is_some_and(|ridge| flops as f64 / ridge > bytes as f64)
+    }
+
     pub fn for_target(t: &kir::Target) -> Costs {
         match t.language {
             kir::Language::Cuda => Costs {
@@ -40,6 +56,7 @@ impl Costs {
                 reread_overlap: 1.0,
                 smem_limit: t.smem_limit as u64,
                 max_regs: t.max_regs,
+                peak_flops_per_byte: None,
             },
             kir::Language::Wgsl => Costs {
                 launch_bytes: us_bytes(WGSL_LAUNCH_US, WGSL_GBS),
@@ -48,6 +65,7 @@ impl Costs {
                 reread_overlap: 0.0,
                 smem_limit: t.smem_limit as u64,
                 max_regs: t.max_regs,
+                peak_flops_per_byte: None,
             },
         }
     }
@@ -98,12 +116,13 @@ pub struct Unit {
     pub barrier: bool,
     pub bound: bool,
     pub row: usize,
+    pub flops: u64,
 }
 
 impl Unit {
     fn new(label: impl Into<String>, op: usize, class: Class, reads: Vec<Tensor>, writes: Vec<Tensor>) -> Unit {
         let row = writes.first().map_or(1, |t| t.cols);
-        Unit { label: label.into(), op, part: Part::Whole, class, reads, writes, launches: 1, geometry: None, barrier: false, bound: matches!(class, Class::Attention | Class::Scan), row }
+        Unit { label: label.into(), op, part: Part::Whole, class, reads, writes, launches: 1, geometry: None, barrier: false, bound: matches!(class, Class::Attention | Class::Scan), row, flops: 0 }
     }
 
     fn with_part(self, part: Part) -> Unit {
@@ -171,6 +190,7 @@ pub enum Reason {
     Cost,
     Outscored { by: Vec<String>, saving: u64 },
     NoKernel,
+    ComputeBound,
 }
 
 impl Reason {
@@ -192,6 +212,7 @@ impl Reason {
             Reason::Cost => "the penalty is at least the saving".into(),
             Reason::Outscored { by, saving } => format!("{} saves more ({saving}) with the same units", by.join(" + ")),
             Reason::NoKernel => "no kernel in the library runs these ops as one".into(),
+            Reason::ComputeBound => "the GEMM is compute bound, so a norm prologue sits on its critical load path ([runtime] compute_prologue turns it on)".into(),
         }
     }
 }
@@ -527,6 +548,7 @@ struct Engine<'a> {
     costs: &'a Costs,
     count: Count,
     library: Option<Library<'a>>,
+    compute_prologue: bool,
 }
 
 struct Candidate {
@@ -692,6 +714,9 @@ impl Engine<'_> {
         for &c in consumers {
             let g2 = &self.groups[c];
             let Some(h) = self.heavy(g2) else { return Err(Reason::Readers) };
+            if self.units[h].class == Class::Gemm && !self.compute_prologue && self.costs.compute_bound(self.external_reads(&BTreeSet::from([h])) + self.units[h].writes.iter().map(|t| self.bytes(t)).sum::<u64>(), self.units[h].flops) {
+                return Err(Reason::ComputeBound);
+            }
             if g2.iter().any(|&u| self.units[u].opaque()) {
                 return Err(Reason::Opaque);
             }
@@ -1015,8 +1040,13 @@ impl Engine<'_> {
 const PHASES: [&[Rule]; 2] = [&[Rule::Epilogue, Rule::Light, Rule::Fill], &[Rule::Prologue]];
 
 fn fuse_section(units: Vec<Unit>, internal: &BTreeSet<Place>, costs: &Costs, count: Count, name: String, repeats: usize, library: Option<Library>) -> SectionFusion {
+    fuse_section_with(units, internal, costs, count, name, repeats, library, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fuse_section_with(units: Vec<Unit>, internal: &BTreeSet<Place>, costs: &Costs, count: Count, name: String, repeats: usize, library: Option<Library>, compute_prologue: bool) -> SectionFusion {
     let vals = values(&units, internal);
-    let mut engine = Engine { units: &units, values: vals, groups: (0..units.len()).map(|u| BTreeSet::from([u])).collect(), costs, count, library };
+    let mut engine = Engine { units: &units, values: vals, groups: (0..units.len()).map(|u| BTreeSet::from([u])).collect(), costs, count, library, compute_prologue };
     let launches_before = units.iter().map(|u| u.launches).sum();
     let (fused, seen) = engine.run();
     let mut ordered = engine.groups.clone();
@@ -1051,6 +1081,103 @@ pub fn fuse_ops(spec: &Spec, signer: &Signer, target: &kir::Target, count: Count
     let Lower { mut units, internal, .. } = lower;
     unique_labels(&mut units);
     Ok(fuse_section(units, &internal, costs, count, section.name, section.repeats, library))
+}
+
+pub fn denoiser_units(graph: &crate::denoiser::DenoiserGraph, dspec: &crate::denoiser::DenoiserSpec, ops: &[Op], count: Count) -> Result<(Vec<Unit>, BTreeSet<Place>)> {
+    use crate::plan::DitOp;
+    let signer = crate::denoiser::Signer { graph, spec: dspec };
+    let mut units = Vec::new();
+    let mut internal = BTreeSet::new();
+    for (i, op) in ops.iter().enumerate() {
+        let Op::Dit(d) = op else { anyhow::bail!("{} is not a denoiser op", op.label()) };
+        let sig = signer.sign(d)?;
+        let flops = signer.flops(d, &count)?;
+        match *d {
+            DitOp::Linear { add, .. } => {
+                let out = sig.writes[0].clone();
+                let n = out.cols;
+                let tile = (kir::vision::GEMM_BN as usize).min(n.max(1));
+                let geo = Geometry { col_blocks: n.div_ceil(tile), rows_block: kir::vision::GEMM_BM as usize, owner: Owner::Tile { cols: tile }, smem: kir::vision::GEMM_SMEM as u64, regs: acc_regs((kir::vision::GEMM_BM * kir::vision::GEMM_BN) as usize, kir::vision::GEMM_THREADS) };
+                let mut reads: Vec<Tensor> = sig.reads.clone();
+                reads.truncate(2);
+                let main_out = if add {
+                    let acc = Tensor::new(Place::Local(format!("{} acc {i}", d.label())), out.rows, n, Form::F32);
+                    internal.insert(acc.place.clone());
+                    acc
+                } else {
+                    out.clone()
+                };
+                let mut u = Unit::new(d.label(), i, Class::Gemm, reads, vec![main_out.clone()]).with_geometry(Some(geo)).with_part(Part::Main);
+                u.flops = flops;
+                units.push(u);
+                if add {
+                    units.push(Unit::new(format!("{} residual", d.label()), i, Class::Elementwise, vec![main_out, out.clone()], vec![out]).with_part(Part::Residual));
+                }
+            }
+            _ => {
+                let row = match d {
+                    DitOp::Modulate { .. } => dspec.hidden(),
+                    DitOp::AxisRope { .. } => dspec.size("head_dim")?,
+                    _ => sig.writes.first().map_or(1, |t| t.cols),
+                };
+                let mut u = Unit::new(d.label(), i, sig.class, sig.reads, sig.writes).with_row(row);
+                u.flops = flops;
+                units.push(u);
+            }
+        }
+    }
+    unique_labels(&mut units);
+    Ok((units, internal))
+}
+
+pub fn denoiser_fusion(graph: &crate::denoiser::DenoiserGraph, dspec: &crate::denoiser::DenoiserSpec, plan: &Plan, count: Count, costs: &Costs, compute_prologue: bool) -> Result<Vec<SectionFusion>> {
+    let mut out = Vec::new();
+    let mut parts: Vec<(String, usize, &[Op])> = vec![("head".into(), 1, &plan.head)];
+    for (b, g) in plan.blocks.iter().zip(&graph.block) {
+        parts.push((format!("layer {}", g.name), dspec.size(&g.count)?, &b.ops));
+    }
+    parts.push(("tail".into(), 1, &plan.tail));
+    for (name, repeats, ops) in parts {
+        let (mut units, mut internal) = denoiser_units(graph, dspec, ops, count)?;
+        split_streams(&mut units);
+        if name != "head" {
+            for u in &units {
+                for t in u.reads.iter().chain(&u.writes) {
+                    if let Place::Local(n) = &t.place
+                        && n != "x"
+                        && !n.starts_with("x ")
+                    {
+                        internal.insert(t.place.clone());
+                    }
+                }
+            }
+        }
+        out.push(fuse_section_with(units, &internal, costs, count, name, repeats, None, compute_prologue));
+    }
+    Ok(out)
+}
+
+fn split_streams(units: &mut [Unit]) {
+    let tag = |t: &mut Tensor| {
+        if let (Place::Local(n), Rows::Image | Rows::Text) = (&t.place, t.rows) {
+            t.place = Place::Local(format!("{n} {}", if t.rows == Rows::Image { "image" } else { "text" }));
+        }
+    };
+    let mut joint: BTreeSet<String> = BTreeSet::new();
+    for u in units.iter() {
+        for t in u.reads.iter().chain(&u.writes) {
+            if let (Place::Local(n), Rows::Joint) = (&t.place, t.rows) {
+                joint.insert(n.clone());
+            }
+        }
+    }
+    for u in units.iter_mut() {
+        for t in u.reads.iter_mut().chain(u.writes.iter_mut()) {
+            if !matches!(&t.place, Place::Local(n) if joint.contains(n)) {
+                tag(t);
+            }
+        }
+    }
 }
 
 pub fn fusion_report(spec: &Spec, plan: &Plan, count: Count, target: &kir::Target, costs: &Costs) -> Result<FusionReport> {

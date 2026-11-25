@@ -225,13 +225,14 @@ impl<'a> HostDenoiser<'a> {
                     }
                 }
             }
-            DitOp::Glu { from, into, offset } => {
+            DitOp::Glu { from, into, rows, offset } => {
                 let fw = width(from)?;
                 let mw = width(into)?;
                 let off = self.spec.size(offset)?;
+                let (a, b) = self.span(rows, x);
                 let src = bufs[from].clone();
                 let dst = bufs.get_mut(into).unwrap();
-                for r in 0..src.len() / fw {
+                for r in a..b {
                     for c in 0..mw {
                         dst[r * mw + c] = act_round(silu(src[r * fw + off + c]) * src[r * fw + off + mw + c]);
                     }

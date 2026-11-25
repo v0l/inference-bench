@@ -156,6 +156,63 @@ fn the_denoiser_modules_compile_with_nvrtc_for_sm_120() {
     }
 }
 
+fn klein() -> DenoiserSpec {
+    let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/flux2-klein-4b.transformer.config.json")).unwrap();
+    DenoiserSpec::from_transformer_config(&json, 2).unwrap()
+}
+
+fn fusion(compute_prologue: bool, image: usize, text: usize) -> Vec<specrt::fusion::SectionFusion> {
+    let graph = DenoiserGraph::embedded();
+    let s = klein();
+    let plan = graph.plan().unwrap();
+    let costs = specrt::fusion::Costs::for_target(&kir::Target::sm_120()).with_compute(400.0, 1600.0);
+    specrt::fusion::denoiser_fusion(graph, &s, &plan, denoiser::count(image, text), &costs, compute_prologue).unwrap()
+}
+
+fn grouped(f: &specrt::fusion::SectionFusion, a: &str, b: &str) -> bool {
+    f.groups.iter().any(|g| g.units.iter().any(|u| u == a) && g.units.iter().any(|u| u == b))
+}
+
+#[test]
+fn the_fusion_pass_rediscovers_the_denoiser_groups() {
+    let sections = fusion(false, 4096, 512);
+    let double = sections.iter().find(|s| s.name == "layer double").unwrap();
+    let single = sections.iter().find(|s| s.name == "layer single").unwrap();
+    for s in [double, single] {
+        for g in &s.groups {
+            eprintln!("{}: [{}]", s.name, g.units.join(" + "));
+        }
+        for d in &s.rejected {
+            eprintln!("{} kept apart {}", s.name, d.describe());
+        }
+    }
+    assert!(grouped(single, "attn.to_out[hidden:cat] (joint) residual", "joint gated add branch mod_single[2]") || grouped(single, "attn.to_out[0:hidden] (joint)", "joint gated add branch mod_single[2]") || grouped(single, "attn.to_out[hidden:cat] (joint)", "joint gated add branch mod_single[2]"), "the gated residual joins the to_out epilogue");
+    assert!(grouped(double, "ff.linear_in (image)", "image swiglu gate_up"), "SwiGLU joins the image linear_in epilogue");
+    assert!(grouped(double, "ff_context.linear_in (text)", "text swiglu gate_up"), "SwiGLU joins the text linear_in epilogue");
+    assert!(grouped(double, "attn.to_out.0 (image)", "image gated add branch mod_image[2]"), "the image gated residual joins to_out");
+    assert!(grouped(double, "ff.linear_out (image)", "image gated add branch mod_image[5]"), "the image gated residual joins linear_out");
+    let refused = double.rejected.iter().any(|d| d.verdict == Err(specrt::fusion::Reason::ComputeBound));
+    assert!(refused, "the modulate prologue on a compute bound GEMM is refused");
+    assert!(double.launches_after < double.launches_before, "{} -> {}", double.launches_before, double.launches_after);
+}
+
+#[test]
+fn the_compute_prologue_switch_lets_the_modulate_prologue_through() {
+    let off = fusion(false, 4096, 512);
+    let on = fusion(true, 4096, 512);
+    let count = |s: &[specrt::fusion::SectionFusion]| s.iter().find(|x| x.name == "layer double").unwrap().rejected.iter().filter(|d| d.verdict == Err(specrt::fusion::Reason::ComputeBound)).count();
+    assert!(count(&off) > 0);
+    assert_eq!(count(&on), 0);
+}
+
+#[test]
+fn decoder_costs_have_no_compute_term() {
+    let c = specrt::fusion::Costs::for_target(&kir::Target::sm_120());
+    assert_eq!(c.peak_flops_per_byte, None);
+    assert!(!c.compute_bound(1, u64::MAX));
+    assert_eq!(c.time_bytes(10, 1 << 40), 10);
+}
+
 #[test]
 fn the_host_plan_matches_diffusers_in_f32() {
     let plan = DenoiserGraph::embedded().plan().unwrap();

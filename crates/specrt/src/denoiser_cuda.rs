@@ -355,12 +355,13 @@ impl Denoiser {
                 b.arg(&x).arg(&br).arg(&g);
                 unsafe { b.launch(Self::row_grid(h, r1 - r0)) }?;
             }
-            DitOp::Glu { from, into, .. } => {
-                let src = self.ptr_f32(a, from, 0)?;
-                let (hi, lo) = self.ptr_planes(a, into, 0)?;
+            DitOp::Glu { from, into, rows, .. } => {
+                let (r0, r1) = self.span(a, from, rows);
+                let src = self.ptr_f32(a, from, r0)?;
+                let (hi, lo) = self.ptr_planes(a, into, r0)?;
                 let mut b = s.launch_builder(self.compose_fn(d)?);
                 b.arg(&src).arg(&hi).arg(&lo);
-                unsafe { b.launch(Self::row_grid(a.bufs[into].cols, a.shapes.joint())) }?;
+                unsafe { b.launch(Self::row_grid(a.bufs[into].cols, r1 - r0)) }?;
             }
             DitOp::AxisRope { from, text, image } => {
                 let i = block.unwrap_or(0).to_string();

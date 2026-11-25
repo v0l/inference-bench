@@ -186,6 +186,13 @@ impl DenoiserSpec {
         Ok(spec)
     }
 
+    pub fn from_transformer_config(json: &str, latent_patch: usize) -> Result<DenoiserSpec> {
+        let mut configs = BTreeMap::new();
+        configs.insert("transformer".to_string(), serde_json::from_str(json)?);
+        configs.insert("vae".to_string(), serde_json::json!({ "patch_size": [latent_patch, latent_patch] }));
+        DenoiserSpec::from_configs(DenoiserGraph::embedded(), &configs)
+    }
+
     pub fn from_pipeline(dir: &Path) -> Result<DenoiserSpec> {
         let mut configs = BTreeMap::new();
         let read = |p: &Path| -> Result<serde_json::Value> { Ok(serde_json::from_str(&std::fs::read_to_string(p).with_context(|| p.display().to_string())?)?) };
@@ -248,7 +255,7 @@ impl DitNode {
             }
             "modulate" => DitOp::Modulate { from: from()?, into: into()?, rows: self.rows()?, set: set()?, shift: self.shift.context("modulate needs shift")?, scale: self.scale.context("modulate needs scale")? },
             "gated_add" => DitOp::GatedAdd { from: from()?, into: intern("x"), rows: self.rows()?, set: set()?, gate: self.gate.context("gated_add needs gate")? },
-            "glu" => DitOp::Glu { from: from()?, into: into()?, offset: intern(self.offset.as_deref().unwrap_or("0")) },
+            "glu" => DitOp::Glu { from: from()?, into: into()?, rows: self.rows()?, offset: intern(self.offset.as_deref().unwrap_or("0")) },
             "axis_rope" => DitOp::AxisRope { from: from()?, text: intern(&full(self.need(&self.text, "text")?)), image: intern(&full(self.need(&self.image, "image")?)) },
             "joint_attention" => DitOp::JointAttention { into: into()? },
             other => bail!("unknown denoiser op {other:?}"),
@@ -377,7 +384,7 @@ impl Signer<'_> {
                 let x = self.t(into, Some(rows))?;
                 sig(Class::Elementwise, vec![self.t(from, Some(rows))?, self.t(set, None)?, x.clone()], vec![x], 0)
             }
-            DitOp::Glu { from, into, .. } => sig(Class::Elementwise, vec![self.t(from, None)?], vec![self.t(into, None)?], 0),
+            DitOp::Glu { from, into, rows, .. } => sig(Class::Elementwise, vec![self.t(from, Some(rows))?], vec![self.t(into, Some(rows))?], 0),
             DitOp::AxisRope { from, text, image } => {
                 let hd = self.spec.size("head_dim")?;
                 let mut reads = vec![self.t(from, None)?, self.t("ids", None)?];

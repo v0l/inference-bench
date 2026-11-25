@@ -28,6 +28,10 @@ impl Stream {
     }
 }
 
+fn short(weight: &str) -> String {
+    weight.split('+').map(|w| w.rsplit_once("{i}.").map_or(w, |(_, t)| t)).collect::<Vec<_>>().join("+")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DitOp {
     Patchify { from: &'static str, into: &'static str },
@@ -38,7 +42,7 @@ pub enum DitOp {
     Linear { weight: &'static str, input: &'static str, output: &'static str, rows: Stream, add: bool },
     Modulate { from: &'static str, into: &'static str, rows: Stream, set: &'static str, shift: u8, scale: u8 },
     GatedAdd { from: &'static str, into: &'static str, rows: Stream, set: &'static str, gate: u8 },
-    Glu { from: &'static str, into: &'static str, offset: &'static str },
+    Glu { from: &'static str, into: &'static str, rows: Stream, offset: &'static str },
     AxisRope { from: &'static str, text: &'static str, image: &'static str },
     JointAttention { into: &'static str },
 }
@@ -52,10 +56,10 @@ impl DitOp {
             DitOp::Split { from, .. } => format!("split {from}"),
             DitOp::Copy { from, .. } => format!("copy {from}"),
             DitOp::TimestepEmbed { .. } => "timestep embed".into(),
-            DitOp::Linear { weight, rows, .. } => format!("{weight} ({})", rows.label()),
+            DitOp::Linear { weight, rows, .. } => format!("{} ({})", short(weight), rows.label()),
             DitOp::Modulate { rows, set, shift, scale, .. } => format!("{} modulate {set}[{shift},{scale}]", rows.label()),
             DitOp::GatedAdd { rows, from, set, gate, .. } => format!("{} gated add {from} {set}[{gate}]", rows.label()),
-            DitOp::Glu { from, .. } => format!("swiglu {from}"),
+            DitOp::Glu { from, rows, .. } => format!("{} swiglu {from}", rows.label()),
             DitOp::AxisRope { .. } => "qk norm and axis rope".into(),
             DitOp::JointAttention { .. } => "joint attention".into(),
         }
@@ -63,7 +67,8 @@ impl DitOp {
 
     pub fn flow(&self) -> String {
         match self {
-            DitOp::Patchify { from, into } | DitOp::Unpatchify { from, into } | DitOp::TimestepEmbed { from, into } | DitOp::Glu { from, into, .. } => format!("{from} to {into}"),
+            DitOp::Patchify { from, into } | DitOp::Unpatchify { from, into } | DitOp::TimestepEmbed { from, into } => format!("{from} to {into}"),
+            DitOp::Glu { from, into, rows, .. } => format!("{from} to {into} ({})", rows.label()),
             DitOp::Split { from, into, rows, .. } | DitOp::Copy { from, into, rows } | DitOp::Modulate { from, into, rows, .. } => format!("{from} to {into} ({})", rows.label()),
             DitOp::Linear { input, output, rows, add, .. } => format!("{input} to {output} ({}{})", rows.label(), if *add { ", added" } else { "" }),
             DitOp::GatedAdd { from, into, rows, .. } => format!("{from} gated into {into} ({})", rows.label()),
