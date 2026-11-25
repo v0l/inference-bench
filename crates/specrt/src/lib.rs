@@ -55,6 +55,7 @@ pub mod prefix;
 pub mod progress;
 pub mod remote;
 pub mod runtime;
+pub mod sampler;
 pub mod sched;
 pub mod serve;
 pub mod signature;
