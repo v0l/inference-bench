@@ -241,7 +241,7 @@ pub fn pool_devices_on(host: &str, cards: &[(usize, u64)]) -> Vec<DeviceConfig> 
         .iter()
         .map(|&(i, free)| DeviceConfig {
             name: if host.is_empty() { format!("gpu{i}") } else { specrt::hardware::device_name(host, i) },
-            memory_gib: (free as f64 * fit::GPU_UTILIZATION) / fit::GB,
+            memory_gib: fit::usable(free) as f64 / fit::GB,
             bandwidth_gbs: 1000.0,
             tflops: 100.0,
             ordinal: Some(i),
@@ -292,7 +292,7 @@ pub fn assess(spec: &Spec, base: &ModelAnatomy, weights: u64, gpus: &[u64], seqs
     a.total_bytes = weights;
     let native = fit::max_context(&a);
     let free: Option<u64> = (!gpus.is_empty()).then(|| gpus.iter().sum());
-    let usable = free.map(|f| (f as f64 * fit::GPU_UTILIZATION) as u64);
+    let usable = free.map(|f| gpus.iter().map(|&g| fit::usable(g)).sum::<u64>().min(f));
     let room = fit::room_bytes(&a, usable, seqs);
     let kvs: Vec<KvFit> = Kv::ALL
         .iter()
@@ -845,7 +845,7 @@ mod tests {
         let a = assess(&s.spec, &s.anatomy, weights, &[free], 1);
         let mut base = s.anatomy.clone();
         base.total_bytes = weights;
-        let room = fit::room_bytes(&base, Some((free as f64 * fit::GPU_UTILIZATION) as u64), 1).unwrap();
+        let room = fit::room_bytes(&base, Some(fit::usable(free)), 1).unwrap();
         for k in &a.kvs {
             let per = k.kv.bytes_per_token(&s.spec);
             assert_eq!(k.context, ((room / per) as usize).min(131072), "{:?}", k.kv);
@@ -863,7 +863,7 @@ mod tests {
         assert!(roomy.full());
         let f16_need = Kv::F16.bytes_per_token(&s.spec) * 131072;
         let mixed_need = Kv::MixedFp8.bytes_per_token(&s.spec) * 131072;
-        let free = (((5 * GB + mixed_need + GB) as f64) / fit::GPU_UTILIZATION) as u64;
+        let free = 5 * GB + mixed_need + GB + fit::GPU_RESERVE;
         assert!(f16_need > mixed_need + GB);
         let tight = assess(&s.spec, &s.anatomy, 5 * GB, &[free], 1);
         assert_eq!((tight.chosen.kv, tight.tier, tight.verdict), (Kv::MixedFp8, 1, Verdict::Fits));
@@ -910,7 +910,7 @@ mod tests {
         assert_eq!(Kv::MixedFp8.f16_layers(&s.spec), Some(27));
         assert_eq!(Kv::Fp8.f16_layers(&s.spec), Some(0));
         let need = |per: u64| 5 * GB + per * 131072 + GB / 2;
-        let free = (need(mixed) as f64 / fit::GPU_UTILIZATION) as u64;
+        let free = need(mixed) + fit::GPU_RESERVE;
         let a = assess(&s.spec, &s.anatomy, 5 * GB, &[free], 1);
         assert_eq!((a.chosen.kv, a.chosen.kv.label(), a.tier), (Kv::MixedFp8, "mixed fp8 KV", 1));
     }
@@ -938,16 +938,16 @@ mod tests {
         assert_eq!(plan_big.ranked.iter().map(|s| s.variant.label.as_str()).collect::<Vec<_>>(), ["Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M"]);
         let s = shape();
         let mixed_need = Kv::Fp8.bytes_per_token(&s.spec) * 131072;
-        let free = (((9 * GB + mixed_need + GB / 4) as f64) / fit::GPU_UTILIZATION) as u64;
+        let free = 9 * GB + mixed_need + GB / 4 + fit::GPU_RESERVE;
         let squeezed = plan(&info(&all), &[free], 1);
         let best = squeezed.best().unwrap();
         assert_eq!((best.variant.label.as_str(), best.fit.as_ref().unwrap().chosen.kv, best.fit.as_ref().unwrap().tier), ("Q8_0", Kv::Fp8, 1));
-        let free = (((7 * GB + mixed_need + GB / 4) as f64) / fit::GPU_UTILIZATION) as u64;
+        let free = 7 * GB + mixed_need + GB / 4 + fit::GPU_RESERVE;
         let mid = plan(&info(&all), &[free], 1);
         assert_eq!(mid.best().unwrap().variant.label, "Q6_K");
         let tiers: Vec<u8> = mid.ranked.iter().map(|s| s.fit.as_ref().unwrap().tier).collect();
         assert!(tiers.windows(2).all(|w| w[0] <= w[1]), "{tiers:?}");
-        let tiny = plan(&info(&all), &[7 * GB + GB / 2], 1);
+        let tiny = plan(&info(&all), &[6 * GB + 3 * GB / 4 + fit::GPU_RESERVE], 1);
         let best = tiny.best().unwrap();
         assert_eq!(best.variant.label, "Q5_K_M", "only the best reduced-context tier that fits at all: {:?}", tiny.ranked.iter().map(|s| (&s.variant.label, s.fit.as_ref().unwrap().tier)).collect::<Vec<_>>());
         assert_eq!(best.fit.as_ref().unwrap().tier, 2);

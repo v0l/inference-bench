@@ -219,7 +219,7 @@ fn memory_check(env: &Environment, f: &ModelFeatures, checks: &mut Vec<Check>) {
         checks.push(Check::fail("memory", format!("needs about {} and no GPU memory is available", gib(need)), "Fix the gpu check first"));
         return;
     }
-    let usable = (free as f64 * crate::fit::GPU_UTILIZATION) as u64;
+    let usable = crate::fit::usable(free);
     let detail = format!("needs about {} (weights {}, one {}-token request), {} free", gib(need), gib(f.weights_bytes), crate::fit::TYPICAL_REQUEST.min(f.max_context), gib(free));
     if need > usable {
         checks.push(Check::fail(

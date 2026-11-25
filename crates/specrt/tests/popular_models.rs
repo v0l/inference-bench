@@ -6,7 +6,11 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 const MEDIA_KEYS: [&str; 2] = ["vision_config", "audio_config"];
-const CARD_SHARE: f64 = 0.9;
+const RESERVE_GB: f64 = specrt::placement::DEFAULT_RESERVE_GIB * (1u64 << 30) as f64 / 1e9;
+
+fn card_room(m: &Machine) -> f64 {
+    m.card_gb - RESERVE_GB
+}
 const FILE_THRESHOLD: u64 = 1_000_000;
 
 fn root() -> PathBuf {
@@ -422,7 +426,7 @@ fn machine(man: &Value) -> Machine {
 }
 
 fn offload_need(gb: f64, m: &Machine, spec: Option<&Spec>) -> Offload {
-    let usable = m.card_gb * CARD_SHARE;
+    let usable = card_room(&m);
     let cards = ((gb / usable).ceil() as u64).clamp(1, m.cards);
     let rest = (gb - cards as f64 * usable).max(0.0);
     let host_budget = m.ram_available_gb * m.host_share;
@@ -457,7 +461,7 @@ fn place_on_desktop(spec: &Spec, gb: f64, m: &Machine, host_budget_gb: f64) -> b
 }
 
 fn sized(v: Verdict, row: &Row, m: &Machine, config: Option<&str>) -> Verdict {
-    let Some(gb) = row.size().filter(|gb| *gb > m.card_gb * CARD_SHARE) else { return v };
+    let Some(gb) = row.size().filter(|gb| *gb > card_room(&m)) else { return v };
     match v.class {
         Class::Loads | Class::TextOnly => {
             let spec = config.and_then(|c| serde_json::from_str::<Value>(c).ok()).and_then(|j| serving(&j).ok());
@@ -513,7 +517,7 @@ fn classify_pipeline(row: &Row, m: &Machine, committed_only: bool) -> Option<Ver
     let resident: f64 = family.pipeline.resident.iter().map(|c| part(c)).sum();
     let encoder = part("text_encoder");
     let peak = resident + encoder;
-    let usable = m.card_gb * CARD_SHARE;
+    let usable = card_room(&m);
     let what = format!("{} image pipeline, family {}, {} steps; weights {:.1} GB (text encoder {encoder:.1}, resident {resident:.1}); peak {peak:.1} GB on 1 card with the text encoder released after encoding, 0 GB host RAM", family.pipeline.graph, family.name, pipeline.steps, row.size().unwrap_or(0.0));
     if peak <= usable {
         return Some(Verdict::new(Class::Loads, what, None));
@@ -857,7 +861,7 @@ fn report() -> Report {
     writeln!(doc, "## Classes\n").unwrap();
     writeln!(doc, "- LOADS: the serving check passes and every input tower the config declares is read.").unwrap();
     writeln!(doc, "- LOADS-TEXT-ONLY: the text model passes; a vision or audio tower in the config is refused or not read, so only text input works.").unwrap();
-    writeln!(doc, "- SUPPORTED-WITH-OFFLOAD: the architecture passes and the weights are more than {:.0}% of one {} GB card. This is not a refusal: placement spreads layers over the cards, then host RAM, then NVMe. The why column gives the cards, host RAM and NVMe the tiers need on this machine (read from the manifest's `machine` block) and whether `PlacementConfig::place` accepts it today with the desktop's device list.", CARD_SHARE * 100.0, mach.card_gb).unwrap();
+    writeln!(doc, "- SUPPORTED-WITH-OFFLOAD: the architecture passes and the weights are more than one {} GB card holds after its {:.1} GB reserve. This is not a refusal: placement spreads layers over the cards, then host RAM, then NVMe. The why column gives the cards, host RAM and NVMe the tiers need on this machine (read from the manifest's `machine` block) and whether `PlacementConfig::place` accepts it today with the desktop's device list.", mach.card_gb, RESERVE_GB).unwrap();
     writeln!(doc, "- DOES-NOT-FIT: the architecture passes but the weights exceed every tier together on this machine; the why column says by how much.").unwrap();
     writeln!(doc, "- UNKNOWN-QUANT: the architecture passes without the quantisation, the quantisation format is refused.").unwrap();
     writeln!(doc, "- REFUSED: the architecture itself is missing or refused; the why column is the exact refusal text. A refused model that is also over one card reads `needs family #N, then offload: ...` in the Main labs tables. Size never refuses a model.").unwrap();
@@ -1060,7 +1064,7 @@ fn a_parked_gap_is_listed_with_its_reason_and_never_ranked() {
 fn a_model_larger_than_one_card_is_refused_only_for_a_missing_architecture() {
     let man = manifest();
     let mach = machine(&man);
-    let big = mach.card_gb * CARD_SHARE;
+    let big = card_room(&mach);
     let mut oversize = 0;
     for m in man["models"].as_array().unwrap() {
         let row = Row { m };
@@ -1083,12 +1087,12 @@ fn a_model_larger_than_one_card_is_refused_only_for_a_missing_architecture() {
 fn the_offload_numbers_follow_the_machine_block() {
     let man = manifest();
     let mach = machine(&man);
-    let huge = offload_need(mach.card_gb * CARD_SHARE * 2.0 + 100.0, &mach, None);
+    let huge = offload_need(card_room(&mach) * 2.0 + 100.0, &mach, None);
     assert_eq!(huge.cards, 2);
     assert!((huge.host_gb - 100.0f64.min(mach.ram_available_gb * mach.host_share)).abs() < 1e-6);
-    let beyond = offload_need((mach.cards as f64) * mach.card_gb * CARD_SHARE + mach.ram_available_gb * mach.host_share + mach.nvme_free_gb + 500.0, &mach, None);
+    let beyond = offload_need((mach.cards as f64) * card_room(&mach) + mach.ram_available_gb * mach.host_share + mach.nvme_free_gb + 500.0, &mach, None);
     assert!((beyond.short_gb - 500.0).abs() < 1e-6, "{beyond:?}");
-    let fits = offload_need(mach.card_gb * CARD_SHARE * 1.5, &mach, None);
+    let fits = offload_need(card_room(&mach) * 1.5, &mach, None);
     assert_eq!((fits.cards, fits.nvme_gb), (2, 0.0));
     let probe = serde_json::json!({"repo": "x/y", "size_gb": 5000.0});
     let refused = sized(Verdict::new(Class::Refused, "model_type zzz is not supported", Some(Gap { kind: Kind::Family, key: "model_type zzz".into() })), &Row { m: &probe }, &mach, None);
