@@ -13,6 +13,7 @@ pub enum Class {
     Attention,
     Scan,
     Gather,
+    GridReduce,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +45,7 @@ pub enum Rows {
     Image,
     Text,
     Joint,
+    Grid(usize),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -72,6 +74,8 @@ pub struct Signature {
     pub writes: Vec<Tensor>,
 }
 
+pub const GRID_LEVELS: usize = 16;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Count {
     pub tokens: usize,
@@ -80,6 +84,7 @@ pub struct Count {
     pub context: usize,
     pub image: usize,
     pub text: usize,
+    pub grid: [usize; GRID_LEVELS],
 }
 
 impl Count {
@@ -89,6 +94,14 @@ impl Count {
             Phase::Decode | Phase::Verify => Count { tokens, out: tokens, seqs: tokens, context, ..Count::default() },
             Phase::Forward => Count { tokens, out: tokens, seqs: 1, context, ..Count::default() },
         }
+    }
+
+    pub fn grids(levels: &[usize]) -> Count {
+        let mut c = Count::new(Phase::Prefill, 0, 0);
+        for (g, l) in c.grid.iter_mut().zip(levels) {
+            *g = *l;
+        }
+        c
     }
 
     pub(crate) fn rows(&self, r: Rows) -> usize {
@@ -103,6 +116,7 @@ impl Count {
             Rows::Image => self.image,
             Rows::Text => self.text,
             Rows::Joint => self.image + self.text,
+            Rows::Grid(l) => self.grid.get(l).copied().unwrap_or(0),
         }
     }
 }

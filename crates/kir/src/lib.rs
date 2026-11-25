@@ -4,6 +4,7 @@ pub mod allreduce;
 pub mod attention;
 pub mod bandwidth;
 pub mod compose;
+pub mod conv;
 pub mod desc;
 pub mod dequant;
 pub mod expr;

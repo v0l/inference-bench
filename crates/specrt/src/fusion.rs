@@ -85,6 +85,7 @@ pub struct Geometry {
     pub owner: Owner,
     pub smem: u64,
     pub regs: u32,
+    pub k_tile: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,6 +102,9 @@ pub enum Part {
     KvWrite,
     Split,
     Combine,
+    Stats,
+    Apply,
+    Resample,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -120,20 +124,20 @@ pub struct Unit {
 }
 
 impl Unit {
-    fn new(label: impl Into<String>, op: usize, class: Class, reads: Vec<Tensor>, writes: Vec<Tensor>) -> Unit {
+    pub fn new(label: impl Into<String>, op: usize, class: Class, reads: Vec<Tensor>, writes: Vec<Tensor>) -> Unit {
         let row = writes.first().map_or(1, |t| t.cols);
         Unit { label: label.into(), op, part: Part::Whole, class, reads, writes, launches: 1, geometry: None, barrier: false, bound: matches!(class, Class::Attention | Class::Scan), row, flops: 0 }
     }
 
-    fn with_part(self, part: Part) -> Unit {
+    pub fn with_part(self, part: Part) -> Unit {
         Unit { part, ..self }
     }
 
-    fn with_row(self, row: usize) -> Unit {
+    pub fn with_row(self, row: usize) -> Unit {
         Unit { row, ..self }
     }
 
-    fn with_geometry(self, g: Option<Geometry>) -> Unit {
+    pub fn with_geometry(self, g: Option<Geometry>) -> Unit {
         Unit { geometry: g, ..self }
     }
 
@@ -146,17 +150,21 @@ impl Unit {
     }
 
     fn light(&self) -> bool {
-        matches!(self.class, Class::Elementwise | Class::RowReduce)
+        matches!(self.class, Class::Elementwise | Class::RowReduce | Class::GridReduce)
+    }
+
+    fn resample(&self) -> bool {
+        self.part == Part::Resample
     }
 
     fn opaque(&self) -> bool {
-        self.launches != 1 || !(self.light() || self.heavy())
+        self.launches != 1 || !(self.light() || self.heavy() || self.resample())
     }
 
     fn regs(&self) -> u32 {
         match (self.geometry, self.class) {
             (Some(g), _) => g.regs,
-            (None, Class::RowReduce) => 8,
+            (None, Class::RowReduce | Class::GridReduce) => 8,
             _ => 4,
         }
     }
@@ -191,6 +199,8 @@ pub enum Reason {
     Outscored { by: Vec<String>, saving: u64 },
     NoKernel,
     ComputeBound,
+    GridBarrier,
+    Layout,
 }
 
 impl Reason {
@@ -213,6 +223,8 @@ impl Reason {
             Reason::Outscored { by, saving } => format!("{} saves more ({saving}) with the same units", by.join(" + ")),
             Reason::NoKernel => "no kernel in the library runs these ops as one".into(),
             Reason::ComputeBound => "the GEMM is compute bound, so a norm prologue sits on its critical load path ([runtime] compute_prologue turns it on)".into(),
+            Reason::GridBarrier => "a grid reduction is complete only after every block ran, so its readers run in a later launch".into(),
+            Reason::Layout => "an index map folds only into the tile load of an implicit GEMM".into(),
         }
     }
 }
@@ -339,7 +351,7 @@ impl Lower<'_> {
     fn geometry(&self, weight: Weight, quant: QuantSource, tokens: usize, n: usize, k: usize) -> Option<(Geometry, GemmPath)> {
         if self.target.language == kir::Language::Wgsl {
             let (per, rows_block) = if tokens == 1 { (kir::wgsl::SG_ROWS as usize, 1) } else { (kir::wgsl::TILE_ROWS as usize, tokens.min(kir::wgsl::TILE_TOKENS as usize)) };
-            return Some((Geometry { col_blocks: n.div_ceil(per), rows_block, owner: Owner::Tile { cols: per }, smem: 0, regs: BASE_REGS }, GemmPath::Mma));
+            return Some((Geometry { col_blocks: n.div_ceil(per), rows_block, owner: Owner::Tile { cols: per }, smem: 0, regs: BASE_REGS, k_tile: None }, GemmPath::Mma));
         }
         let q = quant.resolve_for(self.spec, self.layer, weight);
         let choice = gemm::select(self.spec, self.target, weight.name(), tokens, weight_kind(q)).ok()?;
@@ -349,7 +361,7 @@ impl Lower<'_> {
             _ if gemv => {
                 let threads = if q == Quant::Nvfp4G16 { gemm::FP4_GEMV_THREADS } else { kir::gemv::GEMV_THREADS };
                 let per = threads as usize / 32;
-                return Some((Geometry { col_blocks: n.div_ceil(per), rows_block: 1, owner: Owner::Tile { cols: per }, smem: 0, regs: BASE_REGS }, GemmPath::Mma));
+                return Some((Geometry { col_blocks: n.div_ceil(per), rows_block: 1, owner: Owner::Tile { cols: per }, smem: 0, regs: BASE_REGS, k_tile: None }, GemmPath::Mma));
             }
             GemmPath::F8b | GemmPath::F4b | GemmPath::Ggr => {
                 let kernel = choice.kernel.as_ref()?;
@@ -357,17 +369,17 @@ impl Lower<'_> {
                 let splits = if choice.path == GemmPath::Ggr { b.ggml_splits(t, n, k) } else { b.splits(t, n, k) };
                 let rows = b.rows();
                 let owner = if splits > 1 { Owner::Split { serial: splits } } else { Owner::Tile { cols: rows } };
-                Geometry { col_blocks: n.div_ceil(rows) * splits, rows_block: b.tokens.min(tokens), owner, smem: b.smem() as u64, regs: acc_regs(b.tokens * rows, b.threads()) }
+                Geometry { col_blocks: n.div_ceil(rows) * splits, rows_block: b.tokens.min(tokens), owner, smem: b.smem() as u64, regs: acc_regs(b.tokens * rows, b.threads()), k_tile: None }
             }
-            GemmPath::Rows => Geometry { col_blocks: n, rows_block: tokens, owner: Owner::Tile { cols: 1 }, smem: 0, regs: BASE_REGS + tokens as u32 },
+            GemmPath::Rows => Geometry { col_blocks: n, rows_block: tokens, owner: Owner::Tile { cols: 1 }, smem: 0, regs: BASE_REGS + tokens as u32, k_tile: None },
             GemmPath::Ggv => {
                 let per = GGML_GEMV_THREADS as usize / 32 * ggml_gemv_rows(n);
-                Geometry { col_blocks: n.div_ceil(per), rows_block: 1, owner: Owner::Tile { cols: per }, smem: 0, regs: BASE_REGS }
+                Geometry { col_blocks: n.div_ceil(per), rows_block: 1, owner: Owner::Tile { cols: per }, smem: 0, regs: BASE_REGS, k_tile: None }
             }
             _ => {
                 let tile = choice.tile;
                 let kernel = choice.kernel.as_ref()?;
-                Geometry { col_blocks: n.div_ceil(tile.bn), rows_block: tile.bm.min(tokens), owner: Owner::Tile { cols: tile.bn }, smem: kernel.smem_bytes as u64, regs: acc_regs(tile.bm * tile.bn, kernel.threads) }
+                Geometry { col_blocks: n.div_ceil(tile.bn), rows_block: tile.bm.min(tokens), owner: Owner::Tile { cols: tile.bn }, smem: kernel.smem_bytes as u64, regs: acc_regs(tile.bm * tile.bn, kernel.threads), k_tile: None }
             }
         };
         Some((g, choice.path))
@@ -413,7 +425,7 @@ impl Lower<'_> {
                 let parts = self.local(format!("{label} parts"), out.rows, s.n * serial, Form::F32);
                 self.units.push(Unit::new(label.clone(), i, Class::Gemm, reads, vec![parts.clone()]).with_geometry(Some(geo)).with_part(Part::Main));
                 let block = gemm::BATCH_REDUCE_BLOCK;
-                let reduce = Geometry { col_blocks: (tokens * s.n).div_ceil(block), rows_block: 1, owner: Owner::Flat { cols: block }, smem: 0, regs: BASE_REGS };
+                let reduce = Geometry { col_blocks: (tokens * s.n).div_ceil(block), rows_block: 1, owner: Owner::Flat { cols: block }, smem: 0, regs: BASE_REGS, k_tile: None };
                 self.units.push(Unit::new(format!("{label} reduce"), i, Class::Elementwise, vec![parts], vec![result.clone()]).with_geometry(Some(reduce)).with_part(Part::Reduce));
             }
             Owner::Tile { .. } | Owner::Flat { .. } => self.units.push(Unit::new(label.clone(), i, Class::Gemm, reads, vec![result.clone()]).with_geometry(Some(geo)).with_part(Part::Main)),
@@ -452,7 +464,7 @@ impl Lower<'_> {
         let parts = self.local("attention parts".into(), Rows::Tokens, a.heads * splits * (a.head_dim + 2), Form::F32);
         let mut reads = vec![self.signer.qkv()];
         reads.extend(self.signer.caches(self.layer, Rows::Context));
-        let geo = Geometry { col_blocks: a.kv_heads * splits, rows_block: 1, owner: Owner::Split { serial: group }, smem: 0, regs: BASE_REGS };
+        let geo = Geometry { col_blocks: a.kv_heads * splits, rows_block: 1, owner: Owner::Split { serial: group }, smem: 0, regs: BASE_REGS, k_tile: None };
         self.units.push(Unit::new("attention split", i, Class::Attention, reads, vec![parts.clone()]).with_geometry(Some(geo)).with_part(Part::Split));
         let out = self.signer.signature(op, self.layer)?.writes.last().cloned().expect("decode attention writes its output");
         let mut combine = Unit::new("attention combine", i, Class::Elementwise, vec![parts], vec![out]).with_row(a.head_dim).with_part(Part::Combine);
@@ -618,15 +630,21 @@ impl Engine<'_> {
     }
 
     fn edges(&self) -> BTreeSet<(usize, usize)> {
+        let mut owners: Vec<Vec<usize>> = vec![Vec::new(); self.units.len()];
+        for (g, members) in self.groups.iter().enumerate() {
+            for &u in members {
+                owners[u].push(g);
+            }
+        }
         let mut out = BTreeSet::new();
         for v in &self.values {
             for (r, _) in &v.readers {
-                for (b, g2) in self.groups.iter().enumerate() {
-                    if !g2.contains(r) || g2.contains(&v.writer) {
+                for &b in &owners[*r] {
+                    if self.groups[b].contains(&v.writer) {
                         continue;
                     }
-                    for (a, g1) in self.groups.iter().enumerate() {
-                        if a != b && g1.contains(&v.writer) {
+                    for &a in &owners[v.writer] {
+                        if a != b {
                             out.insert((a, b));
                         }
                     }
@@ -634,6 +652,14 @@ impl Engine<'_> {
             }
         }
         out
+    }
+
+    fn crosses_grid_reduce(&self, from: &BTreeSet<usize>, to: &BTreeSet<usize>) -> bool {
+        self.flow(from, to).any(|(v, _)| self.units[v.writer].class == Class::GridReduce)
+    }
+
+    fn side_output(&self, g: &BTreeSet<usize>) -> bool {
+        g.iter().all(|&u| self.units[u].class == Class::GridReduce)
     }
 
     fn path_between(edges: &BTreeSet<(usize, usize)>, from: usize, to: usize) -> bool {
@@ -710,6 +736,9 @@ impl Engine<'_> {
         if g1.iter().any(|&u| self.units[u].barrier) {
             return Err(Reason::Barrier);
         }
+        if g1.iter().any(|&u| self.units[u].class == Class::GridReduce) {
+            return Err(Reason::GridBarrier);
+        }
         let mut heavies = Vec::new();
         for &c in consumers {
             let g2 = &self.groups[c];
@@ -746,7 +775,7 @@ impl Engine<'_> {
     fn budget(&self, g: &BTreeSet<usize>) -> Result<(), Reason> {
         let Some(h) = self.anchor(g) else { return Ok(()) };
         let Some(geo) = self.units[h].geometry else { return Ok(()) };
-        let staged: usize = self.values.iter().filter(|v| g.contains(&v.writer) && !self.units[v.writer].anchored() && v.readers.iter().any(|(r, _)| *r == h)).map(|v| v.tensor.cols).sum();
+        let staged: usize = if geo.k_tile.is_some() { 0 } else { self.values.iter().filter(|v| g.contains(&v.writer) && !self.units[v.writer].anchored() && v.readers.iter().any(|(r, _)| *r == h)).map(|v| v.tensor.cols).sum() };
         let need = geo.smem + (geo.rows_block * staged * 4) as u64;
         if need > self.costs.smem_limit {
             return Err(Reason::Smem { need, limit: self.costs.smem_limit });
@@ -859,6 +888,12 @@ impl Engine<'_> {
         if Self::path_between(edges, a, b) {
             return Err(Reason::Path);
         }
+        if self.crosses_grid_reduce(g1, g2) {
+            return Err(Reason::GridBarrier);
+        }
+        if merged.iter().any(|&u| self.units[u].resample()) {
+            return Err(Reason::Layout);
+        }
         if rule == Rule::Light {
             let rows: Vec<usize> = merged.iter().filter(|&&u| self.units[u].class == Class::RowReduce).map(|&u| self.units[u].row.max(1)).collect();
             let widest = rows.iter().copied().max().unwrap_or(1);
@@ -889,7 +924,7 @@ impl Engine<'_> {
                 }
             }
         }
-        if held {
+        if held && !self.side_output(g2) {
             return Err(Reason::Readers);
         }
         Ok(())
@@ -1097,7 +1132,7 @@ pub fn denoiser_units(graph: &crate::denoiser::DenoiserGraph, dspec: &crate::den
                 let out = sig.writes[0].clone();
                 let n = out.cols;
                 let tile = (kir::vision::GEMM_BN as usize).min(n.max(1));
-                let geo = Geometry { col_blocks: n.div_ceil(tile), rows_block: kir::vision::GEMM_BM as usize, owner: Owner::Tile { cols: tile }, smem: kir::vision::GEMM_SMEM as u64, regs: acc_regs((kir::vision::GEMM_BM * kir::vision::GEMM_BN) as usize, kir::vision::GEMM_THREADS) };
+                let geo = Geometry { col_blocks: n.div_ceil(tile), rows_block: kir::vision::GEMM_BM as usize, owner: Owner::Tile { cols: tile }, smem: kir::vision::GEMM_SMEM as u64, regs: acc_regs((kir::vision::GEMM_BM * kir::vision::GEMM_BN) as usize, kir::vision::GEMM_THREADS), k_tile: None };
                 let mut reads: Vec<Tensor> = sig.reads.clone();
                 reads.truncate(2);
                 let main_out = if add {
@@ -1178,6 +1213,21 @@ fn split_streams(units: &mut [Unit]) {
             }
         }
     }
+}
+
+pub fn fuse_units(units: Vec<Unit>, internal: &BTreeSet<Place>, costs: &Costs, count: Count, name: String, library: Option<Library>) -> SectionFusion {
+    let mut units = units;
+    unique_labels(&mut units);
+    fuse_section(units, internal, costs, count, name, 1, library)
+}
+
+pub fn unfused_units(units: Vec<Unit>, count: Count, name: String) -> SectionFusion {
+    let mut units = units;
+    unique_labels(&mut units);
+    let groups: Vec<Group> = units.iter().enumerate().map(|(i, u)| Group { units: vec![u.label.clone()], members: vec![i], ops: vec![u.op], launches: u.launches }).collect();
+    let launches = units.iter().map(|u| u.launches).sum();
+    let _ = count;
+    SectionFusion { name, repeats: 1, units, groups, fused: Vec::new(), rejected: Vec::new(), launches_before: launches, launches_after: launches }
 }
 
 pub fn fusion_report(spec: &Spec, plan: &Plan, count: Count, target: &kir::Target, costs: &Costs) -> Result<FusionReport> {

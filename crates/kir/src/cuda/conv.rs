@@ -1,0 +1,355 @@
+use crate::conv::{ConvError, ConvKernel, Family, Prologue, ROW_THREADS, THREADS, THREAD_COLS, THREAD_ROWS};
+
+const LOAD_INPUT: &str = r#"template <int K, int KT, int CIN, bool UP, int GIN, bool SILU>
+__device__ __forceinline__ float vae_conv_input(const float* __restrict__ x, const float* __restrict__ hist, int hist_frames,
+                                                const float* __restrict__ norm, const float* __restrict__ gamma, const float* __restrict__ beta,
+                                                int t, int oy, int ox, int dt, int dy, int dx, int c, int H, int W) {
+    if (c >= CIN || oy >= H || ox >= W) return 0.0f;
+    int iy = oy + dy - K / 2, ix = ox + dx - K / 2;
+    if (iy < 0 || iy >= H || ix < 0 || ix >= W) return 0.0f;
+    int IH = UP ? H / 2 : H, IW = UP ? W / 2 : W;
+    int sy = UP ? iy / 2 : iy, sx = UP ? ix / 2 : ix;
+    int f = t + dt - (KT - 1);
+    const float* src;
+    if (f >= 0) {
+        src = x + (((size_t)f * IH + sy) * IW + sx) * CIN;
+    } else if (hist_frames + f >= 0) {
+        src = hist + (((size_t)(hist_frames + f) * IH + sy) * IW + sx) * CIN;
+    } else {
+        return 0.0f;
+    }
+    float v = src[c];
+    if (GIN) {
+        int g = c / (CIN / (GIN ? GIN : 1));
+        v = (v - norm[2 * g]) * norm[2 * g + 1] * gamma[c] + beta[c];
+        if (SILU) v = v / (1.0f + expf(-v));
+    }
+    return v;
+}
+
+__device__ __forceinline__ void vae_norm_table(const double* __restrict__ sin, float* norm, int groups, float eps, double cnt) {
+    for (int g = threadIdx.x; g < groups; g += blockDim.x) {
+        double mean = sin[2 * g] / cnt;
+        double var = sin[2 * g + 1] / cnt - mean * mean;
+        norm[2 * g] = (float)mean;
+        norm[2 * g + 1] = (float)(1.0 / sqrt((var > 0.0 ? var : 0.0) + (double)eps));
+    }
+}
+
+template <int COUT, bool ILV, bool RES, bool CLAMP>
+__device__ __forceinline__ float vae_conv_store(float v, const float* __restrict__ resid, float* __restrict__ y, float lo, float hi, int t, int oy, int ox, int n, int H, int W) {
+    size_t at;
+    if (ILV) {
+        int half = COUT / 2;
+        int s = n >= half ? 1 : 0;
+        at = (((size_t)(2 * t + s) * H + oy) * W + ox) * half + (n - s * half);
+    } else {
+        at = (((size_t)t * H + oy) * W + ox) * COUT + n;
+    }
+    if (RES) v += resid[at];
+    if (CLAMP) v = fminf(fmaxf(v, lo), hi);
+    y[at] = v;
+    return v;
+}
+"#;
+
+const TILE_BODY: &str = r#"template <int BM, int BN, int BK, int PH, int PW, int TM, int TN, int STAGES, int K, int KT, int CIN, int COUT, bool UP, bool ILV, int GIN, bool SILU, int GOUT, bool RES, bool CLAMP>
+__device__ __forceinline__ void vae_conv_tile(const float* __restrict__ x, const float* __restrict__ hist, int hist_frames, const float* __restrict__ w,
+                                              const float* __restrict__ bias, const float* __restrict__ resid, float* __restrict__ y,
+                                              const double* __restrict__ sin, const float* __restrict__ gamma, const float* __restrict__ beta, float eps, double cnt,
+                                              double* __restrict__ sout, float lo, float hi, int T, int H, int W) {
+    extern __shared__ __align__(16) unsigned char vae_smem[];
+    double* gst = (double*)vae_smem;
+    float* norm = (float*)(gst + 2 * GOUT);
+    float* sa = norm + 2 * GIN;
+    float* sb = sa + STAGES * BK * BM;
+    constexpr int CHUNKS = (CIN + BK - 1) / BK;
+    constexpr int STEPS = K * K * KT * CHUNKS;
+    constexpr int NB = (COUT + BN - 1) / BN;
+    int tid = threadIdx.x;
+    int tr = tid / THREAD_COLS, tc = tid % THREAD_COLS;
+    int t = blockIdx.z / NB, n0 = (blockIdx.z % NB) * BN;
+    int py0 = blockIdx.y * PH, px0 = blockIdx.x * PW;
+    for (int i = tid; i < 2 * GOUT; i += blockDim.x) gst[i] = 0.0;
+    if (GIN) vae_norm_table(sin, norm, GIN, eps, cnt);
+    __syncthreads();
+    auto load = [&](int s, int buf) {
+        int tap = s / CHUNKS, c0 = (s % CHUNKS) * BK;
+        int dt = tap / (K * K), dy = (tap / K) % K, dx = tap % K;
+        float* A = sa + buf * BK * BM;
+        float* B = sb + buf * BK * BN;
+        for (int e = tid; e < BM * BK; e += blockDim.x) {
+            int p = e / BK, kk = e % BK;
+            A[kk * BM + p] = vae_conv_input<K, KT, CIN, UP, GIN, SILU>(x, hist, hist_frames, norm, gamma, beta, t, py0 + p / PW, px0 + p % PW, dt, dy, dx, c0 + kk, H, W);
+        }
+        for (int e = tid; e < BN * BK; e += blockDim.x) {
+            int j = e / BK, kk = e % BK;
+            int n = n0 + j, c = c0 + kk;
+            B[kk * BN + j] = (n < COUT && c < CIN) ? w[((size_t)n * (K * K * KT) + tap) * CIN + c] : 0.0f;
+        }
+    };
+    float acc[TM][TN];
+#pragma unroll
+    for (int i = 0; i < TM; i++)
+#pragma unroll
+        for (int j = 0; j < TN; j++) acc[i][j] = 0.0f;
+    load(0, 0);
+    __syncthreads();
+    for (int s = 0; s < STEPS; s++) {
+        int buf = STAGES == 2 ? (s & 1) : 0;
+        if (STAGES == 2 && s + 1 < STEPS) load(s + 1, buf ^ 1);
+        const float* A = sa + buf * BK * BM;
+        const float* B = sb + buf * BK * BN;
+#pragma unroll 4
+        for (int kk = 0; kk < BK; kk++) {
+            float a[TM], b[TN];
+#pragma unroll
+            for (int i = 0; i < TM; i++) a[i] = A[kk * BM + tr + THREAD_ROWS * i];
+#pragma unroll
+            for (int j = 0; j < TN; j++) b[j] = B[kk * BN + tc + THREAD_COLS * j];
+#pragma unroll
+            for (int i = 0; i < TM; i++)
+#pragma unroll
+                for (int j = 0; j < TN; j++) acc[i][j] = fmaf(a[i], b[j], acc[i][j]);
+        }
+        __syncthreads();
+        if (STAGES == 1 && s + 1 < STEPS) {
+            load(s + 1, 0);
+            __syncthreads();
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < TM; i++) {
+        int p = tr + THREAD_ROWS * i;
+        int oy = py0 + p / PW, ox = px0 + p % PW;
+        if (oy >= H || ox >= W) continue;
+#pragma unroll
+        for (int j = 0; j < TN; j++) {
+            int n = n0 + tc + THREAD_COLS * j;
+            if (n >= COUT) continue;
+            float v = vae_conv_store<COUT, ILV, RES, CLAMP>(acc[i][j] + bias[n], resid, y, lo, hi, t, oy, ox, n, H, W);
+            if (GOUT) {
+                int g = n / (COUT / (GOUT ? GOUT : 1));
+                atomicAdd(&gst[2 * g], (double)v);
+                atomicAdd(&gst[2 * g + 1], (double)v * (double)v);
+            }
+        }
+    }
+    if (GOUT) {
+        __syncthreads();
+        for (int i = tid; i < 2 * GOUT; i += blockDim.x) atomicAdd(&sout[i], gst[i]);
+    }
+}
+"#;
+
+const DIRECT_BODY: &str = r#"template <int K, int KT, int CIN, int COUT, bool UP, bool ILV, int GIN, bool SILU, int GOUT, bool RES, bool CLAMP>
+__device__ __forceinline__ void vae_conv_direct(const float* __restrict__ x, const float* __restrict__ hist, int hist_frames, const float* __restrict__ w,
+                                                const float* __restrict__ bias, const float* __restrict__ resid, float* __restrict__ y,
+                                                const double* __restrict__ sin, const float* __restrict__ gamma, const float* __restrict__ beta, float eps, double cnt,
+                                                double* __restrict__ sout, float lo, float hi, int T, int H, int W) {
+    extern __shared__ __align__(16) unsigned char vae_smem[];
+    double* gst = (double*)vae_smem;
+    float* norm = (float*)(gst + 2 * GOUT);
+    if (GIN) vae_norm_table(sin, norm, GIN, eps, cnt);
+    __syncthreads();
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)T * H * W * COUT) return;
+    int n = idx % COUT;
+    size_t pix = idx / COUT;
+    int ox = pix % W, oy = (pix / W) % H, t = pix / ((size_t)W * H);
+    float acc = bias[n];
+    for (int dt = 0; dt < KT; dt++)
+        for (int dy = 0; dy < K; dy++)
+            for (int dx = 0; dx < K; dx++) {
+                const float* wr = w + ((size_t)n * (K * K * KT) + (dt * K + dy) * K + dx) * CIN;
+                for (int c = 0; c < CIN; c++) acc = fmaf(vae_conv_input<K, KT, CIN, UP, GIN, SILU>(x, hist, hist_frames, norm, gamma, beta, t, oy, ox, dt, dy, dx, c, H, W), wr[c], acc);
+            }
+    float v = vae_conv_store<COUT, ILV, RES, CLAMP>(acc, resid, y, lo, hi, t, oy, ox, n, H, W);
+    if (GOUT) {
+        int g = n / (COUT / (GOUT ? GOUT : 1));
+        atomicAdd(&sout[2 * g], (double)v);
+        atomicAdd(&sout[2 * g + 1], (double)v * (double)v);
+    }
+}
+"#;
+
+const ARGS: &str = "const float* x, const float* hist, int hist_frames, const float* w, const float* bias, const float* resid, float* y, const double* sin, const float* gamma, const float* beta, float eps, double cnt, double* sout, float lo, float hi, int T, int H, int W";
+const PASS: &str = "x, hist, hist_frames, w, bias, resid, y, sin, gamma, beta, eps, cnt, sout, lo, hi, T, H, W";
+
+const ROWS: &str = r#"__device__ __forceinline__ float vae_block_sum(float v, float* red) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    __syncthreads();
+    if (lane == 0) red[warp] = v;
+    __syncthreads();
+    float t = 0.0f;
+    for (int i = 0; i < (int)(blockDim.x / 32); i++) t += red[i];
+    return t;
+}
+
+__device__ __forceinline__ float vae_block_max(float v, float* red) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    __syncthreads();
+    if (lane == 0) red[warp] = v;
+    __syncthreads();
+    float t = red[0];
+    for (int i = 1; i < (int)(blockDim.x / 32); i++) t = fmaxf(t, red[i]);
+    return t;
+}
+
+extern "C" __global__ void vae_zero(double* p, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) p[i] = 0.0;
+}
+
+extern "C" __global__ void vae_group_stats(const float* x, double* s, int P, int C, int G) {
+    __shared__ double part[2 * MAX_GROUPS];
+    for (int i = threadIdx.x; i < 2 * G; i += blockDim.x) part[i] = 0.0;
+    __syncthreads();
+    int per = C / G;
+    size_t total = (size_t)P * C;
+    for (size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x; e < total; e += (size_t)gridDim.x * blockDim.x) {
+        double v = x[e];
+        int g = (e % C) / per;
+        atomicAdd(&part[2 * g], v);
+        atomicAdd(&part[2 * g + 1], v * v);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < 2 * G; i += blockDim.x) atomicAdd(&s[i], part[i]);
+}
+
+extern "C" __global__ void vae_group_apply(const float* x, float* y, const double* s, const float* gamma, const float* beta, int P, int C, int G, float eps, double cnt, int silu) {
+    __shared__ float norm[2 * MAX_GROUPS];
+    vae_norm_table(s, norm, G, eps, cnt);
+    __syncthreads();
+    int per = C / G;
+    size_t total = (size_t)P * C;
+    for (size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x; e < total; e += (size_t)gridDim.x * blockDim.x) {
+        int c = e % C, g = c / per;
+        float v = (x[e] - norm[2 * g]) * norm[2 * g + 1] * gamma[c] + beta[c];
+        if (silu) v = v / (1.0f + expf(-v));
+        y[e] = v;
+    }
+}
+
+extern "C" __global__ void vae_rms(const float* x, float* y, const float* gamma, int P, int C, int silu) {
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    size_t p = (size_t)blockIdx.x * (blockDim.x / 32) + warp;
+    if (p >= (size_t)P) return;
+    const float* row = x + p * C;
+    float ss = 0.0f;
+    for (int c = lane; c < C; c += 32) ss += row[c] * row[c];
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, o);
+    float scale = sqrtf((float)C) / fmaxf(sqrtf(ss), 1e-12f);
+    for (int c = lane; c < C; c += 32) {
+        float v = row[c] * scale * gamma[c];
+        if (silu) v = v / (1.0f + expf(-v));
+        y[p * C + c] = v;
+    }
+}
+
+extern "C" __global__ void vae_upsample(const float* x, float* y, int T, int H, int W, int C) {
+    size_t total = (size_t)T * H * W * C;
+    for (size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x; e < total; e += (size_t)gridDim.x * blockDim.x) {
+        int c = e % C;
+        size_t pix = e / C;
+        int ox = pix % W, oy = (pix / W) % H, t = pix / ((size_t)W * H);
+        y[e] = x[(((size_t)t * (H / 2) + oy / 2) * (W / 2) + ox / 2) * C + c];
+    }
+}
+
+extern "C" __global__ void vae_add(const float* a, const float* b, float* y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = a[i] + b[i];
+}
+
+extern "C" __global__ void vae_clamp(const float* x, float* y, int n, float lo, float hi) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = fminf(fmaxf(x[i], lo), hi);
+}
+
+extern "C" __global__ void vae_attention(const float* qkv, float* out, int S, int C, float scale) {
+    extern __shared__ __align__(16) float att[];
+    float* red = att;
+    float* p = att + 64;
+    int t = blockIdx.y, i = blockIdx.x;
+    const float* base = qkv + (size_t)t * S * 3 * C;
+    const float* q = base + (size_t)i * 3 * C;
+    float m = -3.0e38f;
+    for (int j = threadIdx.x; j < S; j += blockDim.x) {
+        const float* k = base + (size_t)j * 3 * C + C;
+        float d = 0.0f;
+        for (int c = 0; c < C; c++) d = fmaf(q[c], k[c], d);
+        d *= scale;
+        p[j] = d;
+        m = fmaxf(m, d);
+    }
+    m = vae_block_max(m, red);
+    float sum = 0.0f;
+    for (int j = threadIdx.x; j < S; j += blockDim.x) {
+        float e = expf(p[j] - m);
+        p[j] = e;
+        sum += e;
+    }
+    sum = vae_block_sum(sum, red + 32);
+    float inv = 1.0f / sum;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        float acc = 0.0f;
+        for (int j = 0; j < S; j++) acc = fmaf(p[j], base[(size_t)j * 3 * C + 2 * C + c], acc);
+        out[((size_t)t * S + i) * C + c] = acc * inv;
+    }
+}
+"#;
+
+fn flag(b: bool) -> &'static str {
+    if b { "true" } else { "false" }
+}
+
+fn wrapper(k: &ConvKernel) -> String {
+    let s = &k.shape;
+    let (gin, silu) = match k.prologue {
+        Prologue::None => (0, false),
+        Prologue::GroupApply { groups, silu } => (groups, silu),
+    };
+    let gout = k.epilogue.stats.unwrap_or(0);
+    let call = match k.family {
+        Family::Tile => {
+            let t = &k.tile;
+            format!(
+                "vae_conv_tile<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {gin}, {}, {gout}, {}, CLAMP>",
+                t.bm, t.bn, t.bk, t.ph, t.pw, t.tm, t.tn, t.stages, s.k, s.kt, s.cin, s.cout, flag(s.upsample), flag(s.interleave), flag(silu), flag(k.epilogue.residual)
+            )
+        }
+        Family::Direct => format!("vae_conv_direct<{}, {}, {}, {}, {}, {}, {gin}, {}, {gout}, {}, CLAMP>", s.k, s.kt, s.cin, s.cout, flag(s.upsample), flag(s.interleave), flag(silu), flag(k.epilogue.residual)),
+    };
+    let mut out = String::new();
+    for (suffix, clamp) in [("", "false"), ("_clamp", "true")] {
+        out += &format!(
+            "extern \"C\" __global__ void __launch_bounds__({THREADS}) {}{suffix}({ARGS}) {{\n    {}({PASS});\n}}\n\n",
+            k.name(),
+            call.replace("CLAMP", clamp)
+        );
+    }
+    out
+}
+
+pub fn emit_vae(kernels: &[ConvKernel]) -> Result<crate::KirSource, ConvError> {
+    let mut out = format!("constexpr int THREAD_ROWS = {THREAD_ROWS};\nconstexpr int THREAD_COLS = {THREAD_COLS};\nconstexpr int MAX_GROUPS = {};\n\n", crate::conv::MAX_GROUPS);
+    out += LOAD_INPUT;
+    out += TILE_BODY;
+    out += DIRECT_BODY;
+    out += ROWS;
+    let mut seen = Vec::new();
+    for k in kernels {
+        k.validate()?;
+        if THREAD_ROWS * k.tile.tm != k.tile.bm || THREAD_COLS * k.tile.tn != k.tile.bn || (THREAD_ROWS * THREAD_COLS) as u32 != THREADS || !ROW_THREADS.is_multiple_of(32) {
+            return Err(ConvError(format!("{}: the tile {:?} does not map onto {THREADS} threads", k.name(), k.tile)));
+        }
+        if !seen.contains(&k.name()) {
+            seen.push(k.name());
+            out += &wrapper(k);
+        }
+    }
+    Ok(crate::KirSource::emitted(out))
+}

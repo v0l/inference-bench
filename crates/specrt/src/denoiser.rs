@@ -583,7 +583,7 @@ pub fn report(graph: &DenoiserGraph, spec: &DenoiserSpec, plan: &Plan, count: Co
 }
 
 pub fn count(image: usize, text: usize) -> Count {
-    Count { tokens: image + text, out: image, seqs: 1, context: image + text, image, text }
+    Count { tokens: image + text, out: image, seqs: 1, context: image + text, image, text, ..Count::default() }
 }
 
 #[derive(Clone, Debug, PartialEq)]

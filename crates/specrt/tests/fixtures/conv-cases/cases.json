@@ -1,0 +1,632 @@
+{
+ "generator": "splitmix64",
+ "cases": [
+  {
+   "name": "kl_post_quant",
+   "seed": 1000,
+   "cin": 4,
+   "cout": 4,
+   "k": 1,
+   "kt": 1,
+   "upsample": false,
+   "interleave": false,
+   "frames": 1,
+   "height": 16,
+   "width": 16,
+   "out": [
+    4,
+    1,
+    16,
+    16
+   ]
+  },
+  {
+   "name": "kl_conv_in",
+   "seed": 1017,
+   "cin": 4,
+   "cout": 32,
+   "k": 3,
+   "kt": 1,
+   "upsample": false,
+   "interleave": false,
+   "frames": 1,
+   "height": 16,
+   "width": 16,
+   "out": [
+    32,
+    1,
+    16,
+    16
+   ]
+  },
+  {
+   "name": "kl_resnet",
+   "seed": 1034,
+   "cin": 32,
+   "cout": 32,
+   "k": 3,
+   "kt": 1,
+   "upsample": false,
+   "interleave": false,
+   "frames": 1,
+   "height": 16,
+   "width": 16,
+   "out": [
+    32,
+    1,
+    16,
+    16
+   ]
+  },
+  {
+   "name": "kl_up",
+   "seed": 1051,
+   "cin": 32,
+   "cout": 32,
+   "k": 3,
+   "kt": 1,
+   "upsample": true,
+   "interleave": false,
+   "frames": 1,
+   "height": 16,
+   "width": 16,
+   "out": [
+    32,
+    1,
+    32,
+    32
+   ]
+  },
+  {
+   "name": "kl_narrow",
+   "seed": 1068,
+   "cin": 32,
+   "cout": 16,
+   "k": 3,
+   "kt": 1,
+   "upsample": false,
+   "interleave": false,
+   "frames": 1,
+   "height": 32,
+   "width": 32,
+   "out": [
+    16,
+    1,
+    32,
+    32
+   ]
+  },
+  {
+   "name": "kl_shortcut",
+   "seed": 1085,
+   "cin": 32,
+   "cout": 16,
+   "k": 1,
+   "kt": 1,
+   "upsample": false,
+   "interleave": false,
+   "frames": 1,
+   "height": 32,
+   "width": 32,
+   "out": [
+    16,
+    1,
+    32,
+    32
+   ]
+  },
+  {
+   "name": "kl_resnet16",
+   "seed": 1102,
+   "cin": 16,
+   "cout": 16,
+   "k": 3,
+   "kt": 1,
+   "upsample": false,
+   "interleave": false,
+   "frames": 1,
+   "height": 32,
+   "width": 32,
+   "out": [
+    16,
+    1,
+    32,
+    32
+   ]
+  },
+  {
+   "name": "kl_out",
+   "seed": 1119,
+   "cin": 16,
+   "cout": 3,
+   "k": 3,
+   "kt": 1,
+   "upsample": false,
+   "interleave": false,
+   "frames": 1,
+   "height": 32,
+   "width": 32,
+   "out": [
+    3,
+    1,
+    32,
+    32
+   ]
+  },
+  {
+   "name": "kl_qkv",
+   "seed": 1136,
+   "cin": 32,
+   "cout": 96,
+   "k": 1,
+   "kt": 1,
+   "upsample": false,
+   "interleave": false,
+   "frames": 1,
+   "height": 16,
+   "width": 16,
+   "out": [
+    96,
+    1,
+    16,
+    16
+   ]
+  },
+  {
+   "name": "kl_proj",
+   "seed": 1153,
+   "cin": 32,
+   "cout": 32,
+   "k": 1,
+   "kt": 1,
+   "upsample": false,
+   "interleave": false,
+   "frames": 1,
+   "height": 16,
+   "width": 16,
+   "out": [
+    32,
+    1,
+    16,
+    16
+   ]
+  },
+  {
+   "name": "wan_post_quant",
+   "seed": 1170,
+   "cin": 4,
+   "cout": 4,
+   "k": 1,
+   "kt": 1,
+   "upsample": false,
+   "interleave": false,
+   "frames": 3,
+   "height": 8,
+   "width": 8,
+   "out": [
+    4,
+    3,
+    8,
+    8
+   ]
+  },
+  {
+   "name": "wan_conv_in",
+   "seed": 1187,
+   "cin": 4,
+   "cout": 16,
+   "k": 3,
+   "kt": 3,
+   "upsample": false,
+   "interleave": false,
+   "frames": 3,
+   "height": 8,
+   "width": 8,
+   "out": [
+    16,
+    3,
+    8,
+    8
+   ]
+  },
+  {
+   "name": "wan_resnet",
+   "seed": 1204,
+   "cin": 16,
+   "cout": 16,
+   "k": 3,
+   "kt": 3,
+   "upsample": false,
+   "interleave": false,
+   "frames": 3,
+   "height": 8,
+   "width": 8,
+   "out": [
+    16,
+    3,
+    8,
+    8
+   ]
+  },
+  {
+   "name": "wan_qkv",
+   "seed": 1221,
+   "cin": 16,
+   "cout": 48,
+   "k": 1,
+   "kt": 1,
+   "upsample": false,
+   "interleave": false,
+   "frames": 3,
+   "height": 8,
+   "width": 8,
+   "out": [
+    48,
+    3,
+    8,
+    8
+   ]
+  },
+  {
+   "name": "wan_proj",
+   "seed": 1238,
+   "cin": 16,
+   "cout": 16,
+   "k": 1,
+   "kt": 1,
+   "upsample": false,
+   "interleave": false,
+   "frames": 3,
+   "height": 8,
+   "width": 8,
+   "out": [
+    16,
+    3,
+    8,
+    8
+   ]
+  },
+  {
+   "name": "wan_time_up",
+   "seed": 1255,
+   "cin": 16,
+   "cout": 32,
+   "k": 1,
+   "kt": 3,
+   "upsample": false,
+   "interleave": true,
+   "frames": 3,
+   "height": 8,
+   "width": 8,
+   "out": [
+    16,
+    6,
+    8,
+    8
+   ]
+  },
+  {
+   "name": "wan_up",
+   "seed": 1272,
+   "cin": 16,
+   "cout": 8,
+   "k": 3,
+   "kt": 1,
+   "upsample": true,
+   "interleave": false,
+   "frames": 5,
+   "height": 8,
+   "width": 8,
+   "out": [
+    8,
+    5,
+    16,
+    16
+   ]
+  },
+  {
+   "name": "wan_widen",
+   "seed": 1289,
+   "cin": 8,
+   "cout": 16,
+   "k": 3,
+   "kt": 3,
+   "upsample": false,
+   "interleave": false,
+   "frames": 5,
+   "height": 16,
+   "width": 16,
+   "out": [
+    16,
+    5,
+    16,
+    16
+   ]
+  },
+  {
+   "name": "wan_shortcut",
+   "seed": 1306,
+   "cin": 8,
+   "cout": 16,
+   "k": 1,
+   "kt": 1,
+   "upsample": false,
+   "interleave": false,
+   "frames": 5,
+   "height": 16,
+   "width": 16,
+   "out": [
+    16,
+    5,
+    16,
+    16
+   ]
+  },
+  {
+   "name": "wan_up2",
+   "seed": 1323,
+   "cin": 16,
+   "cout": 8,
+   "k": 3,
+   "kt": 1,
+   "upsample": true,
+   "interleave": false,
+   "frames": 5,
+   "height": 16,
+   "width": 16,
+   "out": [
+    8,
+    5,
+    32,
+    32
+   ]
+  },
+  {
+   "name": "wan_resnet8",
+   "seed": 1340,
+   "cin": 8,
+   "cout": 8,
+   "k": 3,
+   "kt": 3,
+   "upsample": false,
+   "interleave": false,
+   "frames": 5,
+   "height": 32,
+   "width": 32,
+   "out": [
+    8,
+    5,
+    32,
+    32
+   ]
+  },
+  {
+   "name": "wan_out",
+   "seed": 1357,
+   "cin": 8,
+   "cout": 3,
+   "k": 3,
+   "kt": 3,
+   "upsample": false,
+   "interleave": false,
+   "frames": 5,
+   "height": 32,
+   "width": 32,
+   "out": [
+    3,
+    5,
+    32,
+    32
+   ]
+  },
+  {
+   "name": "big_resnet",
+   "seed": 1374,
+   "cin": 512,
+   "cout": 512,
+   "k": 3,
+   "kt": 1,
+   "upsample": false,
+   "interleave": false,
+   "frames": 1,
+   "height": 6,
+   "width": 10,
+   "out": [
+    512,
+    1,
+    6,
+    10
+   ]
+  },
+  {
+   "name": "big_conv_in",
+   "seed": 1391,
+   "cin": 32,
+   "cout": 512,
+   "k": 3,
+   "kt": 1,
+   "upsample": false,
+   "interleave": false,
+   "frames": 1,
+   "height": 6,
+   "width": 10,
+   "out": [
+    512,
+    1,
+    6,
+    10
+   ]
+  },
+  {
+   "name": "big_shortcut",
+   "seed": 1408,
+   "cin": 256,
+   "cout": 128,
+   "k": 1,
+   "kt": 1,
+   "upsample": false,
+   "interleave": false,
+   "frames": 1,
+   "height": 6,
+   "width": 10,
+   "out": [
+    128,
+    1,
+    6,
+    10
+   ]
+  },
+  {
+   "name": "big_out",
+   "seed": 1425,
+   "cin": 128,
+   "cout": 3,
+   "k": 3,
+   "kt": 1,
+   "upsample": false,
+   "interleave": false,
+   "frames": 1,
+   "height": 12,
+   "width": 20,
+   "out": [
+    3,
+    1,
+    12,
+    20
+   ]
+  },
+  {
+   "name": "big_up",
+   "seed": 1442,
+   "cin": 512,
+   "cout": 512,
+   "k": 3,
+   "kt": 1,
+   "upsample": true,
+   "interleave": false,
+   "frames": 1,
+   "height": 3,
+   "width": 5,
+   "out": [
+    512,
+    1,
+    6,
+    10
+   ]
+  },
+  {
+   "name": "big_qkv",
+   "seed": 1459,
+   "cin": 512,
+   "cout": 1536,
+   "k": 1,
+   "kt": 1,
+   "upsample": false,
+   "interleave": false,
+   "frames": 1,
+   "height": 4,
+   "width": 4,
+   "out": [
+    1536,
+    1,
+    4,
+    4
+   ]
+  },
+  {
+   "name": "big3d_in",
+   "seed": 1476,
+   "cin": 16,
+   "cout": 384,
+   "k": 3,
+   "kt": 3,
+   "upsample": false,
+   "interleave": false,
+   "frames": 2,
+   "height": 4,
+   "width": 6,
+   "out": [
+    384,
+    2,
+    4,
+    6
+   ]
+  },
+  {
+   "name": "big3d_resnet",
+   "seed": 1493,
+   "cin": 384,
+   "cout": 384,
+   "k": 3,
+   "kt": 3,
+   "upsample": false,
+   "interleave": false,
+   "frames": 2,
+   "height": 4,
+   "width": 6,
+   "out": [
+    384,
+    2,
+    4,
+    6
+   ]
+  },
+  {
+   "name": "big3d_time_up",
+   "seed": 1510,
+   "cin": 384,
+   "cout": 768,
+   "k": 1,
+   "kt": 3,
+   "upsample": false,
+   "interleave": true,
+   "frames": 2,
+   "height": 4,
+   "width": 6,
+   "out": [
+    384,
+    4,
+    4,
+    6
+   ]
+  },
+  {
+   "name": "big3d_up",
+   "seed": 1527,
+   "cin": 384,
+   "cout": 192,
+   "k": 3,
+   "kt": 1,
+   "upsample": true,
+   "interleave": false,
+   "frames": 1,
+   "height": 2,
+   "width": 3,
+   "out": [
+    192,
+    1,
+    4,
+    6
+   ]
+  },
+  {
+   "name": "big3d_out",
+   "seed": 1544,
+   "cin": 96,
+   "cout": 3,
+   "k": 3,
+   "kt": 3,
+   "upsample": false,
+   "interleave": false,
+   "frames": 2,
+   "height": 4,
+   "width": 6,
+   "out": [
+    3,
+    2,
+    4,
+    6
+   ]
+  }
+ ]
+}

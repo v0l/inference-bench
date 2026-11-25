@@ -62,6 +62,7 @@ pub mod solve;
 pub mod sessions;
 pub mod tp;
 pub mod tp_exec;
+pub mod vae;
 pub mod spec;
 pub mod stage;
 pub mod statepool;
