@@ -703,6 +703,9 @@ fn glm5_3_flash_serves_text_with_its_glm_keys() {
     no_theta.rope.theta = None;
     assert!(no_theta.runnable().unwrap_err().to_string().contains("rope theta is required to run"));
     let served = Spec::from_hf_config_serving(&json).unwrap_or_else(|e| panic!("{e:#}"));
+    assert_eq!((spec.quant, spec.mlp.quant), (served.quant, served.mlp.quant), "the describe path reads the quant map as the engine does");
+    let (described, engine) = (specrt::anatomy::ModelAnatomy::new(&spec, 0, None).total_bytes, specrt::anatomy::ModelAnatomy::new(&served, 0, None).total_bytes);
+    assert!(described < 250_000_000_000 && described.abs_diff(engine) * 100 < engine, "described {described} engine {engine}");
     served.runnable().unwrap_or_else(|e| panic!("{e:#}"));
     assert_eq!(served.name, "glm5_next");
     assert_eq!(served.hyper.as_ref().map(|h| (h.streams, h.sinkhorn_iters, h.sites.len())), Some((4, 20, 2)), "hc_mult streams around attention and MLP");

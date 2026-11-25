@@ -2045,7 +2045,7 @@ impl Spec {
             (Some(Err(_)), false) => Default::default(),
         };
         let quantization = match quantization {
-            Err(_) if family.quantization.per_tensor && !quant_map.is_empty() => Ok(Quantization::per_tensor(&quant_map, hf.num_experts.is_some_and(|e| e > 0), hf.num_hidden_layers)),
+            Err(_) if (family.quantization.per_tensor || !strict) && !quant_map.is_empty() => Ok(Quantization::per_tensor(&quant_map, hf.num_experts.is_some_and(|e| e > 0), hf.num_hidden_layers)),
             other => other,
         };
         let Quantization { quant, mlp: mlp_quant, act, mlp_act } = match (quantization, strict) {
