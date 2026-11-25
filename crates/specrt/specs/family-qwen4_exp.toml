@@ -2,12 +2,16 @@ name = "qwen4_exp"
 kind = "family"
 min_engine = 16
 extends = "qwen3_5"
-mtp = false
 
 [match]
 model_types = ["qwen4_exp", "qwen4_exp_text"]
 architectures = ["Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM"]
 gguf = []
+
+[[refuse]]
+when = "mtp_num_hidden_layers > 0"
+part = "mtp"
+message = "the Qwen4Exp MTP layer (four stream input, fc_embedding and fc_hidden, indexed attention) is not supported yet (#1350); text is served without it"
 
 [vision]
 ignore = true

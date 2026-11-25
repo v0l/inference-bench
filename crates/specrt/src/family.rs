@@ -285,6 +285,8 @@ impl Default for FamilyNorm {
 pub struct FamilyRefuse {
     pub when: String,
     pub message: String,
+    #[serde(default)]
+    pub part: Option<String>,
 }
 
 impl FamilyRefuse {

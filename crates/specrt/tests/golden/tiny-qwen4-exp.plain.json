@@ -1,1 +1,643 @@
-refused: model_type qwen4_exp is not supported
+{
+  "name": "qwen4_exp",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 128,
+    "intermediate": 32,
+    "vocab": 512,
+    "tie_embeddings": false
+  },
+  "layers": {
+    "count": 4,
+    "pattern": [
+      "linear",
+      "linear",
+      "linear",
+      "full"
+    ]
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 1e-6,
+    "unit_offset": true,
+    "pre": false
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 4,
+    "kv_heads": 2,
+    "head_dim": 256,
+    "qkv_bias": false,
+    "qk_norm": true,
+    "output_gate": true,
+    "rotary_dim": 64,
+    "node": [
+      {
+        "op": "qk_rope",
+        "phase": "prefill"
+      },
+      {
+        "op": "decode_rope",
+        "phase": "rows"
+      },
+      {
+        "op": "kernel",
+        "kernel": "qsa_index_raw_write",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "dst": {
+            "state": "index_raw"
+          },
+          "src": {
+            "buffer": "qkv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "qsa_index_pool",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "dst": {
+            "state": "index_pool"
+          },
+          "norm": {
+            "weight": "indexer.k_layernorm.weight",
+            "len": "index_head_dim"
+          },
+          "raw": {
+            "state": "index_raw"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "qsa_index_select",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "idx": {
+            "buffer": "index_sel"
+          },
+          "keys": {
+            "state": "index_pool"
+          },
+          "norm": {
+            "weight": "indexer.q_layernorm.weight",
+            "len": "index_head_dim"
+          },
+          "q": {
+            "buffer": "qkv"
+          },
+          "scale": "index_scale"
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "qsa_attention",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "idx": {
+            "buffer": "index_sel"
+          }
+        }
+      }
+    ],
+    "params": {
+      "index_groups": 4.0,
+      "index_head_dim": 64.0,
+      "index_heads": 4.0,
+      "index_out": 19.0,
+      "index_ratio": 4.0,
+      "index_scale": 0.125
+    },
+    "projection": [
+      {
+        "tensor": "indexer.index_qk_proj",
+        "rows": "(index_heads + 1) * index_head_dim",
+        "append": true
+      }
+    ],
+    "int_scratch": {
+      "index_sel": "index_out"
+    }
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 10000000.0
+  },
+  "mlp": {
+    "activation": "swiglu"
+  },
+  "moe": {
+    "experts": 8,
+    "active": 2,
+    "expert_intermediate": 32,
+    "shared_intermediate": 32,
+    "shared_gate": true
+  },
+  "linear_attention": {
+    "kind": "gated_delta_net",
+    "key_heads": 2,
+    "value_heads": 4,
+    "key_head_dim": 128,
+    "value_head_dim": 128,
+    "conv_kernel": 4,
+    "gate_sigmoid": true
+  },
+  "gated_residual": {
+    "streams": 4,
+    "module": "hyper_connection_mixer",
+    "sites": [
+      "attn_hyper_connection",
+      "mlp_hyper_connection"
+    ],
+    "params": {
+      "hc_blocks": 1.0,
+      "hc_lowrank": 16.0
+    },
+    "scratch": {
+      "hc_gate": "hc_width",
+      "hc_inject": "hc_streams",
+      "hc_low": "hc_lowrank",
+      "hc_normed": "hc_width"
+    },
+    "node": [
+      {
+        "op": "expand",
+        "kernel": "hc_expand",
+        "grid": [
+          "hc_blocks",
+          "rows"
+        ],
+        "bind": {
+          "a": {
+            "buffer": "x"
+          },
+          "x": {
+            "buffer": "streams"
+          }
+        }
+      },
+      {
+        "op": "pre",
+        "kernel": "hc_norm",
+        "grid": [
+          "hc_streams",
+          "rows"
+        ],
+        "bind": {
+          "g": {
+            "buffer": "streams"
+          },
+          "w": {
+            "weight": "hc_norm.weight",
+            "len": "hc_width"
+          },
+          "x": {
+            "buffer": "streams"
+          },
+          "y": {
+            "buffer": "hc_normed"
+          }
+        }
+      },
+      {
+        "op": "pre",
+        "kernel": "hc_down",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "input_mix_weight_down.weight",
+            "len": "hc_lowrank * hc_width"
+          },
+          "x": {
+            "buffer": "hc_normed"
+          },
+          "y": {
+            "buffer": "hc_low"
+          }
+        }
+      },
+      {
+        "op": "pre",
+        "kernel": "hc_act",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "out": {
+            "buffer": "hc_low"
+          },
+          "x": {
+            "buffer": "hc_low"
+          }
+        }
+      },
+      {
+        "op": "pre",
+        "kernel": "hc_up",
+        "grid": [
+          "hc_streams",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "input_mix_weight_up.weight",
+            "len": "hc_width * hc_lowrank"
+          },
+          "x": {
+            "buffer": "hc_low"
+          },
+          "y": {
+            "buffer": "hc_gate"
+          }
+        }
+      },
+      {
+        "op": "pre",
+        "kernel": "hc_inject",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "block_inject_weight.weight",
+            "len": "hc_streams * hc_width"
+          },
+          "x": {
+            "buffer": "hc_normed"
+          },
+          "y": {
+            "buffer": "hc_inject"
+          }
+        },
+        "when": "site"
+      },
+      {
+        "op": "pre",
+        "kernel": "hc_mix",
+        "grid": [
+          "hc_blocks",
+          "rows"
+        ],
+        "bind": {
+          "a": {
+            "buffer": "hc_gate"
+          },
+          "b": {
+            "buffer": "hc_normed"
+          },
+          "y": {
+            "buffer": "x"
+          }
+        }
+      },
+      {
+        "op": "post",
+        "kernel": "hc_inject_add",
+        "grid": [
+          "hc_blocks",
+          "rows"
+        ],
+        "bind": {
+          "a": {
+            "buffer": "x"
+          },
+          "c": {
+            "buffer": "hc_inject"
+          },
+          "x": {
+            "buffer": "streams"
+          }
+        }
+      }
+    ]
+  },
+  "prelude": {
+    "module": "ple",
+    "layers": [
+      1
+    ],
+    "index": "ple_index",
+    "count": "ple_layers",
+    "params": {
+      "heads_per_ngram": 2.0,
+      "ngram_base": 1000.0,
+      "ngram_eos": 1.0,
+      "ngram_heads": 4.0,
+      "ngram_rows": 4096.0,
+      "ngram_seed": 1234.0,
+      "ngram_size": 3.0,
+      "ple_blocks": 4.0,
+      "ple_conv_state": 9.0,
+      "ple_conv_taps": 4.0,
+      "ple_embed_dim": 128.0,
+      "ple_gate_scale": 0.08838834764831843,
+      "ple_head_dim": 32.0,
+      "ple_width": 512.0,
+      "streams": 4.0
+    },
+    "scratch": {
+      "ple_convolved": "ple_width",
+      "ple_emb": "ple_embed_dim",
+      "ple_gated": "ple_width",
+      "ple_key": "ple_width",
+      "ple_normed": "ple_width",
+      "ple_out": "ple_width",
+      "ple_value": "hidden"
+    },
+    "int_scratch": {
+      "ple_ids": "ngram_heads"
+    },
+    "node": [
+      {
+        "op": "kernel",
+        "kernel": "ple_ngram_hash",
+        "grid": [
+          "seqs"
+        ],
+        "bind": {
+          "idx": {
+            "buffer": "ple_ids"
+          },
+          "state": {
+            "state": "ngram_history"
+          },
+          "tokens": {
+            "buffer": "tokens"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "ple_embed_gather",
+        "grid": [
+          "ngram_heads",
+          "rows"
+        ],
+        "bind": {
+          "emb": {
+            "buffer": "ple_emb"
+          },
+          "idx": {
+            "buffer": "ple_ids"
+          },
+          "table": {
+            "weight": "ple_embedding.ngram_embedding.weight",
+            "len": "ngram_rows * ple_head_dim"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "ple_key_proj",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "key_proj.weight",
+            "len": "ple_width * ple_embed_dim"
+          },
+          "x": {
+            "buffer": "ple_emb"
+          },
+          "y": {
+            "buffer": "ple_key"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "ple_value_proj",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "value_proj.weight",
+            "len": "hidden * ple_embed_dim"
+          },
+          "x": {
+            "buffer": "ple_emb"
+          },
+          "y": {
+            "buffer": "ple_value"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "ple_gate",
+        "grid": [
+          "streams",
+          "rows"
+        ],
+        "bind": {
+          "gated": {
+            "buffer": "ple_gated"
+          },
+          "key": {
+            "buffer": "ple_key"
+          },
+          "norm_conv": {
+            "weight": "norm_conv.weight",
+            "len": "ple_width"
+          },
+          "norm_key": {
+            "weight": "norm_key.weight",
+            "len": "ple_width"
+          },
+          "norm_query": {
+            "weight": "norm_query.weight",
+            "len": "ple_width"
+          },
+          "normed": {
+            "buffer": "ple_normed"
+          },
+          "value": {
+            "buffer": "ple_value"
+          },
+          "x": {
+            "buffer": "streams"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "ple_conv",
+        "grid": [
+          "ple_blocks",
+          "seqs"
+        ],
+        "bind": {
+          "state": {
+            "state": "ple_conv"
+          },
+          "w": {
+            "weight": "conv1d.weight",
+            "len": "ple_width * ple_conv_taps"
+          },
+          "x": {
+            "buffer": "ple_normed"
+          },
+          "y": {
+            "buffer": "ple_convolved"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "ple_add",
+        "grid": [
+          "streams",
+          "rows"
+        ],
+        "bind": {
+          "conv": {
+            "buffer": "ple_convolved"
+          },
+          "gated": {
+            "buffer": "ple_gated"
+          },
+          "out": {
+            "buffer": "streams"
+          },
+          "ple": {
+            "buffer": "ple_out"
+          },
+          "x": {
+            "buffer": "streams"
+          }
+        }
+      }
+    ]
+  },
+  "state": [
+    {
+      "name": "k",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional"
+    },
+    {
+      "name": "v",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional"
+    },
+    {
+      "name": "index_raw",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "1",
+        "index_head_dim"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional"
+    },
+    {
+      "name": "index_pool",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "1",
+        "index_head_dim"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional"
+    },
+    {
+      "name": "conv",
+      "per": "sequence",
+      "layers": "linear",
+      "shape": [
+        "conv_dim",
+        "conv_taps"
+      ],
+      "dtype": "f32",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "checkpoint"
+    },
+    {
+      "name": "ssm",
+      "per": "sequence",
+      "layers": "linear",
+      "shape": [
+        "value_heads",
+        "key_head_dim",
+        "key_head_dim"
+      ],
+      "dtype": "f32",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "checkpoint"
+    },
+    {
+      "name": "ngram_history",
+      "per": "sequence",
+      "layers": "prelude",
+      "shape": [
+        "ngram_size - 1"
+      ],
+      "dtype": "f32",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "checkpoint"
+    },
+    {
+      "name": "ple_conv",
+      "per": "sequence",
+      "layers": "prelude",
+      "shape": [
+        "ple_width",
+        "ple_conv_state"
+      ],
+      "dtype": "f32",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "checkpoint"
+    }
+  ],
+  "plain_activations": true
+}

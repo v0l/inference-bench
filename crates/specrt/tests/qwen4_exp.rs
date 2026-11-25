@@ -96,7 +96,8 @@ fn the_engine_serves_qwen4_exp_from_its_family_spec() {
     let s = Spec::from_hf_config(&config()).unwrap_or_else(|e| panic!("{e:#}"));
     s.runnable().unwrap();
     assert_eq!(s.name, "qwen4_exp");
-    assert!(s.mtp.is_none() && s.vision.is_none(), "text only, the MTP layer is not served");
+    assert!(s.mtp.is_none() && s.vision.is_none(), "text only, the tiny fixture has no MTP layer");
+    assert!(s.refused.is_empty());
     let p = s.prelude.as_ref().expect("ple_layer_ids names a prelude");
     assert_eq!((p.module.as_str(), p.layers.clone()), ("ple", vec![1]));
     assert_eq!((p.params["ngram_heads"], p.params["ngram_rows"], p.params["ple_head_dim"], p.params["ple_conv_state"]), (4.0, 4096.0, 32.0, 9.0));
@@ -119,6 +120,12 @@ fn the_real_qwen3_8_flash_next_config_serves_text_with_offload_sized_pieces() {
     assert_eq!((moe.experts, moe.active, moe.expert_intermediate, moe.shared_intermediate), (512, Some(10), 640, 640));
     assert_eq!(s.gated_residual().map(|h| (h.streams, h.params["hc_lowrank"])), Some((4, 320.0)));
     assert!(s.mtp.is_none() && s.vision.is_none());
+    let why = s.refused_part("mtp").expect("the MTP layer is refused by name");
+    assert!(why.contains("#1350"), "{why}");
+    let mut on = s.clone();
+    let e = specrt::serve::SpeculativeOptions { enabled: Some(true), ..Default::default() }.apply(&mut on).unwrap_err().to_string();
+    assert!(e.contains("refuses its MTP layer") && e.contains("#1350"), "{e}");
+    specrt::serve::SpeculativeOptions::default().apply(&mut s.clone()).unwrap();
 }
 
 fn engine() -> Spec {

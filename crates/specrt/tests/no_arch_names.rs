@@ -25,7 +25,7 @@ const ALLOWED: &[Entry] = &[
     Entry { path: "core/src/cluster.rs", lines: 2, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
     Entry { path: "core/src/discover.rs", lines: 29, kind: Kind::Permanent, note: "discovery of model repos; tests name real repos" },
     Entry { path: "core/src/hf.rs", lines: 11, kind: Kind::Permanent, note: "Hugging Face client tests use real repo names" },
-    Entry { path: "core/src/library.rs", lines: 93, kind: Kind::Permanent, note: "model catalogue and display names" },
+    Entry { path: "core/src/library.rs", lines: 92, kind: Kind::Permanent, note: "model catalogue and display names" },
     Entry { path: "core/src/matrix.rs", lines: 5, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
     Entry { path: "core/src/openai.rs", lines: 16, kind: Kind::Permanent, note: "OpenAI client tests use model ids" },
     Entry { path: "core/src/report.rs", lines: 3, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },

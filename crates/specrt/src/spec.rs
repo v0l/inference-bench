@@ -1120,6 +1120,21 @@ pub struct Spec {
     pub iq_quants: bool,
     #[serde(default, skip_serializing_if = "crate::quant_map::QuantMap::is_empty")]
     pub quant_map: crate::quant_map::QuantMap,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<Refusal>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Refusal {
+    pub part: String,
+    pub message: String,
+}
+
+impl Spec {
+    pub fn refused_part(&self, part: &str) -> Option<&str> {
+        self.refused.iter().find(|r| r.part == part).map(|r| r.message.as_str())
+    }
 }
 
 pub const MAX_DRAFT_TOKENS: usize = 3;
@@ -1790,9 +1805,18 @@ impl Spec {
             family.attention.output_gate.read(&value),
         );
         family.normalise(&mut value);
+        let mut refused = Vec::new();
         if strict {
             for r in &family.refuse {
-                ensure!(!r.hits(&value)?, "{}", r.message);
+                match r.part.as_deref() {
+                    None => ensure!(!r.hits(&value)?, "{}", r.message),
+                    Some("mtp") => {
+                        if r.hits(&value)? {
+                            refused.push(Refusal { part: "mtp".into(), message: r.message.clone() });
+                        }
+                    }
+                    Some(other) => bail!("[[refuse]] part {other:?} is not mtp"),
+                }
             }
         }
         let dtype_values: std::collections::HashMap<&str, String> = family
@@ -2066,7 +2090,7 @@ impl Spec {
                 },
             },
             moe,
-            mtp: (family.mtp && (hybrid || family.mtp_layout.is_some()) && hf.mtp_num_hidden_layers > 0)
+            mtp: (family.mtp && (hybrid || family.mtp_layout.is_some()) && hf.mtp_num_hidden_layers > 0 && !refused.iter().any(|r| r.part == "mtp"))
                 .then(|| Mtp { layout: family.mtp_layout.clone(), ..Mtp::new(hf.mtp_num_hidden_layers) }),
             linear_attention,
             mixer,
@@ -2080,6 +2104,7 @@ impl Spec {
             plain_activations: !family.runtime.split_activations,
             iq_quants: false,
             quant_map,
+            refused,
         };
         Ok(spec)
     }
