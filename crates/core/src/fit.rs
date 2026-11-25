@@ -3,9 +3,13 @@ use specrt::anatomy::ModelAnatomy;
 pub const MIN_CTX: usize = 512;
 pub const STEP: usize = 512;
 pub const MAX_SEQS: usize = crate::engine::MAX_PARALLEL;
-pub const GPU_UTILIZATION: f64 = 0.9;
+pub const GPU_RESERVE: u64 = (specrt::placement::DEFAULT_RESERVE_GIB * GB) as u64;
 pub const TYPICAL_REQUEST: usize = 4096;
 pub const GB: f64 = (1u64 << 30) as f64;
+
+pub fn usable(free: u64) -> u64 {
+    free.saturating_sub(GPU_RESERVE)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Estimate {
@@ -58,7 +62,7 @@ pub fn default_kv_gb(a: &ModelAnatomy, free: Option<u64>, seqs: usize, ctx: usiz
     let needed = round_gb(a.kv_bytes_per_token * ctx as u64);
     match free {
         Some(f) => {
-            let usable = (f as f64 * GPU_UTILIZATION) as u64;
+            let usable = usable(f);
             let room = usable.saturating_sub(a.total_bytes + a.state_bytes_per_seq * seqs.max(1) as u64);
             round_gb_down(room).max(needed)
         }
@@ -143,7 +147,7 @@ pub fn tokens_for_kv_gb(bytes_per_token: u64, gb: f64) -> usize {
 }
 
 pub fn fitting_context(a: &ModelAnatomy, free: Option<u64>, seqs: usize) -> Option<usize> {
-    let usable = (free? as f64 * GPU_UTILIZATION) as u64;
+    let usable = usable(free?);
     let room = usable.checked_sub(a.total_bytes + a.state_bytes_per_seq * seqs.max(1) as u64)?;
     let tokens = pool_tokens(a, room).min(a.max_context.max(1));
     Some(tokens.max(1))
@@ -275,6 +279,17 @@ pub fn describe(m: &crate::library::LocalModel) -> Result<Described, String> {
     }
 }
 
+pub fn as_served(m: &crate::library::LocalModel, d: &mut Described) {
+    if m.format != crate::library::Format::Safetensors {
+        return;
+    }
+    let Some(served) = std::fs::read_to_string(m.path.join("config.json")).ok().and_then(|t| specrt::spec::Spec::from_hf_config_serving(&t).ok()) else { return };
+    let mtp = if served.speculative().is_some() { d.anatomy.mtp_layers } else { 0 };
+    d.spec.mtp = served.mtp;
+    d.spec.mixer = served.mixer;
+    d.anatomy = ModelAnatomy::new(&d.spec, mtp, Some(d.anatomy.max_context));
+}
+
 pub fn describe_hf_config(name: &str, text: &str, mtp: usize, ctx: Option<usize>) -> Result<Described, String> {
     let mut spec = specrt::spec::Spec::describe_hf_config(text).map_err(|e| format!("{e:#}"))?;
     spec.name = name.to_string();
@@ -397,7 +412,7 @@ mod tests {
         let s = spec();
         let a = specrt::anatomy::ModelAnatomy::new(&s, 0, None);
         let big = fitting_context(&a, Some(96 << 30), 1).unwrap();
-        let small = fitting_context(&a, Some(a.total_bytes + (2 << 30)), 1).unwrap();
+        let small = fitting_context(&a, Some(a.total_bytes + GPU_RESERVE + (2 << 30)), 1).unwrap();
         assert!(small < big);
         assert!(big <= a.max_context.max(1));
         assert_eq!(fitting_context(&a, Some(1 << 20), 1), None);

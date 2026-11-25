@@ -132,7 +132,7 @@ fn choice_of(ui: &mut egui::Ui, id: &str, picked: &mut String, options: Vec<(Str
 
 impl LoadDialog {
     pub fn open(app: &App, model: &LocalModel) -> Self {
-        let view = View::load(model);
+        let view = View::served(model);
         let free = app.free_gpu_bytes();
         let remembered_seqs = app.settings.model_seqs.get(&model.name).copied();
         let (ctx, max, seqs, kv_gb) = match &view {

@@ -4,7 +4,7 @@ use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 const GIB: f64 = (1u64 << 30) as f64;
-const DEFAULT_RESERVE_GIB: f64 = 2.0;
+pub const DEFAULT_RESERVE_GIB: f64 = 2.0;
 const FLOPS_PER_PARAM: f64 = 2.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

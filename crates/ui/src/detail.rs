@@ -48,7 +48,16 @@ impl View {
     }
 
     pub fn load(m: &LocalModel) -> Result<View, String> {
-        let d = inference_bench_core::fit::describe(m)?;
+        Self::from_described(m, inference_bench_core::fit::describe(m)?)
+    }
+
+    pub fn served(m: &LocalModel) -> Result<View, String> {
+        let mut d = inference_bench_core::fit::describe(m)?;
+        inference_bench_core::fit::as_served(m, &mut d);
+        Self::from_described(m, d)
+    }
+
+    fn from_described(m: &LocalModel, d: inference_bench_core::fit::Described) -> Result<View, String> {
         let source = match m.format {
             Format::Gguf => Source::GgufMetadata,
             Format::Spec => Source::SpecToml,

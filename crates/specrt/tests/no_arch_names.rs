@@ -23,6 +23,7 @@ const ALLOWED: &[Entry] = &[
     Entry { path: "cli/src/launch.rs", lines: 3, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
     Entry { path: "cli/src/main.rs", lines: 1, kind: Kind::Permanent, note: "help text names other engines" },
     Entry { path: "core/src/cluster.rs", lines: 2, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
+    Entry { path: "core/src/inventory.rs", lines: 1, kind: Kind::Permanent, note: "tests only: a real config fixture" },
     Entry { path: "core/src/discover.rs", lines: 29, kind: Kind::Permanent, note: "discovery of model repos; tests name real repos" },
     Entry { path: "core/src/hf.rs", lines: 11, kind: Kind::Permanent, note: "Hugging Face client tests use real repo names" },
     Entry { path: "core/src/library.rs", lines: 93, kind: Kind::Permanent, note: "model catalogue and display names" },
@@ -57,7 +58,7 @@ const ALLOWED: &[Entry] = &[
     Entry { path: "ui/src/models.rs", lines: 1, kind: Kind::Permanent, note: "example model name shown as a hint" },
     Entry { path: "core/src/fit.rs", lines: 1, kind: Kind::Permanent, note: "fit tests over a real model fixture" },
     Entry { path: "ui/src/table.rs", lines: 3, kind: Kind::Permanent, note: "UI tests over real model fixtures" },
-    Entry { path: "ui/src/tests.rs", lines: 153, kind: Kind::Permanent, note: "UI tests over real model fixtures" },
+    Entry { path: "ui/src/tests.rs", lines: 154, kind: Kind::Permanent, note: "UI tests over real model fixtures" },
 ];
 
 fn allowed(rel: &str) -> usize {

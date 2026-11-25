@@ -127,7 +127,8 @@
     ]
   },
   "mlp": {
-    "activation": "swiglu"
+    "activation": "swiglu",
+    "quant": "nvfp4_g16"
   },
   "moe": {
     "experts": 288,
