@@ -237,6 +237,7 @@ pub enum Op {
     Kernel { node: u8 },
     MixKernel { node: u8 },
     Gated { node: u8, site: u8 },
+    Prelude { node: u8 },
     Swiglu,
     GdnPrefill,
     GdnDecode,
@@ -299,6 +300,7 @@ impl Op {
             Op::MixKernel { .. } => "described mixer kernel".into(),
             Op::Gated { site: GATED_MODULE, .. } => "gated residual mixer".into(),
             Op::Gated { site, .. } => format!("gated residual site {site}"),
+            Op::Prelude { .. } => "described prelude kernel".into(),
             Op::Swiglu => "swiglu".into(),
             Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => "delta rule".into(),
             Op::MtpIn => "draft input".into(),
@@ -338,6 +340,7 @@ impl Op {
             Op::Flash | Op::FlashLegacy | Op::DecodeAttention | Op::Kernel { .. } => "qkv and kv cache to attn".into(),
             Op::MixKernel { .. } => "mix and sequence state to mix planes".into(),
             Op::Gated { .. } => "streams and x".into(),
+            Op::Prelude { .. } => "tokens, streams and sequence state to streams".into(),
             Op::Swiglu => "gate_up to act".into(),
             Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => "lin, ba and state to gdn".into(),
             Op::MtpIn => "tokens and hidden to fc planes".into(),
@@ -401,6 +404,17 @@ impl Op {
                     let module = h.sites.get(*site as usize).cloned().unwrap_or_else(|| h.module.clone());
                     n.bind.values().filter_map(move |b| match b {
                         crate::graph::Bind::Weight { weight, .. } => Some(format!("{module}.{weight}")),
+                        _ => None,
+                    })
+                })
+                .collect(),
+            Op::Prelude { node } => spec
+                .prelude
+                .iter()
+                .filter_map(|p| p.node.get(*node as usize).map(|n| (p, n)))
+                .flat_map(|(p, n)| {
+                    n.bind.values().filter_map(move |b| match b {
+                        crate::graph::Bind::Weight { weight, .. } => Some(format!("{}.{weight}", p.module)),
                         _ => None,
                     })
                 })
@@ -476,6 +490,7 @@ impl Op {
             Op::Kernel { node } => spec.attention.node.get(*node as usize).and_then(|n| n.kernel.clone()).into_iter().collect(),
             Op::MixKernel { node } => spec.mixer.as_ref().and_then(|m| m.node.get(*node as usize)).and_then(|n| n.kernel.clone()).into_iter().collect(),
             Op::Gated { node, .. } => spec.gated_residual().and_then(|h| h.node.get(*node as usize)).and_then(|n| n.kernel.clone()).into_iter().collect(),
+            Op::Prelude { node } => spec.prelude.as_ref().and_then(|p| p.node.get(*node as usize)).and_then(|n| n.kernel.clone()).into_iter().collect(),
             Op::Swiglu => names(&["swiglu"]),
             Op::GdnPrefill => names(&[
                 "gdn_conv_prefill",

@@ -156,7 +156,7 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, store: &
             slot: before(true),
         }),
     };
-    let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, ln_pre_mlp: up_opt(&l.ln_pre_mlp)?, ln_post_mlp: up_opt(&l.ln_post_mlp)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)?, moe: l.moe.as_ref().map(|m| moe::DeviceMoe::upload(stream, m, i, cached.as_ref().map(|(p, n)| (*p, *n)))).transpose()?, hyper: l.hyper.iter().map(|v| Ok(stream.clone_htod(v)?)).collect::<Result<_>>()?, gated: l.gated.iter().map(|s| upload_gated(stream, s)).collect::<Result<_>>()? };
+    let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, ln_pre_mlp: up_opt(&l.ln_pre_mlp)?, ln_post_mlp: up_opt(&l.ln_post_mlp)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)?, moe: l.moe.as_ref().map(|m| moe::DeviceMoe::upload(stream, m, i, cached.as_ref().map(|(p, n)| (*p, *n)))).transpose()?, hyper: l.hyper.iter().map(|v| Ok(stream.clone_htod(v)?)).collect::<Result<_>>()?, gated: l.gated.iter().map(|s| upload_gated(stream, s)).collect::<Result<_>>()?, prelude: spec.prelude_slot(i).map(|s| Ok::<_, anyhow::Error>((s as i32, upload_gated(stream, &l.prelude)?))).transpose()? };
     copied(stream)?;
     Ok(layer)
 }
@@ -553,6 +553,42 @@ struct GatedTrace {
     inject: std::collections::BTreeMap<usize, CudaSlice<f32>>,
 }
 
+struct PreludeState {
+    name: String,
+    stride: usize,
+    slice: CudaSlice<f32>,
+}
+
+struct PreludeBuffers {
+    launch: Vec<DescribedLaunch>,
+    scratch: std::collections::BTreeMap<String, CudaSlice<f32>>,
+    int_scratch: std::collections::BTreeMap<String, CudaSlice<i32>>,
+    states: Vec<PreludeState>,
+}
+
+impl PreludeBuffers {
+    fn new(stream: &Arc<CudaStream>, spec: &Spec, slots: usize, chunk: usize, max_ctx: usize, target: &kir::Target) -> Result<Option<Self>> {
+        let Some(p) = &spec.prelude else { return Ok(None) };
+        let launch = crate::codegen::prelude_kernels(spec, max_ctx, target)?.into_iter().map(|k| DescribedLaunch { name: k.name, threads: k.threads, chunk: None, tile: false, params: k.params }).collect();
+        let mut states = Vec::new();
+        for s in crate::state::sequence(spec).filter(|s| s.layers == crate::state::Layers::Prelude) {
+            ensure!(s.dtype == crate::state::Dtype::F32, "[[state]] {} on the prelude is not f32", s.name);
+            let stride = s.sequence_bytes(spec) / 4;
+            states.push(PreludeState { name: s.name.clone(), stride, slice: stream.alloc_zeros(stride * slots)? });
+        }
+        Ok(Some(PreludeBuffers {
+            launch,
+            scratch: p.scratch.iter().map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim(spec, w)?)?))).collect::<Result<_>>()?,
+            int_scratch: p.int_scratch.iter().map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim(spec, w)?)?))).collect::<Result<_>>()?,
+            states,
+        }))
+    }
+
+    fn floats(&self) -> usize {
+        self.states.iter().map(|s| s.stride).sum()
+    }
+}
+
 struct DeviceLayer {
     ln1: CudaSlice<f32>,
     ln2: CudaSlice<f32>,
@@ -564,6 +600,7 @@ struct DeviceLayer {
     moe: Option<moe::DeviceMoe>,
     hyper: Vec<CudaSlice<f32>>,
     gated: Vec<GatedWeights>,
+    prelude: Option<(i32, GatedWeights)>,
 }
 
 fn opt_bytes(v: &Option<CudaSlice<f32>>) -> u64 {
@@ -596,6 +633,7 @@ impl DeviceLayer {
             + self.moe.as_ref().map_or(0, moe::DeviceMoe::bytes)
             + (self.ln1.num_bytes() + self.ln2.num_bytes()) as u64
             + self.hyper.iter().map(|v| v.num_bytes() as u64).sum::<u64>()
+            + self.gated.iter().flat_map(|g| g.values()).chain(self.prelude.iter().flat_map(|(_, w)| w.values())).map(|v| v.num_bytes() as u64).sum::<u64>()
     }
 }
 
@@ -849,6 +887,7 @@ pub struct Runtime {
     mixer: Option<MixBuffers>,
     mixer_launch: Vec<DescribedLaunch>,
     gated: Option<GatedBuffers>,
+    prelude: Option<PreludeBuffers>,
     moe: Option<moe::MoeBuffers>,
     fp8_act: Option<Fp8Act>,
     fp4_act: Option<Fp4Act>,
@@ -1253,6 +1292,7 @@ impl Runtime {
                 }),
                 None => None,
             },
+            prelude: PreludeBuffers::new(&stream, spec, layout.slots + 1, chunk, max_ctx, &target)?,
             moe: match &spec.moe {
                 Some(_) => Some(moe::MoeBuffers::new(&stream, chunk, spec, crate::codegen::moe_mma_enabled(spec, &target), crate::codegen::moe_mma_fp8_enabled(spec, &target), crate::codegen::moe_mma_bf16_enabled(spec, &target))?),
                 None => None,
@@ -1612,7 +1652,7 @@ impl Runtime {
     fn step_traced(&self, trace: Option<&CudaSlice<f32>>) -> Result<()> {
         ensure!(self.head_part.is_none(), "a vocabulary sharded rank decodes through the plan, not the single stream step");
         ensure!(self.spec.requanted_linears().is_empty(), "requantised attention and delta-net projections run on the plan decode path (the scheduler), not the single stream step");
-        ensure!(self.spec.mixer.is_none() && self.spec.hyper.is_none() && !self.spec.layers.split && self.spec.mlp.mapped.is_none(), "mixers, hyper-connections, mlp-only layers and non-gated mlps run on the batched decode path (generate_batch and the scheduler), not the single stream step");
+        ensure!(self.spec.mixer.is_none() && self.spec.hyper.is_none() && self.spec.gated_residual().is_none() && !self.spec.layers.split && self.spec.mlp.mapped.is_none(), "mixers, hyper-connections, gated residuals, mlp-only layers and non-gated mlps run on the batched decode path (generate_batch and the scheduler), not the single stream step");
         if !self.spec.attention.node.is_empty() {
             ensure!(self.use_mma, "described attention needs the tensor core path");
             let run = exec::Run { n: 1, tokens: &self.buf.token, logits: &self.buf.logits, rows: 0..1, bb: None, start: None, qlen: 1, mtp: None };
@@ -2483,6 +2523,7 @@ impl Runtime {
 
     pub fn acquire_state(&mut self, slot: usize) -> Result<()> {
         ensure!(slot <= self.slots, "slot {slot} out of {}", self.slots);
+        self.zero_prelude_state(slot)?;
         let need = self.state_slot_bytes();
         let free = self.ctx.mem_get_info().map(|(f, _)| f).unwrap_or(usize::MAX);
         if self.mixer.is_some() {
@@ -2508,6 +2549,48 @@ impl Runtime {
         Ok(())
     }
 
+    fn zero_prelude_state(&mut self, slot: usize) -> Result<()> {
+        let Some(pb) = self.prelude.as_mut() else { return Ok(()) };
+        for s in &mut pb.states {
+            self.stream.memset_zeros(&mut s.slice.slice_mut(slot * s.stride..(slot + 1) * s.stride))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn prelude_floats(&self) -> usize {
+        self.prelude.as_ref().map_or(0, PreludeBuffers::floats)
+    }
+
+    pub(super) fn prelude_to(&self, slot: usize, dst: &mut cudarc::driver::CudaViewMut<f32>) -> Result<()> {
+        let Some(pb) = &self.prelude else { return Ok(()) };
+        let mut at = 0;
+        for s in &pb.states {
+            self.stream.memcpy_dtod(&s.slice.slice(slot * s.stride..(slot + 1) * s.stride), &mut dst.slice_mut(at..at + s.stride))?;
+            at += s.stride;
+        }
+        Ok(())
+    }
+
+    pub(super) fn prelude_host(&self, slot: usize) -> Result<Vec<f32>> {
+        let Some(pb) = &self.prelude else { return Ok(Vec::new()) };
+        let mut out = Vec::with_capacity(pb.floats());
+        for s in &pb.states {
+            out.extend(self.stream.clone_dtoh(&s.slice.slice(slot * s.stride..(slot + 1) * s.stride))?);
+        }
+        Ok(out)
+    }
+
+    pub(super) fn prelude_from(&mut self, slot: usize, host: &[f32]) -> Result<()> {
+        let Some(pb) = self.prelude.as_mut() else { return Ok(()) };
+        ensure!(host.len() == pb.floats(), "prelude state of {} values, expected {}", host.len(), pb.floats());
+        let mut at = 0;
+        for s in &mut pb.states {
+            self.stream.memcpy_htod(&host[at..at + s.stride], &mut s.slice.slice_mut(slot * s.stride..(slot + 1) * s.stride))?;
+            at += s.stride;
+        }
+        Ok(())
+    }
+
     pub fn release_state(&mut self, slot: usize) {
         if slot >= self.slots {
             return;
@@ -2527,6 +2610,7 @@ impl Runtime {
     pub fn reset_slot(&mut self, seq: usize) -> Result<()> {
         ensure!(seq < self.slots, "slot {seq} out of {}", self.slots);
         self.mtp_forget(seq);
+        self.zero_prelude_state(seq)?;
         if self.mixer.is_some() {
             return self.zero_mixer_state(seq);
         }

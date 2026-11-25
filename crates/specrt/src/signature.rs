@@ -182,6 +182,7 @@ pub struct Signer<'a> {
     described: Vec<Option<kir::Kernel>>,
     mixer: Vec<kir::Kernel>,
     gated: Vec<kir::Kernel>,
+    prelude: Vec<kir::Kernel>,
     ranked: bool,
 }
 
@@ -189,7 +190,7 @@ impl<'a> Signer<'a> {
     pub fn new(spec: &'a Spec) -> Result<Signer<'a>> {
         let target = crate::codegen::default_target();
         let ctx = crate::engine::DEFAULT_CTX;
-        Ok(Signer { spec, described: crate::codegen::described_kernels(spec, 1, ctx, &target)?, mixer: crate::codegen::mixer_kernels(spec, 1, ctx, &target)?, gated: crate::codegen::gated_kernels(spec, &target)?, ranked: false })
+        Ok(Signer { spec, described: crate::codegen::described_kernels(spec, 1, ctx, &target)?, mixer: crate::codegen::mixer_kernels(spec, 1, ctx, &target)?, gated: crate::codegen::gated_kernels(spec, &target)?, prelude: crate::codegen::prelude_kernels(spec, ctx, &target)?, ranked: false })
     }
 
     pub fn ranked(self, ranked: bool) -> Signer<'a> {
@@ -377,6 +378,45 @@ impl<'a> Signer<'a> {
         Ok(sig)
     }
 
+    fn prelude_node(&self, node: u8) -> Result<Signature> {
+        let Some(p) = &self.spec.prelude else { bail!("a prelude node needs [prelude]") };
+        let Some(kernel) = self.prelude.get(node as usize) else { bail!("prelude node {node} has no kernel") };
+        let mut bind = p.node[node as usize].bind.clone();
+        for b in bind.values_mut() {
+            if let Bind::Weight { weight, .. } = b {
+                *weight = format!("{}.{weight}", p.module);
+            }
+        }
+        let width = self.spec.gated_residual().map_or(1, |h| h.width(self.hidden()));
+        let mut sig = Signature { class: class_of(&kernel.body), reads: Vec::new(), writes: Vec::new() };
+        for q in kernel.params.iter().filter(|q| q.role != kir::Role::Value) {
+            let t = match bind.get(q.name) {
+                Some(Bind::Weight { weight, len }) => Tensor::weight(weight.clone(), 1, self.spec.weight_len(len)?, Form::F32),
+                Some(Bind::Buffer { buffer }) => match buffer.as_str() {
+                    "x" => self.x(),
+                    "streams" => Tensor::new(Place::Local("streams".into()), Rows::Tokens, width, Form::F32),
+                    "tokens" => Tensor::new(Place::Input("tokens"), Rows::Tokens, 1, Form::I32),
+                    name if p.int_scratch.contains_key(name) => Tensor::new(Place::Local(name.into()), Rows::Tokens, crate::state::dim(self.spec, &p.int_scratch[name])?, Form::I32),
+                    name => Tensor::new(Place::Local(name.into()), Rows::Tokens, crate::state::dim(self.spec, &p.scratch[name])?, Form::F32),
+                },
+                Some(Bind::State { state }) => {
+                    let s = crate::state::named(self.spec, state).ok_or_else(|| anyhow::anyhow!("prelude node {node} binds state {state:?}, which the spec does not declare"))?;
+                    let t = Tensor::new(Place::State(state.clone()), Rows::Seqs, s.elements(self.spec)?, Form::F32);
+                    sig.reads.push(t.clone());
+                    sig.writes.push(t);
+                    continue;
+                }
+                _ if q.name == "slots" => Tensor::new(Place::Input("positions"), Rows::Tokens, 1, Form::I32),
+                _ => continue,
+            };
+            match q.access {
+                kir::Access::Read => sig.reads.push(t),
+                kir::Access::Write => sig.writes.push(t),
+            }
+        }
+        Ok(sig)
+    }
+
     fn gdn(&self) -> Signature {
         let Some(la) = &self.spec.linear_attention else {
             return Signature { class: Class::Scan, reads: Vec::new(), writes: Vec::new() };
@@ -487,6 +527,7 @@ impl<'a> Signer<'a> {
             Op::Kernel { node } => self.described(node, layer)?,
             Op::MixKernel { node } => self.mixed(node)?,
             Op::Gated { node, site } => self.gated_node(node, site)?,
+            Op::Prelude { node } => self.prelude_node(node)?,
             Op::Swiglu => sig(Class::Elementwise, vec![Tensor::buf(Buf::GateUp, Rows::Tokens, 2 * spec.dims.intermediate)], vec![Tensor::buf(Buf::Act, Rows::Tokens, spec.dims.intermediate)]),
             Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => self.gdn(),
             Op::MtpIn => sig(

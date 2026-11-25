@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use kir as kir;
 
-pub const SPEC_FORMAT: u32 = 15;
+pub const SPEC_FORMAT: u32 = 16;
 
 pub fn modelopt_verified() -> bool {
     include_str!("../modelopt-verified.txt").trim() == "pass"
@@ -523,6 +523,53 @@ pub struct GatedResidual {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub scratch: std::collections::BTreeMap<String, String>,
     pub node: Vec<crate::graph::Node>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Prelude {
+    pub module: String,
+    pub layers: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub params: std::collections::BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub scratch: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub int_scratch: std::collections::BTreeMap<String, String>,
+    pub node: Vec<crate::graph::Node>,
+}
+
+impl Prelude {
+    pub const BUFFERS: [&'static str; 3] = ["x", "streams", "tokens"];
+
+    pub fn slot(&self, layer: usize) -> Option<usize> {
+        self.layers.iter().position(|&l| l == layer)
+    }
+
+    pub fn weights(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for n in &self.node {
+            for b in n.bind.values() {
+                if let crate::graph::Bind::Weight { weight, len } = b
+                    && !out.iter().any(|(w, _)| w == weight)
+                {
+                    out.push((weight.clone(), len.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    pub fn symbols(&self, slot: usize) -> Vec<(String, f64)> {
+        let mut out: Vec<(String, f64)> = self.params.iter().map(|(n, v)| (n.clone(), *v)).collect();
+        out.extend(self.index.iter().map(|n| (n.clone(), slot as f64)));
+        out.extend(self.count.iter().map(|n| (n.clone(), self.layers.len() as f64)));
+        out
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1055,6 +1102,8 @@ pub struct Spec {
     pub hyper: Option<Hyper>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gated_residual: Option<GatedResidual>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prelude: Option<Prelude>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtp: Option<Mtp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2023,6 +2072,7 @@ impl Spec {
             mixer,
             hyper: family.hyper.read(&value),
             gated_residual: family.gated_residual.read(&value)?,
+            prelude: family.prelude.read(&value)?,
             tensors: family.tensors.clone(),
             vision: if strict { crate::vision::Vision::from_hf_config(json)? } else { None },
             state: if family.state.is_empty() { crate::state::stock() } else { family.state.clone() },
@@ -2049,6 +2099,7 @@ impl Spec {
         self.validate_attention_nodes()?;
         self.validate_mixer()?;
         self.validate_hyper()?;
+        self.validate_prelude()?;
         crate::state::validate(self)?;
         match self.head_quant {
             None | Some(Quant::Bf16) => {}
@@ -2259,6 +2310,12 @@ impl Spec {
         s.layers.count = end - start;
         s.mlp.quant_until = self.mlp.quant_until.map(|u| u.saturating_sub(start));
         s.quant_map = self.quant_map.stage(start, end);
+        if let Some(p) = s.prelude.as_mut() {
+            p.layers = p.layers.iter().filter(|&&l| (start..end).contains(&l)).map(|l| l - start).collect();
+        }
+        if s.prelude.as_ref().is_some_and(|p| p.layers.is_empty()) {
+            s.prelude = None;
+        }
         if !s.layers.pattern.iter().any(|b| b.is_linear()) {
             s.linear_attention = None;
         }
@@ -2315,6 +2372,48 @@ impl Spec {
             }
         }
         Ok(())
+    }
+
+    fn validate_prelude(&self) -> Result<()> {
+        let Some(p) = &self.prelude else { return Ok(()) };
+        ensure!(self.gated_residual().is_some() && self.mixer.is_none(), "[prelude] runs inside the [gated_residual] blocks and cannot be combined with [mixer] yet");
+        ensure!(!p.module.is_empty() && !p.node.is_empty() && p.node.len() <= 64, "[prelude] needs a module and one to 64 nodes");
+        ensure!(p.layers.len() == 1, "[prelude] runs on {} layers; its kernels fold the layer index in, so more than one layer needs one build per layer, which is not supported yet", p.layers.len());
+        ensure!(p.layers.iter().all(|&l| l < self.layers.count), "[prelude] layers {:?} are not inside the model's {} layers", p.layers, self.layers.count);
+        for (n, w) in p.scratch.iter().chain(&p.int_scratch) {
+            ensure!(!Prelude::BUFFERS.contains(&n.as_str()), "[prelude] scratch {n} shadows a built in buffer");
+            crate::state::dim(self, w).with_context(|| format!("[prelude] scratch {n}"))?;
+        }
+        ensure!(p.int_scratch.keys().all(|n| !p.scratch.contains_key(n)), "[prelude.int_scratch] repeats a [prelude.scratch] name");
+        for (i, n) in p.node.iter().enumerate() {
+            ensure!(n.op == "kernel" && n.kernel.is_some(), "[[prelude.node]] {i} must be a kernel node with `kernel`");
+            ensure!(!n.grid.is_empty() && n.grid.len() <= 3, "[[prelude.node]] {i} needs a grid of one to three symbols");
+            for g in n.grid.iter().filter(|g| !matches!(g.as_str(), "rows" | "seqs")) {
+                crate::state::dim(self, g).with_context(|| format!("[[prelude.node]] {i} grid symbol {g:?}"))?;
+            }
+            for b in n.bind.values() {
+                match b {
+                    crate::graph::Bind::Weight { len, .. } => {
+                        self.weight_len(len)?;
+                    }
+                    crate::graph::Bind::Buffer { buffer } => ensure!(
+                        Prelude::BUFFERS.contains(&buffer.as_str()) || p.scratch.contains_key(buffer) || p.int_scratch.contains_key(buffer),
+                        "[[prelude.node]] {i} binds buffer {buffer:?}, which is not x, streams, tokens or a [prelude] scratch entry"
+                    ),
+                    crate::graph::Bind::State { state } => ensure!(
+                        crate::state::named(self, state).is_some_and(|s| s.per == crate::state::Per::Sequence && s.layers == crate::state::Layers::Prelude && s.dtype == crate::state::Dtype::F32),
+                        "[[prelude.node]] {i} binds state {state:?}, which is not a per sequence f32 [[state]] on the prelude layers"
+                    ),
+                    crate::graph::Bind::Number(_) => {}
+                    crate::graph::Bind::Name(name) => ensure!(p.params.contains_key(name), "[[prelude.node]] {i} binds {name:?}, which is not a [prelude.params] entry"),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn prelude_slot(&self, layer: usize) -> Option<usize> {
+        self.prelude.as_ref().and_then(|p| p.slot(layer))
     }
 
     pub fn weight_len(&self, symbol: &str) -> Result<usize> {

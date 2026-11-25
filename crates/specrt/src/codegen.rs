@@ -378,6 +378,50 @@ pub fn gated_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::Kerne
     Ok(out)
 }
 
+pub fn prelude_symbols(spec: &Spec, max_ctx: usize) -> kir::desc::Shape {
+    let mut symbols = gated_symbols(spec).num("max_context", max_ctx as f64);
+    if let Some(p) = &spec.prelude {
+        for (n, v) in p.symbols(0) {
+            symbols = symbols.num(&n, v);
+        }
+    }
+    symbols
+}
+
+pub fn prelude_kernels(spec: &Spec, max_ctx: usize, target: &kir::Target) -> Result<Vec<kir::Kernel>> {
+    let Some(p) = &spec.prelude else { return Ok(Vec::new()) };
+    let symbols = prelude_symbols(spec, max_ctx);
+    let registry = crate::kir_kernel::Registry::active();
+    let mut built: BTreeMap<String, kir::Kernel> = BTreeMap::new();
+    let mut out = Vec::new();
+    for (i, node) in p.node.iter().enumerate() {
+        let name = node.kernel.as_deref().ok_or_else(|| anyhow::anyhow!("[[prelude.node]] {i} names no kernel"))?;
+        if !built.contains_key(name) {
+            let d = registry.get(name).ok_or_else(|| anyhow::anyhow!("[[prelude.node]] {i} names kernel {name:?}, which no kernel description provides"))?;
+            built.insert(name.to_string(), d.build(target, &symbols).map_err(|e| anyhow::anyhow!("[[prelude.node]] {i}: {e}"))?);
+        }
+        let kernel = &built[name];
+        for q in kernel.params.iter().filter(|q| !kir::recur::LAUNCH.contains(&q.name)) {
+            anyhow::ensure!(node.bind.contains_key(q.name), "[[prelude.node]] {i} does not bind {name} param {:?}", q.name);
+        }
+        for (b, v) in &node.bind {
+            let param = kernel.params.iter().find(|q| q.name == b).ok_or_else(|| anyhow::anyhow!("[[prelude.node]] {i} binds {b:?}, which {name} has no param for"))?;
+            let fits = match v {
+                crate::graph::Bind::Weight { .. } => param.role == kir::Role::Weight,
+                crate::graph::Bind::Buffer { buffer } => {
+                    let ints = buffer == "tokens" || p.int_scratch.contains_key(buffer);
+                    param.role == kir::Role::Activation && param.ty == if ints { kir::Scalar::I32 } else { kir::Scalar::F32 }
+                }
+                crate::graph::Bind::State { .. } => param.role == kir::Role::Activation && param.ty == kir::Scalar::F32 && param.access == kir::Access::Write,
+                crate::graph::Bind::Number(_) | crate::graph::Bind::Name(_) => param.role == kir::Role::Value,
+            };
+            anyhow::ensure!(fits, "[[prelude.node]] {i} binds {b:?} to the wrong kind of value");
+        }
+        out.push(kernel.clone());
+    }
+    Ok(out)
+}
+
 pub fn linear_kernel_shape(la: &crate::spec::LinearAttention) -> kir::linear::LinearShape {
     kir::linear::LinearShape { key_heads: la.key_heads, value_heads: la.value_heads, head_dim: la.key_head_dim, conv_kernel: la.conv_kernel, tiled_value_heads: la.v_heads == crate::spec::VHeadOrder::Tiled, gate_sigmoid: la.gate_sigmoid }
 }
@@ -608,7 +652,7 @@ impl Module {
         let gemms = crate::gemm::gemm_kernels(spec, target)?;
         let described = described_kernels(spec, kv_planes, max_ctx, target)?;
         let mut distinct: Vec<kir::Kernel> = Vec::new();
-        for k in described.into_iter().flatten().chain(mixer_kernels(spec, kv_planes, max_ctx, target)?).chain(hyper_kernels(spec, target)?).chain(gated_kernels(spec, target)?) {
+        for k in described.into_iter().flatten().chain(mixer_kernels(spec, kv_planes, max_ctx, target)?).chain(hyper_kernels(spec, target)?).chain(gated_kernels(spec, target)?).chain(prelude_kernels(spec, max_ctx, target)?) {
             if !distinct.iter().any(|d| d.name == k.name) {
                 distinct.push(k);
             }

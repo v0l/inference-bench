@@ -113,6 +113,7 @@ impl Runtime {
             Op::Kernel { node } => self.kernel_op(node, self.attn_of(layer), run),
             Op::MixKernel { node } => self.mix_kernel_op(node, layer.expect("mixer ops run inside a layer"), run),
             Op::Gated { node, site } => self.gated_op(node, site, layer, run),
+            Op::Prelude { node } => self.prelude_op(node, layer, run),
             Op::Swiglu => self.swiglu_legacy(n),
             Op::GdnPrefill => self.gdn_prefill_rows(self.gdn_of(layer), n, 0),
             Op::GdnDecode => self.gdn_decode_rows(self.gdn_of(layer), &run.bb.expect("decode runs carry batch buffers").slots, n),
@@ -479,6 +480,66 @@ impl Runtime {
         let dim = |symbol: &String| -> Result<u32> {
             Ok(match symbol.as_str() {
                 "rows" => run.n as u32,
+                other => crate::state::dim(&self.spec, other)? as u32,
+            })
+        };
+        let dims = spec_node.grid.iter().map(dim).collect::<Result<Vec<_>>>()?;
+        let config = LaunchConfig { grid_dim: (dims[0], dims.get(1).copied().unwrap_or(1), dims.get(2).copied().unwrap_or(1)), block_dim: (launch.threads, 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    fn prelude_op(&self, node: u8, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
+        let Some((slot, weights)) = layer.and_then(|l| l.prelude.as_ref()) else { return Ok(()) };
+        let pb = self.prelude.as_ref().expect("a prelude has buffers");
+        let p = self.spec.prelude.as_ref().expect("a prelude");
+        let launch = &pb.launch[node as usize];
+        let spec_node = &p.node[node as usize];
+        let (seqs, rows_per_seq, slot_base, slot_step, slots) = match run.bb {
+            Some(bb) if run.n > 0 => (run.n / run.qlen.max(1), run.qlen.max(1), 0, 1, &bb.slots),
+            _ => (1, run.n, self.seq, 0, &self.buf.zero_slots),
+        };
+        let mut b = self.launcher(self.kernel(launch.name));
+        let mut values: Vec<(i32, f32)> = Vec::with_capacity(launch.params.len());
+        for q in &launch.params {
+            let v = match q.name {
+                "layer" => f64::from(*slot),
+                "slot_base" => f64::from(slot_base),
+                "slot_step" => f64::from(slot_step),
+                "rows_per_seq" => rows_per_seq as f64,
+                name => match spec_node.bind.get(name) {
+                    Some(Bind::Number(v)) => *v,
+                    Some(Bind::Name(n)) => *p.params.get(n).with_context(|| format!("{n:?} is not a [prelude.params] entry"))?,
+                    _ => 0.0,
+                },
+            };
+            values.push((v as i32, v as f32));
+        }
+        for (q, (int, float)) in launch.params.iter().zip(&values) {
+            match (q.role, spec_node.bind.get(q.name)) {
+                (kir::Role::Value, _) => match q.ty {
+                    kir::Scalar::F32 => b.arg(float),
+                    _ => b.arg(int),
+                },
+                (_, Some(Bind::Weight { weight, .. })) => b.arg(weights.get(weight).with_context(|| format!("layer has no prelude weight {weight}"))?),
+                (_, Some(Bind::Buffer { buffer })) => match buffer.as_str() {
+                    "x" => b.arg(&self.pre.x),
+                    "streams" => b.arg(&self.gated.as_ref().context("[prelude] streams needs a [gated_residual]")?.streams),
+                    "tokens" => b.arg(run.tokens),
+                    other => match pb.int_scratch.get(other) {
+                        Some(ints) => b.arg(ints),
+                        None => b.arg(pb.scratch.get(other).with_context(|| format!("no prelude scratch {other:?}"))?),
+                    },
+                },
+                (_, Some(Bind::State { state })) => b.arg(&pb.states.iter().find(|s| s.name == *state).with_context(|| format!("no prelude state {state:?}"))?.slice),
+                (_, None) if q.name == "slots" => b.arg(slots),
+                _ => bail!("param {:?} of {} is not bound to a buffer, state or weight", q.name, launch.name),
+            };
+        }
+        let dim = |symbol: &String| -> Result<u32> {
+            Ok(match symbol.as_str() {
+                "rows" => run.n as u32,
+                "seqs" => seqs as u32,
                 other => crate::state::dim(&self.spec, other)? as u32,
             })
         };

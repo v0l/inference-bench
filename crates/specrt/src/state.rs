@@ -15,6 +15,7 @@ pub enum Per {
 pub enum Layers {
     Attention,
     Linear,
+    Prelude,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,7 +93,7 @@ fn symbol(spec: &Spec, name: &str) -> Option<usize> {
         other => match other.parse::<usize>() {
             Ok(n) => n,
             Err(_) => {
-                if let Some(v) = spec.mixer.as_ref().and_then(|m| m.params.get(other)).or_else(|| spec.gated_residual().and_then(|h| h.params.get(other))) {
+                if let Some(v) = spec.mixer.as_ref().and_then(|m| m.params.get(other)).or_else(|| spec.gated_residual().and_then(|h| h.params.get(other))).or_else(|| spec.prelude.as_ref().and_then(|p| p.params.get(other))) {
                     return (*v >= 0.0 && v.fract() == 0.0).then_some(*v as usize);
                 }
                 let v = *a.params.get(other)?;
@@ -123,6 +124,7 @@ impl State {
             Layers::Attention if !self.blocks.is_empty() => (0..spec.layers.count).filter(|&i| self.blocks.iter().any(|b| b == spec.block(i).name())).count(),
             Layers::Attention => spec.kv_layers(),
             Layers::Linear => spec.linear_layers(),
+            Layers::Prelude => spec.prelude.as_ref().map_or(0, |p| p.layers.len()),
         }
     }
 

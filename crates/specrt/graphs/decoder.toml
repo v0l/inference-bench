@@ -436,6 +436,9 @@ layers = ["linear"]
 mlp = "sparse"
 
 [[block.node]]
+op = "prelude_nodes"
+
+[[block.node]]
 op = "gated_pre"
 weight = "0"
 
@@ -514,6 +517,9 @@ name = "gated_attention_moe"
 when = "gated+tensor_core+moe"
 layers = ["dense", "full", "sliding", "shared", "compressed", "indexed"]
 mlp = "sparse"
+
+[[block.node]]
+op = "prelude_nodes"
 
 [[block.node]]
 op = "gated_pre"

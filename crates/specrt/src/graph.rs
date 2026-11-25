@@ -281,6 +281,12 @@ fn lower(nodes: &[Node], phase: Phase, tensor_core: bool, spec: &Spec, kind: Opt
             for (i, _) in h.nodes(stage) {
                 ops.push(Op::Gated { node: i as u8, site });
             }
+        } else if n.op == "prelude_nodes" {
+            let count = spec.prelude.as_ref().map_or(0, |p| p.node.len());
+            ensure!(count <= 64, "a prelude has at most 64 nodes");
+            for i in 0..count {
+                ops.push(Op::Prelude { node: i as u8 });
+            }
         } else if n.op == "attention_nodes" {
             for (i, d) in spec.attention.node.iter().enumerate().filter(|(_, d)| d.runs_in(phase, tensor_core, spec, kind)) {
                 ops.push(d.lower_described(i)?);

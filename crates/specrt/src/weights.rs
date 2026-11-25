@@ -147,6 +147,7 @@ pub struct Layer<'a> {
     pub moe: Option<MoeWeights>,
     pub hyper: Vec<Vec<f32>>,
     pub gated: Vec<Vec<(String, Vec<f32>)>>,
+    pub prelude: Vec<(String, Vec<f32>)>,
 }
 
 pub struct Outside<'a> {
@@ -1305,6 +1306,7 @@ impl Checkpoint {
             moe,
             hyper: self.hyper(spec, &p)?,
             gated: self.gated_sites(spec, &p)?,
+            prelude: self.prelude_weights(spec, i, &p)?,
         })
     }
 
@@ -1329,6 +1331,11 @@ impl Checkpoint {
     fn gated_sites(&self, spec: &Spec, p: &str) -> Result<Vec<Vec<(String, Vec<f32>)>>> {
         let Some(h) = spec.gated_residual() else { return Ok(Vec::new()) };
         h.sites.iter().map(|s| self.gated_weights(spec, &format!("{p}.{s}"), crate::spec::GatedStage::Pre)).collect()
+    }
+
+    fn prelude_weights(&self, spec: &Spec, i: usize, p: &str) -> Result<Vec<(String, Vec<f32>)>> {
+        let Some(pre) = spec.prelude.as_ref().filter(|pre| pre.slot(i).is_some()) else { return Ok(Vec::new()) };
+        pre.weights().into_iter().map(|(w, len)| Ok((w.clone(), self.flat(&format!("{p}.{}.{w}", pre.module), spec.weight_len(&len)?)?))).collect()
     }
 
     pub fn gated_head(&self, spec: &Spec) -> Result<Vec<(String, Vec<f32>)>> {
@@ -1684,6 +1691,7 @@ impl Checkpoint {
                 moe,
                 hyper: Vec::new(),
                 gated: Vec::new(),
+                prelude: Vec::new(),
             },
             norm: self.norm(spec, &lay.norm, h)?,
         })
