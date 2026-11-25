@@ -97,6 +97,29 @@ fn the_host_noise_is_the_noise_the_reference_ran_from() {
 }
 
 #[test]
+fn the_prompt_is_templated_truncated_and_padded_like_transformers() {
+    let cases: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/prompt-ids/qwen3.json")).unwrap()).unwrap();
+    let repo = cases["repo"].as_str().unwrap();
+    let Ok(json) = specrt::weights::find_in_snapshot(repo, "tokenizer.json") else {
+        eprintln!("{repo} is not in the hub cache, nothing to compare");
+        return;
+    };
+    let encoder = specrt::sampler::PromptEncoder::open(json.parent().unwrap()).unwrap();
+    let p = pipeline();
+    assert!(p.chat_prompt && p.masked_pad_keys);
+    for c in cases["cases"].as_array().unwrap() {
+        let prompt = c["prompt"].as_str().unwrap();
+        let max = c["max_length"].as_u64().unwrap() as usize;
+        assert_eq!(encoder.text(&p, prompt).unwrap(), c["text"].as_str().unwrap(), "{prompt:?}");
+        let got = encoder.encode(&p, prompt, max).unwrap();
+        let ids: Vec<u32> = c["ids"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+        let mask: Vec<u8> = c["mask"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u8).collect();
+        assert_eq!(got.ids, ids, "{prompt:?} at {max}");
+        assert_eq!(got.mask, mask, "{prompt:?} at {max}");
+    }
+}
+
+#[test]
 fn the_pipeline_section_binds_the_scheduler_and_vae_configs() {
     let p = pipeline();
     assert_eq!(p.text_layers, vec![1, 2, 3]);

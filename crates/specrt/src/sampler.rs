@@ -366,6 +366,59 @@ fn eval32(e: &Expr, v: &BTreeMap<String, f32>) -> Option<f32> {
     })
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Prompt {
+    pub ids: Vec<u32>,
+    pub mask: Vec<u8>,
+}
+
+impl Prompt {
+    pub fn real(&self) -> usize {
+        self.mask.iter().filter(|&&m| m == 1).count()
+    }
+}
+
+pub struct PromptEncoder {
+    tokenizer: tokenizers::Tokenizer,
+    template: Option<crate::chat::ChatTemplate>,
+    pad: u32,
+}
+
+impl PromptEncoder {
+    pub fn new(tokenizer: tokenizers::Tokenizer, tokenizer_config: &str) -> Result<PromptEncoder> {
+        let config: serde_json::Value = serde_json::from_str(tokenizer_config).context("tokenizer_config.json")?;
+        let pad_text = match &config["pad_token"] {
+            serde_json::Value::String(s) => s.clone(),
+            v => v["content"].as_str().context("the tokenizer config names no pad_token")?.to_string(),
+        };
+        let pad = tokenizer.token_to_id(&pad_text).with_context(|| format!("pad token {pad_text:?} is not in the vocabulary"))?;
+        let tokenizer = crate::engine::without_truncation(tokenizer)?;
+        Ok(PromptEncoder { tokenizer, template: crate::chat::ChatTemplate::from_tokenizer_config(tokenizer_config)?, pad })
+    }
+
+    pub fn open(dir: &Path) -> Result<PromptEncoder> {
+        let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+        PromptEncoder::new(tokenizer, &std::fs::read_to_string(dir.join("tokenizer_config.json"))?)
+    }
+
+    pub fn text(&self, pipeline: &Pipeline, prompt: &str) -> Result<String> {
+        if !pipeline.chat_prompt {
+            return Ok(prompt.to_string());
+        }
+        self.template.as_ref().context("the pipeline renders a chat prompt and the tokenizer has no chat template")?.render_user(prompt)
+    }
+
+    pub fn encode(&self, pipeline: &Pipeline, prompt: &str, max_length: usize) -> Result<Prompt> {
+        let text = self.text(pipeline, prompt)?;
+        let enc = self.tokenizer.encode(text.as_str(), false).map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+        let mut ids: Vec<u32> = enc.get_ids().iter().copied().take(max_length).collect();
+        let mut mask = vec![1u8; ids.len()];
+        ids.resize(max_length, self.pad);
+        mask.resize(max_length, 0);
+        Ok(Prompt { ids, mask })
+    }
+}
+
 fn splitmix(seed: u64, i: u64) -> f64 {
     let mut z = seed.wrapping_add(i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
