@@ -1,0 +1,33 @@
+kind = "kir-kernel"
+family = "head_matvec"
+name = "g4_ple_gate"
+threads = 128
+
+[args]
+x_row = "hidden"
+x_head = 0
+x_offset = 0
+inner = "hidden"
+w_head = 0
+w_inner = 1
+w_out = "hidden"
+w_offset = 0
+out = "ple_dim"
+y_row = "ple_dim"
+y_head = 0
+y_offset = 0
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "w"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "y"
+role = "activation"
+access = "write"

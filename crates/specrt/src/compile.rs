@@ -104,7 +104,7 @@ pub fn gemv_layout(signer: &Signer, ops: &[Op], layer: usize) -> Result<Vec<Op>>
             Op::Linear { weight, quant, input, output } => Op::Linear { weight, quant, input: read(input, &alias)?, output: row_form(output) },
             Op::DecodeAttention => Op::StepAttention,
             Op::GdnDecode => Op::GdnStep,
-            Op::Embed | Op::Clear { .. } | Op::NormAdd { .. } | Op::ScaledAdd { .. } | Op::QkNorm | Op::LogitScale | Op::LogitSoftcap | Op::MoeRoute | Op::MoeExperts | Op::MoeCombine => *op,
+            Op::Embed | Op::Clear { .. } | Op::NormAdd { .. } | Op::ScaledAdd { .. } | Op::QkNorm | Op::LogitScale | Op::LogitSoftcap | Op::MoeRoute | Op::MoeExperts | Op::MoeCombine | Op::MoeCombineInto { .. } => *op,
             ref other => bail!("pass {GEMV_LAYOUT}: {} has no single row form", other.label()),
         };
         if alias == Alias::X && writes_x(signer, &lowered, layer)? {
@@ -229,11 +229,11 @@ fn sections_mut<'p>(spec: &Spec, plan: &'p mut Plan) -> Vec<(String, Vec<usize>,
     let Plan { head, blocks, tail, mtp, mtp_head, .. } = plan;
     let mut out = vec![("head".to_string(), vec![0], head)];
     for b in blocks.iter_mut() {
-        let used = layers_using(spec, &b.layers, b.sparse);
+        let used = layers_using(spec, &b.layers, b.sparse, b.tail);
         let mut kinds: Vec<&str> = used.iter().map(|&i| spec.block(i).name()).collect();
         kinds.sort_unstable();
         kinds.dedup();
-        out.push((format!("layer {}{}", kinds.join("|"), if b.sparse { " moe" } else { "" }), used, &mut b.ops));
+        out.push((format!("layer {}{}{}", kinds.join("|"), if b.sparse { " moe" } else { "" }, if b.tail { " shared" } else { "" }), used, &mut b.ops));
     }
     out.push(("tail".to_string(), vec![count.saturating_sub(1)], tail));
     out.push(("mtp".to_string(), vec![count], mtp));

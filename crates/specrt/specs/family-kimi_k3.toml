@@ -1,0 +1,38 @@
+name = "kimi_k3"
+kind = "family"
+min_engine = 15
+extends = "kimi_linear"
+
+[match]
+model_types = ["kimi_k3", "kimi_k31"]
+architectures = ["KimiK3ForConditionalGeneration"]
+
+[vision]
+ignore = true
+
+[fields]
+kda_full_rank_gate = ["linear_attn_config.use_full_rank_gate"]
+
+[[refuse]]
+when = "attn_res_block_size > 0"
+message = "Kimi K3 block attention residuals (attn_res_block_size) are not supported yet"
+
+[[refuse]]
+when = "routed_expert_hidden_size > 0"
+message = "Kimi K3 latent experts (routed_expert_hidden_size) are not supported yet"
+
+[[refuse]]
+when = "mla_use_output_gate"
+message = "Kimi K3 MLA output gate (mla_use_output_gate) is not supported yet"
+
+[[refuse]]
+when = "q_lora_rank > 0"
+message = "Kimi K3 MLA query LoRA (q_lora_rank) is not supported yet"
+
+[[refuse]]
+when = "kda_full_rank_gate"
+message = "Kimi K3 full rank KDA output gate (use_full_rank_gate) is not supported yet"
+
+[[refuse]]
+when = "activation_situ_beta > 0"
+message = "Kimi K3 SiTU activation (hidden_act situ) is not supported yet"

@@ -56,6 +56,10 @@ impl PlanBackend<Run<'_>> for Runtime {
         self.layers[layer].moe.is_some()
     }
 
+    fn tail(&self, layer: usize) -> bool {
+        self.spec.shares_kv(layer)
+    }
+
     fn run_op(&self, op: &Op, layer: Option<usize>, run: &Run<'_>) -> Result<()> {
         self.run_one(op, layer.map(|i| &self.layers[i]), run)
     }
@@ -95,7 +99,7 @@ impl Runtime {
                 None => Ok(()),
             },
             Op::Norm { which, into } => self.norm_op(which, into, layer, run),
-            Op::NormAdd { which, from } => self.norm_add_op(which, from, layer, run),
+            Op::NormAdd { which, from, into } => self.norm_add_op(which, from, into, layer, run),
             Op::Clear { buf } => self.clear_op(buf, run),
             Op::LogitSoftcap => self.softcap_op(run, "logit_softcap"),
             Op::LogitScale => self.softcap_op(run, "logit_scale"),
@@ -122,11 +126,66 @@ impl Runtime {
             Op::MoeRoute => self.moe_route(layer.expect("moe runs inside a layer"), &self.pre.x, run.tokens, n),
             Op::MoeExperts => self.moe_experts(layer.expect("moe runs inside a layer"), n),
             Op::MoeCombine => self.moe_combine(if self.comm.is_some() { &self.partial } else { &self.pre.x }, n),
+            Op::MoeCombineInto { into } => self.moe_combine(self.f32_buf(into, run), n),
             Op::AllReduce => self.allreduce_op(n),
             Op::AllReduceNorm { which } => self.allreduce_norm_op(which, layer, n),
             Op::Gemv { .. } | Op::GemvStore { .. } | Op::StepAttention | Op::GdnStep => unreachable!("{} runs on the single row plan", op.label()),
             Op::HyperExpand | Op::HyperPre { .. } | Op::HyperPost | Op::HyperMean => self.hyper_op(op, layer, n),
+            Op::PerLayer { node, stage } => self.per_layer_op(node, stage, layer, run),
+            Op::Dit(_) => anyhow::bail!("{} runs in the denoiser, not the token runtime", op.label()),
         }
+    }
+
+    fn per_layer_op(&self, node: u8, stage: u8, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
+        let pb = self.ple.as_ref().context("the spec has no [per_layer]")?;
+        let p = self.spec.per_layer().expect("per layer buffers need a [per_layer]");
+        let launch = &pb.launch[node as usize];
+        let spec_node = &p.node[node as usize];
+        let head = stage == crate::plan::PLE_HEAD;
+        let weights = if head { &pb.head } else { &layer.expect("a per layer node runs inside a layer").ple };
+        let at: i32 = if head { 0 } else { layer.expect("a per layer node runs inside a layer").ple_at };
+        let numbers: Vec<i32> = launch
+            .params
+            .iter()
+            .map(|p| match spec_node.bind.get(p.name) {
+                Some(Bind::Number(v)) => *v as i32,
+                _ => 0,
+            })
+            .collect();
+        let mut b = self.launcher(self.kernel(launch.name));
+        for (i, param) in launch.params.iter().enumerate() {
+            match spec_node.bind.get(param.name) {
+                Some(Bind::Weight { weight, .. }) => {
+                    b.arg(weights.get(weight).with_context(|| format!("no per layer weight {weight}"))?);
+                }
+                Some(Bind::Buffer { buffer }) if buffer == "x" => {
+                    b.arg(&self.pre.x);
+                }
+                Some(Bind::Buffer { buffer }) if buffer == "tokens" => {
+                    b.arg(run.tokens);
+                }
+                Some(Bind::Buffer { buffer }) => {
+                    b.arg(pb.scratch.get(buffer).with_context(|| format!("no per layer scratch {buffer:?}"))?);
+                }
+                Some(Bind::Name(n)) if n == "layer" => {
+                    b.arg(&at);
+                }
+                Some(Bind::Number(_)) => {
+                    b.arg(&numbers[i]);
+                }
+                _ => bail!("param {:?} of {} is not bound to a buffer, weight or number", param.name, launch.name),
+            }
+        }
+        let dim = |symbol: &String| -> Result<u32> {
+            Ok(match symbol.as_str() {
+                "rows" => run.n as u32,
+                other => crate::state::dim(&self.spec, other)? as u32,
+            })
+        };
+        let dims = spec_node.grid.iter().map(dim).collect::<Result<Vec<_>>>()?;
+        let config = LaunchConfig { grid_dim: (dims[0], dims.get(1).copied().unwrap_or(1), dims.get(2).copied().unwrap_or(1)), block_dim: (launch.threads, 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(config) }?;
+        Ok(())
     }
 
     fn hyper_op(&self, op: &Op, layer: Option<&DeviceLayer>, n: usize) -> Result<()> {
@@ -409,6 +468,8 @@ impl Runtime {
             NormKind::PostAttention => &l().ln2,
             NormKind::PreMlp => l().ln_pre_mlp.as_ref().expect("a sandwich layer has a pre mlp norm"),
             NormKind::PostMlp => l().ln_post_mlp.as_ref().expect("a sandwich layer has a post mlp norm"),
+            NormKind::PostDense => l().moe_norms().0,
+            NormKind::PostExperts => l().moe_norms().1,
             NormKind::Final => &self.norm,
         }
     }
@@ -428,11 +489,12 @@ impl Runtime {
         }
     }
 
-    fn norm_add_op(&self, which: NormKind, from: Buf, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
+    fn norm_add_op(&self, which: NormKind, from: Buf, into: Buf, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
         let weight = self.norm_weight(which, layer);
         let mut b = self.launcher(self.kernel("norm_add"));
         let delta = self.f32_buf(from, run);
-        b.arg(delta).arg(weight).arg(&self.pre.x).arg(&self.pre.x);
+        let target = self.f32_buf(into, run);
+        b.arg(delta).arg(weight).arg(target).arg(target);
         unsafe { b.launch(super::cfg(run.n as u32, 1024)) }?;
         Ok(())
     }
@@ -606,6 +668,7 @@ impl Runtime {
             Buf::X => &self.pre.x,
             Buf::Xn => &self.pre.xn,
             Buf::Branch => &self.pre.branch,
+            Buf::Merged => &self.pre.merged,
             Buf::Qkv => &self.pre.qkv,
             Buf::Attn => &self.pre.attn,
             Buf::GateUp => &self.pre.gate_up,
@@ -627,8 +690,8 @@ impl Runtime {
         match weight {
             Weight::Qkv => (&attn().qkv, attn().qkv_bias.as_ref()),
             Weight::O => (&attn().o, attn().o_bias.as_ref()),
-            Weight::GateUp => (&layer_of().gate_up, None),
-            Weight::Down => (&layer_of().down, None),
+            Weight::GateUp | Weight::GateUpWide => (&layer_of().gate_up, None),
+            Weight::Down | Weight::DownWide => (&layer_of().down, None),
             Weight::LinIn => (&gdn().in_proj, None),
             Weight::LinBa => (&gdn().ba, None),
             Weight::LinOut => (&gdn().out, None),

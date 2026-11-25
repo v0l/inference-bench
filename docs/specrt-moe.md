@@ -58,6 +58,19 @@ Batch 1 reaches about 12% of the card's roughly 1.8 TB/s: the expert kernels are
 
 The first version of this comparison gave 43 of 48 and mean KL 0.29. The cause was not MoE: `Runtime::load_layout` left every slot's block table at zero, so with a contiguous layout every KV page aliased block 0. Prompts of 16 tokens or fewer fit in one page and were exact; from 17 tokens the first full-attention layer attended over a corrupted cache. The 27B tests never hit it because they set the table (`load_batched`, `set_block_table`). `load_layout` now gives each slot its own contiguous blocks, and `serving.rs` has a test for it. `tests/flash_prefill.rs` and `tests/gemm_shapes.rs` check the flash kernel and the attention GEMMs at the 122B shapes against a CPU reference, so those are known good.
 
+## Dense MLP beside the experts (Gemma 4 26B-A4B)
+
+`[moe] parallel_dense = true` keeps the layer's dense MLP and runs the experts beside it, each with its own post norm; the decoder graph block `attention_parallel_moe` (`when = "sandwich+tensor_core+parallel"`) wires it: dense MLP into `branch`, `post_feedforward_layernorm_1` adds it into `merged`, the routed experts combine into `branch`, `post_feedforward_layernorm_2` adds them into `merged`, then `post_feedforward_layernorm` adds `merged` into the residual. Router options, all read by `moe_route_logits` and `moe_route`:
+
+| Field | Meaning |
+| --- | --- |
+| `router_norm` | per-channel router input scale (`mlp.router.scale`); the router reads the weightless rms norm of the residual times it |
+| `router_norm_scale` | expression over config.json folded into that scale (`1 / sqrt(hidden_size)`) |
+| `input_norm` | the expert input norm weight, if it is not `post_attention_layernorm` (`pre_feedforward_layernorm_2.weight`) |
+| `expert_scale` | a per-expert factor on each routed weight after top-k renormalisation (`mlp.router.per_expert_scale`) |
+
+Fused `experts.gate_up_proj` [E, 2I, H] and `experts.down_proj` [E, H, I] load through `fused_experts`; per-expert quantised copies fall back to the per-expert names. Fixture `tests/fixtures/tiny-gemma4-moe` (4 experts, top 2, `G4_MOE=1 scripts/tiny_gemma4.py <dir>`), tests in `tests/gemma4.rs`.
+
 ## Not done
 
 The 122B decode b8 gap to vLLM (365 vs 435) and the 4k prefill gap remain (#652 below).

@@ -267,6 +267,31 @@ The arena of a denoiser forward or a VAE tile is a plan query, not a constant. L
 5. Vision attention family: separate key and value source, head_dim 384 and 512 shape. Done by identity against the diffusers attention outputs.
 6. `arena` plan query and `memory_plan` offsets. Done when the arena reported for the tiny fixtures equals the runtime's allocation and a request over the budget is refused or tiled before launch.
 
+### Denoiser on the engine (#1282)
+
+What landed, in the order the compiler sees it:
+
+- `graphs/denoiser.toml`: the generic denoiser graph. `[fields]` bind the diffusers `transformer`, `vae` and `pipeline` configs, `[symbols]` derive the widths (`hidden`, `mlp`, `fused`, `cat`, the modulation set widths), `[[buffer]]` declares every activation with its rows (`image`, `text`, `joint`, `seqs`) and form. `[[head]]`, `[[block]]` (`double`, `single`, with their `count` field and tensor `prefix`) and `[[tail]]` lower to a `Plan` with `Phase::Forward` and one `Op::Dit(DitOp)` per node. Nothing in Rust names the architecture; `DenoiserSpec::from_pipeline` reads a diffusers folder.
+- Ops: `Patchify`, `Unpatchify`, `TimestepEmbed`, `Split` (with SiLU), `Copy`, `Linear` (rows per stream, `+` joins weights, `[a:b]` slices weight columns, `add` accumulates), `Modulate { set, shift, scale }`, `GatedAdd { set, gate }`, `Glu { offset }`, `AxisRope`, `JointAttention`. `denoiser::Signer` signs them over `Rows::Image | Text | Joint` and `Count { image, text }` (zero for every decoder count). `denoiser::validate` walks the plan and checks every read against what was written, per row stream.
+- Kernels: compose descriptions in `specs/` (`dit_modulate` is LayerNorm plus `(1 + scale) x + shift` plus the plane split in one kernel with two block sums; `dit_gated_add`, `dit_glu`, `dit_split`, `dit_silu_split`, `dit_copy`, `dit_timestep`, `dit_patchify`, `dit_unpatchify`). Compose gained several block sums, an `index` stage, a bf16 `split_store`, row strides and offsets, nested layouts with symbol sizes, and `sin`/`cos`. The tile GEMM is `vis_mma`, attention is `vis_flash` with one segment `[0, S)`, and qk norm plus the 4 axis table rope is `vis_axis_rope` in the vision family (`VisionKernel::joint`).
+- Runtime: `denoiser_cuda::Denoiser` with `load`, `arena` (its own buffers, no KV state), `prepare` (runs the step invariant head ops once) and `forward(latent, sigma)`. `denoiser_host::HostDenoiser` runs the same plan on the CPU in f32, which is how the graph, the spec binding, the modulation order and the rope were proven before any kernel ran.
+- H1: `denoiser::hoisted` marks head ops whose reads do not depend on the latent or the timestep and whose writes no later section rewrites: `split text` and `context_embedder`. The copy of the context into `x` stays in the step because the blocks rewrite `x`.
+- Cost model: `Costs::with_compute(tflops, gbs)` adds the ridge; `compute_bound` is false for every decoder unit (their flops are 0), so `fusion_plan.rs` and `compile_plan.rs` are unchanged. A prologue onto a compute bound GEMM is refused with `Reason::ComputeBound` unless `compute_prologue`.
+
+Tolerances, from `scripts/denoiser_reference.py` (diffusers CPU f32, and the same model with its weights rounded to bf16): the host plan matches the f32 velocity to 5e-7 and every block output to 1e-4. With bf16 weights the reference itself moves 3e-3 from f32, so the engine (bf16 weights, f32 accumulation, split bf16 activations) is held to 1e-4 against the bf16 weight reference and 5e-3 against f32.
+
+Counts for FLUX.2 klein 4B at 1024 x 1024 (4096 image tokens, 512 text), from `inference-bench kernels --spec crates/specrt/tests/fixtures/tiny-flux2-klein/klein-4b-transformer.json --plan --graph denoiser --fusion`:
+
+| Section | Launches before | After fusion | What fused |
+|---|---|---|---|
+| head (x1) | 14 | 14 (12 per step after the hoist) | none |
+| double (x5) | 20 | 14 | gated residual into `to_out.0`, `to_add_out`, `linear_out` (both streams); SwiGLU into `linear_in` (both streams) |
+| single (x20) | 8 | 7 | both halves of `to_out` and the gated residual into one epilogue |
+| tail (x1) | 3 | 3 | none |
+| step | 277 | 227 | |
+
+34.8 TFLOP and 48.7 GB read per step. Every modulate prologue (11 per step) is refused as compute bound. The fused groups are the dry run of the fusion engine; the runtime still launches the unfused plan, so the identity of each fused kernel against the unfused plan is the next step (queue item 3).
+
 ## 7. Slices
 
 Filed as #1282 to #1286 by the supervisor; the order and the done test of each:

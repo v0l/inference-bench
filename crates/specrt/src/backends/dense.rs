@@ -174,7 +174,7 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
                     NormKind::Input => &l.expect("layer norm needs a layer").ln1,
                     NormKind::PostAttention => &l.expect("layer norm needs a layer").ln2,
                     NormKind::Final => m.final_norm.as_ref().expect("the last stage owns the final norm"),
-                    NormKind::PreMlp | NormKind::PostMlp => bail!("sandwich norms are not yet on wgpu"),
+                    NormKind::PreMlp | NormKind::PostMlp | NormKind::PostDense | NormKind::PostExperts => bail!("sandwich norms are not yet on wgpu"),
                 };
                 be.dispatch(kernels[0], &[&m.scratch.x, w, self.buf(into)], [row0 as u32, 0, 0, 0, 0, 0, 0, 0], [r, 1, 1])
             }
@@ -221,15 +221,15 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
             }
             Op::Swiglu if rows == 1 && be.limits().subgroup_size == 32 => Ok(()),
             Op::Swiglu => be.dispatch(kernels[0], &[&m.scratch.gate_up, &m.scratch.act], [r, 0, 0, 0, 0, 0, 0, 0], grid_1d(rows * spec.dims.intermediate)),
-            Op::Kernel { .. } | Op::MixKernel { .. } | Op::DecodeRope => bail!("described kernels are not yet on wgpu"),
+            Op::Kernel { .. } | Op::MixKernel { .. } | Op::DecodeRope | Op::PerLayer { .. } | Op::Gated { .. } => bail!("described kernels are not yet on wgpu"),
             Op::NormAdd { .. } | Op::Clear { .. } | Op::Split { .. } | Op::QkNorm | Op::ScaledAdd { .. } | Op::LogitScale | Op::LogitSoftcap => bail!("{} is not yet on wgpu", op.label()),
             Op::Splice => bail!("vision is not yet on wgpu"),
             Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => bail!("delta-net is not yet on wgpu"),
             Op::MtpIn | Op::MtpGather | Op::MtpNorm | Op::MtpDraft => bail!("MTP is not yet on wgpu"),
-            Op::MoeRoute | Op::MoeExperts | Op::MoeCombine => bail!("mixture of experts is not yet on wgpu"),
+            Op::MoeRoute | Op::MoeExperts | Op::MoeCombine | Op::MoeCombineInto { .. } => bail!("mixture of experts is not yet on wgpu"),
             Op::AllReduce | Op::AllReduceNorm { .. } => bail!("tensor parallel is not on wgpu"),
             Op::Gemv { .. } | Op::GemvStore { .. } | Op::StepAttention | Op::GdnStep => bail!("the single row cuda plan is not on wgpu"),
-            Op::HyperExpand | Op::HyperPre { .. } | Op::HyperPost | Op::HyperMean => bail!("hyper-connections are not yet on wgpu"),
+            Op::HyperExpand | Op::HyperPre { .. } | Op::HyperPost | Op::HyperMean | Op::PerLayer { .. } => bail!("hyper-connections are not yet on wgpu"),
         }
     }
 }

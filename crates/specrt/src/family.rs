@@ -103,6 +103,7 @@ pub struct FamilyAttention {
     pub params: std::collections::BTreeMap<String, ParamSource>,
     pub projection: Vec<crate::spec::Projection>,
     pub o_cols: Option<String>,
+    pub head_dim: Option<String>,
     pub o_cols_by: Vec<crate::spec::OCols>,
     pub scratch: std::collections::BTreeMap<String, String>,
     pub int_scratch: std::collections::BTreeMap<String, String>,
@@ -240,6 +241,22 @@ impl FamilyPrelude {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyPerLayer {
+    pub dim: Option<String>,
+    pub params: std::collections::BTreeMap<String, ParamSource>,
+    pub scratch: std::collections::BTreeMap<String, String>,
+    pub node: Vec<crate::graph::Node>,
+}
+
+impl FamilyPerLayer {
+    pub fn read(&self, config: &serde_json::Value) -> Result<Option<crate::spec::PerLayer>> {
+        let Some(dim) = self.dim.as_deref().and_then(|k| dotted(config, k)).and_then(|v| v.as_u64()).filter(|d| *d > 0) else { return Ok(None) };
+        Ok(Some(crate::spec::PerLayer { dim: dim as usize, params: read_params(&self.params, config)?, scratch: self.scratch.clone(), node: self.node.clone() }))
+    }
+}
+
 impl Default for FamilyAttention {
     fn default() -> Self {
         FamilyAttention {
@@ -247,6 +264,7 @@ impl Default for FamilyAttention {
             params: Default::default(),
             projection: Vec::new(),
             o_cols: None,
+            head_dim: None,
             o_cols_by: Vec::new(),
             scratch: Default::default(),
             int_scratch: Default::default(),
@@ -313,6 +331,7 @@ pub struct FamilyMlp {
     pub gated: Option<FamilyGated>,
     pub mapped: Option<FamilyGated>,
     pub dense_intermediate_key: Option<String>,
+    pub shared_tail_wide_key: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -344,6 +363,11 @@ pub struct FamilyMoe {
     pub experts_transposed: bool,
     pub quantized_experts: bool,
     pub hash_table: Option<String>,
+    pub parallel_dense: bool,
+    pub router_norm: Option<String>,
+    pub router_norm_scale: Option<String>,
+    pub input_norm: Option<String>,
+    pub expert_scale: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -412,7 +436,9 @@ pub struct FamilyBlocks {
     pub other_layer_type: Option<crate::spec::Block>,
     pub from_layer_types: bool,
     pub sliding_period_key: Option<String>,
+    pub shared_tail_key: Option<String>,
     pub attention_indices_key: Option<String>,
+    pub attention_indices_base: usize,
     pub types_key: Option<String>,
     pub sparse_types: Vec<String>,
     pub sparse_layers_key: Option<String>,
@@ -692,6 +718,8 @@ pub struct Family {
     #[serde(default)]
     pub prelude: FamilyPrelude,
     #[serde(default)]
+    pub per_layer: FamilyPerLayer,
+    #[serde(default)]
     pub tensors: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub refuse: Vec<FamilyRefuse>,
@@ -712,7 +740,7 @@ impl Family {
                 push(a, &mut out);
             }
         }
-        for (_, key) in self.attention.params.iter().chain(self.mixer.params.iter()).chain(self.gated_residual.params.iter()).chain(self.prelude.params.iter()) {
+        for (_, key) in self.attention.params.iter().chain(self.mixer.params.iter()).chain(self.gated_residual.params.iter()).chain(self.per_layer.params.iter()).chain(self.prelude.params.iter()) {
             match key {
                 ParamSource::Config { config, alt, .. } => {
                     push(config, &mut out);
@@ -757,6 +785,9 @@ impl Family {
         if let Some(k) = self.blocks.sliding_period_key.as_deref() {
             push(k, &mut out);
         }
+        for k in [self.blocks.shared_tail_key.as_deref(), self.mlp.shared_tail_wide_key.as_deref()].into_iter().flatten() {
+            push(k, &mut out);
+        }
         if let Some(k) = self.blocks.sparse_layers_key.as_deref() {
             push(k, &mut out);
         }
@@ -775,7 +806,7 @@ impl Family {
         if let Some(k) = self.rope.nope_zero_key.as_deref() {
             push(k, &mut out);
         }
-        for k in self.hyper.keys().chain(self.gated_residual.streams.as_deref()) {
+        for k in self.hyper.keys().chain(self.gated_residual.streams.as_deref()).chain(self.per_layer.dim.as_deref()) {
             push(k, &mut out);
         }
         if let Some(i) = &self.attention.indexer {

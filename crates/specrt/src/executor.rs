@@ -8,6 +8,9 @@ pub trait PlanBackend<R> {
     fn sparse(&self, _layer: usize) -> bool {
         false
     }
+    fn tail(&self, _layer: usize) -> bool {
+        false
+    }
     fn run_op(&self, op: &Op, layer: Option<usize>, run: &R) -> Result<()>;
     fn enter_layer(&self, _layer: usize) -> Result<()> {
         Ok(())
@@ -28,7 +31,8 @@ pub fn run_plan<R, B: PlanBackend<R>>(be: &B, plan: &Plan, run: &R, after_layer:
     run_ops(be, &plan.head, None, run)?;
     for i in 0..be.layers() {
         be.enter_layer(i)?;
-        run_ops(be, plan.layer_of(be.block(i), be.sparse(i)), Some(i), run)?;
+        run_ops(be, plan.layer_for(be.block(i), be.sparse(i), be.tail(i)), Some(i), run)?;
+        run_ops(be, &plan.per_layer, Some(i), run)?;
         be.leave_layer(i)?;
         after_layer(i)?;
     }

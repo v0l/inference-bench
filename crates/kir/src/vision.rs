@@ -11,6 +11,7 @@ pub const MAX_HEAD_DIM: usize = 128;
 
 pub const KERNELS: &[&str] = &["vis_mma", "vis_split", "vis_layernorm", "vis_pos", "vis_rope_pack", "vis_flash", "vis_to_f16", "vis_pool"];
 pub const TILED_KERNELS: &[&str] = &["vis_assemble", "vis_rope_pairs", "vis_layernorm_f32", "vis_shuffle_norm"];
+pub const JOINT_KERNELS: &[&str] = &["vis_axis_rope"];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct VisionKernel {
@@ -18,6 +19,7 @@ pub struct VisionKernel {
     pub head_dim: usize,
     pub precise: bool,
     pub tiled: bool,
+    pub joint: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,13 +39,18 @@ pub fn head_pad(head_dim: usize) -> usize {
 
 impl VisionKernel {
     pub fn new(t: &Target, head_dim: usize, precise: bool) -> Result<VisionKernel, VisionError> {
-        let k = VisionKernel { target: *t, head_dim, precise, tiled: false };
+        let k = VisionKernel { target: *t, head_dim, precise, tiled: false, joint: false };
         k.validate()?;
         Ok(k)
     }
 
     pub fn tiled(mut self) -> VisionKernel {
         self.tiled = true;
+        self
+    }
+
+    pub fn joint(mut self) -> VisionKernel {
+        self.joint = true;
         self
     }
 
@@ -86,7 +93,8 @@ impl VisionKernel {
 
     pub fn describe(&self) -> String {
         let tiled = if self.tiled { " tiled" } else { "" };
-        format!("{}\nvision head_dim={} hdp={} precise={} gemm_smem={} flash_smem={}{tiled}", self.target.describe(), self.head_dim, self.head_pad(), self.precise, self.gemm_smem(), self.flash_smem())
+        let joint = if self.joint { " joint" } else { "" };
+        format!("{}\nvision head_dim={} hdp={} precise={} gemm_smem={} flash_smem={}{tiled}{joint}", self.target.describe(), self.head_dim, self.head_pad(), self.precise, self.gemm_smem(), self.flash_smem())
     }
 
     pub fn hash(&self) -> String {

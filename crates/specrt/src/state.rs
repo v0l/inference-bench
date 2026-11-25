@@ -93,7 +93,14 @@ fn symbol(spec: &Spec, name: &str) -> Option<usize> {
         other => match other.parse::<usize>() {
             Ok(n) => n,
             Err(_) => {
-                if let Some(v) = spec.mixer.as_ref().and_then(|m| m.params.get(other)).or_else(|| spec.gated_residual().and_then(|h| h.params.get(other))).or_else(|| spec.prelude.as_ref().and_then(|p| p.params.get(other))) {
+                if let Some(v) = spec
+                    .mixer
+                    .as_ref()
+                    .and_then(|m| m.params.get(other))
+                    .or_else(|| spec.gated_residual().and_then(|h| h.params.get(other)))
+                    .or_else(|| spec.per_layer().and_then(|p| p.params.get(other)))
+                    .or_else(|| spec.prelude.as_ref().and_then(|p| p.params.get(other)))
+                {
                     return (*v >= 0.0 && v.fract() == 0.0).then_some(*v as usize);
                 }
                 let v = *a.params.get(other)?;
@@ -121,7 +128,7 @@ pub fn dim(spec: &Spec, text: &str) -> Result<usize> {
 impl State {
     pub fn layer_count(&self, spec: &Spec) -> usize {
         match self.layers {
-            Layers::Attention if !self.blocks.is_empty() => (0..spec.layers.count).filter(|&i| self.blocks.iter().any(|b| b == spec.block(i).name())).count(),
+            Layers::Attention if !self.blocks.is_empty() => (0..spec.layers.count).filter(|&i| spec.owns_kv(i) && self.blocks.iter().any(|b| b == spec.block(i).name())).count(),
             Layers::Attention => spec.kv_layers(),
             Layers::Linear => spec.linear_layers(),
             Layers::Prelude => spec.prelude.as_ref().map_or(0, |p| p.layers.len()),
@@ -188,7 +195,7 @@ pub fn kv_block_bytes(spec: &Spec, planes: usize) -> usize {
 }
 
 pub fn kv_bytes_per_token_at(spec: &Spec, attention_index: usize) -> u64 {
-    let layer = (0..spec.layers.count).filter(|&i| spec.block(i).is_attention()).nth(attention_index);
+    let layer = (0..spec.layers.count).filter(|&i| spec.owns_kv(i)).nth(attention_index);
     positional(spec)
         .filter(|s| s.layers == Layers::Attention && s.keeps(spec, layer))
         .map(|s| s.token_layer_bytes(spec, attention_index, 1) as u64)

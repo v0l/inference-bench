@@ -228,7 +228,7 @@ fn mlp_parts(spec: &Spec, index: usize, force_moe: bool) -> MlpParts {
             let routed = matrices * h * m.expert_intermediate as u64 * m.experts as u64;
             let per_token = m.active.unwrap_or(m.experts).min(m.experts) as u64;
             MlpParts {
-                dense: 0,
+                dense: if m.parallel_dense { (spec.gate_up_rows() + spec.dims.intermediate) as u64 * h } else { 0 },
                 routed,
                 shared: matrices * h * m.shared_intermediate as u64,
                 router: h * m.experts as u64 + if m.shared_intermediate > 0 && m.shared_gate { h } else { 0 },

@@ -63,6 +63,8 @@ pub struct MoeShape {
     pub mapped: bool,
     pub input_scaled: bool,
     pub input_norm: bool,
+    pub split_input: bool,
+    pub expert_scale: bool,
 }
 
 pub(crate) fn f32_literal(v: f64) -> String {

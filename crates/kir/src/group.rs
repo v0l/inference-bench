@@ -4,7 +4,7 @@ use crate::{Access, Kernel, Language, Param, Role, Scalar, Target};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum GroupStage {
-    Load { dst: String, src: String, row: u32, group: u32, offset: u32, index: Option<String> },
+    Load { dst: String, src: String, row: u32, group: u32, offset: u32, index: Option<String>, shift: Option<String>, by_row: bool },
     Value { dst: String, expr: Expr },
     Sum { dst: String, expr: Expr },
     Scalar { dst: String, expr: Expr },
@@ -49,7 +49,14 @@ impl GroupMap {
         }
         for (i, p) in params.iter().enumerate() {
             let index = self.stages.iter().any(|s| matches!(s, GroupStage::Load { index: Some(n), .. } if n == p.name));
-            let ty_ok = if index { p.ty == Scalar::I32 && p.role == Role::Activation && p.access == Access::Read } else { p.ty == Scalar::F32 };
+            let shift = self.stages.iter().any(|s| matches!(s, GroupStage::Load { shift: Some(n), .. } if n == p.name));
+            let ty_ok = if index {
+                p.ty == Scalar::I32 && p.role == Role::Activation && p.access == Access::Read
+            } else if shift {
+                p.ty == Scalar::I32 && p.role == Role::Value
+            } else {
+                p.ty == Scalar::F32
+            };
             if params[..i].iter().any(|q| q.name == p.name) || RESERVED.contains(&p.name) || !ty_ok {
                 return Err(format!("group_map param {:?} is not usable", p.name));
             }
@@ -84,7 +91,7 @@ impl GroupMap {
                 e.clone().bind(&self.consts).subst(&env)?.lower(Dialect::Cuda, &[])
             };
             match s {
-                GroupStage::Load { dst, src, row, group, offset, index } => {
+                GroupStage::Load { dst, src, row, group, offset, index, shift, by_row } => {
                     if !ok(dst, &defined) {
                         return Err(format!("group_map name {dst:?} is not usable or is defined twice"));
                     }
@@ -93,12 +100,24 @@ impl GroupMap {
                         _ => return Err(format!("group_map load from {src:?}, which is not a read f32 buffer param")),
                     }
                     let at = match index {
-                        None => address(*row, *group, *offset),
+                        None => match shift {
+                            None => address(*row, *group, *offset),
+                            Some(s) => {
+                                if !params.iter().any(|p| p.name == s && p.role == Role::Value) {
+                                    return Err(format!("group_map shift {s:?} is not a value param"));
+                                }
+                                format!("{} + (size_t){s} * WIDTH", address(*row, *group, *offset))
+                            }
+                        },
                         Some(ix) => {
                             if !params.iter().any(|p| p.name == ix) {
                                 return Err(format!("group_map gather index {ix:?} is not a param"));
                             }
-                            format!("(size_t){ix}[(size_t)row * {row} + grp] * {group} + {offset} + i")
+                            if *by_row {
+                                format!("(size_t){ix}[row] * {row} + (size_t)grp * {group} + {offset} + i")
+                            } else {
+                                format!("(size_t){ix}[(size_t)row * {row} + grp] * {group} + {offset} + i")
+                            }
                         }
                     };
                     elements.push((dst.clone(), Expr::Raw(format!("{src}[{at}]"))));

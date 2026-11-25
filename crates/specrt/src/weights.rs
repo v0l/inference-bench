@@ -131,9 +131,18 @@ pub struct MoeWeights {
     pub gate_up_bias: Option<Vec<f32>>,
     pub down_bias: Option<Vec<f32>>,
     pub hash_table: Option<Vec<i32>>,
+    pub norms: Option<ParallelNorms>,
     pub gate: Stacked,
     pub up: Stacked,
     pub down: Stacked,
+}
+
+pub struct ParallelNorms {
+    pub router: Vec<f32>,
+    pub input: Vec<f32>,
+    pub expert_scale: Vec<f32>,
+    pub post_dense: Vec<f32>,
+    pub post_experts: Vec<f32>,
 }
 
 pub struct Layer<'a> {
@@ -148,6 +157,7 @@ pub struct Layer<'a> {
     pub hyper: Vec<Vec<f32>>,
     pub gated: Vec<Vec<(String, Vec<f32>)>>,
     pub prelude: Vec<(String, Vec<f32>)>,
+    pub ple: Vec<(String, Vec<f32>)>,
 }
 
 pub struct Outside<'a> {
@@ -218,9 +228,11 @@ pub struct View<'a> {
 }
 
 fn shard_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let index = dir.join(INDEX);
+    let diffusers = ["diffusion_pytorch_model.safetensors.index.json", "diffusion_pytorch_model.safetensors"];
+    let (index_name, single_name) = if !dir.join(INDEX).exists() && !dir.join(SINGLE).exists() && (dir.join(diffusers[0]).exists() || dir.join(diffusers[1]).exists()) { (diffusers[0], diffusers[1]) } else { (INDEX, SINGLE) };
+    let index = dir.join(index_name);
     if !index.exists() {
-        return Ok(vec![dir.join(SINGLE)]);
+        return Ok(vec![dir.join(single_name)]);
     }
     let text = std::fs::read_to_string(&index).with_context(|| index.display().to_string())?;
     let json: serde_json::Value = serde_json::from_str(&text).with_context(|| index.display().to_string())?;
@@ -492,6 +504,10 @@ impl Checkpoint {
             Dtype::F8_E4M3 => bail!("{name} is FP8; use quant = \"fp8_block128\""),
             other => bail!("{name} is {other:?}, expected bf16, f16 or f32"),
         })
+    }
+
+    pub fn f32_values(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
+        self.floats(name, shape)
     }
 
     fn floats(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
@@ -1044,11 +1060,11 @@ impl Checkpoint {
         Ok(self.f32(name, len)?.into_iter().map(|w| w + offset).collect())
     }
 
-    fn attention(&self, spec: &Spec, attn: &str, block: Block) -> Result<Attn<'_>> {
-        self.attention_as(spec, attn, false, block)
+    fn attention(&self, spec: &Spec, attn: &str, block: Block, shared: bool) -> Result<Attn<'_>> {
+        self.attention_as(spec, attn, false, block, shared)
     }
 
-    fn attention_as(&self, spec: &Spec, attn: &str, bf16: bool, block: Block) -> Result<Attn<'_>> {
+    fn attention_as(&self, spec: &Spec, attn: &str, bf16: bool, block: Block, shared: bool) -> Result<Attn<'_>> {
         let a = &spec.attention;
         let quant = if bf16 { Quant::Bf16 } else { spec.quant };
         let (qkv_quant, o_quant) = if bf16 { (Quant::Bf16, Quant::Bf16) } else { (spec.requanted("qkv", quant), spec.requanted("o", quant)) };
@@ -1063,7 +1079,7 @@ impl Checkpoint {
             let mut layout: Vec<(Option<usize>, usize, usize)> = Vec::new();
             let mut loaded = Vec::new();
             for (group, width) in spec.projection_groups() {
-                let live: Vec<_> = group.iter().filter(|p| spec.projection_live(p, block)).collect();
+                let live: Vec<_> = group.iter().filter(|p| spec.projection_live(p, block, shared)).collect();
                 ensure!(live.len() <= 1, "{attn}: {} projections share one slot in {} layers", live.len(), block.name());
                 match live.first() {
                     Some(p) => {
@@ -1108,7 +1124,7 @@ impl Checkpoint {
         parts.extend(gates);
         if a.projection.iter().any(|p| p.append) {
             for (group, width) in spec.projection_groups() {
-                let live: Vec<_> = group.iter().filter(|p| spec.projection_live(p, block)).collect();
+                let live: Vec<_> = group.iter().filter(|p| spec.projection_live(p, block, shared)).collect();
                 ensure!(live.len() <= 1, "{attn}: {} appended projections share one slot in {} layers", live.len(), block.name());
                 let rows = match live.first() {
                     Some(p) => {
@@ -1143,7 +1159,7 @@ impl Checkpoint {
             (None, None)
         };
         let mut extra = Vec::new();
-        for bind in spec.attention.node.iter().filter(|n| n.present_in(block)).flat_map(|n| n.bind.values()) {
+        for bind in spec.attention.node.iter().filter(|n| n.present_in(block) && !(shared && n.owner_only())).flat_map(|n| n.bind.values()) {
             if let crate::graph::Bind::Weight { weight, len } = bind
                 && !extra.iter().any(|(n, _): &(String, Vec<f32>)| n == weight)
             {
@@ -1233,11 +1249,11 @@ impl Checkpoint {
 
     pub fn layer_attention(&self, spec: &Spec, i: usize) -> Result<Attn<'_>> {
         ensure!(spec.block(i).is_attention(), "layer {i} is not an attention layer");
-        self.attention(spec, &format!("{}.layers.{i}.self_attn", self.root()), spec.block(i))
+        self.attention(spec, &format!("{}.layers.{i}.self_attn", self.root()), spec.block(i), spec.shares_kv(i))
     }
 
     pub fn layer_at(&self, spec: &Spec, i: usize, global: usize) -> Result<Layer<'_>> {
-        let (h, inter) = (spec.dims.hidden, spec.dims.intermediate);
+        let (h, inter) = (spec.dims.hidden, spec.layer_intermediate(i));
         let p = format!("{}.layers.{global}", self.root());
         self.require_activation_scales(spec, i, global, &p)?;
         let mixer = if !spec.has_mixer(i) {
@@ -1247,14 +1263,15 @@ impl Checkpoint {
         } else if spec.block(i).is_linear() {
             Mixer::Linear(self.gated_delta_net(spec, &format!("{p}.linear_attn"))?)
         } else {
-            Mixer::Attention(self.attention(spec, &format!("{p}.self_attn"), spec.block(i))?)
+            Mixer::Attention(self.attention(spec, &format!("{p}.self_attn"), spec.block(i), spec.shares_kv(i))?)
         };
         let mlp = spec.mlp_quant(i);
         let served = spec.served_mlp_quant(i);
         let sparse = spec.moe.as_ref().is_some_and(|m| m.is_sparse(global)) && spec.has_mlp(i);
         let moe = if sparse { Some(self.moe_layer(spec, &p, mlp)?) } else { None };
         let none = || (Matrix::Bf16(Cow::Owned(vec![0; 8])), Matrix::Bf16(Cow::Owned(vec![0; 8])));
-        let (gate_up, down) = if sparse || !spec.has_mlp(i) {
+        let dense_beside = sparse && spec.parallel_moe();
+        let (gate_up, down) = if (sparse && !dense_beside) || !spec.has_mlp(i) {
             none()
         } else if spec.mlp.mapped.is_some() {
             let up = self.raw(&format!("{p}.mlp.up_proj.weight"), inter, h)?;
@@ -1295,6 +1312,7 @@ impl Checkpoint {
             let s = spec.norm.residual_scale.filter(|_| spec.norm.sandwich).unwrap_or(1.0) * layer_scale;
             if s == 1.0 { w } else { w.into_iter().map(|v| (v as f64 * s) as f32).collect() }
         };
+        let ple_factor = spec.norm.residual_scale.filter(|_| spec.norm.sandwich).unwrap_or(1.0) * layer_scale;
         Ok(Layer {
             ln1,
             ln2: if spec.norm.sandwich { branch(ln2) } else { ln2 },
@@ -1307,6 +1325,7 @@ impl Checkpoint {
             hyper: self.hyper(spec, &p)?,
             gated: self.gated_sites(spec, &p)?,
             prelude: self.prelude_weights(spec, i, &p)?,
+            ple: self.ple_layer(spec, &p, ple_factor)?,
         })
     }
 
@@ -1341,6 +1360,22 @@ impl Checkpoint {
     pub fn gated_head(&self, spec: &Spec) -> Result<Vec<(String, Vec<f32>)>> {
         let Some(h) = spec.gated_residual() else { return Ok(Vec::new()) };
         self.gated_weights(spec, &format!("{}.{}", self.root(), h.module), crate::spec::GatedStage::Collapse)
+    }
+
+    pub fn ple_layer(&self, spec: &Spec, p: &str, factor: f64) -> Result<Vec<(String, Vec<f32>)>> {
+        let Some(pl) = spec.per_layer() else { return Ok(Vec::new()) };
+        pl.weights("layer")
+            .into_iter()
+            .map(|(w, len)| {
+                let values = self.flat(&format!("{p}.{w}"), spec.weight_len(&len)?)?;
+                Ok((w.clone(), if factor == 1.0 { values } else { values.into_iter().map(|v| (v as f64 * factor) as f32).collect() }))
+            })
+            .collect()
+    }
+
+    pub fn ple_head(&self, spec: &Spec) -> Result<Vec<(String, Vec<f32>)>> {
+        let Some(pl) = spec.per_layer() else { return Ok(Vec::new()) };
+        pl.weights("head").into_iter().map(|(w, len)| Ok((w.clone(), self.flat(&format!("{}.{w}", self.root()), spec.weight_len(&len)?)?))).collect()
     }
 
     fn gguf_stack(&self, g: &Gguf, name: &str, shape: &[usize], out: &mut Vec<u16>) -> Result<()> {
@@ -1383,7 +1418,7 @@ impl Checkpoint {
         } else {
             None
         };
-        Ok(MoeWeights { router, shared_gate, score_bias: None, router_bias: None, gate_up_bias: None, down_bias: None, hash_table: None, gate: stack("gate", inter, h)?, up: stack("up", inter, h)?, down: stack("down", h, inter)? })
+        Ok(MoeWeights { router, shared_gate, score_bias: None, router_bias: None, gate_up_bias: None, down_bias: None, hash_table: None, norms: None, gate: stack("gate", inter, h)?, up: stack("up", inter, h)?, down: stack("down", h, inter)? })
     }
 
     fn moe_layer(&self, spec: &Spec, p: &str, quant: Quant) -> Result<MoeWeights> {
@@ -1481,7 +1516,7 @@ impl Checkpoint {
                 }
                 (Stacked::Bf16(gate), Stacked::Bf16(up), Stacked::Bf16(down))
             }
-            None if m.fused_experts => {
+            None if m.fused_experts && self.has(&format!("{p}.mlp.experts.gate_up_proj.weight")) => {
                 ensure!(quant == Quant::Bf16, "fused experts are bf16 only");
                 let shared = m.shared_intermediate;
                 let fused = self.bf16(&format!("{p}.mlp.experts.gate_up_proj.weight"), &[e, 2 * inter, h])?;
@@ -1515,9 +1550,31 @@ impl Checkpoint {
                 (Some(t), true) => Some(self.int_table(&format!("{p}.mlp.{}.{t}", m.router_module), m.top_k())?),
                 _ => None,
             },
+            norms: if m.parallel_dense { Some(self.parallel_norms(spec, m, p)?) } else { None },
             gate,
             up,
             down,
+        })
+    }
+
+    fn parallel_norms(&self, spec: &Spec, m: &crate::spec::Moe, p: &str) -> Result<ParallelNorms> {
+        let h = spec.dims.hidden;
+        let router = match &m.router_norm {
+            Some(t) => self.f32(&format!("{p}.{t}"), h)?.into_iter().map(|v| (v as f64 * m.router_norm_scale) as f32).collect(),
+            None => vec![m.router_norm_scale as f32; h],
+        };
+        Ok(ParallelNorms {
+            router,
+            input: match &m.input_norm {
+                Some(t) => self.norm(spec, &format!("{p}.{t}"), h)?,
+                None => self.norm(spec, &format!("{p}.post_attention_layernorm.weight"), h)?,
+            },
+            expert_scale: match &m.expert_scale {
+                Some(t) => self.f32(&format!("{p}.{t}"), m.experts)?,
+                None => vec![1.0; m.experts],
+            },
+            post_dense: self.norm(spec, &format!("{p}.{}", crate::plan::NormKind::PostDense.tensor()), h)?,
+            post_experts: self.norm(spec, &format!("{p}.{}", crate::plan::NormKind::PostExperts.tensor()), h)?,
         })
     }
 
@@ -1665,7 +1722,7 @@ impl Checkpoint {
         ensure!(self.has(&lay.fc), "the checkpoint has no {}", lay.fc);
         let bf16 = |r: Raw<'a>, what: &str| -> Result<Matrix<'a>> { r.dequantized().into_matrix(Quant::Bf16, what) };
         let p = lay.layer.as_str();
-        let attn = self.attention_as(spec, &format!("{p}.self_attn"), true, Block::Full)?;
+        let attn = self.attention_as(spec, &format!("{p}.self_attn"), true, Block::Full, false)?;
         let sparse = spec.moe.is_some();
         let (gate_up, down, moe) = if sparse {
             let dummy = || Matrix::Bf16(Cow::Owned(vec![0; 8]));
@@ -1692,6 +1749,7 @@ impl Checkpoint {
                 hyper: Vec::new(),
                 gated: Vec::new(),
                 prelude: Vec::new(),
+                ple: Vec::new(),
             },
             norm: self.norm(spec, &lay.norm, h)?,
         })

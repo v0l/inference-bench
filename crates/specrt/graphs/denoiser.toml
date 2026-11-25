@@ -1,0 +1,489 @@
+name = "denoiser"
+kind = "denoiser-graph"
+
+[fields]
+heads = ["transformer.num_attention_heads"]
+head_dim = ["transformer.attention_head_dim"]
+in_channels = ["transformer.in_channels"]
+out_channels = ["transformer.out_channels", "transformer.in_channels"]
+joint_dim = ["transformer.joint_attention_dim"]
+freq = ["transformer.timestep_guidance_channels"]
+mlp_ratio = ["transformer.mlp_ratio"]
+norm_eps = ["transformer.eps"]
+rope_theta = ["transformer.rope_theta"]
+axes = ["transformer.axes_dims_rope"]
+double = ["transformer.num_layers"]
+single = ["transformer.num_single_layers"]
+latent_patch = ["vae.patch_size.0", "transformer.patch_size"]
+time_scale = ["transformer.timestep_scale", "pipeline.timestep_scale"]
+
+[symbols]
+hidden = "heads * head_dim"
+mlp = "floor(hidden * mlp_ratio)"
+qkv = "3 * hidden"
+fused = "3 * hidden + 2 * mlp"
+gate_up = "2 * mlp"
+cat = "hidden + mlp"
+mod2 = "6 * hidden"
+mod1 = "3 * hidden"
+mod0 = "2 * hidden"
+grid_channels = "in_channels / (latent_patch * latent_patch)"
+
+[[buffer]]
+name = "x"
+rows = "joint"
+cols = "hidden"
+
+[[buffer]]
+name = "xn"
+rows = "joint"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "qkv"
+rows = "joint"
+cols = "qkv"
+
+[[buffer]]
+name = "fused"
+rows = "joint"
+cols = "fused"
+
+[[buffer]]
+name = "attn"
+rows = "joint"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "gate_up"
+rows = "joint"
+cols = "gate_up"
+
+[[buffer]]
+name = "act"
+rows = "joint"
+cols = "mlp"
+planes = true
+
+[[buffer]]
+name = "branch"
+rows = "joint"
+cols = "hidden"
+
+[[buffer]]
+name = "tokens"
+rows = "image"
+cols = "in_channels"
+planes = true
+
+[[buffer]]
+name = "text_planes"
+rows = "text"
+cols = "joint_dim"
+planes = true
+
+[[buffer]]
+name = "context"
+rows = "text"
+cols = "hidden"
+
+[[buffer]]
+name = "tproj"
+rows = "seqs"
+cols = "freq"
+planes = true
+
+[[buffer]]
+name = "t1"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "t1_act"
+rows = "seqs"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "temb"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "temb_act"
+rows = "seqs"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "mod_image"
+rows = "seqs"
+cols = "mod2"
+
+[[buffer]]
+name = "mod_text"
+rows = "seqs"
+cols = "mod2"
+
+[[buffer]]
+name = "mod_single"
+rows = "seqs"
+cols = "mod1"
+
+[[buffer]]
+name = "mod_out"
+rows = "seqs"
+cols = "mod0"
+
+[[buffer]]
+name = "out"
+rows = "image"
+cols = "out_channels"
+
+[[input]]
+name = "latent"
+rows = "image"
+cols = "in_channels"
+
+[[input]]
+name = "text"
+rows = "text"
+cols = "joint_dim"
+
+[[input]]
+name = "timestep"
+rows = "seqs"
+cols = "1"
+
+[[input]]
+name = "ids"
+rows = "joint"
+cols = "axes_count"
+int = true
+
+[[output]]
+name = "velocity"
+rows = "image"
+cols = "out_channels"
+
+[[head]]
+op = "patchify"
+in = "latent"
+out = "tokens"
+
+[[head]]
+op = "split"
+in = "text"
+out = "text_planes"
+rows = "text"
+
+[[head]]
+op = "linear"
+weight = "context_embedder"
+in = "text_planes"
+out = "context"
+rows = "text"
+
+[[head]]
+op = "copy"
+in = "context"
+out = "x"
+rows = "text"
+
+[[head]]
+op = "linear"
+weight = "x_embedder"
+in = "tokens"
+out = "x"
+rows = "image"
+
+[[head]]
+op = "timestep"
+in = "timestep"
+out = "tproj"
+
+[[head]]
+op = "linear"
+weight = "time_guidance_embed.timestep_embedder.linear_1"
+in = "tproj"
+out = "t1"
+rows = "seqs"
+
+[[head]]
+op = "silu_split"
+in = "t1"
+out = "t1_act"
+rows = "seqs"
+
+[[head]]
+op = "linear"
+weight = "time_guidance_embed.timestep_embedder.linear_2"
+in = "t1_act"
+out = "temb"
+rows = "seqs"
+
+[[head]]
+op = "silu_split"
+in = "temb"
+out = "temb_act"
+rows = "seqs"
+
+[[head]]
+op = "linear"
+weight = "double_stream_modulation_img.linear"
+in = "temb_act"
+out = "mod_image"
+rows = "seqs"
+
+[[head]]
+op = "linear"
+weight = "double_stream_modulation_txt.linear"
+in = "temb_act"
+out = "mod_text"
+rows = "seqs"
+
+[[head]]
+op = "linear"
+weight = "single_stream_modulation.linear"
+in = "temb_act"
+out = "mod_single"
+rows = "seqs"
+
+[[head]]
+op = "linear"
+weight = "norm_out.linear"
+in = "temb_act"
+out = "mod_out"
+rows = "seqs"
+
+[[block]]
+name = "double"
+prefix = "transformer_blocks"
+count = "double"
+
+[[block.node]]
+op = "modulate"
+in = "x"
+out = "xn"
+rows = "image"
+set = "mod_image"
+shift = 0
+scale = 1
+
+[[block.node]]
+op = "modulate"
+in = "x"
+out = "xn"
+rows = "text"
+set = "mod_text"
+shift = 0
+scale = 1
+
+[[block.node]]
+op = "linear"
+weight = "attn.to_q+attn.to_k+attn.to_v"
+in = "xn"
+out = "qkv"
+rows = "image"
+
+[[block.node]]
+op = "linear"
+weight = "attn.add_q_proj+attn.add_k_proj+attn.add_v_proj"
+in = "xn"
+out = "qkv"
+rows = "text"
+
+[[block.node]]
+op = "axis_rope"
+in = "qkv"
+text = "attn.norm_added"
+image = "attn.norm"
+
+[[block.node]]
+op = "joint_attention"
+out = "attn"
+
+[[block.node]]
+op = "linear"
+weight = "attn.to_out.0"
+in = "attn"
+out = "branch"
+rows = "image"
+
+[[block.node]]
+op = "linear"
+weight = "attn.to_add_out"
+in = "attn"
+out = "branch"
+rows = "text"
+
+[[block.node]]
+op = "gated_add"
+in = "branch"
+rows = "image"
+set = "mod_image"
+gate = 2
+
+[[block.node]]
+op = "gated_add"
+in = "branch"
+rows = "text"
+set = "mod_text"
+gate = 2
+
+[[block.node]]
+op = "modulate"
+in = "x"
+out = "xn"
+rows = "image"
+set = "mod_image"
+shift = 3
+scale = 4
+
+[[block.node]]
+op = "modulate"
+in = "x"
+out = "xn"
+rows = "text"
+set = "mod_text"
+shift = 3
+scale = 4
+
+[[block.node]]
+op = "linear"
+weight = "ff.linear_in"
+in = "xn"
+out = "gate_up"
+rows = "image"
+
+[[block.node]]
+op = "linear"
+weight = "ff_context.linear_in"
+in = "xn"
+out = "gate_up"
+rows = "text"
+
+[[block.node]]
+op = "glu"
+in = "gate_up"
+out = "act"
+rows = "image"
+offset = "0"
+
+[[block.node]]
+op = "glu"
+in = "gate_up"
+out = "act"
+rows = "text"
+offset = "0"
+
+[[block.node]]
+op = "linear"
+weight = "ff.linear_out"
+in = "act"
+out = "branch"
+rows = "image"
+
+[[block.node]]
+op = "linear"
+weight = "ff_context.linear_out"
+in = "act"
+out = "branch"
+rows = "text"
+
+[[block.node]]
+op = "gated_add"
+in = "branch"
+rows = "image"
+set = "mod_image"
+gate = 5
+
+[[block.node]]
+op = "gated_add"
+in = "branch"
+rows = "text"
+set = "mod_text"
+gate = 5
+
+[[block]]
+name = "single"
+prefix = "single_transformer_blocks"
+count = "single"
+
+[[block.node]]
+op = "modulate"
+in = "x"
+out = "xn"
+rows = "joint"
+set = "mod_single"
+shift = 0
+scale = 1
+
+[[block.node]]
+op = "linear"
+weight = "attn.to_qkv_mlp_proj"
+in = "xn"
+out = "fused"
+rows = "joint"
+
+[[block.node]]
+op = "axis_rope"
+in = "fused"
+text = "attn.norm"
+image = "attn.norm"
+
+[[block.node]]
+op = "joint_attention"
+out = "attn"
+
+[[block.node]]
+op = "glu"
+in = "fused"
+out = "act"
+rows = "joint"
+offset = "qkv"
+
+[[block.node]]
+op = "linear"
+weight = "attn.to_out[0:hidden]"
+in = "attn"
+out = "branch"
+rows = "joint"
+
+[[block.node]]
+op = "linear"
+weight = "attn.to_out[hidden:cat]"
+in = "act"
+out = "branch"
+rows = "joint"
+add = true
+
+[[block.node]]
+op = "gated_add"
+in = "branch"
+rows = "joint"
+set = "mod_single"
+gate = 2
+
+[[tail]]
+op = "modulate"
+in = "x"
+out = "xn"
+rows = "image"
+set = "mod_out"
+shift = 1
+scale = 0
+
+[[tail]]
+op = "linear"
+weight = "proj_out"
+in = "xn"
+out = "out"
+rows = "image"
+
+[[tail]]
+op = "unpatchify"
+in = "out"
+out = "velocity"

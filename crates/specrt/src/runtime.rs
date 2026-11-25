@@ -84,7 +84,7 @@ enum Work {
 }
 
 enum Uploaded {
-    Head { norm: CudaSlice<f32>, lm_head: DeviceMatrix, embed: Option<CudaSlice<u16>>, draft: Option<DeviceMatrix>, gated: GatedWeights },
+    Head { norm: CudaSlice<f32>, lm_head: DeviceMatrix, embed: Option<CudaSlice<u16>>, draft: Option<DeviceMatrix>, gated: GatedWeights, ple: PleWeights },
     Embed(CudaSlice<u16>),
     Mtp(Option<mtp::DeviceMtp>),
     Layer(usize, DeviceLayer),
@@ -98,11 +98,16 @@ struct Weights {
     mtp: Option<mtp::DeviceMtp>,
     direct: bool,
     gated: GatedWeights,
+    ple: PleWeights,
 }
 
 type GatedWeights = std::collections::BTreeMap<String, CudaSlice<f32>>;
 
 fn upload_gated(stream: &Arc<CudaStream>, weights: &[(String, Vec<f32>)]) -> Result<GatedWeights> {
+    weights.iter().map(|(n, v)| Ok((n.clone(), stream.clone_htod(v)?))).collect()
+}
+
+fn upload_ple(stream: &Arc<CudaStream>, weights: &[(String, Vec<f32>)]) -> Result<PleWeights> {
     weights.iter().map(|(n, v)| Ok((n.clone(), stream.clone_htod(v)?))).collect()
 }
 
@@ -133,8 +138,8 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, store: &
             q_norm: up_opt(&a.q_norm)?,
             k_norm: up_opt(&a.k_norm)?,
             o: up_m(&a.o)?,
-            kv: spec.attention_before(i) as i32,
-            kind_kv: spec.kind_before(i) as i32,
+            kv: spec.kv_index(i) as i32,
+            kind_kv: spec.kind_index(i) as i32,
             window: if spec.block(i).windowed() { spec.layers.window.unwrap_or(0) as i32 } else { 0 },
             nope: spec.nope(i),
             extra: a.extra.iter().map(|(n, v)| Ok((n.clone(), stream.clone_htod(v)?))).collect::<Result<_>>()?,
@@ -156,7 +161,7 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, store: &
             slot: before(true),
         }),
     };
-    let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, ln_pre_mlp: up_opt(&l.ln_pre_mlp)?, ln_post_mlp: up_opt(&l.ln_post_mlp)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)?, moe: l.moe.as_ref().map(|m| moe::DeviceMoe::upload(stream, m, i, cached.as_ref().map(|(p, n)| (*p, *n)))).transpose()?, hyper: l.hyper.iter().map(|v| Ok(stream.clone_htod(v)?)).collect::<Result<_>>()?, gated: l.gated.iter().map(|s| upload_gated(stream, s)).collect::<Result<_>>()?, prelude: spec.prelude_slot(i).map(|s| Ok::<_, anyhow::Error>((s as i32, upload_gated(stream, &l.prelude)?))).transpose()? };
+    let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, ln_pre_mlp: up_opt(&l.ln_pre_mlp)?, ln_post_mlp: up_opt(&l.ln_post_mlp)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)?, moe: l.moe.as_ref().map(|m| moe::DeviceMoe::upload(stream, m, i, cached.as_ref().map(|(p, n)| (*p, *n)))).transpose()?, hyper: l.hyper.iter().map(|v| Ok(stream.clone_htod(v)?)).collect::<Result<_>>()?, gated: l.gated.iter().map(|s| upload_gated(stream, s)).collect::<Result<_>>()?, prelude: spec.prelude_slot(i).map(|s| Ok::<_, anyhow::Error>((s as i32, upload_gated(stream, &l.prelude)?))).transpose()?, ple: upload_ple(stream, &l.ple)?, ple_at: i as i32 };
     copied(stream)?;
     Ok(layer)
 }
@@ -242,6 +247,7 @@ fn upload_head(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, role: Sta
         lm_head: DeviceMatrix::upload(stream, &head)?,
         embed,
         gated: upload_gated(stream, &ck.gated_head(spec)?)?,
+        ple: upload_ple(stream, &ck.ple_head(spec)?)?,
         draft: match spec.draft_head_quant() {
             Some(q) => {
                 let on_device = match q {
@@ -359,14 +365,16 @@ fn load_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, ck: &Checkpoin
     let mut layers: Vec<Option<DeviceLayer>> = (0..spec.layers.count).map(|_| None).collect();
     let (mut head, mut embed, mut mtp, mut draft) = (None, None, None, None);
     let mut gated = GatedWeights::new();
+    let mut ple = PleWeights::new();
     for up in results.into_inner().unwrap() {
         match up {
             Uploaded::Layer(i, l) => layers[i] = Some(l),
-            Uploaded::Head { norm, lm_head, embed: tied, draft: d, gated: hw } => {
+            Uploaded::Head { norm, lm_head, embed: tied, draft: d, gated: hw, ple: pw } => {
                 head = Some((norm, lm_head));
                 embed = embed.or(tied);
                 draft = d;
                 gated = hw;
+                ple = pw;
             }
             Uploaded::Embed(e) => embed = Some(e),
             Uploaded::Mtp(m) => mtp = m,
@@ -386,7 +394,7 @@ fn load_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, ck: &Checkpoin
         None => (stream.alloc_zeros(1)?, DeviceMatrix::Bf16(stream.alloc_zeros(1)?)),
     };
     let layers = layers.into_iter().enumerate().map(|(i, l)| l.with_context(|| format!("layer {} was not loaded", range.start + i))).collect::<Result<Vec<_>>>()?;
-    Ok(Weights { layers, embed, norm, lm_head, mtp, direct, gated })
+    Ok(Weights { layers, embed, norm, lm_head, mtp, direct, gated, ple })
 }
 
 enum DeviceMatrix {
@@ -540,6 +548,12 @@ impl Drop for MixBuffers {
     }
 }
 
+struct PleBuffers {
+    scratch: std::collections::BTreeMap<String, CudaSlice<f32>>,
+    launch: Vec<DescribedLaunch>,
+    head: PleWeights,
+}
+
 struct GatedBuffers {
     streams: CudaSlice<f32>,
     scratch: std::collections::BTreeMap<String, CudaSlice<f32>>,
@@ -601,13 +615,22 @@ struct DeviceLayer {
     hyper: Vec<CudaSlice<f32>>,
     gated: Vec<GatedWeights>,
     prelude: Option<(i32, GatedWeights)>,
+    ple: PleWeights,
+    ple_at: i32,
 }
+
+type PleWeights = std::collections::BTreeMap<String, CudaSlice<f32>>;
 
 fn opt_bytes(v: &Option<CudaSlice<f32>>) -> u64 {
     v.as_ref().map_or(0, |s| s.num_bytes() as u64)
 }
 
 impl DeviceLayer {
+    fn moe_norms(&self) -> (&CudaSlice<f32>, &CudaSlice<f32>) {
+        let p = self.moe.as_ref().and_then(|m| m.parallel()).expect("a parallel moe layer has its post norms");
+        (&p.post_dense, &p.post_experts)
+    }
+
     fn bytes(&self) -> u64 {
         let mixer = match &self.mixer {
             DeviceMixer::Attention(a) => {
@@ -634,6 +657,7 @@ impl DeviceLayer {
             + (self.ln1.num_bytes() + self.ln2.num_bytes()) as u64
             + self.hyper.iter().map(|v| v.num_bytes() as u64).sum::<u64>()
             + self.gated.iter().flat_map(|g| g.values()).chain(self.prelude.iter().flat_map(|(_, w)| w.values())).map(|v| v.num_bytes() as u64).sum::<u64>()
+            + self.ple.values().map(|v| v.num_bytes() as u64).sum::<u64>()
     }
 }
 
@@ -831,6 +855,7 @@ struct PrefillBuffers {
     branch: CudaSlice<f32>,
     streams: CudaSlice<f32>,
     hyper_mix: CudaSlice<f32>,
+    merged: CudaSlice<f32>,
     qkv: CudaSlice<f32>,
     attn: CudaSlice<f32>,
     gate_up: CudaSlice<f32>,
@@ -888,6 +913,7 @@ pub struct Runtime {
     mixer_launch: Vec<DescribedLaunch>,
     gated: Option<GatedBuffers>,
     prelude: Option<PreludeBuffers>,
+    ple: Option<PleBuffers>,
     moe: Option<moe::MoeBuffers>,
     fp8_act: Option<Fp8Act>,
     fp4_act: Option<Fp4Act>,
@@ -1153,7 +1179,7 @@ impl Runtime {
         };
         checkpoint.check_quant_layout(&checkpoint.quant_map()?.renamed(&spec.tensors))?;
         let weights_started = Instant::now();
-        let Weights { mut layers, embed, norm, lm_head, mtp: mtp_weights, direct: weights_direct, gated: gated_head } =
+        let Weights { mut layers, embed, norm, lm_head, mtp: mtp_weights, direct: weights_direct, gated: gated_head, ple: ple_head } =
             load_weights(&ctx, &stream, &checkpoint, spec, range, role)?;
         let weight_secs = weights_started.elapsed().as_secs_f64();
         let weight_bytes = layers.iter().map(DeviceLayer::bytes).sum::<u64>()
@@ -1180,8 +1206,8 @@ impl Runtime {
             qkv: stream.alloc_zeros(spec.qkv_rows())?,
             attn: stream.alloc_zeros(spec.q_dim())?,
             attn_part: stream.alloc_zeros(spec.attention.heads * ATTN_SPLITS * (spec.attention.head_dim + 2))?,
-            gate_up: stream.alloc_zeros(2 * d.intermediate)?,
-            act: stream.alloc_zeros(d.intermediate)?,
+            gate_up: stream.alloc_zeros(2 * spec.max_intermediate())?,
+            act: stream.alloc_zeros(spec.max_intermediate())?,
             logits: stream.alloc_zeros(d.vocab)?,
             caches: vec![stream.alloc_zeros(1)?],
             block_table: stream.alloc_zeros((layout.slots + 1) * pages)?,
@@ -1199,13 +1225,14 @@ impl Runtime {
             branch: stream.alloc_zeros(if spec.uses_branch() { chunk * d.hidden } else { 1 })?,
             streams: stream.alloc_zeros(spec.hyper.as_ref().map_or(1, |h| chunk * h.streams * d.hidden))?,
             hyper_mix: stream.alloc_zeros(spec.hyper.as_ref().map_or(1, |h| chunk * (2 + h.streams) * h.streams))?,
+            merged: stream.alloc_zeros(if spec.parallel_moe() { chunk * d.hidden } else { 1 })?,
             qkv: stream.alloc_zeros(chunk * spec.qkv_rows())?,
             attn: stream.alloc_zeros(mma_only(chunk * spec.q_dim().max(spec.o_dim())))?,
-            gate_up: stream.alloc_zeros(mma_only(chunk * 2 * d.intermediate))?,
-            act: stream.alloc_zeros(mma_only(chunk * d.intermediate))?,
+            gate_up: stream.alloc_zeros(mma_only(chunk * 2 * spec.max_intermediate()))?,
+            act: stream.alloc_zeros(mma_only(chunk * spec.max_intermediate()))?,
             xn_planes: Planes::new(&stream, chunk * d.hidden)?,
             attn_planes: Planes::new(&stream, chunk * spec.q_dim().max(spec.o_dim()))?,
-            act_planes: Planes::new(&stream, chunk * d.intermediate)?,
+            act_planes: Planes::new(&stream, chunk * spec.max_intermediate())?,
             dummy_u16: stream.alloc_zeros(8)?,
             dummy_u8: stream.alloc_zeros(8)?,
         };
@@ -1235,7 +1262,7 @@ impl Runtime {
         };
         ensure!(use_mma || mixer.is_none(), "a described mixer needs the tensor core path (sm_80 or newer)");
         ensure!(use_mma || (!spec.layers.split && spec.mlp.mapped.is_none()), "mlp-only layers and non-gated mlps need the tensor core path (sm_80 or newer)");
-        let widest = [d.hidden, d.intermediate, spec.q_dim()]
+        let widest = [d.hidden, spec.max_intermediate(), spec.q_dim()]
             .into_iter()
             .chain(spec.linear_attention.as_ref().map(|l| l.value_dim()))
             .max()
@@ -1250,7 +1277,7 @@ impl Runtime {
             None
         };
         let fp4_act = if spec.mlp.quant == Some(crate::spec::Quant::Nvfp4G16) && crate::codegen::fp4_act_enabled(spec) {
-            let widest = d.hidden.max(d.intermediate);
+            let widest = d.hidden.max(spec.max_intermediate());
             Some(Fp4Act {
                 q: stream.alloc_zeros(chunk * widest / 2)?,
                 scales: stream.alloc_zeros(chunk * widest / crate::nvfp4::GROUP)?,
@@ -1293,6 +1320,14 @@ impl Runtime {
                 None => None,
             },
             prelude: PreludeBuffers::new(&stream, spec, layout.slots + 1, chunk, max_ctx, &target)?,
+            ple: match spec.per_layer() {
+                Some(p) => Some(PleBuffers {
+                    scratch: p.scratch.iter().map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim(spec, w)?)?))).collect::<Result<_>>()?,
+                    launch: crate::codegen::per_layer_kernels(spec, &target)?.into_iter().map(|k| DescribedLaunch { name: k.name, threads: k.threads, chunk: None, tile: false, params: k.params }).collect(),
+                    head: ple_head,
+                }),
+                None => None,
+            },
             moe: match &spec.moe {
                 Some(_) => Some(moe::MoeBuffers::new(&stream, chunk, spec, crate::codegen::moe_mma_enabled(spec, &target), crate::codegen::moe_mma_fp8_enabled(spec, &target), crate::codegen::moe_mma_bf16_enabled(spec, &target))?),
                 None => None,

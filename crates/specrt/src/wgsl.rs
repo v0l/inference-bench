@@ -45,14 +45,15 @@ pub fn kernels_for(op: &Op, spec: &Spec, tokens: usize) -> Result<Vec<&'static s
         Op::DecodeRope => anyhow::bail!("described kernels are not yet on wgpu"),
         Op::Flash | Op::FlashLegacy | Op::DecodeAttention => vec!["attention"],
         Op::Swiglu => vec!["swiglu"],
-        Op::Kernel { .. } | Op::MixKernel { .. } | Op::Gated { .. } | Op::Prelude { .. } => anyhow::bail!("described kernels are not yet on wgpu"),
+        Op::Kernel { .. } | Op::MixKernel { .. } | Op::Gated { .. } | Op::PerLayer { .. } | Op::Prelude { .. } => anyhow::bail!("described kernels are not yet on wgpu"),
         Op::NormAdd { .. } | Op::LogitSoftcap | Op::LogitScale | Op::Split { .. } | Op::QkNorm | Op::ScaledAdd { .. } | Op::Clear { .. } => anyhow::bail!("this op is not yet on wgpu"),
         Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => anyhow::bail!("delta-net is not yet on wgpu"),
         Op::MtpIn | Op::MtpGather | Op::MtpNorm | Op::MtpDraft => anyhow::bail!("MTP is not yet on wgpu"),
-        Op::MoeRoute | Op::MoeExperts | Op::MoeCombine => anyhow::bail!("mixture of experts is not yet on wgpu"),
+        Op::MoeRoute | Op::MoeExperts | Op::MoeCombine | Op::MoeCombineInto { .. } => anyhow::bail!("mixture of experts is not yet on wgpu"),
         Op::AllReduce | Op::AllReduceNorm { .. } => anyhow::bail!("tensor parallel is not on wgpu"),
         Op::Gemv { .. } | Op::GemvStore { .. } | Op::StepAttention | Op::GdnStep => anyhow::bail!("the single row cuda plan is not on wgpu"),
         Op::HyperExpand | Op::HyperPre { .. } | Op::HyperPost | Op::HyperMean => anyhow::bail!("hyper-connections are not yet on wgpu"),
+        Op::Dit(_) => anyhow::bail!("the denoiser is not yet on wgpu"),
     })
 }
 
@@ -67,7 +68,7 @@ pub fn unsupported(spec: &Spec) -> Option<String> {
     if spec.linear_attention.is_some() {
         return Some("delta-net layers are not yet on wgpu".into());
     }
-    if spec.gated_residual().is_some() {
+    if spec.gated_residual().is_some() || spec.per_layer().is_some() {
         return Some("described hyper-connections are not yet on wgpu".into());
     }
     if spec.mixer.is_some() {

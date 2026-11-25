@@ -6,6 +6,93 @@ pub enum Phase {
     Prefill,
     Decode,
     Verify,
+    Forward,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Stream {
+    Image,
+    Text,
+    Joint,
+    Seqs,
+}
+
+impl Stream {
+    pub fn label(self) -> &'static str {
+        match self {
+            Stream::Image => "image",
+            Stream::Text => "text",
+            Stream::Joint => "joint",
+            Stream::Seqs => "seqs",
+        }
+    }
+}
+
+fn short(weight: &str) -> String {
+    weight.split('+').map(|w| w.rsplit_once("{i}.").map_or(w, |(_, t)| t)).collect::<Vec<_>>().join("+")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DitOp {
+    Patchify { from: &'static str, into: &'static str },
+    Unpatchify { from: &'static str, into: &'static str },
+    Split { from: &'static str, into: &'static str, rows: Stream, act: bool },
+    Copy { from: &'static str, into: &'static str, rows: Stream },
+    TimestepEmbed { from: &'static str, into: &'static str },
+    Linear { weight: &'static str, input: &'static str, output: &'static str, rows: Stream, add: bool },
+    Modulate { from: &'static str, into: &'static str, rows: Stream, set: &'static str, shift: u8, scale: u8 },
+    GatedAdd { from: &'static str, into: &'static str, rows: Stream, set: &'static str, gate: u8 },
+    Glu { from: &'static str, into: &'static str, rows: Stream, offset: &'static str },
+    AxisRope { from: &'static str, text: &'static str, image: &'static str },
+    JointAttention { into: &'static str },
+}
+
+impl DitOp {
+    pub fn label(&self) -> String {
+        match self {
+            DitOp::Patchify { .. } => "patchify".into(),
+            DitOp::Unpatchify { .. } => "unpatchify".into(),
+            DitOp::Split { act: true, from, .. } => format!("silu {from}"),
+            DitOp::Split { from, .. } => format!("split {from}"),
+            DitOp::Copy { from, .. } => format!("copy {from}"),
+            DitOp::TimestepEmbed { .. } => "timestep embed".into(),
+            DitOp::Linear { weight, rows, .. } => format!("{} ({})", short(weight), rows.label()),
+            DitOp::Modulate { rows, set, shift, scale, .. } => format!("{} modulate {set}[{shift},{scale}]", rows.label()),
+            DitOp::GatedAdd { rows, from, set, gate, .. } => format!("{} gated add {from} {set}[{gate}]", rows.label()),
+            DitOp::Glu { from, rows, .. } => format!("{} swiglu {from}", rows.label()),
+            DitOp::AxisRope { .. } => "qk norm and axis rope".into(),
+            DitOp::JointAttention { .. } => "joint attention".into(),
+        }
+    }
+
+    pub fn flow(&self) -> String {
+        match self {
+            DitOp::Patchify { from, into } | DitOp::Unpatchify { from, into } | DitOp::TimestepEmbed { from, into } => format!("{from} to {into}"),
+            DitOp::Glu { from, into, rows, .. } => format!("{from} to {into} ({})", rows.label()),
+            DitOp::Split { from, into, rows, .. } | DitOp::Copy { from, into, rows } | DitOp::Modulate { from, into, rows, .. } => format!("{from} to {into} ({})", rows.label()),
+            DitOp::Linear { input, output, rows, add, .. } => format!("{input} to {output} ({}{})", rows.label(), if *add { ", added" } else { "" }),
+            DitOp::GatedAdd { from, into, rows, .. } => format!("{from} gated into {into} ({})", rows.label()),
+            DitOp::AxisRope { from, .. } => format!("{from} to attention planes"),
+            DitOp::JointAttention { into } => format!("attention planes to {into}"),
+        }
+    }
+
+    pub fn kernel(&self) -> &'static str {
+        match self {
+            DitOp::Patchify { .. } => "dit_patchify",
+            DitOp::Unpatchify { .. } => "dit_unpatchify",
+            DitOp::Split { act: true, .. } => "dit_silu_split",
+            DitOp::Split { .. } => "dit_split",
+            DitOp::Copy { .. } => "dit_copy",
+            DitOp::TimestepEmbed { .. } => "dit_timestep",
+            DitOp::Linear { .. } => "vis_mma",
+            DitOp::Modulate { .. } => "dit_modulate",
+            DitOp::GatedAdd { .. } => "dit_gated_add",
+            DitOp::Glu { .. } => "dit_glu",
+            DitOp::AxisRope { .. } => "vis_axis_rope",
+            DitOp::JointAttention { .. } => "vis_flash",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -31,6 +118,7 @@ pub enum Buf {
     Partial,
     Gdn,
     Streams,
+    Merged,
 }
 
 impl Buf {
@@ -57,6 +145,7 @@ impl Buf {
             Buf::Partial => "rank partial",
             Buf::Gdn => "gdn",
             Buf::Streams => "streams",
+            Buf::Merged => "merged",
         }
     }
 
@@ -74,7 +163,9 @@ pub enum Weight {
     Qkv,
     O,
     GateUp,
+    GateUpWide,
     Down,
+    DownWide,
     LinIn,
     LinBa,
     LinOut,
@@ -95,7 +186,9 @@ impl Weight {
             Weight::Qkv => "qkv",
             Weight::O => "o",
             Weight::GateUp => "gate_up",
+            Weight::GateUpWide => "gate_up_wide",
             Weight::Down => "down",
+            Weight::DownWide => "down_wide",
             Weight::LinIn => "lin_in",
             Weight::LinBa => "lin_ba",
             Weight::LinOut => "lin_out",
@@ -116,8 +209,9 @@ impl Weight {
         match self {
             Weight::Qkv | Weight::MtpQkv => spec.qkv_rows(),
             Weight::GateUp => spec.gate_up_rows(),
+            Weight::GateUpWide => spec.gate_up_rows_wide(),
             Weight::MtpGateUp => 2 * spec.dims.intermediate,
-            Weight::O | Weight::Down | Weight::LinOut | Weight::MtpFc | Weight::MtpO | Weight::MtpDown => spec.dims.hidden,
+            Weight::O | Weight::Down | Weight::DownWide | Weight::LinOut | Weight::MtpFc | Weight::MtpO | Weight::MtpDown => spec.dims.hidden,
             Weight::LinIn => la.map_or(0, |l| l.in_proj_rows()),
             Weight::LinBa => la.map_or(0, |l| l.ba_rows()),
             Weight::MixIn => spec.mix_in_rows(),
@@ -146,10 +240,10 @@ impl Weight {
                 }
                 t
             }
-            Weight::GateUp if spec.mlp.mapped.is_some() => vec![w("mlp.up_proj")],
-            Weight::GateUp if spec.mlp.fused_gate_up => vec![w("mlp.gate_up_proj")],
-            Weight::GateUp => vec![w("mlp.gate_proj"), w("mlp.up_proj")],
-            Weight::Down => vec![w("mlp.down_proj")],
+            Weight::GateUp | Weight::GateUpWide if spec.mlp.mapped.is_some() => vec![w("mlp.up_proj")],
+            Weight::GateUp | Weight::GateUpWide if spec.mlp.fused_gate_up => vec![w("mlp.gate_up_proj")],
+            Weight::GateUp | Weight::GateUpWide => vec![w("mlp.gate_proj"), w("mlp.up_proj")],
+            Weight::Down | Weight::DownWide => vec![w("mlp.down_proj")],
             Weight::LinIn if spec.linear_attention.as_ref().is_some_and(|l| l.fused_interleaved) => vec![w("linear_attn.in_proj_qkvz")],
             Weight::LinBa if spec.linear_attention.as_ref().is_some_and(|l| l.fused_interleaved) => vec![w("linear_attn.in_proj_ba")],
             Weight::LinIn => vec![w("linear_attn.in_proj_qkv"), w("linear_attn.in_proj_z")],
@@ -200,6 +294,8 @@ pub enum NormKind {
     PostAttention,
     PreMlp,
     PostMlp,
+    PostDense,
+    PostExperts,
     Final,
 }
 
@@ -210,6 +306,8 @@ impl NormKind {
             NormKind::PostAttention => "post_attention_layernorm.weight",
             NormKind::PreMlp => "pre_feedforward_layernorm.weight",
             NormKind::PostMlp => "post_feedforward_layernorm.weight",
+            NormKind::PostDense => "post_feedforward_layernorm_1.weight",
+            NormKind::PostExperts => "post_feedforward_layernorm_2.weight",
             NormKind::Final => "norm.weight",
         }
     }
@@ -220,7 +318,7 @@ pub enum Op {
     Embed,
     Splice,
     Norm { which: NormKind, into: Buf },
-    NormAdd { which: NormKind, from: Buf },
+    NormAdd { which: NormKind, from: Buf, into: Buf },
     Clear { buf: Buf },
     Split { from: Buf, into: Buf },
     QkNorm,
@@ -249,6 +347,7 @@ pub enum Op {
     MoeRoute,
     MoeExperts,
     MoeCombine,
+    MoeCombineInto { into: Buf },
     AllReduce,
     AllReduceNorm { which: NormKind },
     Gemv { norm: Option<NormKind>, weight: Weight, quant: QuantSource, input: Buf, output: Buf },
@@ -259,7 +358,12 @@ pub enum Op {
     HyperPre { site: u8 },
     HyperPost,
     HyperMean,
+    PerLayer { node: u8, stage: u8 },
+    Dit(DitOp),
 }
+
+pub const PLE_HEAD: u8 = 0;
+pub const PLE_LAYER: u8 = 1;
 
 pub const GATED_MODULE: u8 = u8::MAX;
 
@@ -283,6 +387,8 @@ impl Op {
                 NormKind::PostAttention => "post attention norm".into(),
                 NormKind::PreMlp => "pre mlp norm".into(),
                 NormKind::PostMlp => "post mlp norm".into(),
+                NormKind::PostDense => "post dense mlp norm".into(),
+                NormKind::PostExperts => "post experts norm".into(),
                 NormKind::Final => "final norm".into(),
             },
             Op::NormAdd { which, .. } => format!("{which:?} norm and add"),
@@ -310,6 +416,7 @@ impl Op {
             Op::MoeRoute => "router".into(),
             Op::MoeExperts => "experts".into(),
             Op::MoeCombine => "combine".into(),
+            Op::MoeCombineInto { .. } => "combine".into(),
             Op::AllReduce => "allreduce".into(),
             Op::AllReduceNorm { .. } => "allreduce, add and norm".into(),
             Op::Gemv { norm: Some(_), weight, .. } => format!("norm and {}", weight.name()),
@@ -321,6 +428,9 @@ impl Op {
             Op::HyperPre { site } => format!("hyper pre {site}"),
             Op::HyperPost => "hyper post".into(),
             Op::HyperMean => "hyper mean".into(),
+            Op::PerLayer { stage: PLE_HEAD, .. } => "per layer inputs".into(),
+            Op::PerLayer { .. } => "per layer residual".into(),
+            Op::Dit(d) => d.label(),
         }
     }
 
@@ -329,7 +439,7 @@ impl Op {
             Op::Embed => "tokens to x".into(),
             Op::Splice => "media embeddings into x".into(),
             Op::Norm { into, .. } => format!("x to {}", into.label()),
-            Op::NormAdd { from, .. } => format!("{} added to x", from.label()),
+            Op::NormAdd { from, into, .. } => format!("{} added to {}", from.label(), into.label()),
             Op::LogitSoftcap | Op::LogitScale => "logits to logits".into(),
             Op::Clear { buf } => format!("zero {}", buf.label()),
             Op::Split { from, into } => format!("{} to {}", from.label(), into.label()),
@@ -350,6 +460,7 @@ impl Op {
             Op::MoeRoute => "x to top-k experts".into(),
             Op::MoeExperts => "x and top-k to expert outputs".into(),
             Op::MoeCombine => "expert outputs to x".into(),
+            Op::MoeCombineInto { into } => format!("expert outputs to {}", into.label()),
             Op::AllReduce => "rank partials summed into x".into(),
             Op::AllReduceNorm { .. } => "rank partials summed into x, x to xn planes".into(),
             Op::Gemv { norm: Some(_), output, .. } => format!("x normed to {}", output.label()),
@@ -361,6 +472,9 @@ impl Op {
             Op::HyperPre { .. } => "streams to x and hyper weights".into(),
             Op::HyperPost => "x and hyper weights into streams".into(),
             Op::HyperMean => "streams to x".into(),
+            Op::PerLayer { stage: PLE_HEAD, .. } => "tokens and hidden to per layer inputs".into(),
+            Op::PerLayer { .. } => "x and per layer inputs into x".into(),
+            Op::Dit(d) => d.flow(),
         }
     }
 
@@ -423,6 +537,10 @@ impl Op {
             Op::MoeRoute => vec!["mlp.gate.weight".into(), "mlp.shared_expert_gate.weight".into()],
             Op::MoeExperts => spec.expert_tensors(),
             Op::HyperPre { site } => spec.hyper.as_ref().and_then(|h| h.sites.get(*site as usize)).map(|s| ["fn", "base", "scale"].iter().map(|t| format!("{s}_{t}")).collect()).unwrap_or_default(),
+            Op::PerLayer { node, .. } => spec.per_layer.as_ref().and_then(|p| p.node.get(*node as usize)).into_iter().flat_map(|n| n.bind.values()).filter_map(|b| match b {
+                crate::graph::Bind::Weight { weight, .. } => Some(weight.clone()),
+                _ => None,
+            }).collect(),
             _ => Vec::new(),
         }
     }
@@ -509,7 +627,7 @@ impl Op {
             Op::MtpDraft => names(&["mtp_draft"]),
             Op::MoeRoute => names(&["moe_route_logits", "moe_route"]),
             Op::MoeExperts => names(&["moe_up_bf16", "moe_down_bf16"]),
-            Op::MoeCombine => names(&["moe_combine"]),
+            Op::MoeCombine | Op::MoeCombineInto { .. } => names(&["moe_combine"]),
             Op::AllReduce => vec![crate::allreduce::kernel_name(crate::allreduce::pick_mode(tokens * spec.dims.hidden * 4), kir::allreduce::Dtype::F32)],
             Op::AllReduceNorm { .. } => names(&["ar_add_rmsnorm_f32"]),
             Op::GemvStore { weight, quant, .. } => match crate::gemm::gemv_into(spec, weight.name(), weight_kind(quant.resolve_for(spec, layer, *weight)), false, true) {
@@ -526,6 +644,8 @@ impl Op {
             Op::HyperPre { .. } => names(&["hyper_pre"]),
             Op::HyperPost => names(&["hyper_post"]),
             Op::HyperMean => names(&["hyper_mean"]),
+            Op::PerLayer { node, .. } => spec.per_layer.as_ref().and_then(|p| p.node.get(*node as usize)).and_then(|n| n.kernel.clone()).into_iter().collect(),
+            Op::Dit(d) => names(&[d.kernel()]),
         }
     }
 }
@@ -534,6 +654,7 @@ impl Op {
 pub struct PlanBlock {
     pub layers: Vec<String>,
     pub sparse: bool,
+    pub tail: bool,
     pub ops: Vec<Op>,
 }
 
@@ -543,6 +664,7 @@ pub struct Plan {
     pub tensor_core: bool,
     pub head: Vec<Op>,
     pub blocks: Vec<PlanBlock>,
+    pub per_layer: Vec<Op>,
     pub tail: Vec<Op>,
     pub mtp: Vec<Op>,
     pub mtp_head: Vec<Op>,
@@ -553,15 +675,23 @@ impl Plan {
         crate::graph::Graph::decoder().plan(spec, phase, tensor_core).expect("the embedded decoder graph lowers")
     }
 
+    pub fn layer_tail(&self) -> &[Op] {
+        &self.per_layer
+    }
+
     pub fn layer(&self, block: Block) -> &[Op] {
         self.layer_of(block, false)
     }
 
     pub fn layer_of(&self, block: Block, sparse: bool) -> &[Op] {
+        self.layer_for(block, sparse, false)
+    }
+
+    pub fn layer_for(&self, block: Block, sparse: bool, tail: bool) -> &[Op] {
         let name = block.name();
         self.blocks
             .iter()
-            .find(|b| b.sparse == sparse && b.layers.iter().any(|l| l == name))
+            .find(|b| b.sparse == sparse && b.tail == tail && b.layers.iter().any(|l| l == name))
             .map_or(&[], |b| &b.ops)
     }
 }

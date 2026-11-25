@@ -43,6 +43,8 @@ impl DeviceMtp {
             ln_post_mlp: None,
             gated: Vec::new(),
             prelude: None,
+            ple: crate::runtime::PleWeights::new(),
+            ple_at: -1,
             mixer: DeviceMixer::Attention(DeviceAttn {
                 qkv: DeviceMatrix::upload(stream, &a.qkv)?,
                 qkv_bias: up(&a.qkv_bias)?,

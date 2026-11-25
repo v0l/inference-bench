@@ -6,25 +6,118 @@ extends = "gemma3"
 model_types = ["gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text"]
 architectures = ["Gemma4ForConditionalGeneration", "Gemma4ForCausalLM", "Gemma4UnifiedForConditionalGeneration"]
 
-[[refuse]]
-when = "enable_moe_block"
-message = "Gemma 4 mixture-of-experts layers (enable_moe_block) are not supported yet"
+[per_layer]
+dim = "hidden_size_per_layer_input"
 
-[[refuse]]
-when = "hidden_size_per_layer_input > 0"
-message = "Gemma 4 per-layer input embeddings (hidden_size_per_layer_input) are not supported yet"
+[per_layer.params]
+ple_dim = { expr = "hidden_size_per_layer_input" }
+ple_width = { expr = "ple_dim * num_hidden_layers" }
+ple_embed_scale = { expr = "sqrt(hidden_size_per_layer_input)" }
+ple_proj_scale = { expr = "rsqrt(hidden_size)" }
+ple_mix_scale = { expr = "sqrt(0.5)" }
+ple_vocab = { config = "vocab_size_per_layer_input", alt = "vocab_size" }
+ple_layers = { expr = "num_hidden_layers" }
+ple_one = { expr = "1" }
 
-[[refuse]]
-when = "num_kv_shared_layers > 0"
-message = "Gemma 4 KV sharing across layers (num_kv_shared_layers) is not supported yet"
+[per_layer.scratch]
+ple_proj = "ple_width"
+ple = "ple_width"
+ple_gate = "ple_dim"
+ple_out = "ple_dim"
 
-[[refuse]]
-when = "use_double_wide_mlp"
-message = "Gemma 4 double wide MLP layers (use_double_wide_mlp) are not supported yet"
+[[per_layer.node]]
+op = "head"
+kernel = "g4_ple_proj"
+grid = ["ple_one", "rows"]
+
+[per_layer.node.bind]
+x = { buffer = "x" }
+w = { weight = "per_layer_model_projection.weight", len = "ple_width * hidden" }
+y = { buffer = "ple_proj" }
+
+[[per_layer.node]]
+op = "head"
+kernel = "g4_ple_mix"
+grid = ["ple_layers", "rows"]
+
+[per_layer.node.bind]
+idx = { buffer = "tokens" }
+table = { weight = "embed_tokens_per_layer.weight", len = "ple_vocab * ple_width" }
+proj = { buffer = "ple_proj" }
+w = { weight = "per_layer_projection_norm.weight", len = "ple_dim" }
+ple = { buffer = "ple" }
+
+[[per_layer.node]]
+op = "layer"
+kernel = "g4_ple_gate"
+grid = ["ple_one", "rows"]
+
+[per_layer.node.bind]
+x = { buffer = "x" }
+w = { weight = "per_layer_input_gate.weight", len = "ple_dim * hidden" }
+y = { buffer = "ple_gate" }
+
+[[per_layer.node]]
+op = "layer"
+kernel = "g4_ple_act"
+grid = ["ple_one", "rows"]
+
+[per_layer.node.bind]
+gate = { buffer = "ple_gate" }
+ple = { buffer = "ple" }
+layer = "layer"
+gp = { buffer = "ple_gate" }
+
+[[per_layer.node]]
+op = "layer"
+kernel = "g4_ple_out"
+grid = ["ple_one", "rows"]
+
+[per_layer.node.bind]
+x = { buffer = "ple_gate" }
+w = { weight = "per_layer_projection.weight", len = "ple_dim * hidden" }
+y = { buffer = "ple_out" }
+
+[[per_layer.node]]
+op = "layer"
+kernel = "g4_ple_add"
+grid = ["ple_one", "rows"]
+
+[per_layer.node.bind]
+pout = { buffer = "ple_out" }
+w = { weight = "post_per_layer_input_norm.weight", len = "hidden" }
+xin = { buffer = "x" }
+x = { buffer = "x" }
+
+[blocks]
+shared_tail_key = "num_kv_shared_layers"
+
+[mlp]
+shared_tail_wide_key = "use_double_wide_mlp"
 
 [norm]
 unit_offset = false
 layer_scale = "layer_scalar"
+
+[fields]
+num_experts_per_tok = ["top_k_experts"]
+
+[moe]
+router_module = "router.proj"
+norm_topk = true
+shared_gate = false
+fused_experts = true
+parallel_dense = true
+router_norm = "mlp.router.scale"
+router_norm_scale = "1 / sqrt(hidden_size)"
+input_norm = "pre_feedforward_layernorm_2.weight"
+expert_scale = "mlp.router.per_expert_scale"
+
+[tensors]
+".experts." = ".mlp.experts."
+".router." = ".mlp.router."
+"mlp.experts.down_proj" = "mlp.experts.down_proj.weight"
+"mlp.experts.gate_up_proj" = "mlp.experts.gate_up_proj.weight"
 
 [rope]
 unscaled = ["default", "proportional"]
@@ -78,24 +171,28 @@ slot = "q_w"
 tensor = "k_proj"
 rows = "kvh_s * hd_s"
 layers = ["sliding"]
+kv_owner = true
 slot = "k_w"
 
 [[attention.projection]]
 tensor = "k_proj"
 rows = "kvh_g * hd_g"
 layers = ["full"]
+kv_owner = true
 slot = "k_w"
 
 [[attention.projection]]
 tensor = "v_proj"
 rows = "kvh_s * hd_s"
 layers = ["sliding"]
+kv_owner = true
 slot = "v_w"
 
 [[attention.projection]]
 tensor = "v_proj"
 rows = "kvh_g * hd_g"
 layers = ["full"]
+kv_owner = true
 slot = "v_w"
 when = "!k_eq_v"
 
@@ -103,6 +200,7 @@ when = "!k_eq_v"
 tensor = "k_proj"
 rows = "kvh_g * hd_g"
 layers = ["full"]
+kv_owner = true
 slot = "v_w"
 when = "k_eq_v"
 
@@ -156,6 +254,7 @@ w = { weight = "q_norm.weight", len = "hd_s" }
 op = "kernel"
 kernel = "g4_k_norm_s"
 layers = ["sliding"]
+when = "kv_owner"
 grid = ["kvh_s", "rows"]
 
 [attention.node.bind]
@@ -166,6 +265,7 @@ w = { weight = "k_norm.weight", len = "hd_s" }
 op = "kernel"
 kernel = "g4_v_norm_s"
 layers = ["sliding"]
+when = "kv_owner"
 grid = ["kvh_s", "rows"]
 
 [attention.node.bind]
@@ -184,6 +284,7 @@ x = { buffer = "qkv" }
 op = "kernel"
 kernel = "g4_k_rope_s"
 layers = ["sliding"]
+when = "kv_owner"
 grid = ["kvh_s", "rows"]
 
 [attention.node.bind]
@@ -193,6 +294,7 @@ x = { buffer = "qkv" }
 op = "kernel"
 kernel = "g4_k_write_s"
 layers = ["sliding"]
+when = "kv_owner"
 grid = ["kvh_s", "rows"]
 
 [attention.node.bind]
@@ -204,6 +306,7 @@ layer = "kind_layer"
 op = "kernel"
 kernel = "g4_v_write_s"
 layers = ["sliding"]
+when = "kv_owner"
 grid = ["kvh_s", "rows"]
 
 [attention.node.bind]
@@ -237,6 +340,7 @@ w = { weight = "q_norm.weight", len = "hd_g" }
 op = "kernel"
 kernel = "g4_k_norm_g"
 layers = ["full"]
+when = "kv_owner"
 grid = ["kvh_g", "rows"]
 
 [attention.node.bind]
@@ -247,6 +351,7 @@ w = { weight = "k_norm.weight", len = "hd_g" }
 op = "kernel"
 kernel = "g4_v_norm_g"
 layers = ["full"]
+when = "kv_owner"
 grid = ["kvh_g", "rows"]
 
 [attention.node.bind]
@@ -265,6 +370,7 @@ x = { buffer = "qkv" }
 op = "kernel"
 kernel = "g4_k_rope_g"
 layers = ["full"]
+when = "kv_owner"
 grid = ["kvh_g", "rows"]
 
 [attention.node.bind]
@@ -274,6 +380,7 @@ x = { buffer = "qkv" }
 op = "kernel"
 kernel = "g4_k_write_g"
 layers = ["full"]
+when = "kv_owner"
 grid = ["kvh_g", "rows"]
 
 [attention.node.bind]
@@ -285,6 +392,7 @@ layer = "kind_layer"
 op = "kernel"
 kernel = "g4_v_write_g"
 layers = ["full"]
+when = "kv_owner"
 grid = ["kvh_g", "rows"]
 
 [attention.node.bind]

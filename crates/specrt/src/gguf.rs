@@ -575,6 +575,11 @@ impl Gguf {
                     hash_layers: 0,
                     hash_table: None,
                     tp_split: crate::spec::TpSplit::Auto,
+                    parallel_dense: false,
+                    router_norm: None,
+                    router_norm_scale: 1.0,
+                    input_norm: None,
+                    expert_scale: None,
                     local: None,
                 })
             }
@@ -588,7 +593,7 @@ impl Gguf {
             head_quant: None,
             act_quant: ActQuant::None,
             dims: Dims { hidden, intermediate, vocab, tie_embeddings: tied, embed_scale: None, logit_softcap: None, logit_scale: None, head_rows: None },
-            layers: Layers { count: layers, pattern, window: None, split: false },
+            layers: Layers { count: layers, pattern, window: None, split: false, shared_tail: 0 },
             norm: Norm { kind: NormKind::Rmsnorm, eps, unit_offset: false, sandwich: false, pre: true, residual_scale: None, layer_scale: None },
             attention: Attention {
                 kind: AttentionKind::Gqa,
@@ -616,7 +621,7 @@ impl Gguf {
                 indexer: None,
             },
             rope: Rope { style: RopeStyle::Neox, theta: Some(theta), scaling: self.rope_scaling(family, head_dim)?, mrope, local_theta: None, nope_layers: Vec::new() },
-            mlp: Mlp { activation: Activation::Swiglu, quant: None, quant_until: None, act_quant: ActQuant::None, up_act_planes: 1, down_act_planes: 1, fused_gate_up: false, gated: None, mapped: None },
+            mlp: Mlp { activation: Activation::Swiglu, quant: None, quant_until: None, act_quant: ActQuant::None, up_act_planes: 1, down_act_planes: 1, fused_gate_up: false, gated: None, mapped: None, wide_shared_tail: false },
             moe,
             linear_attention,
             mixer: None,
@@ -624,6 +629,7 @@ impl Gguf {
             gated_residual: None,
             prelude: None,
             refused: Vec::new(),
+            per_layer: None,
             tensors: Default::default(),
             mtp: (family.mtp && nextn > 0).then(|| crate::spec::Mtp { head_quant: Some(Quant::Bf16), ..crate::spec::Mtp::new(nextn) }),
             vision: None,

@@ -614,6 +614,37 @@ impl GatedResidual {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PerLayer {
+    pub dim: usize,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub params: std::collections::BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub scratch: std::collections::BTreeMap<String, String>,
+    pub node: Vec<crate::graph::Node>,
+}
+
+impl PerLayer {
+    pub fn nodes<'a>(&'a self, stage: &'a str) -> impl Iterator<Item = (usize, &'a crate::graph::Node)> {
+        self.node.iter().enumerate().filter(move |(_, n)| n.op == stage)
+    }
+
+    pub fn weights(&self, stage: &str) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (_, n) in self.nodes(stage) {
+            for b in n.bind.values() {
+                if let crate::graph::Bind::Weight { weight, len } = b
+                    && !out.iter().any(|(w, _)| w == weight)
+                {
+                    out.push((weight.clone(), len.clone()));
+                }
+            }
+        }
+        out
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RopeStyle {
@@ -785,6 +816,16 @@ pub struct Moe {
     pub hash_table: Option<String>,
     #[serde(default, skip_serializing_if = "TpSplit::is_auto")]
     pub tp_split: TpSplit,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub parallel_dense: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_norm: Option<String>,
+    #[serde(default = "default_routed_scale", skip_serializing_if = "is_default_routed_scale")]
+    pub router_norm_scale: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_norm: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert_scale: Option<String>,
     #[serde(skip)]
     pub local: Option<ExpertRange>,
 }
@@ -905,6 +946,8 @@ pub struct Layers {
     pub window: Option<usize>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub split: bool,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub shared_tail: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -988,6 +1031,8 @@ pub struct Mixer {
 pub struct Projection {
     pub tensor: String,
     pub rows: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub kv_owner: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub layers: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1064,6 +1109,8 @@ pub struct Mlp {
     pub gated: Option<GatedAct>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mapped: Option<GatedAct>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub wide_shared_tail: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1104,6 +1151,8 @@ pub struct Spec {
     pub gated_residual: Option<GatedResidual>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prelude: Option<Prelude>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_layer: Option<PerLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtp: Option<Mtp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1738,6 +1787,14 @@ impl Spec {
         ensure!(m.expert_intermediate.is_multiple_of(128) || experts_quant == Quant::Bf16, "quantised experts need an intermediate size that is a multiple of 128");
         ensure!(m.expert_intermediate.is_multiple_of(16) && m.shared_intermediate.is_multiple_of(16), "expert intermediate sizes must be multiples of 16");
         ensure!(
+            m.parallel_dense || (m.router_norm.is_none() && m.input_norm.is_none() && m.expert_scale.is_none() && m.router_norm_scale == 1.0),
+            "[moe] router_norm, router_norm_scale, input_norm and expert_scale take parallel_dense = true"
+        );
+        ensure!(
+            !m.parallel_dense || (self.norm.sandwich && self.dims.intermediate > 0 && m.dense_layers.is_empty() && m.sparse_step <= 1),
+            "[moe] parallel_dense needs sandwich norms, a dense intermediate size and experts on every layer"
+        );
+        ensure!(
             m.shared_intermediate == 0 || m.shared_intermediate.is_multiple_of(m.expert_intermediate),
             "the shared experts ({} wide) must be a whole number of routed expert widths ({})",
             m.shared_intermediate,
@@ -1904,13 +1961,21 @@ impl Spec {
         };
         let (qkv_bias, o_bias, qk_norm, output_gate) = attn_flags;
         let multiplier = |key: &Option<String>| key.as_deref().and_then(|k| value.get(k)).and_then(|v| v.as_f64());
-        let head_dim = hf.head_dim.filter(|d| *d > 0).unwrap_or(hf.hidden_size / hf.num_attention_heads);
+        let head_dim = match family.attention.head_dim.as_deref() {
+            Some(expr) => {
+                let e = kir::expr::Expr::parse(expr).map_err(anyhow::Error::msg).with_context(|| format!("[attention] head_dim {expr:?}"))?;
+                let env = |k: &str| k.split('.').try_fold(&value, |v, p| v.get(p)).and_then(|v| v.as_f64());
+                e.eval(&env).with_context(|| format!("[attention] head_dim {expr:?} reads a missing config key"))? as usize
+            }
+            None => hf.head_dim.filter(|d| *d > 0).unwrap_or(hf.hidden_size / hf.num_attention_heads),
+        };
         let keyed_rotary = family.rope.rotary_dim_key.as_deref().and_then(|k| value.get(k)?.as_u64()).map(|d| d as usize);
         let rotary_dim = keyed_rotary.or_else(|| {
             hf.partial_rotary_factor.or(param("partial_rotary_factor")).filter(|f| *f != 1.0).map(|f| (head_dim as f64 * f).round() as usize)
         });
-        let indexed = family.blocks.attention_indices_key.as_deref().and_then(|k| value.get(k)).and_then(|v| v.as_array()).map(|a| {
-            let full: Vec<u64> = a.iter().filter_map(|v| v.as_u64()).collect();
+        let indexed = family.blocks.attention_indices_key.as_deref().and_then(|k| k.split('.').try_fold(&value, |v, p| v.get(p))).and_then(|v| v.as_array()).map(|a| {
+            let base = family.blocks.attention_indices_base as u64;
+            let full: Vec<u64> = a.iter().filter_map(|v| v.as_u64()?.checked_sub(base)).collect();
             (0..hf.num_hidden_layers).map(|i| if full.contains(&(i as u64)) { "full_attention" } else { "linear_attention" }.to_string()).collect::<Vec<_>>()
         });
         let keyed: Option<Vec<String>> = family.blocks.types_key.as_deref().and_then(|k| value.get(k)).and_then(|v| match v {
@@ -2006,6 +2071,14 @@ impl Spec {
                     hash_layers: if family.moe.hash_table.is_some() { hf.num_hash_layers.unwrap_or(0) } else { 0 },
                     hash_table: family.moe.hash_table.clone(),
                     tp_split: TpSplit::Auto,
+                    parallel_dense: family.moe.parallel_dense,
+                    router_norm: family.moe.router_norm.clone(),
+                    router_norm_scale: match &family.moe.router_norm_scale {
+                        Some(expr) => crate::family::ParamSource::Expr { expr: expr.clone() }.read("router_norm_scale", &value)?,
+                        None => 1.0,
+                    },
+                    input_norm: family.moe.input_norm.clone(),
+                    expert_scale: family.moe.expert_scale.clone(),
                     local: None,
                 })
             }
@@ -2036,7 +2109,7 @@ impl Spec {
                 logit_scale: multiplier(&family.multipliers.logits_divisor).filter(|d| *d > 0.0).map(|d| 1.0 / d),
                 head_rows: None,
             },
-            layers: Layers { count: hf.num_hidden_layers, window: hf.sliding_window.filter(|_| pattern.iter().any(|b| b.windowed())), pattern, split: family.blocks.split },
+            layers: Layers { count: hf.num_hidden_layers, window: hf.sliding_window.filter(|_| pattern.iter().any(|b| b.windowed())), pattern, split: family.blocks.split, shared_tail: family.blocks.shared_tail_key.as_deref().and_then(|k| value.get(k)?.as_u64()).unwrap_or(0) as usize },
             norm: Norm {
                 kind: NormKind::Rmsnorm,
                 eps: hf.rms_norm_eps,
@@ -2088,6 +2161,7 @@ impl Spec {
                     Some(g) if activation == Activation::Mapped => Some(GatedAct { expr: g.expr.clone(), params: crate::family::read_params(&g.params, &value)? }),
                     _ => None,
                 },
+                wide_shared_tail: family.mlp.shared_tail_wide_key.as_deref().and_then(|k| value.get(k)?.as_bool()).unwrap_or(false),
             },
             moe,
             mtp: (family.mtp && (hybrid || family.mtp_layout.is_some()) && hf.mtp_num_hidden_layers > 0 && !refused.iter().any(|r| r.part == "mtp"))
@@ -2097,6 +2171,7 @@ impl Spec {
             hyper: family.hyper.read(&value),
             gated_residual: family.gated_residual.read(&value)?,
             prelude: family.prelude.read(&value)?,
+            per_layer: family.per_layer.read(&value)?,
             tensors: family.tensors.clone(),
             vision: if strict { crate::vision::Vision::from_hf_config(json)? } else { None },
             state: if family.state.is_empty() { crate::state::stock() } else { family.state.clone() },
@@ -2125,6 +2200,7 @@ impl Spec {
         self.validate_mixer()?;
         self.validate_hyper()?;
         self.validate_prelude()?;
+        self.validate_per_layer()?;
         crate::state::validate(self)?;
         match self.head_quant {
             None | Some(Quant::Bf16) => {}
@@ -2361,6 +2437,50 @@ impl Spec {
         self.gated_residual.as_ref()
     }
 
+    pub fn per_layer(&self) -> Option<&PerLayer> {
+        self.per_layer.as_ref()
+    }
+
+    fn validate_per_layer(&self) -> Result<()> {
+        let Some(p) = self.per_layer() else { return Ok(()) };
+        ensure!(p.dim > 0, "[per_layer] needs a positive dim");
+        ensure!(self.gated_residual().is_none() && self.hyper.is_none() && self.mixer.is_none(), "[per_layer] cannot be combined with other residual or mixer descriptions yet");
+        ensure!(self.speculative().is_none(), "[per_layer] cannot be combined with [mtp] yet");
+        ensure!(p.node.len() <= 64, "[[per_layer.node]] has more than 64 nodes");
+        for stage in ["head", "layer"] {
+            ensure!(p.nodes(stage).next().is_some(), "[[per_layer.node]] has no {stage} node");
+        }
+        for (n, w) in &p.scratch {
+            ensure!(!matches!(n.as_str(), "x" | "tokens"), "[per_layer.scratch] {n} shadows a built in buffer");
+            crate::state::dim(self, w).with_context(|| format!("[per_layer.scratch] {n}"))?;
+        }
+        for (i, n) in p.node.iter().enumerate() {
+            ensure!(matches!(n.op.as_str(), "head" | "layer") && n.kernel.is_some(), "[[per_layer.node]] {i} must be a head or layer node with `kernel`");
+            ensure!(!n.grid.is_empty() && n.grid.len() <= 3, "[[per_layer.node]] {i} needs a grid of one to three symbols");
+            for g in n.grid.iter().filter(|g| *g != "rows") {
+                crate::state::dim(self, g).with_context(|| format!("[[per_layer.node]] {i} grid symbol {g:?}"))?;
+            }
+            for b in n.bind.values() {
+                match b {
+                    crate::graph::Bind::Weight { len, .. } => {
+                        self.weight_len(len)?;
+                    }
+                    crate::graph::Bind::Buffer { buffer } => ensure!(
+                        matches!(buffer.as_str(), "x" | "tokens") || p.scratch.contains_key(buffer),
+                        "[[per_layer.node]] {i} binds buffer {buffer:?}, which is not x, tokens or a [per_layer.scratch] entry"
+                    ),
+                    crate::graph::Bind::Name(n) => ensure!(n == "layer", "[[per_layer.node]] {i} binds the name {n:?}, which is not layer"),
+                    crate::graph::Bind::Number(_) => {}
+                    crate::graph::Bind::State { .. } => bail!("[[per_layer.node]] {i} binds a state, which per layer nodes do not take"),
+                }
+            }
+        }
+        for (w, _how) in &p.scratch {
+            let _ = w;
+        }
+        Ok(())
+    }
+
     fn validate_hyper(&self) -> Result<()> {
         let Some(h) = self.gated_residual() else { return Ok(()) };
         ensure!(h.streams > 1, "[gated_residual] needs more than one stream");
@@ -2440,6 +2560,10 @@ impl Spec {
 
     pub fn prelude_slot(&self, layer: usize) -> Option<usize> {
         self.prelude.as_ref().and_then(|p| p.slot(layer))
+    }
+
+    pub fn parallel_moe(&self) -> bool {
+        self.moe.as_ref().is_some_and(|m| m.parallel_dense)
     }
 
     pub fn weight_len(&self, symbol: &str) -> Result<usize> {
@@ -2585,11 +2709,51 @@ impl Spec {
     }
 
     pub fn attention_layers(&self) -> usize {
-        (0..self.layers.count).filter(|&i| self.block(i).is_attention()).count()
+        (0..self.layers.count).filter(|&i| self.owns_kv(i)).count()
     }
 
     pub fn attention_before(&self, layer: usize) -> usize {
-        (0..layer).filter(|&i| self.block(i).is_attention()).count()
+        (0..layer).filter(|&i| self.owns_kv(i)).count()
+    }
+
+    pub fn owns_kv(&self, layer: usize) -> bool {
+        self.block(layer).is_attention() && !self.shares_kv(layer)
+    }
+
+    pub fn kv_index(&self, layer: usize) -> usize {
+        self.attention_before(self.kv_source(layer))
+    }
+
+    pub fn kind_index(&self, layer: usize) -> usize {
+        self.kind_before(self.kv_source(layer))
+    }
+
+    pub fn max_intermediate(&self) -> usize {
+        if self.mlp.wide_shared_tail && self.layers.shared_tail > 0 { 2 * self.dims.intermediate } else { self.dims.intermediate }
+    }
+
+    pub fn gate_up_rows_wide(&self) -> usize {
+        if self.mlp.mapped.is_some() { 2 * self.dims.intermediate } else { 4 * self.dims.intermediate }
+    }
+
+    pub fn wide_layer(&self, layer: usize) -> bool {
+        self.mlp.wide_shared_tail && self.shares_kv(layer)
+    }
+
+    pub fn shares_kv(&self, layer: usize) -> bool {
+        layer >= self.layers.count.saturating_sub(self.layers.shared_tail)
+    }
+
+    pub fn kv_source(&self, layer: usize) -> usize {
+        if !self.shares_kv(layer) {
+            return layer;
+        }
+        let first = self.layers.count - self.layers.shared_tail;
+        (0..first).rev().find(|&j| self.block(j) == self.block(layer)).unwrap_or(layer)
+    }
+
+    pub fn layer_intermediate(&self, layer: usize) -> usize {
+        if self.mlp.wide_shared_tail && self.shares_kv(layer) { 2 * self.dims.intermediate } else { self.dims.intermediate }
     }
 
     pub fn kind_before(&self, layer: usize) -> usize {
@@ -2735,8 +2899,9 @@ impl Spec {
         out
     }
 
-    pub fn projection_live(&self, p: &Projection, block: Block) -> bool {
+    pub fn projection_live(&self, p: &Projection, block: Block, shared: bool) -> bool {
         p.present_in(block)
+            && !(p.kv_owner && shared)
             && p.when.as_deref().is_none_or(|w| {
                 let (name, want) = match w.strip_prefix('!') {
                     Some(n) => (n, false),

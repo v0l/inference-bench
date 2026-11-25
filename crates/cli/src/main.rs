@@ -1,6 +1,6 @@
 #![allow(clippy::large_enum_variant)]
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use inference_bench_core::target::{NATIVE, Request, TargetConfig};
 use inference_bench_core::logging::{self, LogArgs};
@@ -292,6 +292,12 @@ enum Cmd {
         context: Option<usize>,
         #[arg(long, default_value = "decode", help = "prefill, decode or verify")]
         phase: String,
+        #[arg(long, help = "With --plan: count a non decoder graph instead; denoiser reads --spec as a diffusers pipeline folder or a transformer config.json")]
+        graph: Option<String>,
+        #[arg(long, default_value = "1024x1024", help = "With --graph denoiser: image size in pixels")]
+        size: String,
+        #[arg(long, default_value_t = 512, help = "With --graph denoiser: text tokens")]
+        text: usize,
     },
     #[command(about = "Compile and cache the kernels of a spec without loading weights")]
     Warmup {
@@ -467,6 +473,34 @@ fn kernels_command(data: &Path, spec: &str, target: Option<&str>, plan: Option<(
         return Ok(());
     }
     print!("{}", specrt::codegen::kernels_report(&spec, &target)?);
+    Ok(())
+}
+
+fn denoiser_command(path: &Path, size: &str, text: usize, fusion: bool) -> Result<()> {
+    use specrt::denoiser::{self, DenoiserGraph, DenoiserSpec};
+    let spec = if path.is_dir() { DenoiserSpec::from_pipeline(path)? } else { DenoiserSpec::from_transformer_config(&std::fs::read_to_string(path)?, 2)? };
+    let (w, h) = size.split_once('x').context("--size is WIDTHxHEIGHT")?;
+    let (w, h): (usize, usize) = (w.parse()?, h.parse()?);
+    let step = 8 * spec.size("latent_patch")?;
+    ensure!(w % step == 0 && h % step == 0, "--size must be a multiple of {step} pixels");
+    let image = (w / step) * (h / step);
+    let graph = DenoiserGraph::embedded();
+    let plan = graph.plan()?;
+    denoiser::validate(graph, &spec, &plan)?;
+    let count = denoiser::count(image, text);
+    print!("{}", denoiser::report(graph, &spec, &plan, count)?.render());
+    if fusion {
+        let costs = specrt::fusion::Costs::for_target(&kir::Target::sm_120()).with_compute(400.0, 1600.0);
+        for s in specrt::fusion::denoiser_fusion(graph, &spec, &plan, count, &costs, false)? {
+            println!("\n== {} (x{}) launches {} -> {}", s.name, s.repeats, s.launches_before, s.launches_after);
+            for g in &s.groups {
+                println!("  group [{}] launches {}", g.units.join(" + "), g.launches);
+            }
+            for d in s.rejected.iter().filter(|d| d.rule == specrt::fusion::Rule::Prologue) {
+                println!("  kept apart {}", d.describe());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -726,9 +760,13 @@ fn main() -> Result<()> {
         }
         Cmd::Spec { model, out, expect_act_quant } => spec_command(model, out.as_deref(), expect_act_quant.as_deref())?,
         Cmd::Warmup { spec, max_ctx, slots } => warmup_command(&data, spec, *max_ctx, *slots)?,
-        Cmd::Kernels { spec, target, plan, fusion, compiled, tokens, context, phase } => {
+        Cmd::Kernels { spec, target, plan, fusion, compiled, tokens, context, phase, graph, size, text } => {
             if (*fusion || *compiled) && !*plan {
                 bail!("--fusion and --compiled need --plan");
+            }
+            if let Some(g) = graph {
+                ensure!(*plan && g == "denoiser", "--graph takes denoiser, with --plan");
+                return denoiser_command(Path::new(spec), size, *text, *fusion);
             }
             kernels_command(&data, spec, target.as_deref(), plan.then_some((phase.as_str(), *tokens, *context)), *fusion, *compiled)?
         }

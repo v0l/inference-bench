@@ -10,7 +10,7 @@ use std::sync::Arc;
 use kir::vision::{FLASH_BQ, FLASH_THREADS, GEMM_BM, GEMM_BN, GEMM_SMEM, GEMM_THREADS, KERNELS, head_pad};
 
 fn flash_smem(head_dim: usize) -> u32 {
-    kir::vision::VisionKernel { target: crate::codegen::default_target(), head_dim, precise: false, tiled: false }.flash_smem()
+    kir::vision::VisionKernel { target: crate::codegen::default_target(), head_dim, precise: false, tiled: false, joint: false }.flash_smem()
 }
 pub const MAX_ENCODE_PATCHES: usize = 32768;
 pub const WORKSPACE_PATCHES: usize = 4800;

@@ -1,0 +1,281 @@
+name = "kimi_linear"
+kind = "family"
+min_engine = 15
+extends = "generic"
+mtp = false
+
+[match]
+model_types = ["kimi_linear"]
+architectures = ["KimiLinearForCausalLM"]
+
+[blocks]
+kind = "hybrid"
+attention_indices_key = "linear_attn_config.full_attn_layers"
+attention_indices_base = 1
+
+[norm]
+unit_offset = false
+
+[fields]
+num_experts_per_tok = ["num_experts_per_token"]
+n_shared_experts = ["num_shared_experts"]
+norm_topk_prob = ["moe_renormalize"]
+n_group = ["num_expert_group"]
+max_position_embeddings = ["model_max_length"]
+
+[runtime]
+split_activations = true
+
+[tensors]
+".block_sparse_moe." = ".mlp."
+".w1.weight" = ".gate_proj.weight"
+".w3.weight" = ".up_proj.weight"
+".w2.weight" = ".down_proj.weight"
+
+[moe]
+router = "sigmoid"
+score_bias = true
+shared_module = "shared_experts"
+shared_gate = false
+
+[rope]
+nope_all = true
+
+[attention]
+o_cols = "heads * v_head_dim"
+head_dim = "qk_nope_head_dim + qk_rope_head_dim"
+
+[[attention.projection]]
+tensor = "q_proj"
+rows = "heads * (qk_nope_head_dim + qk_rope_head_dim)"
+
+[[attention.projection]]
+tensor = "kv_a_proj_with_mqa"
+rows = "kv_lora_rank + qk_rope_head_dim"
+
+[attention.scratch]
+q_latent = "heads * kv_lora_rank"
+o_latent = "heads * kv_lora_rank"
+
+[attention.params]
+kv_lora_rank = { config = "kv_lora_rank" }
+qk_nope_head_dim = { config = "qk_nope_head_dim" }
+qk_rope_head_dim = { config = "qk_rope_head_dim" }
+v_head_dim = { config = "v_head_dim" }
+softmax_scale = { expr = "rsqrt(qk_nope_head_dim + qk_rope_head_dim)" }
+
+[[state]]
+name = "latent"
+per = "token"
+layers = "attention"
+shape = ["1", "kv_lora_rank + qk_rope_head_dim"]
+dtype = "bf16"
+rollback = "positional"
+
+[[state]]
+name = "conv_q"
+per = "sequence"
+layers = "linear"
+shape = ["kda_qkv", "kda_taps - 1"]
+dtype = "f32"
+rollback = "checkpoint"
+
+[[state]]
+name = "conv_k"
+per = "sequence"
+layers = "linear"
+shape = ["kda_qkv", "kda_taps - 1"]
+dtype = "f32"
+rollback = "checkpoint"
+
+[[state]]
+name = "conv_v"
+per = "sequence"
+layers = "linear"
+shape = ["kda_qkv", "kda_taps - 1"]
+dtype = "f32"
+rollback = "checkpoint"
+
+[[state]]
+name = "kda"
+per = "sequence"
+layers = "linear"
+shape = ["kda_heads", "kda_head_dim", "kda_head_dim"]
+dtype = "f32"
+rollback = "checkpoint"
+
+[[attention.node]]
+op = "kernel"
+kernel = "mla_latent_norm"
+grid = ["rows"]
+
+[attention.node.bind]
+x = { buffer = "qkv" }
+out = { buffer = "qkv" }
+weight = { weight = "kv_a_layernorm.weight", len = "kv_lora_rank" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "mla_latent_write"
+grid = ["1", "rows"]
+
+[attention.node.bind]
+src = { buffer = "qkv" }
+dst = { state = "latent" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "mla_absorb_q"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+x = { buffer = "qkv" }
+w = { weight = "kv_b_proj.weight", len = "heads * (qk_nope_head_dim + v_head_dim) * kv_lora_rank" }
+y = { buffer = "q_latent" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "mla_attention"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+k_cache = { state = "latent" }
+v_cache = { state = "latent" }
+q_latent = { buffer = "q_latent" }
+out = { buffer = "o_latent" }
+softmax_scale = "softmax_scale"
+
+[[attention.node]]
+op = "kernel"
+kernel = "mla_expand_v"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+x = { buffer = "o_latent" }
+w = { weight = "kv_b_proj.weight", len = "heads * (qk_nope_head_dim + v_head_dim) * kv_lora_rank" }
+
+[mixer]
+module = "self_attn"
+out_tensor = "o_proj"
+out_cols = "kda_qkv"
+
+[[mixer.projection]]
+tensor = "q_proj"
+rows = "kda_qkv"
+
+[[mixer.projection]]
+tensor = "k_proj"
+rows = "kda_qkv"
+
+[[mixer.projection]]
+tensor = "v_proj"
+rows = "kda_qkv"
+
+[[mixer.projection]]
+tensor = "f_a_proj"
+rows = "kda_head_dim"
+
+[[mixer.projection]]
+tensor = "g_a_proj"
+rows = "kda_head_dim"
+
+[[mixer.projection]]
+tensor = "b_proj"
+rows = "kda_heads"
+
+[mixer.params]
+kda_heads = { config = "linear_attn_config.num_heads" }
+kda_head_dim = { config = "linear_attn_config.head_dim" }
+kda_taps = { config = "linear_attn_config.short_conv_kernel_size" }
+kda_qkv = { expr = "kda_heads * kda_head_dim" }
+kda_row = { expr = "3 * kda_qkv" }
+kda_gate_row = { expr = "kda_qkv" }
+kda_gate_offset = 0
+kda_beta_row = { expr = "3 * kda_qkv + 2 * kda_head_dim + kda_heads" }
+kda_beta_offset = { expr = "3 * kda_qkv + 2 * kda_head_dim" }
+kda_f_offset = { expr = "3 * kda_qkv" }
+kda_g_offset = { expr = "3 * kda_qkv + kda_head_dim" }
+kda_conv_blocks = { expr = "floor((kda_qkv + 127) / 128)" }
+
+[mixer.scratch]
+conv = "3 * kda_qkv"
+gate = "kda_qkv"
+ogate = "kda_qkv"
+core = "kda_qkv"
+
+[[mixer.node]]
+op = "kernel"
+kernel = "kda_conv_q"
+grid = ["kda_conv_blocks", "seqs"]
+
+[mixer.node.bind]
+x = { buffer = "mix" }
+w = { weight = "q_conv1d.weight", len = "kda_qkv * kda_taps" }
+y = { buffer = "conv" }
+state = { state = "conv_q" }
+
+[[mixer.node]]
+op = "kernel"
+kernel = "kda_conv_k"
+grid = ["kda_conv_blocks", "seqs"]
+
+[mixer.node.bind]
+x = { buffer = "mix" }
+w = { weight = "k_conv1d.weight", len = "kda_qkv * kda_taps" }
+y = { buffer = "conv" }
+state = { state = "conv_k" }
+
+[[mixer.node]]
+op = "kernel"
+kernel = "kda_conv_v"
+grid = ["kda_conv_blocks", "seqs"]
+
+[mixer.node.bind]
+x = { buffer = "mix" }
+w = { weight = "v_conv1d.weight", len = "kda_qkv * kda_taps" }
+y = { buffer = "conv" }
+state = { state = "conv_v" }
+
+[[mixer.node]]
+op = "kernel"
+kernel = "kda_forget_up"
+grid = ["1", "rows"]
+
+[mixer.node.bind]
+x = { buffer = "mix" }
+w = { weight = "f_b_proj.weight", len = "kda_qkv * kda_head_dim" }
+y = { buffer = "gate" }
+
+[[mixer.node]]
+op = "kernel"
+kernel = "kda_out_gate_up"
+grid = ["1", "rows"]
+
+[mixer.node.bind]
+x = { buffer = "mix" }
+w = { weight = "g_b_proj.weight", len = "kda_qkv * kda_head_dim" }
+y = { buffer = "ogate" }
+
+[[mixer.node]]
+op = "kernel"
+kernel = "kda_softplus_recurrence"
+grid = ["kda_heads", "seqs"]
+
+[mixer.node.bind]
+mix = { buffer = "conv" }
+betas = { buffer = "mix" }
+gates = { buffer = "gate" }
+dt_bias = { weight = "dt_bias", len = "kda_qkv" }
+a_log = { weight = "A_log", len = "kda_heads" }
+y = { buffer = "core" }
+kda = { state = "kda" }
+
+[[mixer.node]]
+op = "kernel"
+kernel = "kda_gated_norm"
+grid = ["kda_heads", "rows"]
+
+[mixer.node.bind]
+x = { buffer = "core" }
+g = { buffer = "ogate" }
+w = { weight = "o_norm.weight", len = "kda_head_dim" }

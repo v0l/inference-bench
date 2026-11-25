@@ -1,0 +1,44 @@
+{
+  "name": "kimi_linear",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 128,
+    "intermediate": 256,
+    "vocab": 512,
+    "tie_embeddings": false
+  },
+  "layers": {
+    "count": 4,
+    "pattern": [
+      "dense"
+    ]
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 0.00001
+  },
+  "attention": {
+    "kind": "mla",
+    "heads": 4,
+    "kv_heads": 4,
+    "head_dim": 72,
+    "qkv_bias": false,
+    "qk_norm": false
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 10000.0
+  },
+  "mlp": {
+    "activation": "swiglu"
+  },
+  "moe": {
+    "experts": 8,
+    "expert_intermediate": 32,
+    "dense_layers": [
+      0
+    ],
+    "routed_scale": 2.446
+  }
+}

@@ -10,7 +10,7 @@ const SMS: u32 = 84;
 
 fn node(op: &Op, spec: &Spec, layer: usize, phase: Phase, root: &str, index: Option<usize>) -> Node {
     let tokens = match phase {
-        Phase::Prefill => PREFILL_TOKENS,
+        Phase::Prefill | Phase::Forward => PREFILL_TOKENS,
         Phase::Decode | Phase::Verify => DECODE_ROWS,
     };
     let mut target = specrt::codegen::default_target();
@@ -34,7 +34,7 @@ pub fn rows_for(spec: &Spec, structure: &Structure, layer: usize, phase: Phase) 
     let root = structure.root().ok_or("not runnable on specrt: the checkpoint has no layer stack")?;
     let plan = Plan::build(spec, phase, true);
     let mut rows = column(&plan.head, spec, layer, phase, root, None);
-    rows.extend(column(plan.layer_of(spec.block(layer), spec.moe.as_ref().is_some_and(|m| m.is_sparse(layer))), spec, layer, phase, root, Some(layer)));
+    rows.extend(column(plan.layer_for(spec.block(layer), spec.moe.as_ref().is_some_and(|m| m.is_sparse(layer)), spec.shares_kv(layer)), spec, layer, phase, root, Some(layer)));
     rows.extend(column(&plan.tail, spec, layer, phase, root, None));
     Ok(rows)
 }
@@ -44,6 +44,7 @@ pub fn title(spec: &Spec, layer: usize, phase: Phase) -> String {
         Phase::Prefill => format!("prefill at {PREFILL_TOKENS} tokens"),
         Phase::Decode => format!("decode at {DECODE_ROWS} rows"),
         Phase::Verify => format!("verify at {DECODE_ROWS} rows"),
+        Phase::Forward => format!("forward at {PREFILL_TOKENS} tokens"),
     };
     let kind = if spec.block(layer).is_linear() { "gated delta-net" } else { "attention" };
     format!("engine plan, layer {layer} ({kind}), {phase}")

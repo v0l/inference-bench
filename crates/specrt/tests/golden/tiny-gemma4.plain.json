@@ -69,6 +69,7 @@
             "buffer": "qkv"
           }
         },
+        "when": "kv_owner",
         "layers": [
           "sliding"
         ]
@@ -85,6 +86,7 @@
             "buffer": "qkv"
           }
         },
+        "when": "kv_owner",
         "layers": [
           "sliding"
         ]
@@ -117,6 +119,7 @@
             "buffer": "qkv"
           }
         },
+        "when": "kv_owner",
         "layers": [
           "sliding"
         ]
@@ -137,6 +140,7 @@
             "buffer": "qkv"
           }
         },
+        "when": "kv_owner",
         "layers": [
           "sliding"
         ]
@@ -157,6 +161,7 @@
             "buffer": "qkv"
           }
         },
+        "when": "kv_owner",
         "layers": [
           "sliding"
         ]
@@ -218,6 +223,7 @@
             "buffer": "qkv"
           }
         },
+        "when": "kv_owner",
         "layers": [
           "full"
         ]
@@ -234,6 +240,7 @@
             "buffer": "qkv"
           }
         },
+        "when": "kv_owner",
         "layers": [
           "full"
         ]
@@ -266,6 +273,7 @@
             "buffer": "qkv"
           }
         },
+        "when": "kv_owner",
         "layers": [
           "full"
         ]
@@ -286,6 +294,7 @@
             "buffer": "qkv"
           }
         },
+        "when": "kv_owner",
         "layers": [
           "full"
         ]
@@ -306,6 +315,7 @@
             "buffer": "qkv"
           }
         },
+        "when": "kv_owner",
         "layers": [
           "full"
         ]
@@ -369,6 +379,7 @@
       {
         "tensor": "k_proj",
         "rows": "kvh_s * hd_s",
+        "kv_owner": true,
         "layers": [
           "sliding"
         ],
@@ -377,6 +388,7 @@
       {
         "tensor": "k_proj",
         "rows": "kvh_g * hd_g",
+        "kv_owner": true,
         "layers": [
           "full"
         ],
@@ -385,6 +397,7 @@
       {
         "tensor": "v_proj",
         "rows": "kvh_s * hd_s",
+        "kv_owner": true,
         "layers": [
           "sliding"
         ],
@@ -393,6 +406,7 @@
       {
         "tensor": "v_proj",
         "rows": "kvh_g * hd_g",
+        "kv_owner": true,
         "layers": [
           "full"
         ],
@@ -402,6 +416,7 @@
       {
         "tensor": "k_proj",
         "rows": "kvh_g * hd_g",
+        "kv_owner": true,
         "layers": [
           "full"
         ],
@@ -499,5 +514,11 @@
       ]
     }
   ],
+  "tensors": {
+    ".experts.": ".mlp.experts.",
+    ".router.": ".mlp.router.",
+    "mlp.experts.down_proj": "mlp.experts.down_proj.weight",
+    "mlp.experts.gate_up_proj": "mlp.experts.gate_up_proj.weight"
+  },
   "plain_activations": true
 }

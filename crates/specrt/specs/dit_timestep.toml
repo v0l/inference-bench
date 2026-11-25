@@ -1,0 +1,77 @@
+kind = "kir-kernel"
+family = "compose"
+name = "dit_timestep"
+threads = 256
+
+[args]
+width = "freq"
+
+[rows]
+iter = "grid"
+address = "advance"
+per_row = ["out_hi", "out_lo"]
+
+[rows.stride]
+steps = 1
+
+[[param]]
+name = "steps"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "out_hi"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "out_lo"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[const]]
+name = "scale"
+value = "time_scale"
+
+[[const]]
+name = "log_period"
+value = 9.210340371976184
+
+[[stage]]
+op = "index"
+name = "col"
+
+[[stage]]
+op = "tile_load"
+name = "ts"
+src = "steps"
+layout = "(width):(0)"
+at = ["i"]
+
+[[stage]]
+op = "epilogue"
+name = "half"
+expr = "width / 2.0"
+
+[[stage]]
+op = "epilogue"
+name = "j"
+expr = "select(col < half, col, col - half)"
+
+[[stage]]
+op = "epilogue"
+name = "angle"
+expr = "ts * scale * exp(-log_period * j / half)"
+
+[[stage]]
+op = "epilogue"
+name = "y"
+expr = "select(col < half, cos(angle), sin(angle))"
+
+[[stage]]
+op = "split_store"
+dst = "out_hi"
+lo = "out_lo"
+value = "y"

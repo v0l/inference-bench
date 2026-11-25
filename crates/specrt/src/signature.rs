@@ -1,7 +1,7 @@
 use crate::graph::Bind;
 use crate::plan::{Buf, NormKind, Op, Phase, Plan, Weight, weight_kind};
 use crate::spec::{KvDtype, Quant, Spec};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use kir::gemm::Epilogue;
 use std::collections::BTreeMap;
 
@@ -32,7 +32,7 @@ pub enum Layout {
     Paged,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Rows {
     Tokens,
     Out,
@@ -41,6 +41,9 @@ pub enum Rows {
     Pairs(usize),
     Experts { total: usize, top_k: usize },
     Fixed(usize),
+    Image,
+    Text,
+    Joint,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -69,19 +72,22 @@ pub struct Signature {
     pub writes: Vec<Tensor>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Count {
     pub tokens: usize,
     pub out: usize,
     pub seqs: usize,
     pub context: usize,
+    pub image: usize,
+    pub text: usize,
 }
 
 impl Count {
     pub fn new(phase: Phase, tokens: usize, context: usize) -> Count {
         match phase {
-            Phase::Prefill => Count { tokens, out: 1, seqs: 1, context },
-            Phase::Decode | Phase::Verify => Count { tokens, out: tokens, seqs: tokens, context },
+            Phase::Prefill => Count { tokens, out: 1, seqs: 1, context, ..Count::default() },
+            Phase::Decode | Phase::Verify => Count { tokens, out: tokens, seqs: tokens, context, ..Count::default() },
+            Phase::Forward => Count { tokens, out: tokens, seqs: 1, context, ..Count::default() },
         }
     }
 
@@ -94,6 +100,9 @@ impl Count {
             Rows::Pairs(p) => self.tokens * p,
             Rows::Experts { total, top_k } => total.min(self.tokens * top_k),
             Rows::Fixed(n) => n,
+            Rows::Image => self.image,
+            Rows::Text => self.text,
+            Rows::Joint => self.image + self.text,
         }
     }
 }
@@ -183,6 +192,7 @@ pub struct Signer<'a> {
     mixer: Vec<kir::Kernel>,
     gated: Vec<kir::Kernel>,
     prelude: Vec<kir::Kernel>,
+    per_layer: Vec<kir::Kernel>,
     ranked: bool,
 }
 
@@ -190,11 +200,58 @@ impl<'a> Signer<'a> {
     pub fn new(spec: &'a Spec) -> Result<Signer<'a>> {
         let target = crate::codegen::default_target();
         let ctx = crate::engine::DEFAULT_CTX;
-        Ok(Signer { spec, described: crate::codegen::described_kernels(spec, 1, ctx, &target)?, mixer: crate::codegen::mixer_kernels(spec, 1, ctx, &target)?, gated: crate::codegen::gated_kernels(spec, &target)?, prelude: crate::codegen::prelude_kernels(spec, ctx, &target)?, ranked: false })
+        Ok(Signer { spec, described: crate::codegen::described_kernels(spec, 1, ctx, &target)?, mixer: crate::codegen::mixer_kernels(spec, 1, ctx, &target)?, gated: crate::codegen::gated_kernels(spec, &target)?, prelude: crate::codegen::prelude_kernels(spec, ctx, &target)?, per_layer: crate::codegen::per_layer_kernels(spec, &target)?, ranked: false })
     }
 
     pub fn ranked(self, ranked: bool) -> Signer<'a> {
         Signer { ranked, ..self }
+    }
+
+    fn per_layer_node(&self, node: u8, stage: u8, layer: usize) -> Result<Signature> {
+        let p = self.spec.per_layer().context("[per_layer]")?;
+        let _ = p;
+        let Some(kernel) = self.per_layer.get(node as usize) else { bail!("per layer node {node} has no kernel") };
+        let spec_node: &crate::graph::Node = &self.spec.per_layer().context("[per_layer]")?.node[node as usize];
+        let head = stage == crate::plan::PLE_HEAD;
+        let defaults = |name: &str| -> Option<Tensor> {
+            match name {
+                "x" => Some(self.x()),
+                "tokens" => Some(Tensor::new(Place::Input("tokens"), Rows::Tokens, 1, Form::I32)),
+                _ => None,
+            }
+        };
+        let scratch = &self.spec.per_layer().context("[per_layer]")?.scratch;
+        let mut sig = self.bound_stage(kernel, spec_node, scratch, &defaults)?;
+        let _ = layer;
+        if !head {
+            sig.reads.retain(|t| t.place != Place::Buf(Buf::X));
+            sig.writes.retain(|t| t.place != Place::Buf(Buf::X));
+            sig.writes.push(self.x());
+            sig.reads.push(self.x());
+        }
+        Ok(sig)
+    }
+
+    fn bound_stage(&self, kernel: &kir::Kernel, node: &crate::graph::Node, scratch: &BTreeMap<String, String>, defaults: &dyn Fn(&str) -> Option<Tensor>) -> Result<Signature> {
+        let mut reads = Vec::new();
+        let mut writes = Vec::new();
+        for param in kernel.params.iter().filter(|p| p.role != kir::Role::Value) {
+            let t = match node.bind.get(param.name) {
+                Some(crate::graph::Bind::Weight { weight, len }) => Tensor::weight(weight.clone(), 1, self.spec.weight_len(len)?, Form::F32),
+                Some(crate::graph::Bind::Buffer { buffer }) => match scratch.get(buffer) {
+                    Some(w) => Tensor::new(Place::Local(buffer.clone()), Rows::Tokens, crate::state::dim(self.spec, w)?, Form::F32),
+                    None => defaults(buffer).with_context(|| format!("no buffer {buffer:?}"))?,
+                },
+                Some(crate::graph::Bind::Name(_) | crate::graph::Bind::Number(_)) => continue,
+                Some(crate::graph::Bind::State { state }) => bail!("per layer node binds state {state:?}, which per layer nodes do not take"),
+                None => defaults(param.name).with_context(|| format!("{} has no binding for {}", kernel.name, param.name))?,
+            };
+            match param.access {
+                kir::Access::Read => reads.push(t),
+                kir::Access::Write => writes.push(t),
+            }
+        }
+        Ok(Signature { class: Class::Elementwise, reads, writes })
     }
 
     fn hidden(&self) -> usize {
@@ -210,7 +267,7 @@ impl<'a> Signer<'a> {
     }
 
     pub(crate) fn caches(&self, layer: usize, rows: Rows) -> Vec<Tensor> {
-        let at = self.spec.attention_before(layer);
+        let at = self.spec.kv_index(layer);
         crate::state::positional(self.spec)
             .filter(|s| s.layers == crate::state::Layers::Attention && s.keeps(self.spec, Some(layer)))
             .map(|s| Tensor::new(Place::Cache(s.name.clone()), rows, s.token_layer_bytes(self.spec, at, 1), Form::Paged(self.spec.runtime.kv_dtype)))
@@ -463,7 +520,11 @@ impl<'a> Signer<'a> {
                 Signature { class: Class::Gemm, reads, writes: vec![outs] }
             }
             _ => {
-                let target = if self.ranked { Tensor::buf(Buf::Partial, Rows::Tokens, h) } else { self.x() };
+                let target = match op {
+                    Op::MoeCombineInto { into } => Tensor::buf(*into, Rows::Tokens, h),
+                    _ if self.ranked => Tensor::buf(Buf::Partial, Rows::Tokens, h),
+                    _ => self.x(),
+                };
                 Signature { class: Class::Gather, reads: vec![outs, routes, target.clone()], writes: vec![target] }
             }
         }
@@ -475,13 +536,14 @@ impl<'a> Signer<'a> {
         let tokens_in = Tensor::new(Place::Input("tokens"), Rows::Tokens, 1, Form::I32);
         let sig = |class, reads, writes| Signature { class, reads, writes };
         Ok(match *op {
+            Op::PerLayer { node, stage } => self.per_layer_node(node, stage, layer)?,
             Op::Embed => sig(Class::Gather, vec![tokens_in, Tensor::new(Place::Weight("embed_tokens.weight".into()), Rows::Tokens, h, Form::Bf16)], vec![self.x()]),
             Op::Splice => sig(Class::Gather, vec![Tensor::new(Place::Input("media"), Rows::Tokens, h, Form::F32)], vec![self.x()]),
             Op::Norm { which, into } => {
                 let rows = if which == NormKind::Final && into.is_planes() { Rows::Out } else { Rows::Tokens };
                 sig(Class::RowReduce, vec![Tensor::buf(Buf::X, rows, h), self.norm_weight(which)], vec![Tensor::buf(into, rows, h)])
             }
-            Op::NormAdd { which, from } => sig(Class::RowReduce, vec![Tensor::buf(from, Rows::Tokens, h), self.norm_weight(which), self.x()], vec![self.x()]),
+            Op::NormAdd { which, from, into } => sig(Class::RowReduce, vec![Tensor::buf(from, Rows::Tokens, h), self.norm_weight(which), Tensor::buf(into, Rows::Tokens, h)], vec![Tensor::buf(into, Rows::Tokens, h)]),
             Op::Clear { buf } => sig(Class::Elementwise, Vec::new(), vec![Tensor::buf(buf, Rows::Tokens, h)]),
             Op::Split { from, into } => sig(Class::Elementwise, vec![Tensor::buf(from, Rows::Tokens, h)], vec![Tensor::buf(into, Rows::Tokens, h)]),
             Op::QkNorm => sig(
@@ -542,7 +604,7 @@ impl<'a> Signer<'a> {
                 vec![Tensor::buf(Buf::XnPlanes, Rows::Tokens, h)],
             ),
             Op::MtpDraft => sig(Class::RowReduce, vec![Tensor::buf(Buf::MtpLogits, Rows::Tokens, spec.dims.vocab)], vec![Tensor::new(Place::Local("drafts".into()), Rows::Tokens, 1, Form::I32)]),
-            Op::MoeRoute | Op::MoeExperts | Op::MoeCombine => self.moe(op, layer),
+            Op::MoeRoute | Op::MoeExperts | Op::MoeCombine | Op::MoeCombineInto { .. } => self.moe(op, layer),
             Op::AllReduce => {
                 let partial = Tensor::buf(Buf::Partial, Rows::Tokens, h);
                 sig(Class::Elementwise, vec![partial.clone(), self.x()], vec![self.x(), partial])
@@ -562,6 +624,7 @@ impl<'a> Signer<'a> {
                     _ => sig(Class::Elementwise, vec![streams], vec![self.x()]),
                 }
             }
+            Op::Dit(_) => bail!("{} is a denoiser op; sign it with denoiser::Signer", op.label()),
         })
     }
 }
@@ -573,21 +636,21 @@ pub struct Section<'p> {
     pub ops: &'p [Op],
 }
 
-pub(crate) fn layers_using(spec: &Spec, layers: &[String], sparse: bool) -> Vec<usize> {
+pub(crate) fn layers_using(spec: &Spec, layers: &[String], sparse: bool, tail: bool) -> Vec<usize> {
     (0..spec.layers.count)
-        .filter(|&i| layers.iter().any(|l| l == spec.block(i).name()) && spec.moe.as_ref().is_some_and(|m| m.is_sparse(i) && spec.has_mlp(i)) == sparse)
+        .filter(|&i| spec.shares_kv(i) == tail && layers.iter().any(|l| l == spec.block(i).name()) && spec.moe.as_ref().is_some_and(|m| m.is_sparse(i) && spec.has_mlp(i)) == sparse)
         .collect()
 }
 
 pub fn sections<'p>(spec: &Spec, plan: &'p Plan) -> Vec<Section<'p>> {
     let mut out = vec![Section { name: "head".into(), layer: 0, repeats: 1, ops: &plan.head }];
     for b in &plan.blocks {
-        let used = layers_using(spec, &b.layers, b.sparse);
+        let used = layers_using(spec, &b.layers, b.sparse, b.tail);
         let Some(&first) = used.first() else { continue };
         let mut kinds: Vec<&str> = used.iter().map(|&i| spec.block(i).name()).collect();
         kinds.sort_unstable();
         kinds.dedup();
-        let name = format!("layer {}{}", kinds.join("|"), if b.sparse { " moe" } else { "" });
+        let name = format!("layer {}{}{}", kinds.join("|"), if b.sparse { " moe" } else { "" }, if b.tail { " shared" } else { "" });
         out.push(Section { name, layer: first, repeats: used.len(), ops: &b.ops });
     }
     out.push(Section { name: "tail".into(), layer: spec.layers.count.saturating_sub(1), repeats: 1, ops: &plan.tail });
@@ -657,7 +720,7 @@ pub fn validate_with(signer: &Signer, plan: &Plan, spec: &Spec) -> Result<()> {
         let block = spec.block(i);
         let mut defined = entry.clone();
         defined.extend(carried.clone());
-        walk(&mut defined, &format!("layer {i} ({}{})", block.name(), if sparse { ", moe" } else { "" }), i, plan.layer_of(block, sparse))?;
+        walk(&mut defined, &format!("layer {i} ({}{})", block.name(), if sparse { ", moe" } else { "" }), i, plan.layer_for(block, sparse, spec.shares_kv(i)))?;
         carried.extend(defined.iter().filter(|(p, _)| matches!(p, Place::Local(_))).map(|(p, t)| (p.clone(), t.clone())));
         last = defined;
     }
