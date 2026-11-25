@@ -47,6 +47,9 @@ fn cluster(spec: &Spec, cuts: &[usize], max_ctx: usize, slots: usize) -> Cluster
 }
 
 fn single_reference(spec: &Spec, prompt: &[u32], new_tokens: usize, max_ctx: usize) -> Vec<u32> {
+    if spec.gated_residual.is_some() {
+        return Runtime::load_batched(spec, max_ctx, 1).unwrap().generate_batch(std::slice::from_ref(&prompt.to_vec()), new_tokens).unwrap().tokens.remove(0);
+    }
     let mut rt = Runtime::load_layout(spec, Layout { kv_planes: 1, ..Layout::contiguous(max_ctx, 1) }).unwrap();
     let pages = max_ctx.div_ceil(specrt::codegen::PAGE) as u32;
     rt.set_block_table(0, &(0..pages).collect::<Vec<_>>()).unwrap();
@@ -55,7 +58,7 @@ fn single_reference(spec: &Spec, prompt: &[u32], new_tokens: usize, max_ctx: usi
 
 fn pipeline_matches_single(dir: &str, cuts: &[usize]) {
     let spec = spec_for(dir);
-    let p = prompt(300);
+    let p: Vec<u32> = prompt(300).into_iter().map(|t| t % spec.dims.vocab as u32).collect();
     let want = single_reference(&spec, &p, 64, 512);
     let mut c = cluster(&spec, cuts, 512, 2);
     let got = generate(&mut c.chain, 0, &p, 64, 128).unwrap();
@@ -65,6 +68,13 @@ fn pipeline_matches_single(dir: &str, cuts: &[usize]) {
     let again = generate(&mut c.chain, 1, &p, 64, 100).unwrap();
     assert_eq!(again.tokens, want, "second slot, other chunking");
     drop(c.servers);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn qwen4_exp_two_stage_pipeline_matches_the_single_runtime() {
+    pipeline_matches_single("tiny-qwen4-exp", &[2]);
+    pipeline_matches_single("tiny-qwen4-exp", &[3]);
 }
 
 #[test]
@@ -107,6 +117,29 @@ fn a_dead_stage_fails_the_request_and_the_rest_keep_serving() {
 }
 
 #[test]
+fn a_stage_after_the_first_cannot_start_before_a_prelude_layer() {
+    let spec = spec_for("tiny-qwen4-exp");
+    let ple = spec.prelude.as_ref().unwrap().layers[0];
+    assert!(ple >= 1);
+    let cut_before = specrt::runtime::StageRange { device: 0, start: ple, end: spec.layers.count };
+    let err = cut_before.check(&spec).unwrap_err().to_string();
+    assert!(err.contains("prelude"), "{err}");
+    specrt::runtime::StageRange { device: 0, start: ple + 1, end: spec.layers.count }.check(&spec).unwrap();
+    specrt::runtime::StageRange { device: 0, start: 0, end: ple + 1 }.check(&spec).unwrap();
+}
+
+#[test]
+fn the_planner_never_cuts_in_front_of_a_prelude_layer() {
+    let spec = spec_for("tiny-qwen4-exp");
+    let ple = spec.prelude.as_ref().unwrap().layers[0];
+    let model = specrt::placement::CostModel::new(&spec, 512, 1);
+    for start in 1..=ple {
+        assert!(model.stage_fit_error(start, spec.layers.count).is_some_and(|e| e.contains("prelude")), "start {start}");
+    }
+    assert!(model.stage_fit_error(ple + 1, spec.layers.count).is_none());
+}
+
+#[test]
 fn moe_stage_specs_keep_the_output_gate_and_drop_unused_attention_nodes() {
     let spec = spec_for("tiny-qwen4-exp");
     assert!(spec.attention.output_gate);
@@ -114,7 +147,7 @@ fn moe_stage_specs_keep_the_output_gate_and_drop_unused_attention_nodes() {
     let linear_only = spec.stage(0, 1);
     assert!(!linear_only.block(0).is_attention());
     assert!(linear_only.attention.node.is_empty());
-    specrt::runtime::StageRange { device: 0, start: 1, end: spec.layers.count }.check(&spec).unwrap();
+    specrt::runtime::StageRange { device: 0, start: spec.layers.count - 1, end: spec.layers.count }.check(&spec).unwrap();
     let tail = spec.stage(spec.layers.count - 1, spec.layers.count);
     assert_eq!(tail.attention.node.is_empty(), !tail.block(0).is_attention());
 }

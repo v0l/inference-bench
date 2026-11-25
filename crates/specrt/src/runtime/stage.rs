@@ -16,6 +16,9 @@ impl StageRange {
 
     pub fn check(&self, spec: &Spec) -> Result<()> {
         ensure!(self.start < self.end && self.end <= spec.layers.count, "stage layers {}..{} outside the {} layers of {}", self.start, self.end, spec.layers.count, spec.name);
+        if self.start != 0 {
+            ensure!(!spec.prelude.as_ref().is_some_and(|p| p.layers.iter().any(|l| (self.start..self.end).contains(l))), "a stage after the first cannot hold a prelude layer: layers {}..{} of {} need the token history, which only the first stage has", self.start, self.end, spec.name);
+        }
         if self.start != 0 || self.end != spec.layers.count {
             ensure!(spec.moe.as_ref().is_none_or(|m| m.dense_layers.is_empty() && m.sparse_step <= 1), "pipeline stages need every layer of a MoE model to be sparse");
         }
