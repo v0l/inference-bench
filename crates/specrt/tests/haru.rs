@@ -464,6 +464,67 @@ fn the_lm_root_comes_from_the_family_rename_and_every_input_weight_loads() {
 }
 
 #[test]
+fn the_codec_graph_plans_every_codec_tensor_of_the_real_checkpoint() {
+    let plan = specrt::codec::graph::plan(&real_config()).unwrap();
+    let rows = header();
+    let codec: BTreeMap<String, Vec<usize>> = rows.into_iter().filter(|(n, _)| n.starts_with("codec.")).collect();
+    let planned: BTreeMap<String, Vec<usize>> = plan.encoder.tensors().into_iter().chain(plan.decoder.tensors()).collect();
+    assert_eq!(planned, codec);
+    assert_eq!(plan.encoder.params(), 343_696_032);
+    assert_eq!(plan.decoder.params(), 343_695_969);
+    assert_eq!((plan.frame_samples, plan.latent_dim), (3200, 64));
+    assert_eq!(plan.encoder.steps(1).last(), Some(&1));
+    assert_eq!(plan.decoder.steps(1).last(), Some(&3200));
+    let (enc, dec) = codec_state_floats(&real_config()["codec"]);
+    assert_eq!((plan.encoder.state_floats(), plan.decoder.reference_state_floats()), (enc, dec));
+    assert_eq!((plan.encoder.state_floats(), plan.decoder.reference_state_floats()), (159_622, 147_904));
+    assert_eq!(plan.decoder.state_floats(), 139_200, "the transposed conv keeps one input column, not an overlap tail");
+    let tiny = specrt::codec::graph::plan(&tiny_config()).unwrap();
+    let meta = json(&dir().join("tiny/reference.json"));
+    assert_eq!(tiny.encoder.state_floats() as u64, meta["codec_state_floats"]["encoder"].as_u64().unwrap());
+    assert_eq!(tiny.decoder.reference_state_floats() as u64, meta["codec_state_floats"]["decoder"].as_u64().unwrap());
+    let w = Weights::load();
+    tiny.check_tensors(&|n| w.tensors.get(n).map(|t| t.0.clone()).ok_or_else(|| anyhow::anyhow!("{n} missing"))).unwrap();
+}
+
+#[test]
+fn the_host_codec_encodes_and_decodes_like_the_reference_whole_and_frame_by_frame() {
+    let codec = specrt::codec::HostCodec::open(&dir().join("tiny")).unwrap();
+    let frame = codec.plan.frame_samples;
+    let check = |what: &str, got: &[f32], want: &[f32], tol: f32| {
+        let e = max_rel(got, want);
+        eprintln!("{what}: max rel {e:e}");
+        assert!(e < tol, "{what} {e}");
+    };
+    let (clip, _) = reference("codec.clip");
+    let (clip_mean, _) = reference("codec.clip_mean");
+    let whole = codec.encode(&clip).unwrap();
+    check("codec.clip_mean", &whole, &clip_mean, 1e-4);
+
+    let (audio, _) = reference("session.user_audio");
+    let (user_mean, _) = reference("session.user_mean");
+    let mut state = codec.encoder.new_state();
+    assert_eq!(state.floats(), codec.plan.encoder.state_floats());
+    let streamed: Vec<f32> = audio.chunks(frame).flat_map(|f| codec.encoder.run(f, &mut state).unwrap()).collect();
+    check("session.user_mean", &streamed, &user_mean, 1e-4);
+    check("encode frame by frame against whole", &streamed, &codec.encode(&audio).unwrap(), 1e-5);
+
+    let (clip_audio, _) = reference("codec.clip_audio");
+    check("codec.clip_audio", &codec.decode(&clip_mean).unwrap(), &clip_audio, 1e-4);
+
+    let (latents, _) = reference("session.latent");
+    let (session_audio, _) = reference("session.audio");
+    let mut state = codec.decoder.new_state();
+    assert_eq!(state.floats(), codec.plan.decoder.state_floats());
+    let streamed: Vec<f32> = latents.chunks(codec.plan.latent_dim).flat_map(|z| codec.decoder.run(z, &mut state).unwrap()).collect();
+    check("session.audio", &streamed, &session_audio, 1e-4);
+    check("decode frame by frame against whole", &streamed, &codec.decode(&latents).unwrap(), 1e-5);
+
+    let (silence, _) = reference("codec.silence");
+    check("codec.silence", &codec.silence().unwrap(), &silence, 1e-4);
+}
+
+#[test]
 fn the_fixture_stays_under_3_mb() {
     fn size(p: &Path) -> u64 {
         std::fs::read_dir(p).unwrap().flatten().map(|e| if e.path().is_dir() { size(&e.path()) } else { e.metadata().unwrap().len() }).sum()

@@ -1971,6 +1971,14 @@ impl Checkpoint {
         plane.decode().with_context(|| scale.to_string())
     }
 
+    pub fn drop_absent_mtp(&self, spec: &mut Spec) -> bool {
+        let absent = spec.mtp.is_some() && !self.has(&spec.mtp_layout().fc);
+        if absent {
+            spec.mtp = None;
+        }
+        absent
+    }
+
     pub fn mtp<'a>(&'a self, spec: &Spec) -> Result<MtpWeights<'a>> {
         let (h, inter) = (spec.dims.hidden, spec.dims.intermediate);
         let lay = spec.mtp_layout();

@@ -66,7 +66,8 @@ pub enum Expr {
     Call(&'static str, Vec<Expr>),
 }
 
-const UNARY: [(&str, &str, &str); 9] = [
+const UNARY: [(&str, &str, &str); 10] = [
+    ("erf", "erff", ""),
     ("floor", "floorf", "floor"),
     ("sin", "sinf", "sin"),
     ("cos", "cosf", "cos"),
@@ -78,7 +79,8 @@ const UNARY: [(&str, &str, &str); 9] = [
     ("abs", "fabsf", "abs"),
 ];
 
-const MACROS: [(&str, &str); 4] = [
+const MACROS: [(&str, &str); 5] = [
+    ("gelu", "0.5 * x * (1.0 + erf(x * 0.7071067811865476))"),
     ("sigmoid", "1.0 / (1.0 + exp(-x))"),
     ("silu", "x / (1.0 + exp(-x))"),
     ("gelu_tanh", "0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))"),
@@ -364,6 +366,7 @@ impl Expr {
                     ("rsqrt", [a]) => 1.0 / a.sqrt(),
                     ("sqrt", [a]) => a.sqrt(),
                     ("abs", [a]) => a.abs(),
+                    ("erf", [a]) => erf(*a),
                     ("probit", [p]) => probit(*p)?,
                     _ => return None,
                 }
@@ -452,6 +455,7 @@ impl Expr {
                 format!("{cu}({})", parts?.join(", "))
             }
             Expr::Call("probit", _) => return Err("probit is evaluated when the spec is read and has no device lowering".into()),
+            Expr::Call("erf", args) if d == Dialect::Wgsl => erf_poly(args[0].clone()).lower(d, wgsl_consts)?,
             Expr::Call(f, args) => {
                 let (_, cu, wg) = UNARY.iter().chain(BINARY.iter()).find(|(n, _, _)| n == f).ok_or_else(|| format!("unknown function {f}"))?;
                 let parts: Result<Vec<String>, String> = args.iter().map(|a| child(a, false)).collect();
@@ -459,6 +463,39 @@ impl Expr {
             }
         })
     }
+}
+
+pub fn erf(x: f64) -> f64 {
+    let a = x.abs();
+    let v = if a < 2.0 {
+        let (mut term, mut sum, mut n) = (a, a, 0.0);
+        while term.abs() > 1e-17 * sum {
+            n += 1.0;
+            term *= -a * a / n;
+            sum += term / (2.0 * n + 1.0);
+            if n > 200.0 {
+                break;
+            }
+        }
+        sum * std::f64::consts::FRAC_2_SQRT_PI
+    } else {
+        let mut k = a;
+        for n in (1..400).rev() {
+            k = a + (n as f64 / 2.0) / k;
+        }
+        1.0 - (-a * a).exp() / (std::f64::consts::PI.sqrt() * k)
+    };
+    v.copysign(x)
+}
+
+pub fn erf_poly(x: Expr) -> Expr {
+    let body = "select(x < 0.0, -1.0, 1.0) * (1.0 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-x * x))";
+    let t = Expr::parse("1.0 / (1.0 + 0.3275911 * abs(x))").expect("erf polynomial").subst(&|n| (n == "x").then(|| x.clone())).expect("erf polynomial");
+    Expr::parse(body).expect("erf polynomial").subst(&|n| match n {
+        "x" => Some(x.clone()),
+        "t" => Some(t.clone()),
+        _ => None,
+    }).expect("erf polynomial")
 }
 
 pub fn probit(p: f64) -> Option<f64> {

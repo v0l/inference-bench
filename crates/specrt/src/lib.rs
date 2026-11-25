@@ -14,6 +14,7 @@ pub mod coordinator;
 pub mod direct;
 pub mod discovery;
 pub mod codegen;
+pub mod codec;
 pub mod compile;
 pub mod denoiser;
 pub mod denoiser_host;

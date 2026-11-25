@@ -2517,10 +2517,9 @@ impl Spec {
                 let experts = self.quant == Quant::Bf16 && self.moe.is_some();
                 ensure!(m == Quant::Nvfp4G16 && (beside_fp8 || experts), "[mlp] quant {m:?} beside {:?} is not supported (nvfp4_g16 beside fp8_channel is, and beside bf16 for mixture-of-experts)", self.quant);
                 ensure!(until.is_none_or(|u| u > 0 && u < self.layers.count), "[mlp] quant_until must be inside the layer count");
-                let width = if self.moe.is_some() { 128 } else { 256 };
                 ensure!(
-                    self.dims.hidden.is_multiple_of(256) && self.dims.intermediate.is_multiple_of(width),
-                    "nvfp4_g16 needs hidden to be a multiple of 256 and intermediate a multiple of {width}"
+                    self.dense_fp4_fits() || (self.moe.as_ref().is_some_and(|m| !m.parallel_dense) && self.dims.hidden.is_multiple_of(256)),
+                    "nvfp4_g16 needs hidden to be a multiple of 256 and intermediate a multiple of 256"
                 );
             }
             (None, None) => {}
@@ -2588,11 +2587,18 @@ impl Spec {
     }
 
     pub fn mlp_quant(&self, layer: usize) -> Quant {
-        match self.mlp.quant {
+        let q = match self.mlp.quant {
             Some(Quant::Nvfp4G16) if !self.quant_map.is_empty() && self.quant_map.mlp_fp4(layer) != Some(true) => self.quant,
             Some(q) if self.mlp.quant_until.is_none_or(|u| layer < u) => q,
             _ => self.quant,
-        }
+        };
+        let dense = self.moe.as_ref().is_some_and(|m| !m.is_sparse(layer));
+        if q == Quant::Nvfp4G16 && dense && !self.dense_fp4_fits() { self.quant } else { q }
+    }
+
+    pub fn dense_fp4_fits(&self) -> bool {
+        let width = if self.moe.is_some() { 128 } else { 256 };
+        self.dims.hidden.is_multiple_of(256) && self.dims.intermediate.is_multiple_of(width)
     }
 
     pub fn requanted(&self, linear: &str, stored: Quant) -> Quant {

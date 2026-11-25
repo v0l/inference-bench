@@ -334,6 +334,193 @@ fn wrapper(k: &ConvKernel) -> String {
     out
 }
 
+const LINE: &str = r#"__device__ __forceinline__ float line_gelu(float v) { return 0.5f * v * (1.0f + erff(v * 0.70710678118654752f)); }
+
+template <int KT, int STRIDE, int CIN>
+__device__ __forceinline__ float line_input(const float* __restrict__ x, const float* __restrict__ st, int T, int b, int o, int tap, int c) {
+    if (c >= CIN) return 0.0f;
+    constexpr int CTX = KT - STRIDE;
+    int p = o * STRIDE + tap - CTX;
+    if (p >= T) return 0.0f;
+    if (p >= 0) return x[((size_t)b * T + p) * CIN + c];
+    return st[((size_t)b * (CTX > 0 ? CTX : 1) + (CTX + p)) * CIN + c];
+}
+
+template <int COUT, int PHASES, bool RES, bool GELU>
+__device__ __forceinline__ void line_store(float v, const float* __restrict__ scale, float* __restrict__ y, int TO, int b, int o, int n) {
+    if (GELU) v = line_gelu(v);
+    constexpr int PER = COUT / PHASES;
+    int r = n / PER, co = n % PER;
+    size_t at = (((size_t)b * TO + o) * PHASES + r) * PER + co;
+    if (RES) y[at] += scale[co] * v;
+    else y[at] = v;
+}
+
+template <int BM, int BN, int BK, int TM, int TN, int STAGES, int KT, int STRIDE, int CIN, int COUT, int PHASES, bool RES, bool GELU>
+__device__ __forceinline__ void line_conv_tile(const float* __restrict__ x, const float* __restrict__ st, const float* __restrict__ w, const float* __restrict__ bias,
+                                               const float* __restrict__ scale, float* __restrict__ y, int B, int T, int TO) {
+    extern __shared__ __align__(16) unsigned char line_smem[];
+    float* sa = (float*)line_smem;
+    float* sb = sa + STAGES * BK * BM;
+    constexpr int CHUNKS = (CIN + BK - 1) / BK;
+    constexpr int STEPS = KT * CHUNKS;
+    int tid = threadIdx.x;
+    int tr = tid / THREAD_COLS, tc = tid % THREAD_COLS;
+    int m0 = blockIdx.x * BM, n0 = blockIdx.y * BN;
+    int rows = B * TO;
+    auto load = [&](int s, int buf) {
+        int tap = s / CHUNKS, c0 = (s % CHUNKS) * BK;
+        float* A = sa + buf * BK * BM;
+        float* Bs = sb + buf * BK * BN;
+        for (int e = tid; e < BM * BK; e += blockDim.x) {
+            int p = e / BK, kk = e % BK;
+            int m = m0 + p;
+            A[kk * BM + p] = m < rows ? line_input<KT, STRIDE, CIN>(x, st, T, m / TO, m % TO, tap, c0 + kk) : 0.0f;
+        }
+        for (int e = tid; e < BN * BK; e += blockDim.x) {
+            int j = e / BK, kk = e % BK;
+            int n = n0 + j, c = c0 + kk;
+            Bs[kk * BN + j] = (n < COUT && c < CIN) ? w[((size_t)n * KT + tap) * CIN + c] : 0.0f;
+        }
+    };
+    float acc[TM][TN];
+#pragma unroll
+    for (int i = 0; i < TM; i++)
+#pragma unroll
+        for (int j = 0; j < TN; j++) acc[i][j] = 0.0f;
+    load(0, 0);
+    __syncthreads();
+    for (int s = 0; s < STEPS; s++) {
+        int buf = STAGES == 2 ? (s & 1) : 0;
+        if (STAGES == 2 && s + 1 < STEPS) load(s + 1, buf ^ 1);
+        const float* A = sa + buf * BK * BM;
+        const float* Bs = sb + buf * BK * BN;
+#pragma unroll 4
+        for (int kk = 0; kk < BK; kk++) {
+            float a[TM], bb[TN];
+#pragma unroll
+            for (int i = 0; i < TM; i++) a[i] = A[kk * BM + tr + THREAD_ROWS * i];
+#pragma unroll
+            for (int j = 0; j < TN; j++) bb[j] = Bs[kk * BN + tc + THREAD_COLS * j];
+#pragma unroll
+            for (int i = 0; i < TM; i++)
+#pragma unroll
+                for (int j = 0; j < TN; j++) acc[i][j] = fmaf(a[i], bb[j], acc[i][j]);
+        }
+        __syncthreads();
+        if (STAGES == 1 && s + 1 < STEPS) {
+            load(s + 1, 0);
+            __syncthreads();
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < TM; i++) {
+        int m = m0 + tr + THREAD_ROWS * i;
+        if (m >= rows) continue;
+#pragma unroll
+        for (int j = 0; j < TN; j++) {
+            int n = n0 + tc + THREAD_COLS * j;
+            if (n >= COUT) continue;
+            line_store<COUT, PHASES, RES, GELU>(acc[i][j] + bias[n], scale, y, TO, m / TO, m % TO, n);
+        }
+    }
+}
+
+template <int KT, int STRIDE, int CIN, int COUT, int PHASES, bool RES, bool GELU>
+__device__ __forceinline__ void line_conv_direct(const float* __restrict__ x, const float* __restrict__ st, const float* __restrict__ w, const float* __restrict__ bias,
+                                                 const float* __restrict__ scale, float* __restrict__ y, int B, int T, int TO) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)B * TO * COUT) return;
+    int n = idx % COUT;
+    size_t m = idx / COUT;
+    int b = m / TO, o = m % TO;
+    float acc = bias[n];
+    for (int tap = 0; tap < KT; tap++) {
+        const float* wr = w + ((size_t)n * KT + tap) * CIN;
+        for (int c = 0; c < CIN; c++) acc = fmaf(line_input<KT, STRIDE, CIN>(x, st, T, b, o, tap, c), wr[c], acc);
+    }
+    line_store<COUT, PHASES, RES, GELU>(acc, scale, y, TO, b, o, n);
+}
+
+extern "C" __global__ void line_rms(const float* x, float* y, const float* gamma, int P, int C, float eps) {
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    size_t p = (size_t)blockIdx.x * (blockDim.x / 32) + warp;
+    if (p >= (size_t)P) return;
+    const float* row = x + p * C;
+    float ss = 0.0f;
+    for (int c = lane; c < C; c += 32) ss += row[c] * row[c];
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, o);
+    float r = rsqrtf(ss / (float)C + eps);
+    for (int c = lane; c < C; c += 32) y[p * C + c] = row[c] * r * gamma[c];
+}
+
+extern "C" __global__ void line_dwconv(const float* x, const float* st, const float* w, const float* bias, const float* scale, float* y, int B, int T, int C, int K) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)B * T * C) return;
+    int c = idx % C;
+    size_t m = idx / C;
+    int b = m / T, t = m % T;
+    int ctx = K - 1;
+    float acc = bias[c];
+    for (int tap = 0; tap < K; tap++) {
+        int p = t + tap - ctx;
+        float v = p >= 0 ? x[((size_t)b * T + p) * C + c] : st[((size_t)b * ctx + (ctx + p)) * C + c];
+        acc = fmaf(w[c * K + tap], v, acc);
+    }
+    y[idx] += scale[c] * acc;
+}
+
+extern "C" __global__ void line_shift(const float* x, const float* st, float* next, int B, int T, int TP, int C, int CTX) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)B * CTX * C) return;
+    int c = idx % C;
+    size_t m = idx / C;
+    int b = m / CTX, j = m % CTX;
+    int p = TP - CTX + j;
+    float v;
+    if (p >= T) v = 0.0f;
+    else if (p >= 0) v = x[((size_t)b * T + p) * C + c];
+    else v = st[((size_t)b * CTX + (CTX + p)) * C + c];
+    next[idx] = v;
+}
+"#;
+
+const LINE_ARGS: &str = "const float* x, const float* st, const float* w, const float* bias, const float* scale, float* y, int B, int T, int TO";
+const LINE_PASS: &str = "x, st, w, bias, scale, y, B, T, TO";
+
+fn line_wrapper(k: &ConvKernel) -> String {
+    let s = &k.shape;
+    let (res, gelu) = (flag(k.epilogue.residual), flag(k.epilogue.gelu));
+    let call = match k.family {
+        Family::Tile => {
+            let t = &k.tile;
+            format!("line_conv_tile<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {res}, {gelu}>", t.bm, t.bn, t.bk, t.tm, t.tn, t.stages, s.kt, s.stride, s.cin, s.cout, s.phases)
+        }
+        Family::Direct => format!("line_conv_direct<{}, {}, {}, {}, {}, {res}, {gelu}>", s.kt, s.stride, s.cin, s.cout, s.phases),
+    };
+    format!("extern \"C\" __global__ void __launch_bounds__({THREADS}) {}({LINE_ARGS}) {{\n    {call}({LINE_PASS});\n}}\n\n", k.name())
+}
+
+pub fn emit_line(kernels: &[ConvKernel]) -> Result<crate::KirSource, ConvError> {
+    let mut out = format!("constexpr int THREAD_ROWS = {THREAD_ROWS};\nconstexpr int THREAD_COLS = {THREAD_COLS};\n\n");
+    out += LINE;
+    let mut seen = Vec::new();
+    for k in kernels {
+        k.validate()?;
+        if !k.shape.line {
+            return Err(ConvError(format!("{} is not a line conv", k.name())));
+        }
+        if THREAD_ROWS * k.tile.tm != k.tile.bm || THREAD_COLS * k.tile.tn != k.tile.bn {
+            return Err(ConvError(format!("{}: the tile {:?} does not map onto {THREADS} threads", k.name(), k.tile)));
+        }
+        if !seen.contains(&k.name()) {
+            seen.push(k.name());
+            out += &line_wrapper(k);
+        }
+    }
+    Ok(crate::KirSource::emitted(out))
+}
+
 pub fn emit_vae(kernels: &[ConvKernel]) -> Result<crate::KirSource, ConvError> {
     let mut out = format!("constexpr int THREAD_ROWS = {THREAD_ROWS};\nconstexpr int THREAD_COLS = {THREAD_COLS};\nconstexpr int MAX_GROUPS = {};\n\n", crate::conv::MAX_GROUPS);
     out += LOAD_INPUT;

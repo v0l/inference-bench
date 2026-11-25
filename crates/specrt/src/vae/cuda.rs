@@ -32,7 +32,7 @@ pub fn kernels(c: &Compiled, target: &kir::Target) -> Result<BTreeMap<usize, Con
         };
         let shape = conv_shape(&c.plan.ops[op], up).context("a conv step has a conv op")?;
         let prologue = apply.map_or(Prologue::None, |(groups, silu)| Prologue::GroupApply { groups, silu });
-        let k = ConvKernel::new(target, shape, prologue, Epilogue { residual, stats }).map_err(anyhow::Error::msg)?;
+        let k = ConvKernel::new(target, shape, prologue, Epilogue { residual, stats, gelu: false }).map_err(anyhow::Error::msg)?;
         out.insert(op * 4 + usize::from(up), k);
     }
     Ok(out)
@@ -407,8 +407,8 @@ fn unsafe_view(buf: &mut CudaSlice<f32>, from: usize, n: usize) -> CudaViewMut<'
 
 pub fn conv_once(ctx: &Arc<CudaContext>, jit: &Jit, x: &Grid, c: &super::host::ConvWeights, up: bool, interleave: bool) -> Result<Grid> {
     let target = crate::codegen::cuda_target(ctx)?;
-    let shape = kir::conv::ConvShape { cin: c.cin, cout: c.cout, k: c.k, kt: c.kt, upsample: up, interleave };
-    let k = ConvKernel::new(&target, shape, Prologue::None, Epilogue { residual: false, stats: None }).map_err(anyhow::Error::msg)?;
+    let shape = kir::conv::ConvShape::grid(c.cin, c.cout, c.k, c.kt, up, interleave);
+    let k = ConvKernel::new(&target, shape, Prologue::None, Epilogue { residual: false, stats: None, gelu: false }).map_err(anyhow::Error::msg)?;
     let m = module(std::slice::from_ref(&k))?;
     let loaded = jit.load(&m)?;
     let f = loaded.function(&k.name())?;
