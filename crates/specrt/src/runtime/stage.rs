@@ -17,7 +17,7 @@ impl StageRange {
     pub fn check(&self, spec: &Spec) -> Result<()> {
         ensure!(self.start < self.end && self.end <= spec.layers.count, "stage layers {}..{} outside the {} layers of {}", self.start, self.end, spec.layers.count, spec.name);
         if self.start != 0 || self.end != spec.layers.count {
-            ensure!(spec.moe.is_none(), "pipeline stages do not support MoE models yet");
+            ensure!(spec.moe.as_ref().is_none_or(|m| m.dense_layers.is_empty() && m.sparse_step <= 1), "pipeline stages need every layer of a MoE model to be sparse");
         }
         Ok(())
     }
