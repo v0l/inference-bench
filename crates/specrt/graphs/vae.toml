@@ -1,0 +1,124 @@
+name = "vae"
+kind = "graph"
+
+[[decoder]]
+name = "kl"
+classes = ["AutoencoderKL", "AutoencoderKLFlux2"]
+entry = "decode"
+defaults = [
+  ["use_post_quant_conv", "1"],
+  ["mid_block_add_attention", "1"],
+  ["layers_per_block", "2"],
+  ["norm_num_groups", "32"],
+  ["out_channels", "3"],
+  ["decoder_block_out_channels", "block_out_channels"],
+  ["eps", "0.000001"],
+]
+let = [
+  ["chans", "decoder_block_out_channels"],
+  ["levels", "len(chans)"],
+  ["top", "chans[levels - 1]"],
+]
+
+[[decoder.macro]]
+name = "decode"
+node = [
+  { op = "conv", weight = "post_quant_conv", cin = "latent_channels", cout = "latent_channels", k = "1", when = "use_post_quant_conv" },
+  { op = "conv", weight = "decoder.conv_in", cin = "latent_channels", cout = "top", k = "3" },
+  { call = "resnet", prefix = "decoder.mid_block.resnets.0", args = { cin = "top", cout = "top" } },
+  { call = "attention", prefix = "decoder.mid_block.attentions.0", args = { c = "top" }, when = "mid_block_add_attention" },
+  { call = "resnet", prefix = "decoder.mid_block.resnets.1", args = { cin = "top", cout = "top" } },
+  { call = "up_block", repeat = "levels", var = "i", prefix = "decoder.up_blocks.{i}", args = { cin = "select(i == 0, top, chans[levels - i])", cout = "chans[levels - 1 - i]", last = "i == levels - 1" } },
+  { op = "group_norm", weight = "decoder.conv_norm_out", channels = "chans[0]", groups = "norm_num_groups", eps = "eps", act = "silu", out = "t" },
+  { op = "conv", weight = "decoder.conv_out", cin = "chans[0]", cout = "out_channels", k = "3", in = "t" },
+]
+
+[[decoder.macro]]
+name = "up_block"
+node = [
+  { call = "resnet", repeat = "layers_per_block + 1", var = "j", prefix = "{prefix}.resnets.{j}", args = { cin = "select(j == 0, cin, cout)", cout = "cout" } },
+  { op = "upsample", when = "last == 0" },
+  { op = "conv", weight = "{prefix}.upsamplers.0.conv", cin = "cout", cout = "cout", k = "3", when = "last == 0" },
+]
+
+[[decoder.macro]]
+name = "resnet"
+node = [
+  { op = "group_norm", weight = "{prefix}.norm1", channels = "cin", groups = "norm_num_groups", eps = "eps", act = "silu", out = "t" },
+  { op = "conv", weight = "{prefix}.conv1", cin = "cin", cout = "cout", k = "3", in = "t", out = "t" },
+  { op = "group_norm", weight = "{prefix}.norm2", channels = "cout", groups = "norm_num_groups", eps = "eps", act = "silu", in = "t", out = "t" },
+  { op = "conv", weight = "{prefix}.conv2", cin = "cout", cout = "cout", k = "3", in = "t", out = "t" },
+  { op = "conv", weight = "{prefix}.conv_shortcut", cin = "cin", cout = "cout", k = "1", out = "h", when = "cin != cout" },
+  { op = "add", in = "t", with = "h", when = "cin != cout" },
+  { op = "add", in = "t", with = "x", when = "cin == cout" },
+]
+
+[[decoder.macro]]
+name = "attention"
+node = [
+  { op = "group_norm", weight = "{prefix}.group_norm", channels = "c", groups = "norm_num_groups", eps = "eps", out = "t" },
+  { op = "conv", weights = ["{prefix}.to_q", "{prefix}.to_k", "{prefix}.to_v"], cin = "c", cout = "3 * c", k = "1", in = "t", out = "t" },
+  { op = "attention", channels = "c", in = "t", out = "t" },
+  { op = "conv", weight = "{prefix}.to_out.0", cin = "c", cout = "c", k = "1", in = "t", out = "t" },
+  { op = "add", in = "t", with = "x" },
+]
+
+[[decoder]]
+name = "causal3d"
+classes = ["AutoencoderKLWan", "AutoencoderKLQwenImage"]
+entry = "decode"
+defaults = [
+  ["decoder_base_dim", "base_dim"],
+  ["out_channels", "3"],
+  ["num_res_blocks", "2"],
+]
+let = [
+  ["n", "len(dim_mult)"],
+  ["base", "decoder_base_dim"],
+  ["top", "base * dim_mult[n - 1]"],
+]
+
+[[decoder.macro]]
+name = "decode"
+node = [
+  { op = "conv", weight = "post_quant_conv", cin = "z_dim", cout = "z_dim", k = "1" },
+  { op = "conv", weight = "decoder.conv_in", cin = "z_dim", cout = "top", k = "3", kt = "3" },
+  { call = "resnet", prefix = "decoder.mid_block.resnets.0", args = { cin = "top", cout = "top" } },
+  { call = "attention", prefix = "decoder.mid_block.attentions.0", args = { c = "top" } },
+  { call = "resnet", prefix = "decoder.mid_block.resnets.1", args = { cin = "top", cout = "top" } },
+  { call = "up_block", repeat = "n", var = "i", prefix = "decoder.up_blocks.{i}", args = { cin = "select(i == 0, top, base * dim_mult[n - i] / 2)", cout = "base * dim_mult[n - 1 - i]", up = "i != n - 1", temporal = "select(i != n - 1, temperal_downsample[n - 2 - i], 0)" } },
+  { op = "rms_norm", weight = "decoder.norm_out", channels = "base * dim_mult[0]", act = "silu", out = "t" },
+  { op = "conv", weight = "decoder.conv_out", cin = "base * dim_mult[0]", cout = "out_channels", k = "3", kt = "3", in = "t" },
+  { op = "clamp", lo = "-1", hi = "1" },
+]
+
+[[decoder.macro]]
+name = "up_block"
+node = [
+  { call = "resnet", repeat = "num_res_blocks + 1", var = "j", prefix = "{prefix}.resnets.{j}", args = { cin = "select(j == 0, cin, cout)", cout = "cout" } },
+  { op = "time_up", weight = "{prefix}.upsamplers.0.time_conv", channels = "cout", when = "up * temporal" },
+  { op = "upsample", when = "up" },
+  { op = "conv", weight = "{prefix}.upsamplers.0.resample.1", cin = "cout", cout = "cout / 2", k = "3", when = "up" },
+]
+
+[[decoder.macro]]
+name = "resnet"
+node = [
+  { op = "conv", weight = "{prefix}.conv_shortcut", cin = "cin", cout = "cout", k = "1", out = "h", when = "cin != cout" },
+  { op = "rms_norm", weight = "{prefix}.norm1", channels = "cin", act = "silu", out = "t" },
+  { op = "conv", weight = "{prefix}.conv1", cin = "cin", cout = "cout", k = "3", kt = "3", in = "t", out = "t" },
+  { op = "rms_norm", weight = "{prefix}.norm2", channels = "cout", act = "silu", in = "t", out = "t" },
+  { op = "conv", weight = "{prefix}.conv2", cin = "cout", cout = "cout", k = "3", kt = "3", in = "t", out = "t" },
+  { op = "add", in = "t", with = "h", when = "cin != cout" },
+  { op = "add", in = "t", with = "x", when = "cin == cout" },
+]
+
+[[decoder.macro]]
+name = "attention"
+node = [
+  { op = "rms_norm", weight = "{prefix}.norm", channels = "c", out = "t" },
+  { op = "conv", weight = "{prefix}.to_qkv", cin = "c", cout = "3 * c", k = "1", in = "t", out = "t" },
+  { op = "attention", channels = "c", in = "t", out = "t" },
+  { op = "conv", weight = "{prefix}.proj", cin = "c", cout = "c", k = "1", in = "t", out = "t" },
+  { op = "add", in = "t", with = "x" },
+]
