@@ -107,6 +107,19 @@ fn a_dead_stage_fails_the_request_and_the_rest_keep_serving() {
 }
 
 #[test]
+fn moe_stage_specs_keep_the_output_gate_and_drop_unused_attention_nodes() {
+    let spec = spec_for("tiny-qwen4-exp");
+    assert!(spec.attention.output_gate);
+    assert!(spec.moe.is_some());
+    let linear_only = spec.stage(0, 1);
+    assert!(!linear_only.block(0).is_attention());
+    assert!(linear_only.attention.node.is_empty());
+    specrt::runtime::StageRange { device: 0, start: 1, end: spec.layers.count }.check(&spec).unwrap();
+    let tail = spec.stage(spec.layers.count - 1, spec.layers.count);
+    assert_eq!(tail.attention.node.is_empty(), !tail.block(0).is_attention());
+}
+
+#[test]
 fn stage_specs_cut_the_pattern_and_the_quant_boundary() {
     let spec = Spec::load(&fixture_dir("qwen3.8-27b-nvfp4.toml")).unwrap();
     let tail = spec.stage(40, 64);
