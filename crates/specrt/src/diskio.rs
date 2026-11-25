@@ -396,13 +396,20 @@ mod tests {
         data: Vec<u8>,
         bytes_per_sec: f64,
         calls: AtomicUsize,
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
     }
 
     impl ReadAt for Throttled {
         fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            if now > self.max_in_flight.load(Ordering::SeqCst) {
+                self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            }
             std::thread::sleep(Duration::from_secs_f64(buf.len() as f64 / self.bytes_per_sec));
             buf.copy_from_slice(&self.data[offset as usize..offset as usize + buf.len()]);
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -414,7 +421,7 @@ mod tests {
     #[test]
     fn chunked_read_is_identical_and_split_in_four_megabyte_pieces() {
         let data = pattern(10 << 20);
-        let src = Arc::new(Throttled { data: data.clone(), bytes_per_sec: 1e12, calls: AtomicUsize::new(0) });
+        let src = Arc::new(Throttled { data: data.clone(), bytes_per_sec: 1e12, calls: AtomicUsize::new(0), in_flight: AtomicUsize::new(0), max_in_flight: AtomicUsize::new(0) });
         let pool = IoPool::new(3);
         let mut out = vec![0u8; 9 << 20];
         let dyn_src: Arc<dyn ReadAt> = src.clone();
@@ -426,13 +433,27 @@ mod tests {
     #[test]
     fn parallel_workers_overlap_a_throttled_drive() {
         let data = pattern(16 << 20);
-        let src: Arc<dyn ReadAt> = Arc::new(Throttled { data, bytes_per_sec: 400e6, calls: AtomicUsize::new(0) });
+        let src = Arc::new(Throttled { data: data.clone(), bytes_per_sec: 400e6, calls: AtomicUsize::new(0), in_flight: AtomicUsize::new(0), max_in_flight: AtomicUsize::new(0) });
         let pool = IoPool::new(4);
         let mut out = vec![0u8; 16 << 20];
-        let t = Instant::now();
-        unsafe { pool.read(&src, 0, out.as_mut_ptr(), out.len()) }.wait().unwrap();
-        let serial = (16 << 20) as f64 / 400e6;
-        assert!(t.elapsed().as_secs_f64() < serial * 0.6, "{:?}", t.elapsed());
+        let dyn_src: Arc<dyn ReadAt> = src.clone();
+        unsafe { pool.read(&dyn_src, 0, out.as_mut_ptr(), out.len()) }.wait().unwrap();
+        assert_eq!(out, data);
+        let max = src.max_in_flight.load(Ordering::SeqCst);
+        assert_eq!(max, 4, "4 workers should read 4 chunks at once, saw {max} in flight");
+    }
+
+    #[test]
+    fn a_serial_pool_reads_one_chunk_at_a_time() {
+        let data = pattern(16 << 20);
+        let src = Arc::new(Throttled { data: data.clone(), bytes_per_sec: 400e6, calls: AtomicUsize::new(0), in_flight: AtomicUsize::new(0), max_in_flight: AtomicUsize::new(0) });
+        let pool = IoPool::new(1);
+        let mut out = vec![0u8; 16 << 20];
+        let dyn_src: Arc<dyn ReadAt> = src.clone();
+        unsafe { pool.read(&dyn_src, 0, out.as_mut_ptr(), out.len()) }.wait().unwrap();
+        assert_eq!(out, data);
+        let max = src.max_in_flight.load(Ordering::SeqCst);
+        assert_eq!(max, 1, "a single worker reads one chunk at a time, saw {max} in flight");
     }
 
     #[test]
