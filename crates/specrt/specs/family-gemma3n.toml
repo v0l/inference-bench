@@ -137,7 +137,7 @@ grid = ["laurel_rank", "rows"]
 x = { buffer = "x" }
 n = { weight = "input_layernorm.weight", len = "hidden" }
 w = { weight = "laurel.linear_left.weight", len = "laurel_rank * hidden" }
-lo = { buffer = "laurel_lo" }
+low = { buffer = "laurel_lo" }
 
 [[gated_residual.node]]
 op = "laurel"

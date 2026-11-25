@@ -638,7 +638,7 @@
           "rows"
         ],
         "bind": {
-          "lo": {
+          "low": {
             "buffer": "laurel_lo"
           },
           "n": {
@@ -712,17 +712,17 @@
           "rows"
         ],
         "bind": {
-          "act_hi": {
-            "buffer": "act_hi"
-          },
-          "act_lo": {
-            "buffer": "act_lo"
-          },
           "cut": "sparse_cut",
           "gate": {
             "buffer": "gate_up"
           },
-          "on": "sparse_on"
+          "on": "sparse_on",
+          "out_hi": {
+            "buffer": "act_hi"
+          },
+          "out_lo": {
+            "buffer": "act_lo"
+          }
         }
       },
       {

@@ -26,7 +26,7 @@ role = "weight"
 access = "read"
 
 [[param]]
-name = "lo"
+name = "low"
 role = "activation"
 access = "write"
 
@@ -64,7 +64,7 @@ expr = "v * inv * nv * wv"
 
 [[stage]]
 op = "put"
-dst = "lo"
+dst = "low"
 value = "d"
 row = "laurel_rank"
 head = 1

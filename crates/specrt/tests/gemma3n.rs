@@ -90,8 +90,8 @@ fn gemma3n_logits_and_greedy_match_transformers() {
         let arg = |v: &[f32]| v[row * r.vocab..(row + 1) * r.vocab].iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
         assert_eq!(arg(&ours), arg(&r.logits), "row {row}");
     }
-    let got = rt.generate(&r.tokens, r.greedy.len(), specrt::runtime::Sampling::GREEDY).unwrap();
-    assert_eq!(got.tokens, r.greedy);
+    let got = specrt::runtime::Runtime::load_batched(&tiny(), 256, 1).unwrap().generate_batch(std::slice::from_ref(&r.tokens), r.greedy.len()).unwrap().tokens;
+    assert_eq!(got[0], r.greedy);
 }
 
 #[test]
