@@ -1,0 +1,33 @@
+kind = "kir-kernel"
+family = "head_matvec"
+name = "g3n_unembed_2"
+threads = 128
+
+[args]
+x_row = "hc_width"
+x_head = 0
+x_offset = "2 * hidden"
+inner = "hidden"
+w_head = 0
+w_inner = 1
+w_out = "hidden"
+w_offset = 0
+out = "hidden"
+y_row = "hidden"
+y_head = 0
+y_offset = 0
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "w"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "y"
+role = "activation"
+access = "write"

@@ -113,7 +113,13 @@ fn act(spec: &Spec) -> kir::Activation {
 }
 
 fn gate_up_epilogue(spec: &Spec) -> Epilogue {
-    if spec.mlp.mapped.is_some() { Epilogue::Map } else { Epilogue::Act }
+    if spec.mlp.mapped.is_some() {
+        Epilogue::Map
+    } else if spec.mlp.stored_gate_up {
+        Epilogue::Store
+    } else {
+        Epilogue::Act
+    }
 }
 
 pub fn linear_shape(spec: &Spec, linear: &str) -> GemmShape {

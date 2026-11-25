@@ -243,10 +243,16 @@ fn holds(when: Option<&str>, tensor_core: bool, spec: &Spec, tail: bool) -> bool
             "pre" => spec.norm.pre,
             "nopre" => !spec.norm.pre,
             "qk_norm_full" => spec.attention.qk_norm_full,
-            "branch" => spec.uses_branch() && !spec.layers.split && spec.hyper.is_none(),
+            "branch" => spec.uses_branch() && !spec.layers.split && spec.hyper.is_none() && spec.gated_residual().is_none(),
             "plain" => !spec.uses_branch() && !spec.layers.split && spec.hyper.is_none() && spec.gated_residual().is_none(),
             "hyper" => spec.hyper.is_some(),
             "gated" => spec.gated_residual().is_some(),
+            "untagged" => spec.gated_residual().is_some_and(|h| h.tags().is_empty()),
+            "tagged" => spec.gated_residual().is_some_and(|h| !h.tags().is_empty()),
+            "gated_norm" => spec.gated_residual().is_some_and(|h| h.final_norm),
+            "bare" => spec.gated_residual().is_some_and(|h| !h.final_norm),
+            "stored" => spec.mlp.stored_gate_up,
+            "unstored" => !spec.mlp.stored_gate_up,
             "flat" => spec.gated_residual().is_none(),
             "ple" => spec.per_layer().is_some(),
             "split" => spec.layers.split,
@@ -307,6 +313,12 @@ fn lower(nodes: &[Node], phase: Phase, tensor_core: bool, spec: &Spec, kind: Opt
             let p = spec.per_layer().with_context(|| format!("{} needs a [per_layer]", n.op))?;
             for (i, _) in p.nodes(if stage == crate::plan::PLE_HEAD { "head" } else { "layer" }) {
                 ops.push(Op::PerLayer { node: i as u8, stage });
+            }
+        } else if n.op == "gated_at" {
+            let h = spec.gated_residual().context("gated_at needs a [gated_residual]")?;
+            let tag = n.weight.as_deref().context("a gated_at node names its tag in weight")?;
+            for (i, _) in h.tagged(tag) {
+                ops.push(Op::Gated { node: i as u8, site: 0 });
             }
         } else if let Some(stage) = gated_stage(&n.op) {
             let h = spec.gated_residual().with_context(|| format!("{} needs a [gated_residual]", n.op))?;

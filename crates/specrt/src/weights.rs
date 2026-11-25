@@ -1288,7 +1288,7 @@ impl Checkpoint {
             )
         };
         let ln1 = if spec.norm.pre { self.norm(spec, &format!("{p}.input_layernorm.weight"), h)? } else { vec![0.0; 1] };
-        let ln2 = if spec.layers.split { ln1.clone() } else if spec.gated_residual().is_some() { vec![0.0; 1] } else { self.norm(spec, &format!("{p}.post_attention_layernorm.weight"), h)? };
+        let ln2 = if spec.layers.split { ln1.clone() } else if spec.gated_residual().is_some_and(|g| g.tags().is_empty()) { vec![0.0; 1] } else { self.norm(spec, &format!("{p}.post_attention_layernorm.weight"), h)? };
         let layer_scale = match &spec.norm.layer_scale {
             Some(t) => {
                 let root = self.root();
@@ -1336,17 +1336,22 @@ impl Checkpoint {
 
     pub fn gated_weights(&self, spec: &Spec, module: &str, stage: crate::spec::GatedStage) -> Result<Vec<(String, Vec<f32>)>> {
         let Some(h) = spec.gated_residual() else { return Ok(Vec::new()) };
-        h.weights(stage).into_iter().map(|(w, len)| Ok((w.clone(), self.flat(&format!("{module}.{w}"), spec.weight_len(&len)?)?))).collect()
+        self.gated_load(spec, module, h.weights(stage))
+    }
+
+    fn gated_load(&self, spec: &Spec, module: &str, weights: Vec<(String, String)>) -> Result<Vec<(String, Vec<f32>)>> {
+        weights.into_iter().map(|(w, len)| Ok((w.clone(), self.flat(&format!("{module}.{w}"), spec.weight_len(&len)?)?))).collect()
     }
 
     fn gated_sites(&self, spec: &Spec, p: &str) -> Result<Vec<Vec<(String, Vec<f32>)>>> {
         let Some(h) = spec.gated_residual() else { return Ok(Vec::new()) };
-        h.sites.iter().map(|s| self.gated_weights(spec, &format!("{p}.{s}"), crate::spec::GatedStage::Pre)).collect()
+        let weights = if h.tags().is_empty() { h.weights(crate::spec::GatedStage::Pre) } else { h.layer_weights() };
+        h.sites.iter().map(|s| self.gated_load(spec, &crate::spec::GatedResidual::module_path(s, p), weights.clone())).collect()
     }
 
     pub fn gated_head(&self, spec: &Spec) -> Result<Vec<(String, Vec<f32>)>> {
         let Some(h) = spec.gated_residual() else { return Ok(Vec::new()) };
-        self.gated_weights(spec, &format!("{}.{}", self.root(), h.module), crate::spec::GatedStage::Collapse)
+        self.gated_load(spec, &crate::spec::GatedResidual::module_path(&h.module, self.root()), h.head_weights())
     }
 
     pub fn ple_layer(&self, spec: &Spec, p: &str, factor: f64) -> Result<Vec<(String, Vec<f32>)>> {
@@ -1769,7 +1774,7 @@ impl Checkpoint {
 
     fn head_from<'s>(&'s self, spec: &Spec, embed: &Cow<'s, [u16]>) -> Result<(Vec<f32>, Matrix<'s>)> {
         let d = &spec.dims;
-        let norm = if spec.gated_residual().is_some() { vec![0.0; 1] } else { self.norm(spec, &format!("{}.norm.weight", self.root()), d.hidden)? };
+        let norm = if spec.gated_residual().is_some_and(|g| !g.final_norm) { vec![0.0; 1] } else { self.norm(spec, &format!("{}.norm.weight", self.root()), d.hidden)? };
         let lm_head = head_rows_matrix(self.head_raw(spec, embed)?, spec.lm_head_quant(), spec.head_rows(), "lm_head")?;
         Ok((norm, lm_head))
     }

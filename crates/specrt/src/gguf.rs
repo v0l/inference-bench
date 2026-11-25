@@ -621,7 +621,7 @@ impl Gguf {
                 indexer: None,
             },
             rope: Rope { style: RopeStyle::Neox, theta: Some(theta), scaling: self.rope_scaling(family, head_dim)?, mrope, local_theta: None, nope_layers: Vec::new() },
-            mlp: Mlp { activation: Activation::Swiglu, quant: None, quant_until: None, act_quant: ActQuant::None, up_act_planes: 1, down_act_planes: 1, fused_gate_up: false, gated: None, mapped: None, wide_shared_tail: false },
+            mlp: Mlp { activation: Activation::Swiglu, quant: None, quant_until: None, act_quant: ActQuant::None, up_act_planes: 1, down_act_planes: 1, fused_gate_up: false, gated: None, mapped: None, wide_shared_tail: false, stored_gate_up: false },
             moe,
             linear_attention,
             mixer: None,

@@ -1,30 +1,317 @@
 name = "gemma3n"
 kind = "family"
-min_engine = 15
-extends = "gemma3"
+min_engine = 16
+extends = "gemma4"
 
 [match]
 model_types = ["gemma3n", "gemma3n_text"]
 architectures = ["Gemma3nForConditionalGeneration", "Gemma3nForCausalLM"]
 
 [[refuse]]
-when = "altup_num_inputs > 1"
-message = "Gemma 3n AltUp residual streams (altup_num_inputs) are not supported yet"
+when = "altup_num_inputs != 4"
+message = "Gemma 3n AltUp with other than 4 residual streams (altup_num_inputs) is not supported yet"
 
 [[refuse]]
-when = "laurel_rank > 0"
-message = "Gemma 3n Laurel blocks (laurel_rank) are not supported yet"
+when = "altup_active_idx != 0"
+message = "Gemma 3n AltUp with an active stream other than 0 (altup_active_idx) is not supported yet"
 
 [[refuse]]
-when = "hidden_size_per_layer_input > 0"
-message = "Gemma 3n per-layer input embeddings (hidden_size_per_layer_input) are not supported yet"
-
-[[refuse]]
-when = "num_kv_shared_layers > 0"
-message = "Gemma 3n KV sharing across layers (num_kv_shared_layers) is not supported yet"
+when = "altup_correct_scale == 0"
+message = "Gemma 3n AltUp without the corrected output scale (altup_correct_scale) is not supported yet"
 
 [norm]
 unit_offset = false
+layer_scale = ""
+
+[mlp]
+stored_gate_up = true
 
 [vision]
 ignore = true
+
+[attention.params]
+theta_s = { config = "rope_parameters.sliding_attention.rope_theta", alt = "rope_local_base_freq", default = 10000.0 }
+theta_g = { config = "rope_parameters.full_attention.rope_theta", alt = "rope_theta", default = 1000000.0 }
+
+[gated_residual]
+streams = "altup_num_inputs"
+module = "."
+sites = ["."]
+final_norm = true
+
+[gated_residual.params]
+laurel_rank = { config = "laurel_rank" }
+
+[gated_residual.layer_params]
+sparse_on = { config = "activation_sparsity_pattern", map = "select(v > 0, 1, 0)" }
+sparse_cut = { config = "activation_sparsity_pattern", map = "select(v > 0, probit(v), 0)" }
+
+[gated_residual.scratch]
+a1 = "hidden"
+a2 = "hidden"
+a3 = "hidden"
+mod = "hc_streams"
+pred = "hc_width"
+laurel_lo = "laurel_rank"
+laurel_hi = "hidden"
+
+[[gated_residual.node]]
+op = "expand"
+kernel = "g3n_alt_proj"
+grid = ["1", "rows"]
+
+[gated_residual.node.bind]
+x = { buffer = "x" }
+w = { weight = "altup_projections.0.weight", len = "hidden * hidden" }
+y = { buffer = "a1" }
+
+[[gated_residual.node]]
+op = "expand"
+kernel = "g3n_alt_proj"
+grid = ["1", "rows"]
+
+[gated_residual.node.bind]
+x = { buffer = "x" }
+w = { weight = "altup_projections.1.weight", len = "hidden * hidden" }
+y = { buffer = "a2" }
+
+[[gated_residual.node]]
+op = "expand"
+kernel = "g3n_alt_proj"
+grid = ["1", "rows"]
+
+[gated_residual.node.bind]
+x = { buffer = "x" }
+w = { weight = "altup_projections.2.weight", len = "hidden * hidden" }
+y = { buffer = "a3" }
+
+[[gated_residual.node]]
+op = "expand"
+kernel = "g3n_expand"
+grid = ["1", "rows"]
+
+[gated_residual.node.bind]
+x = { buffer = "x" }
+a1 = { buffer = "a1" }
+a2 = { buffer = "a2" }
+a3 = { buffer = "a3" }
+streams = { buffer = "streams" }
+
+[[gated_residual.node]]
+op = "predict"
+kernel = "g3n_router_s"
+grid = ["hc_streams", "rows"]
+
+[gated_residual.node.bind]
+x = { buffer = "streams" }
+n = { weight = "altup.router_norm.weight", len = "hidden" }
+w = { weight = "altup.modality_router.weight", len = "hc_streams * hidden" }
+m = { buffer = "mod" }
+
+[[gated_residual.node]]
+op = "predict"
+kernel = "g3n_predict"
+grid = ["hc_streams", "rows"]
+
+[gated_residual.node.bind]
+s = { buffer = "streams" }
+m = { buffer = "mod" }
+p = { weight = "altup.prediction_coefs.weight", len = "hc_streams * hc_streams * hc_streams" }
+pred = { buffer = "pred" }
+
+[[gated_residual.node]]
+op = "predict"
+kernel = "g3n_take"
+grid = ["1", "rows"]
+
+[gated_residual.node.bind]
+pred = { buffer = "pred" }
+x = { buffer = "x" }
+
+[[gated_residual.node]]
+op = "laurel"
+kernel = "g3n_laurel_left"
+grid = ["laurel_rank", "rows"]
+
+[gated_residual.node.bind]
+x = { buffer = "x" }
+n = { weight = "input_layernorm.weight", len = "hidden" }
+w = { weight = "laurel.linear_left.weight", len = "laurel_rank * hidden" }
+lo = { buffer = "laurel_lo" }
+
+[[gated_residual.node]]
+op = "laurel"
+kernel = "g3n_laurel_right"
+grid = ["1", "rows"]
+
+[gated_residual.node.bind]
+x = { buffer = "laurel_lo" }
+w = { weight = "laurel.linear_right.weight", len = "hidden * laurel_rank" }
+y = { buffer = "laurel_hi" }
+
+[[gated_residual.node]]
+op = "laurel_add"
+kernel = "g3n_laurel_add"
+grid = ["1", "rows"]
+
+[gated_residual.node.bind]
+xin = { buffer = "x" }
+pred = { buffer = "pred" }
+n = { weight = "input_layernorm.weight", len = "hidden" }
+lr = { buffer = "laurel_hi" }
+pn = { weight = "laurel.post_laurel_norm.weight", len = "hidden" }
+x = { buffer = "x" }
+
+[[gated_residual.node]]
+op = "act"
+kernel = "g3n_act"
+grid = ["1", "rows"]
+
+[gated_residual.node.bind]
+gate = { buffer = "gate_up" }
+on = "sparse_on"
+cut = "sparse_cut"
+act_hi = { buffer = "act_hi" }
+act_lo = { buffer = "act_lo" }
+
+[[gated_residual.node]]
+op = "correct"
+kernel = "g3n_router_x"
+grid = ["hc_streams", "rows"]
+
+[gated_residual.node.bind]
+x = { buffer = "x" }
+n = { weight = "altup.router_norm.weight", len = "hidden" }
+w = { weight = "altup.modality_router.weight", len = "hc_streams * hidden" }
+m = { buffer = "mod" }
+
+[[gated_residual.node]]
+op = "correct"
+kernel = "g3n_correct"
+grid = ["hc_streams", "rows"]
+
+[gated_residual.node.bind]
+pred = { buffer = "pred" }
+m = { buffer = "mod" }
+c = { weight = "altup.correction_coefs.weight", len = "hc_streams * hc_streams" }
+x = { buffer = "x" }
+streams = { buffer = "streams" }
+
+[[gated_residual.node]]
+op = "collapse"
+kernel = "g3n_unembed_1"
+grid = ["1", "rows"]
+
+[gated_residual.node.bind]
+x = { buffer = "streams" }
+w = { weight = "altup_unembed_projections.0.weight", len = "hidden * hidden" }
+y = { buffer = "a1" }
+
+[[gated_residual.node]]
+op = "collapse"
+kernel = "g3n_unembed_2"
+grid = ["1", "rows"]
+
+[gated_residual.node.bind]
+x = { buffer = "streams" }
+w = { weight = "altup_unembed_projections.1.weight", len = "hidden * hidden" }
+y = { buffer = "a2" }
+
+[[gated_residual.node]]
+op = "collapse"
+kernel = "g3n_unembed_3"
+grid = ["1", "rows"]
+
+[gated_residual.node.bind]
+x = { buffer = "streams" }
+w = { weight = "altup_unembed_projections.2.weight", len = "hidden * hidden" }
+y = { buffer = "a3" }
+
+[[gated_residual.node]]
+op = "collapse"
+kernel = "g3n_collapse"
+grid = ["1", "rows"]
+
+[gated_residual.node.bind]
+streams = { buffer = "streams" }
+u1 = { buffer = "a1" }
+u2 = { buffer = "a2" }
+u3 = { buffer = "a3" }
+x = { buffer = "x" }
+
+[per_layer.scratch]
+ple_x = "hidden"
+
+[[per_layer.node]]
+op = "head"
+kernel = "g4_ple_proj"
+grid = ["ple_one", "rows"]
+
+[per_layer.node.bind]
+x = { buffer = "x" }
+w = { weight = "per_layer_model_projection.weight", len = "ple_width * hidden" }
+y = { buffer = "ple_proj" }
+
+[[per_layer.node]]
+op = "head"
+kernel = "g3n_ple_mix"
+grid = ["ple_layers", "rows"]
+
+[per_layer.node.bind]
+idx = { buffer = "tokens" }
+table = { weight = "embed_tokens_per_layer.weight", len = "ple_vocab * ple_width" }
+proj = { buffer = "ple_proj" }
+w = { weight = "per_layer_projection_norm.weight", len = "ple_dim" }
+ple = { buffer = "ple" }
+
+[[per_layer.node]]
+op = "layer"
+kernel = "g3n_scaled"
+grid = ["1", "rows"]
+
+[per_layer.node.bind]
+streams = { buffer = "streams" }
+w = { weight = "altup.correct_output_scale", len = "hidden" }
+x = { buffer = "ple_x" }
+
+[[per_layer.node]]
+op = "layer"
+kernel = "g4_ple_gate"
+grid = ["ple_one", "rows"]
+
+[per_layer.node.bind]
+x = { buffer = "ple_x" }
+w = { weight = "per_layer_input_gate.weight", len = "ple_dim * hidden" }
+y = { buffer = "ple_gate" }
+
+[[per_layer.node]]
+op = "layer"
+kernel = "g4_ple_act"
+grid = ["ple_one", "rows"]
+
+[per_layer.node.bind]
+gate = { buffer = "ple_gate" }
+ple = { buffer = "ple" }
+layer = "layer"
+gp = { buffer = "ple_gate" }
+
+[[per_layer.node]]
+op = "layer"
+kernel = "g4_ple_out"
+grid = ["ple_one", "rows"]
+
+[per_layer.node.bind]
+x = { buffer = "ple_gate" }
+w = { weight = "per_layer_projection.weight", len = "ple_dim * hidden" }
+y = { buffer = "ple_out" }
+
+[[per_layer.node]]
+op = "layer"
+kernel = "g3n_ple_add"
+grid = ["hc_streams - 1", "rows"]
+
+[per_layer.node.bind]
+pout = { buffer = "ple_out" }
+w = { weight = "post_per_layer_input_norm.weight", len = "hidden" }
+sin = { buffer = "streams" }
+streams = { buffer = "streams" }

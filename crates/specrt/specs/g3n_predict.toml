@@ -1,0 +1,228 @@
+kind = "kir-kernel"
+family = "group_map"
+name = "g3n_predict"
+threads = 256
+
+[args]
+width = "hidden"
+
+[[param]]
+name = "s"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "m"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "p"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "pred"
+role = "activation"
+access = "write"
+
+[[stage]]
+op = "pick"
+name = "m0"
+src = "m"
+row = "hc_streams"
+offset = 0
+
+[[stage]]
+op = "pick"
+name = "m1"
+src = "m"
+row = "hc_streams"
+offset = 1
+
+[[stage]]
+op = "pick"
+name = "m2"
+src = "m"
+row = "hc_streams"
+offset = 2
+
+[[stage]]
+op = "pick"
+name = "m3"
+src = "m"
+row = "hc_streams"
+offset = 3
+
+[[stage]]
+op = "pick"
+name = "p00"
+src = "p"
+head = 16
+offset = 0
+
+[[stage]]
+op = "pick"
+name = "p01"
+src = "p"
+head = 16
+offset = 1
+
+[[stage]]
+op = "pick"
+name = "p02"
+src = "p"
+head = 16
+offset = 2
+
+[[stage]]
+op = "pick"
+name = "p03"
+src = "p"
+head = 16
+offset = 3
+
+[[stage]]
+op = "pick"
+name = "p10"
+src = "p"
+head = 16
+offset = 4
+
+[[stage]]
+op = "pick"
+name = "p11"
+src = "p"
+head = 16
+offset = 5
+
+[[stage]]
+op = "pick"
+name = "p12"
+src = "p"
+head = 16
+offset = 6
+
+[[stage]]
+op = "pick"
+name = "p13"
+src = "p"
+head = 16
+offset = 7
+
+[[stage]]
+op = "pick"
+name = "p20"
+src = "p"
+head = 16
+offset = 8
+
+[[stage]]
+op = "pick"
+name = "p21"
+src = "p"
+head = 16
+offset = 9
+
+[[stage]]
+op = "pick"
+name = "p22"
+src = "p"
+head = 16
+offset = 10
+
+[[stage]]
+op = "pick"
+name = "p23"
+src = "p"
+head = 16
+offset = 11
+
+[[stage]]
+op = "pick"
+name = "p30"
+src = "p"
+head = 16
+offset = 12
+
+[[stage]]
+op = "pick"
+name = "p31"
+src = "p"
+head = 16
+offset = 13
+
+[[stage]]
+op = "pick"
+name = "p32"
+src = "p"
+head = 16
+offset = 14
+
+[[stage]]
+op = "pick"
+name = "p33"
+src = "p"
+head = 16
+offset = 15
+
+[[stage]]
+op = "scalar"
+name = "c0"
+expr = "p00 * m0 + p01 * m1 + p02 * m2 + p03 * m3"
+
+[[stage]]
+op = "scalar"
+name = "c1"
+expr = "p10 * m0 + p11 * m1 + p12 * m2 + p13 * m3"
+
+[[stage]]
+op = "scalar"
+name = "c2"
+expr = "p20 * m0 + p21 * m1 + p22 * m2 + p23 * m3"
+
+[[stage]]
+op = "scalar"
+name = "c3"
+expr = "p30 * m0 + p31 * m1 + p32 * m2 + p33 * m3"
+
+[[stage]]
+op = "load"
+name = "s0"
+src = "s"
+row = "hc_width"
+
+[[stage]]
+op = "load"
+name = "s1"
+src = "s"
+row = "hc_width"
+offset = "hidden"
+
+[[stage]]
+op = "load"
+name = "s2"
+src = "s"
+row = "hc_width"
+offset = "2 * hidden"
+
+[[stage]]
+op = "load"
+name = "s3"
+src = "s"
+row = "hc_width"
+offset = "3 * hidden"
+
+[[stage]]
+op = "load"
+name = "own"
+src = "s"
+row = "hc_width"
+head = "hidden"
+
+[[stage]]
+op = "store"
+dst = "pred"
+value = "c0 * s0 + c1 * s1 + c2 * s2 + c3 * s3 + own"
+row = "hc_width"
+head = "hidden"

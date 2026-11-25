@@ -162,6 +162,9 @@ impl Runtime {
                 Some(Bind::Buffer { buffer }) if buffer == "tokens" => {
                     b.arg(run.tokens);
                 }
+                Some(Bind::Buffer { buffer }) if buffer == "streams" => {
+                    b.arg(&self.gated.as_ref().context("a per layer node binds streams, which needs a [gated_residual]")?.streams);
+                }
                 Some(Bind::Buffer { buffer }) => {
                     b.arg(pb.scratch.get(buffer).with_context(|| format!("no per layer scratch {buffer:?}"))?);
                 }
@@ -527,14 +530,32 @@ impl Runtime {
             Some(l) if site != crate::plan::GATED_MODULE => &l.gated[site as usize],
             _ => &hb.head,
         };
+        let at = layer.map_or(0, |l| l.ple_at.max(0) as usize);
+        let values: Vec<(i32, f32)> = launch
+            .params
+            .iter()
+            .map(|p| {
+                let v = match spec_node.bind.get(p.name) {
+                    Some(Bind::Number(v)) => *v,
+                    Some(Bind::Name(n)) => h.layer_value(n, at).unwrap_or(0.0),
+                    _ => 0.0,
+                };
+                (v as i32, v as f32)
+            })
+            .collect();
         let mut b = self.launcher(self.kernel(launch.name));
-        for p in &launch.params {
+        for (i, p) in launch.params.iter().enumerate() {
             match spec_node.bind.get(p.name) {
                 Some(Bind::Weight { weight, .. }) => b.arg(weights.get(weight).with_context(|| format!("no hyper weight {weight}"))?),
                 Some(Bind::Buffer { buffer }) if buffer == "x" => b.arg(&self.pre.x),
                 Some(Bind::Buffer { buffer }) if buffer == "streams" => b.arg(&hb.streams),
+                Some(Bind::Buffer { buffer }) if buffer == "gate_up" => b.arg(&self.pre.gate_up),
+                Some(Bind::Buffer { buffer }) if buffer == "act_hi" => b.arg(&self.pre.act_planes.hi),
+                Some(Bind::Buffer { buffer }) if buffer == "act_lo" => b.arg(&self.pre.act_planes.lo),
                 Some(Bind::Buffer { buffer }) => b.arg(hb.scratch.get(buffer).with_context(|| format!("no hyper scratch {buffer:?}"))?),
-                _ => bail!("param {:?} of {} is not bound to a buffer or weight", p.name, launch.name),
+                Some(Bind::Number(_) | Bind::Name(_)) if p.ty == kir::Scalar::F32 => b.arg(&values[i].1),
+                Some(Bind::Number(_) | Bind::Name(_)) => b.arg(&values[i].0),
+                _ => bail!("param {:?} of {} is not bound to a buffer, weight or value", p.name, launch.name),
             };
         }
         let dim = |symbol: &String| -> Result<u32> {

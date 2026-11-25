@@ -424,6 +424,7 @@ impl Op {
                 .flat_map(|(h, n)| {
                     let module = h.sites.get(*site as usize).cloned().unwrap_or_else(|| h.module.clone());
                     n.bind.values().filter_map(move |b| match b {
+                        crate::graph::Bind::Weight { weight, .. } if module == crate::spec::GATED_ROOT => Some(weight.clone()),
                         crate::graph::Bind::Weight { weight, .. } => Some(format!("{module}.{weight}")),
                         _ => None,
                     })

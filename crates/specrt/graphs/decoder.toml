@@ -422,7 +422,14 @@ when = "tensor_core+gated"
 op = "split"
 in = "x"
 out = "xn_planes"
-when = "tensor_core+gated"
+when = "tensor_core+gated+bare"
+
+[[tail]]
+op = "rmsnorm"
+weight = "norm.weight"
+out = "xn_planes"
+when = "tensor_core+gated_norm"
+in = "x"
 
 [[tail]]
 op = "linear"
@@ -434,8 +441,110 @@ when = "tensor_core"
 in = "xn_planes"
 
 [[block]]
+name = "gated_sandwich"
+when = "tagged+tensor_core+described"
+layers = ["dense", "full", "sliding", "shared", "compressed", "indexed"]
+mlp = "dense"
+
+[[block.node]]
+op = "gated_at"
+weight = "predict"
+
+[[block.node]]
+op = "gated_at"
+weight = "laurel"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+in = "x"
+out = "xn_planes"
+
+[[block.node]]
+op = "linear"
+weight = "qkv"
+shard = "column"
+quant = "attn"
+in = "xn_planes"
+out = "qkv"
+
+[[block.node]]
+op = "attention_nodes"
+
+[[block.node]]
+op = "clear"
+out = "branch"
+
+[[block.node]]
+op = "linear"
+weight = "o"
+shard = "row"
+quant = "attn"
+in = "attn_planes"
+out = "branch"
+
+[[block.node]]
+op = "norm_add"
+weight = "post_attention_layernorm.weight"
+in = "branch"
+
+[[block.node]]
+op = "gated_at"
+weight = "laurel_add"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "pre_feedforward_layernorm.weight"
+in = "x"
+out = "xn_planes"
+
+[[block.node]]
+op = "linear"
+weight = "gate_up"
+shard = "column"
+quant = "mlp"
+in = "xn_planes"
+out = "gate_up"
+when = "stored"
+
+[[block.node]]
+op = "gated_at"
+weight = "act"
+when = "stored"
+
+[[block.node]]
+op = "linear"
+weight = "gate_up"
+shard = "column"
+quant = "mlp"
+in = "xn_planes"
+out = "act_planes"
+when = "unstored"
+
+[[block.node]]
+op = "clear"
+out = "branch"
+
+[[block.node]]
+op = "linear"
+weight = "down"
+shard = "row"
+quant = "mlp"
+in = "act_planes"
+out = "branch"
+
+[[block.node]]
+op = "norm_add"
+weight = "post_feedforward_layernorm.weight"
+in = "branch"
+
+[[block.node]]
+op = "gated_at"
+weight = "correct"
+
+[[block]]
 name = "gated_linear_moe"
-when = "gated+tensor_core+gdn+moe"
+when = "untagged+tensor_core+gdn+moe"
 layers = ["linear"]
 mlp = "sparse"
 
@@ -515,7 +624,7 @@ weight = "1"
 
 [[block]]
 name = "gated_attention_moe"
-when = "gated+tensor_core+moe"
+when = "untagged+tensor_core+moe"
 layers = ["dense", "full", "sliding", "shared", "compressed", "indexed"]
 mlp = "sparse"
 

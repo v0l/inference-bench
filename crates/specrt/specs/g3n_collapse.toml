@@ -1,0 +1,102 @@
+kind = "kir-kernel"
+family = "group_map"
+name = "g3n_collapse"
+threads = 256
+
+[args]
+width = "hidden"
+
+[[param]]
+name = "streams"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "u1"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "u2"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "u3"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "x"
+role = "activation"
+access = "write"
+
+[[stage]]
+op = "load"
+name = "v0"
+src = "streams"
+row = "hc_width"
+
+[[stage]]
+op = "load"
+name = "v1"
+src = "u1"
+row = "hidden"
+
+[[stage]]
+op = "load"
+name = "v2"
+src = "u2"
+row = "hidden"
+
+[[stage]]
+op = "load"
+name = "v3"
+src = "u3"
+row = "hidden"
+
+[[stage]]
+op = "sum"
+name = "s0"
+expr = "v0 * v0"
+
+[[stage]]
+op = "sum"
+name = "s1"
+expr = "v1 * v1"
+
+[[stage]]
+op = "sum"
+name = "s2"
+expr = "v2 * v2"
+
+[[stage]]
+op = "sum"
+name = "s3"
+expr = "v3 * v3"
+
+[[stage]]
+op = "scalar"
+name = "m0"
+expr = "sqrt(s0 / width)"
+
+[[stage]]
+op = "scalar"
+name = "r1"
+expr = "m0 / sqrt(max(s1 / width, 0.00001))"
+
+[[stage]]
+op = "scalar"
+name = "r2"
+expr = "m0 / sqrt(max(s2 / width, 0.00001))"
+
+[[stage]]
+op = "scalar"
+name = "r3"
+expr = "m0 / sqrt(max(s3 / width, 0.00001))"
+
+[[stage]]
+op = "store"
+dst = "x"
+value = "(v0 + v1 * r1 + v2 * r2 + v3 * r3) * 0.25"
+row = "hidden"

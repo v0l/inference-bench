@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use kir as kir;
 
-pub const SPEC_FORMAT: u32 = 15;
+pub const SPEC_FORMAT: u32 = 16;
 
 pub fn modelopt_verified() -> bool {
     include_str!("../modelopt-verified.txt").trim() == "pass"
@@ -521,7 +521,11 @@ pub struct GatedResidual {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub params: std::collections::BTreeMap<String, f64>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub layer_params: std::collections::BTreeMap<String, Vec<f64>>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub scratch: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub final_norm: bool,
     pub node: Vec<crate::graph::Node>,
 }
 
@@ -537,24 +541,66 @@ impl GatedStage {
     pub fn op(self) -> &'static str {
         match self {
             GatedStage::Expand => "expand",
-            GatedStage::Pre | GatedStage::Collapse => "pre",
+            GatedStage::Pre => "pre",
+            GatedStage::Collapse => "collapse",
             GatedStage::Post => "post",
         }
     }
 }
+
+pub const GATED_ROOT: &str = ".";
 
 impl GatedResidual {
     pub fn width(&self, hidden: usize) -> usize {
         self.streams * hidden
     }
 
-    pub fn nodes(&self, stage: GatedStage) -> impl Iterator<Item = (usize, &crate::graph::Node)> {
-        self.node.iter().enumerate().filter(move |(_, n)| n.op == stage.op() && (stage != GatedStage::Collapse || n.when.as_deref() != Some("site")))
+    pub fn collapses(&self) -> bool {
+        self.node.iter().any(|n| n.op == "collapse")
     }
 
-    pub fn weights(&self, stage: GatedStage) -> Vec<(String, String)> {
+    pub fn nodes(&self, stage: GatedStage) -> impl Iterator<Item = (usize, &crate::graph::Node)> {
+        let own = self.collapses();
+        self.node.iter().enumerate().filter(move |(_, n)| match stage {
+            GatedStage::Collapse if !own => n.op == "pre" && n.when.as_deref() != Some("site"),
+            _ => n.op == stage.op(),
+        })
+    }
+
+    pub fn tagged(&self, tag: &str) -> impl Iterator<Item = (usize, &crate::graph::Node)> {
+        let tag = tag.to_string();
+        self.node.iter().enumerate().filter(move |(_, n)| n.op == tag)
+    }
+
+    pub fn tags(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for n in &self.node {
+            if !matches!(n.op.as_str(), "expand" | "pre" | "post" | "collapse") && !out.contains(&n.op.as_str()) {
+                out.push(n.op.as_str());
+            }
+        }
+        out
+    }
+
+    pub fn module_path(module: &str, under: &str) -> String {
+        if module == GATED_ROOT { under.to_string() } else { format!("{under}.{module}") }
+    }
+
+    pub fn layer_weights(&self) -> Vec<(String, String)> {
+        self.collect_weights(self.node.iter().filter(|n| !matches!(n.op.as_str(), "expand" | "collapse")))
+    }
+
+    pub fn head_weights(&self) -> Vec<(String, String)> {
+        if self.collapses() {
+            self.collect_weights(self.node.iter().filter(|n| matches!(n.op.as_str(), "expand" | "collapse")))
+        } else {
+            self.weights(GatedStage::Collapse)
+        }
+    }
+
+    fn collect_weights<'a>(&self, nodes: impl Iterator<Item = &'a crate::graph::Node>) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = Vec::new();
-        for (_, n) in self.nodes(stage) {
+        for n in nodes {
             for b in n.bind.values() {
                 if let crate::graph::Bind::Weight { weight, len } = b
                     && !out.iter().any(|(w, _)| w == weight)
@@ -564,6 +610,14 @@ impl GatedResidual {
             }
         }
         out
+    }
+
+    pub fn weights(&self, stage: GatedStage) -> Vec<(String, String)> {
+        self.collect_weights(self.nodes(stage).map(|(_, n)| n))
+    }
+
+    pub fn layer_value(&self, name: &str, layer: usize) -> Option<f64> {
+        self.layer_params.get(name).and_then(|v| v.get(layer).copied())
     }
 }
 
@@ -1064,6 +1118,8 @@ pub struct Mlp {
     pub mapped: Option<GatedAct>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub wide_shared_tail: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stored_gate_up: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2044,7 +2100,7 @@ impl Spec {
                 sandwich: family.norm.sandwich,
                 pre: family.norm.pre,
                 residual_scale: multiplier(&family.multipliers.residual),
-                layer_scale: family.norm.layer_scale.clone(),
+                layer_scale: family.norm.layer_scale.clone().filter(|t| !t.is_empty()),
             },
             attention: Attention {
                 kind: crate::family::first_kind(&family.attention.kinds, &value).unwrap_or(AttentionKind::Gqa),
@@ -2089,6 +2145,7 @@ impl Spec {
                     _ => None,
                 },
                 wide_shared_tail: family.mlp.shared_tail_wide_key.as_deref().and_then(|k| value.get(k)?.as_bool()).unwrap_or(false),
+                stored_gate_up: family.mlp.stored_gate_up,
             },
             moe,
             mtp: (family.mtp && (hybrid || family.mtp_layout.is_some()) && hf.mtp_num_hidden_layers > 0)
@@ -2361,7 +2418,7 @@ impl Spec {
     fn validate_per_layer(&self) -> Result<()> {
         let Some(p) = self.per_layer() else { return Ok(()) };
         ensure!(p.dim > 0, "[per_layer] needs a positive dim");
-        ensure!(self.gated_residual().is_none() && self.hyper.is_none() && self.mixer.is_none(), "[per_layer] cannot be combined with other residual or mixer descriptions yet");
+        ensure!(self.hyper.is_none() && self.mixer.is_none(), "[per_layer] cannot be combined with [hyper] or [mixer] yet");
         ensure!(self.speculative().is_none(), "[per_layer] cannot be combined with [mtp] yet");
         ensure!(p.node.len() <= 64, "[[per_layer.node]] has more than 64 nodes");
         for stage in ["head", "layer"] {
@@ -2383,8 +2440,8 @@ impl Spec {
                         self.weight_len(len)?;
                     }
                     crate::graph::Bind::Buffer { buffer } => ensure!(
-                        matches!(buffer.as_str(), "x" | "tokens") || p.scratch.contains_key(buffer),
-                        "[[per_layer.node]] {i} binds buffer {buffer:?}, which is not x, tokens or a [per_layer.scratch] entry"
+                        matches!(buffer.as_str(), "x" | "tokens") || (buffer == "streams" && self.gated_residual().is_some()) || p.scratch.contains_key(buffer),
+                        "[[per_layer.node]] {i} binds buffer {buffer:?}, which is not x, tokens, the gated streams or a [per_layer.scratch] entry"
                     ),
                     crate::graph::Bind::Name(n) => ensure!(n == "layer", "[[per_layer.node]] {i} binds the name {n:?}, which is not layer"),
                     crate::graph::Bind::Number(_) => {}
@@ -2403,18 +2460,37 @@ impl Spec {
         ensure!(h.streams > 1, "[gated_residual] needs more than one stream");
         ensure!(self.hyper.is_none(), "[gated_residual] and [hyper] are two different residuals, a spec takes one");
         ensure!(!h.module.is_empty() && !h.sites.is_empty() && h.sites.len() <= 2, "[gated_residual] needs a module and one or two sites");
-        ensure!(!self.uses_branch() && !self.layers.split && !self.norm.pre, "[gated_residual] replaces the block norms and the residual, so it takes no pre, sandwich, scaled or split layers");
+        ensure!(!self.layers.split, "[gated_residual] takes no split layers");
+        let tags = h.tags();
+        if tags.is_empty() {
+            ensure!(!self.uses_branch() && !self.norm.pre, "[gated_residual] replaces the block norms and the residual, so it takes no pre, sandwich, scaled or split layers");
+        } else {
+            ensure!(
+                self.norm.sandwich && self.norm.pre && self.norm.residual_scale.is_none() && self.moe.is_none() && !self.attention.node.is_empty(),
+                "a [gated_residual] with tagged nodes runs in the sandwich block: it needs sandwich and pre norms, described attention, no residual scale and no experts"
+            );
+            ensure!(h.collapses(), "a [gated_residual] with tagged nodes needs its own collapse nodes");
+        }
+        ensure!(!self.mlp.stored_gate_up || tags.contains(&"act"), "[mlp] stored_gate_up needs a [[gated_residual.node]] tagged act that turns gate_up into the activation planes");
         ensure!(self.speculative().is_none() && self.mixer.is_none(), "[gated_residual] cannot be combined with [mtp] or [mixer] yet");
         ensure!(h.node.len() <= 64, "[[gated_residual.node]] has more than 64 nodes");
-        for stage in [GatedStage::Expand, GatedStage::Pre, GatedStage::Post, GatedStage::Collapse] {
+        let stages: &[GatedStage] = if tags.is_empty() { &[GatedStage::Expand, GatedStage::Pre, GatedStage::Post, GatedStage::Collapse] } else { &[GatedStage::Expand, GatedStage::Collapse] };
+        for &stage in stages {
             ensure!(h.nodes(stage).next().is_some(), "[[gated_residual.node]] has no {:?} node", stage);
         }
         for (n, w) in &h.scratch {
-            ensure!(!matches!(n.as_str(), "x" | "streams"), "[gated_residual.scratch] {n} shadows a built in buffer");
+            ensure!(!matches!(n.as_str(), "x" | "streams" | "gate_up" | "act_hi" | "act_lo"), "[gated_residual.scratch] {n} shadows a built in buffer");
             crate::state::dim(self, w).with_context(|| format!("[gated_residual.scratch] {n}"))?;
         }
+        for (n, v) in &h.layer_params {
+            ensure!(v.len() == self.layers.count, "[gated_residual.layer_params] {n} has {} values for {} layers", v.len(), self.layers.count);
+        }
         for (i, n) in h.node.iter().enumerate() {
-            ensure!(matches!(n.op.as_str(), "expand" | "pre" | "post") && n.kernel.is_some(), "[[gated_residual.node]] {i} must be an expand, pre or post node with `kernel`");
+            ensure!(n.kernel.is_some(), "[[gated_residual.node]] {i} needs `kernel`");
+            ensure!(
+                matches!(n.op.as_str(), "expand" | "pre" | "post") || (!tags.is_empty() && (n.op == "collapse" || tags.contains(&n.op.as_str()))),
+                "[[gated_residual.node]] {i} must be an expand, pre or post node, or a tag beside a collapse node"
+            );
             ensure!(n.when.as_deref().is_none_or(|w| w == "site"), "[[gated_residual.node]] {i} when {:?} is not site", n.when);
             ensure!(!n.grid.is_empty() && n.grid.len() <= 3, "[[gated_residual.node]] {i} needs a grid of one to three symbols");
             for g in n.grid.iter().filter(|g| *g != "rows") {
@@ -2423,14 +2499,16 @@ impl Spec {
             for b in n.bind.values() {
                 match b {
                     crate::graph::Bind::Weight { len, .. } => {
-                        ensure!(n.op != "expand", "[[gated_residual.node]] {i} is an expand node, which reads no weight");
+                        ensure!(n.op != "expand" || h.collapses(), "[[gated_residual.node]] {i} is an expand node, which reads no weight");
                         self.weight_len(len)?;
                     }
                     crate::graph::Bind::Buffer { buffer } => ensure!(
-                        matches!(buffer.as_str(), "x" | "streams") || h.scratch.contains_key(buffer),
+                        matches!(buffer.as_str(), "x" | "streams") || (!tags.is_empty() && matches!(buffer.as_str(), "gate_up" | "act_hi" | "act_lo")) || h.scratch.contains_key(buffer),
                         "[[gated_residual.node]] {i} binds buffer {buffer:?}, which is not x, streams or a [gated_residual.scratch] entry"
                     ),
-                    _ => bail!("[[gated_residual.node]] {i} binds a state or a number, which gated nodes do not take"),
+                    crate::graph::Bind::Name(name) => ensure!(h.layer_params.contains_key(name), "[[gated_residual.node]] {i} binds {name:?}, which is not a [gated_residual.layer_params] entry"),
+                    crate::graph::Bind::Number(_) => {}
+                    crate::graph::Bind::State { .. } => bail!("[[gated_residual.node]] {i} binds a state, which gated nodes do not take"),
                 }
             }
         }

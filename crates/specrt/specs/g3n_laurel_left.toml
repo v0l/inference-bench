@@ -1,0 +1,70 @@
+kind = "kir-kernel"
+family = "group_map"
+name = "g3n_laurel_left"
+threads = 256
+
+[args]
+width = "hidden"
+
+[[const]]
+name = "eps"
+value = "norm_eps"
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "n"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "w"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "lo"
+role = "activation"
+access = "write"
+
+[[stage]]
+op = "load"
+name = "v"
+src = "x"
+row = "hidden"
+
+[[stage]]
+op = "sum"
+name = "ss"
+expr = "v * v"
+
+[[stage]]
+op = "scalar"
+name = "inv"
+expr = "rsqrt(ss / width + eps)"
+
+[[stage]]
+op = "load"
+name = "nv"
+src = "n"
+
+[[stage]]
+op = "load"
+name = "wv"
+src = "w"
+head = "hidden"
+
+[[stage]]
+op = "sum"
+name = "d"
+expr = "v * inv * nv * wv"
+
+[[stage]]
+op = "put"
+dst = "lo"
+value = "d"
+row = "laurel_rank"
+head = 1

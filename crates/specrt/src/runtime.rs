@@ -43,7 +43,7 @@ fn weight_plan(ck: &Checkpoint, spec: &Spec, range: StageRange, role: StageRole)
         head.push(format!("{root}.norm.weight"));
         head.push(if tied { embed.clone() } else { "lm_head.weight".to_string() });
         if let Some(h) = spec.gated_residual() {
-            head.extend(h.weights(crate::spec::GatedStage::Collapse).into_iter().map(|(w, _)| format!("{root}.{}.{w}", h.module)));
+            head.extend(h.head_weights().into_iter().map(|(w, _)| format!("{}.{w}", crate::spec::GatedResidual::module_path(&h.module, root))));
         }
     }
     let mut plan = Plan { groups: Vec::new(), work: Vec::new() };
@@ -1189,7 +1189,7 @@ impl Runtime {
             merged: stream.alloc_zeros(if spec.parallel_moe() { chunk * d.hidden } else { 1 })?,
             qkv: stream.alloc_zeros(chunk * spec.qkv_rows())?,
             attn: stream.alloc_zeros(mma_only(chunk * spec.q_dim().max(spec.o_dim())))?,
-            gate_up: stream.alloc_zeros(mma_only(chunk * 2 * spec.max_intermediate()))?,
+            gate_up: stream.alloc_zeros(if spec.mlp.stored_gate_up { chunk * 2 * spec.max_intermediate() } else { mma_only(chunk * 2 * spec.max_intermediate()) })?,
             act: stream.alloc_zeros(mma_only(chunk * spec.max_intermediate()))?,
             xn_planes: Planes::new(&stream, chunk * d.hidden)?,
             attn_planes: Planes::new(&stream, chunk * spec.q_dim().max(spec.o_dim()))?,

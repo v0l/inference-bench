@@ -173,8 +173,37 @@ pub struct FamilyGatedResidual {
     pub module: String,
     pub sites: Vec<String>,
     pub params: std::collections::BTreeMap<String, ParamSource>,
+    pub layer_params: std::collections::BTreeMap<String, FamilyLayerParam>,
     pub scratch: std::collections::BTreeMap<String, String>,
+    pub final_norm: bool,
     pub node: Vec<crate::graph::Node>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FamilyLayerParam {
+    pub config: String,
+    #[serde(default)]
+    pub map: Option<String>,
+    #[serde(default)]
+    pub default: Option<f64>,
+}
+
+impl FamilyLayerParam {
+    pub fn read(&self, name: &str, config: &serde_json::Value, layers: usize) -> Result<Vec<f64>> {
+        let number = |v: &serde_json::Value| v.as_f64().or_else(|| v.as_bool().map(f64::from));
+        let raw: Vec<f64> = match dotted(config, &self.config) {
+            Some(serde_json::Value::Array(a)) => {
+                ensure!(a.len() == layers, "layer param {name} reads {} with {} values for {layers} layers", self.config, a.len());
+                a.iter().map(|v| number(v).with_context(|| format!("layer param {name}: {} holds {v}, not a number", self.config))).collect::<Result<_>>()?
+            }
+            Some(v) => vec![number(v).with_context(|| format!("layer param {name}: {} holds {v}, not a number", self.config))?; layers],
+            None => vec![self.default.with_context(|| format!("layer param {name} reads config.json key {}, which is missing", self.config))?; layers],
+        };
+        let Some(map) = &self.map else { return Ok(raw) };
+        let e = kir::expr::Expr::parse(map).map_err(anyhow::Error::msg).with_context(|| format!("layer param {name} map"))?;
+        raw.iter().enumerate().map(|(i, v)| e.eval(&|k| (k == "v").then_some(*v)).with_context(|| format!("layer param {name}: {map} has no value at layer {i} ({v})"))).collect()
+    }
 }
 
 impl FamilyGatedResidual {
@@ -184,7 +213,9 @@ impl FamilyGatedResidual {
         }
         let key = self.streams.as_deref().context("[gated_residual] needs streams, the config key of the stream count")?;
         let streams = dotted(config, key).and_then(|v| v.as_u64()).with_context(|| format!("[gated_residual] streams reads {key}, which the config does not hold"))? as usize;
-        Ok(Some(crate::spec::GatedResidual { streams, module: self.module.clone(), sites: self.sites.clone(), params: read_params(&self.params, config)?, scratch: self.scratch.clone(), node: self.node.clone() }))
+        let layers = config.get("num_hidden_layers").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let layer_params = self.layer_params.iter().map(|(n, p)| Ok((n.clone(), p.read(n, config, layers)?))).collect::<Result<_>>()?;
+        Ok(Some(crate::spec::GatedResidual { streams, module: self.module.clone(), sites: self.sites.clone(), params: read_params(&self.params, config)?, layer_params, scratch: self.scratch.clone(), final_norm: self.final_norm, node: self.node.clone() }))
     }
 }
 
@@ -273,6 +304,7 @@ pub struct FamilyMultipliers {
 #[serde(default, deny_unknown_fields)]
 pub struct FamilyMlp {
     pub fused_gate_up: bool,
+    pub stored_gate_up: bool,
     pub gated: Option<FamilyGated>,
     pub mapped: Option<FamilyGated>,
     pub dense_intermediate_key: Option<String>,
@@ -737,7 +769,7 @@ impl Family {
         if let Some(k) = self.rope.nope_zero_key.as_deref() {
             push(k, &mut out);
         }
-        for k in self.hyper.keys().chain(self.gated_residual.streams.as_deref()).chain(self.per_layer.dim.as_deref()) {
+        for k in self.hyper.keys().chain(self.gated_residual.streams.as_deref()).chain(self.per_layer.dim.as_deref()).chain(self.gated_residual.layer_params.values().map(|p| p.config.as_str())) {
             push(k, &mut out);
         }
         if let Some(i) = &self.attention.indexer {
