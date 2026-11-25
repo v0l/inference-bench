@@ -813,7 +813,7 @@ def report(args):
     out.append(f"- Our modules compiled with NVRTC `--split-compile={r.get('compile_jobs')}`, as the runtime JIT does (register counts and spills per kernel are in the ours rows; they depend on this setting, see kernel-static.md rank 6).")
     v = r["versions"]
     out.append(f"- torch {v['torch']} (CUDA {v['cuda']}), FlashInfer {v['flashinfer']}, Triton {v['triton']}, vLLM {v['vllm']}, NVRTC {v['nvrtc']}.")
-    out.append(f"- {r['iters']} timed launches per side and mode after {r['warmup']} warmup launches, sides alternated launch by launch with a rotating start. Warm: the side runs once untimed right before each timed launch. Cold: a {r['flush_bytes'] >> 20} MB buffer is zeroed before each timed launch. A {r['spin_cycles']} cycle GPU spin precedes each timed launch so host enqueue time is not counted.")
+    out.append(f"- {r['iters']} timed samples per side and mode (5x that for cold rows of kernels under about 25 us) after {r['warmup']} warmup launches. Sides run in a fresh random order every iteration, in one process, with an ours-vs-ours control side. Warm: the side runs once untimed right before its timed sample, so whatever fits in L2 (about 128 MB) is resident; warm rates can pass the DRAM roofline for that reason. Cold: a {r['flush_bytes'] >> 20} MB buffer is zeroed before each timed launch; cold is the DRAM number. A {r['spin_cycles']} cycle GPU spin precedes each timed sample so host enqueue time is not counted.")
     out.append(f"- Card before: `{r['before']['query']}`")
     out.append(f"- Card after: `{r['after']['query']}`")
     if r.get("refused"):
