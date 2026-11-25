@@ -1,0 +1,214 @@
+{
+ "files": {
+  "prompt.tokens": {
+   "file": "prompt.tokens.bin",
+   "shape": [
+    15
+   ]
+  },
+  "prompt.model_latents": {
+   "file": "prompt.model_latents.bin",
+   "shape": [
+    15,
+    64
+   ]
+  },
+  "prompt.user_latents": {
+   "file": "prompt.user_latents.bin",
+   "shape": [
+    15,
+    64
+   ]
+  },
+  "prompt.model_mask": {
+   "file": "prompt.model_mask.bin",
+   "shape": [
+    15
+   ]
+  },
+  "prompt.user_mask": {
+   "file": "prompt.user_mask.bin",
+   "shape": [
+    15
+   ]
+  },
+  "prompt.embeds": {
+   "file": "prompt.embeds.bin",
+   "shape": [
+    15,
+    64
+   ]
+  },
+  "prompt.layers": {
+   "file": "prompt.layers.bin",
+   "shape": [
+    5,
+    15,
+    64
+   ]
+  },
+  "prompt.hidden": {
+   "file": "prompt.hidden.bin",
+   "shape": [
+    15,
+    64
+   ]
+  },
+  "prompt.logits": {
+   "file": "prompt.logits.bin",
+   "shape": [
+    15,
+    512
+   ]
+  },
+  "session.user_audio": {
+   "file": "session.user_audio.bin",
+   "shape": [
+    6,
+    3200
+   ]
+  },
+  "session.user_mean": {
+   "file": "session.user_mean.bin",
+   "shape": [
+    6,
+    64
+   ]
+  },
+  "session.user_latent": {
+   "file": "session.user_latent.bin",
+   "shape": [
+    6,
+    64
+   ]
+  },
+  "session.embeds": {
+   "file": "session.embeds.bin",
+   "shape": [
+    6,
+    64
+   ]
+  },
+  "session.head_noise": {
+   "file": "session.head_noise.bin",
+   "shape": [
+    7,
+    64
+   ]
+  },
+  "session.hidden": {
+   "file": "session.hidden.bin",
+   "shape": [
+    7,
+    64
+   ]
+  },
+  "session.logits": {
+   "file": "session.logits.bin",
+   "shape": [
+    7,
+    512
+   ]
+  },
+  "session.token": {
+   "file": "session.token.bin",
+   "shape": [
+    7
+   ]
+  },
+  "session.latent": {
+   "file": "session.latent.bin",
+   "shape": [
+    7,
+    64
+   ]
+  },
+  "session.audio": {
+   "file": "session.audio.bin",
+   "shape": [
+    22400
+   ]
+  },
+  "head.guidance1.0": {
+   "file": "head.guidance1.0.bin",
+   "shape": [
+    7,
+    64
+   ]
+  },
+  "head.guidance1.5": {
+   "file": "head.guidance1.5.bin",
+   "shape": [
+    7,
+    64
+   ]
+  },
+  "head.guidance2.0": {
+   "file": "head.guidance2.0.bin",
+   "shape": [
+    7,
+    64
+   ]
+  },
+  "head.steps2": {
+   "file": "head.steps2.bin",
+   "shape": [
+    7,
+    64
+   ]
+  },
+  "codec.clip": {
+   "file": "codec.clip.bin",
+   "shape": [
+    8366
+   ]
+  },
+  "codec.clip_mean": {
+   "file": "codec.clip_mean.bin",
+   "shape": [
+    3,
+    64
+   ]
+  },
+  "codec.clip_mean_stream": {
+   "file": "codec.clip_mean_stream.bin",
+   "shape": [
+    3,
+    64
+   ]
+  },
+  "codec.clip_audio": {
+   "file": "codec.clip_audio.bin",
+   "shape": [
+    9600
+   ]
+  },
+  "codec.silence": {
+   "file": "codec.silence.bin",
+   "shape": [
+    64
+   ]
+  }
+ },
+ "haru_commit": "7fe6b7665f8bf035998f401f8cb779fbe53f2751",
+ "torch": "2.15.0+cpu",
+ "seed": 0,
+ "dtype": "float32 on bf16 rounded weights",
+ "card_tokens": 12,
+ "reference_frames": 3,
+ "prompt_length": 15,
+ "steps": 6,
+ "guidance": 1.5,
+ "codec_state_floats": {
+  "encoder": 3094,
+  "decoder": 2716
+ },
+ "checks": {
+  "chunked_prefill_max_diff": 5.036592483520508e-06,
+  "stream_decode_vs_whole": 4.706302661361406e-06,
+  "stream_encode_vs_whole": 9.377312721881026e-07,
+  "clip_encode_stream_vs_whole": 7.828026582501479e-07,
+  "clip_decode_stream_vs_whole": 6.040243079041829e-06
+ },
+ "params": 1274319
+}
