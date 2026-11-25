@@ -229,7 +229,7 @@ docs/glm5-real/capture.sh http://127.0.0.1:8013 glm-5.3-flash docs/glm5-real/spe
 Two engine fixes were needed to load it:
 
 - `StageRange::check` refused any pipeline over a MoE model with dense layers. `Spec::stage` now renumbers `[moe] dense_layers` and `[rope] nope_layers` into the stage, and `Checkpoint::layer_at` decides sparse by the stage local index. Tests: `stage_specs_renumber_dense_moe_layers_and_nope_layers` (CPU), `moe_with_dense_first_layers_and_hyper_streams_pipeline_is_bit_identical_to_the_single_runtime` (`tests/pipeline.rs`, GPU1, tiny-glm5-next split in two and three stages over both hops, tokens and logits bit identical).
-- The describe path (what the app's load dialog sizes from) ignored the per tensor quant map and counted the routed experts as bf16: 598.4 GB of weights. It now reads the map as the engine does: 189.5 GB. Test: `glm5_3_flash_serves_text_with_its_glm_keys` checks the describe and the serving spec agree within 1%.
+- The describe path (what the app's load dialog sizes from) ignored the per tensor quant map and counted the routed experts as bf16: 598.4 GB of weights. It now reads the map as the engine does: 189.5 GB in the describe output, 173.4 GB in the load dialog, which sizes the text model without the MTP layer the engine refuses. Test: `glm5_3_flash_serves_text_with_its_glm_keys` checks the describe and the serving spec agree within 1%.
 
 Placement (planner and the run agree): gpu0 layers 0..23, gpu1 layers 23..45, planned 11.3 ms per decode step (88.7 tok/s one stream).
 
@@ -255,7 +255,9 @@ Speed, greedy, one request at a time (time to first token and decode tok/s from 
 | 463 | 32 | 2.66 s | 174 | 4.35 |
 | 3101 | 32 | 20.0 s | 155 | 3.96 |
 
-Expert cache hit ratio: none. Every expert is resident, so the cache is off and `/metrics` has no `inference_offload_hit_ratio`. Decode at 4.4 tok/s against the planned 88.7 is the same pipelined path gap as the Qwen4Exp run (3.7 against 36.5, `docs/specrt-qwen4exp.md`): one stream runs through both stages a row at a time. Prefill is slow because KDA prefill runs the recurrent form (the chunked form refuses KDA, see stage 3b).
+Expert cache hit ratio: none. Every expert is resident, so the cache is off and `/metrics` has no `inference_offload_hit_ratio`.
+
+Decode is about 227 ms a step (4.4 tok/s) against the planned 11.3 ms (88.7 tok/s), about 20x off. It is the same two stage pipeline gap as the Qwen4Exp run (270 ms against 36.5 ms, `docs/specrt-qwen4exp.md`) and is tracked in #1389, not fixed here. GLM-5.3 Flash has no n-gram table or PLE, so the shared suspects are the stage hand-off (4 hyper streams of 4096 per row), per step host work in the pipeline executor, and batch 1 MoE on both stages. Prefill is slow because KDA prefill runs the recurrent form (the chunked form refuses KDA, see stage 3b).
 
 Greedy text is coherent on all four prompts (`docs/glm5-real/specrt/p0.json` to `p3.json`, 64 tokens each with `logprobs: 20`, `temperature: 0`, `ignore_eos`):
 
@@ -279,7 +281,15 @@ python3 docs/glm5-real/compare.py docs/glm5-real/specrt docs/glm5-real/vllm
 
 ### Load dialog
 
-Walked in headless sway (`inference-bench-ui`, both cards visible, model picked from the model bar). After the describe fix the dialog shows 189.5 GB of weights and 185.4 GB free on 2 GPUs, but the planner blocks the load: it gives the planner 90% of free memory per card (`inventory.rs` `usable`, 166.9 GiB) against 176.9 GiB needed. Filed as #1394 with the screenshots `docs/glm5-real/load-dialog.png` and `load-dialog-mtp-off.png`. The dialog also ticks MTP on, which the engine refuses for this family.
+Walked first in headless sway (`inference-bench-ui`, both cards visible, model picked from the model bar). Three things disagreed with the engine and are fixed on this branch (#1394):
+
+- The dialog sized the experts as bf16 (598.4 GB). It now reads the quant map: 173.4 GB of weights.
+- The planner got 90% of free memory per card (166.9 GiB of 185.4). `inventory.rs`, `discover.rs`, `fit.rs` and `doctor.rs` now take free memory less `fit::GPU_RESERVE`, which is `specrt::placement::DEFAULT_RESERVE_GIB` (2 GiB per card), the same reserve the planner and `serve` use. The coverage survey (`popular_models.rs`) uses the same reserve. Test: `two_cards_give_the_planner_free_memory_less_the_engine_reserve` (two cards of 92.7 GiB free place a 176.9 GiB model; 90 GiB each do not).
+- The dialog ticked MTP on and offered TP2, which the engine refuses for a `[mixer]` family. The load dialog now sizes from the spec as served (`fit::as_served`: MTP and mixer from `from_hf_config_serving`), so MTP is off and the plan is the two stage pipeline. The model details page still shows the checkpoint's MTP layer.
+
+Test: `glm5_flash_plans_across_two_cards_with_no_mtp_ticked` (two 92.7 GiB cards: two stage plan, MTP off, load enabled). Its pictures at 1280 x 800 and 390 x 844: `docs/glm5-real/glm5-load-1280x800.png`, `docs/glm5-real/glm5-load-390x844.png` (gpu0 layers 0 to 23, gpu1 24 to 44). A load through the real app in sway with `nvidia-smi` on both cards was not repeated after the fix: it needs both cards free.
+
+Fit verdicts that changed with the reserve (`crates/specrt/tests/fixtures/popular/classes.tsv`, regenerated with `crates/specrt/scripts/model_coverage.sh`): only two rows change class, both from DOES-NOT-FIT to SUPPORTED-WITH-OFFLOAD, because the NVMe tier is now just big enough: `Qwen/Qwen3.5-397B-A17B` (806.8 GB) and `meta-llama/Llama-4-Maverick-17B-128E-Instruct` (803.2 GB). Every other change is a smaller host or NVMe figure in the why column.
 
 ## Other MoE configs in the fixtures
 
