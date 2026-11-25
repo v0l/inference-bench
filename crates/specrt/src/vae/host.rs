@@ -381,6 +381,22 @@ impl HostVae {
         }
     }
 
+    pub fn conv_step(&self, op: usize, x: &Grid, c: &ConvWeights, stream: &mut Stream) -> Grid {
+        if c.kt == 1 {
+            return conv(x, c, None);
+        }
+        let prev = stream.history.get(&op);
+        let y = conv(x, c, prev);
+        let tail = causal_tail(prev, x, c.kt - 1);
+        stream.history.insert(op, tail);
+        y
+    }
+
+    pub fn time_up_step(&self, op: usize, x: &Grid, stream: &mut Stream) -> Grid {
+        let Param::Conv(c) = &self.params[op] else { unreachable!() };
+        time_up(x, c, stream, op)
+    }
+
     pub fn run(&self, latent: &Grid, stream: &mut Stream) -> Result<Grid> {
         ensure!(latent.c == self.plan.latent_channels, "the latent has {} channels, the vae reads {}", latent.c, self.plan.latent_channels);
         let mut slots: BTreeMap<Slot, Grid> = BTreeMap::new();
@@ -391,15 +407,7 @@ impl HostVae {
                 VaeOp::Conv { input, .. } => {
                     let x = take(&slots, *input)?;
                     let Param::Conv(c) = &self.params[i] else { unreachable!() };
-                    let y = if c.kt > 1 {
-                        let prev = stream.history.get(&i);
-                        let y = conv(&x, c, prev);
-                        stream.history.insert(i, causal_tail(prev, &x, c.kt - 1));
-                        y
-                    } else {
-                        conv(&x, c, None)
-                    };
-                    y
+                    self.conv_step(i, &x, c, stream)
                 }
                 VaeOp::GroupNorm { groups, eps, act: a, input, .. } => {
                     let mut x = take(&slots, *input)?;
@@ -440,13 +448,17 @@ impl HostVae {
     }
 
     pub fn decode(&self, latent: &Grid) -> Result<Grid> {
+        self.decode_with(latent, &mut |x, s| self.run(x, s))
+    }
+
+    pub fn decode_with(&self, latent: &Grid, run: &mut dyn FnMut(&Grid, &mut Stream) -> Result<Grid>) -> Result<Grid> {
         if !self.plan.temporal {
-            return self.run(latent, &mut Stream::default());
+            return run(latent, &mut Stream::default());
         }
         let mut stream = Stream::default();
         let mut out: Option<Grid> = None;
         for f in 0..latent.t {
-            let y = self.run(&latent.frames(f, 1), &mut stream)?;
+            let y = run(&latent.frames(f, 1), &mut stream)?;
             match &mut out {
                 Some(o) => o.append_frames(&y),
                 None => out = Some(y),

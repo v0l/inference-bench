@@ -100,3 +100,146 @@ fn the_host_vae_decodes_the_tiny_wan_latent_frame_by_frame_like_diffusers() {
     eprintln!("tiny-wan21 host decode: max abs {err:e}, PSNR {db:.1} dB");
     assert!(err < 1e-4 && db > 60.0);
 }
+
+fn compiled(name: &str, fuse: bool, first: bool) -> specrt::vae::compile::Compiled {
+    let p = load_plan(&fixture(&format!("{name}/vae"))).unwrap();
+    let l = latent(name);
+    specrt::vae::compile::compile(&p, specrt::vae::compile::Dims { t: 1, h: l.h, w: l.w }, &kir::Target::sm_120(), fuse, first).unwrap()
+}
+
+#[test]
+fn the_compiler_rediscovers_the_conv_norm_act_fusions_of_the_kl_decoder() {
+    let c = compiled("tiny-flux2-klein", true, true);
+    let s = &c.fusion;
+    let grouped = |units: &[&str]| s.groups.iter().any(|g| g.units.iter().map(String::as_str).eq(units.iter().copied()));
+    let want: [&[&str]; 4] = [
+        &["mid_block.resnets.0.norm1 apply", "conv mid_block.resnets.0.conv1", "mid_block.resnets.0.norm2 stats"],
+        &["mid_block.resnets.0.norm2 apply", "conv mid_block.resnets.0.conv2", "add 6", "mid_block.attentions.0.group_norm stats"],
+        &["upsample 27", "conv up_blocks.0.upsamplers.0.conv", "up_blocks.1.resnets.0.norm1 stats"],
+        &["conv_norm_out apply", "conv conv_out"],
+    ];
+    let report = specrt::vae::compile::fusion_report(s, c.lowered.count, &kir::Target::sm_120()).render();
+    for units in want {
+        assert!(grouped(units), "no group {units:?}\n{report}");
+    }
+    assert_eq!((s.launches_before, s.launches_after), (56, 21), "{report}");
+    let stats_apart = s.rejected.iter().find(|d| d.producer == ["mid_block.resnets.0.norm1 stats"] && d.consumers.iter().any(|c| c.iter().any(|u| u == "mid_block.resnets.0.norm1 apply")));
+    assert!(stats_apart.is_some(), "{report}");
+}
+
+#[test]
+fn the_compiler_folds_residuals_upsamples_and_the_clamp_into_the_causal_convs() {
+    let c = compiled("tiny-wan21", true, false);
+    let s = &c.fusion;
+    let grouped = |units: &[&str]| s.groups.iter().any(|g| g.units.iter().map(String::as_str).eq(units.iter().copied()));
+    for units in [&["conv mid_block.resnets.0.conv2", "add 6"][..], &["upsample 28", "conv up_blocks.0.upsamplers.0.resample.1"], &["conv conv_out", "clamp 55"]] {
+        assert!(grouped(units), "no group {units:?}");
+    }
+    assert_eq!((s.launches_before, s.launches_after), (56, 44));
+}
+
+#[test]
+fn a_grid_reduction_never_fuses_with_its_reader() {
+    for name in ["tiny-flux2-klein"] {
+        let c = compiled(name, true, true);
+        for g in &c.fusion.groups {
+            let stats: Vec<&String> = g.units.iter().filter(|u| u.ends_with(" stats")).collect();
+            for st in stats {
+                let apply = st.replace(" stats", " apply");
+                assert!(!g.units.contains(&apply), "{st} and {apply} share a launch");
+            }
+        }
+    }
+}
+
+fn run_schedule(name: &str, fuse: bool) -> Vec<f32> {
+    use specrt::vae::run::Runner;
+    let vae = HostVae::open(&fixture(&format!("{name}/vae"))).unwrap();
+    let (first, steady) = (compiled(name, fuse, true), compiled(name, fuse, false));
+    let mut frame = 0;
+    let out = vae
+        .decode_with(&latent(name), &mut |x, s| {
+            let c = if frame == 0 { &first } else { &steady };
+            frame += 1;
+            Runner { vae: &vae, compiled: c }.run(x, s)
+        })
+        .unwrap();
+    out.to_channels_first()
+}
+
+#[test]
+fn the_fused_schedule_decodes_exactly_like_the_unfused_one() {
+    for name in ["tiny-flux2-klein", "tiny-wan21"] {
+        let fused = run_schedule(name, true);
+        let plain = run_schedule(name, false);
+        assert_eq!(fused, plain, "{name}");
+        let (want, _) = reference(name, "vae.decoded");
+        assert!(max_abs(&fused, &want) < 1e-4, "{name}");
+    }
+}
+
+#[test]
+fn the_arena_is_the_peak_of_live_values_and_offsets_never_overlap() {
+    use specrt::vae::compile::lifetimes;
+    for (name, first) in [("tiny-flux2-klein", true), ("tiny-wan21", true), ("tiny-wan21", false)] {
+        for fuse in [false, true] {
+            let c = compiled(name, fuse, first);
+            let a = &c.arena;
+            assert!(a.size >= a.peak && a.peak > 0, "{name}");
+            let life = lifetimes(&c.schedule);
+            for (v, (o, s)) in &a.offsets {
+                for (w, (p, t)) in &a.offsets {
+                    let (x, y) = (life[v], life[w]);
+                    if v < w && x.0 <= y.1 && y.0 <= x.1 {
+                        assert!(o + s <= *p || p + t <= *o, "{name}: values {v} and {w} overlap in the arena");
+                    }
+                }
+            }
+        }
+        assert!(compiled(name, true, first).arena.peak <= compiled(name, false, first).arena.peak, "fusion never grows the arena");
+    }
+    let c = compiled("tiny-flux2-klein", true, true);
+    let top = 32 * 32 * 16 * 4;
+    assert!(c.arena.peak >= 2 * top as u64 && c.arena.peak < 8 * top as u64, "{}", c.arena.peak);
+}
+
+#[test]
+fn the_tile_size_is_the_largest_whose_arena_fits_the_budget() {
+    use specrt::vae::tiled::{arena_bytes, choose};
+    let p = load_plan(&fixture("tiny-flux2-klein/vae")).unwrap();
+    let t = kir::Target::sm_120();
+    let full = arena_bytes(&p, &t, 128, 128).unwrap();
+    assert_eq!(choose(&p, &t, 128, 128, full, 8, 0.25).unwrap(), None);
+    let budget = arena_bytes(&p, &t, 40, 40).unwrap();
+    let tiling = choose(&p, &t, 128, 128, budget, 8, 0.25).unwrap().unwrap();
+    assert_eq!(tiling.tile, 40);
+    assert!(arena_bytes(&p, &t, 48, 48).unwrap() > budget);
+    assert_eq!(tiling.overlap, 10);
+    assert!(choose(&p, &t, 128, 128, 1024, 8, 0.25).is_err());
+    let w = load_plan(&fixture("tiny-wan21/vae")).unwrap();
+    assert!(arena_bytes(&w, &t, 60, 104).unwrap() > arena_bytes(&w, &t, 30, 52).unwrap());
+}
+
+const DIFFUSERS_TILED_PSNR: f64 = 18.1;
+
+#[test]
+fn tiled_and_untiled_decodes_agree_within_the_seam_tolerance() {
+    use specrt::vae::tiled::{Tiling, decode_tiled};
+    let vae = HostVae::open(&fixture("tiny-flux2-klein/vae")).unwrap();
+    let l = latent("tiny-flux2-klein");
+    let whole = vae.decode(&l).unwrap();
+    let tiling = Tiling { tile: 12, overlap: 8 };
+    let mut tiles = 0;
+    let tiled = decode_tiled(&l, 2, tiling, &mut |x| {
+        tiles += 1;
+        vae.decode(x)
+    })
+    .unwrap();
+    assert_eq!(tiles, 4);
+    let (a, b) = (whole.to_channels_first(), tiled.to_channels_first());
+    let (err, db) = (max_abs(&a, &b), psnr(&a, &b));
+    eprintln!("tiled 12 overlap 8 against untiled: max abs {err:e}, PSNR {db:.1} dB");
+    assert!(db > DIFFUSERS_TILED_PSNR + 2.0 && err < 0.6, "seams: max abs {err}, PSNR {db}");
+    let one = decode_tiled(&l, 2, Tiling { tile: 16, overlap: 4 }, &mut |x| vae.decode(x)).unwrap();
+    assert_eq!(one.to_channels_first(), a, "a single tile is the untiled decode");
+}
