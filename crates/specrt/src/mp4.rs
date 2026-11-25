@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, RateControlMode, UsageType};
+use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, UsageType};
 use openh264::formats::{RgbSliceU8, YUVBuffer};
 
 pub const TIMESCALE: u32 = 90000;
@@ -49,7 +49,7 @@ pub fn encode(frames: &[Vec<u8>], width: usize, height: usize, fps: u32) -> Resu
     ensure!(fps > 0, "fps must be at least 1");
     ensure!(width >= 2 && height >= 2 && width.is_multiple_of(2) && height.is_multiple_of(2), "H.264 needs an even frame size, not {width}x{height}");
     let bps = ((width * height) as u64 * u64::from(fps) * 4).min(u64::from(u32::MAX)) as u32;
-    let config = EncoderConfig::new().bitrate(BitRate::from_bps(bps)).max_frame_rate(FrameRate::from_hz(fps as f32)).usage_type(UsageType::CameraVideoRealTime).rate_control_mode(RateControlMode::Quality).skip_frames(false);
+    let config = EncoderConfig::new().bitrate(BitRate::from_bps(bps)).max_frame_rate(FrameRate::from_hz(fps as f32)).usage_type(UsageType::CameraVideoRealTime).skip_frames(false);
     let mut enc = Encoder::with_api_config(openh264::OpenH264API::from_source(), config).context("open the H.264 encoder")?;
     let mut stream = Stream { width, height, fps, sps: Vec::new(), pps: Vec::new(), samples: Vec::new() };
     for (i, rgb) in frames.iter().enumerate() {
