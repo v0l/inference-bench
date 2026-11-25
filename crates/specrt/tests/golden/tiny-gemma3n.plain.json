@@ -1,0 +1,1110 @@
+{
+  "name": "gemma3n_text",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 128,
+    "intermediate": 256,
+    "vocab": 512,
+    "tie_embeddings": true,
+    "embed_scale": 11.313708498984761,
+    "logit_softcap": 30.0
+  },
+  "layers": {
+    "count": 4,
+    "pattern": [
+      "sliding",
+      "full"
+    ],
+    "window": 16,
+    "shared_tail": 2
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 1e-6,
+    "sandwich": true
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 4,
+    "kv_heads": 1,
+    "head_dim": 32,
+    "qkv_bias": false,
+    "qk_norm": false,
+    "node": [
+      {
+        "op": "kernel",
+        "kernel": "g4_q_norm_s",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "q_norm.weight",
+            "len": "hd_s"
+          },
+          "x": {
+            "buffer": "qkv"
+          }
+        },
+        "layers": [
+          "sliding"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_k_norm_s",
+        "grid": [
+          "kvh_s",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "k_norm.weight",
+            "len": "hd_s"
+          },
+          "x": {
+            "buffer": "qkv"
+          }
+        },
+        "when": "kv_owner",
+        "layers": [
+          "sliding"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_v_norm_s",
+        "grid": [
+          "kvh_s",
+          "rows"
+        ],
+        "bind": {
+          "x": {
+            "buffer": "qkv"
+          }
+        },
+        "when": "kv_owner",
+        "layers": [
+          "sliding"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_q_rope_s",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "x": {
+            "buffer": "qkv"
+          }
+        },
+        "layers": [
+          "sliding"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_k_rope_s",
+        "grid": [
+          "kvh_s",
+          "rows"
+        ],
+        "bind": {
+          "x": {
+            "buffer": "qkv"
+          }
+        },
+        "when": "kv_owner",
+        "layers": [
+          "sliding"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_k_write_s",
+        "grid": [
+          "kvh_s",
+          "rows"
+        ],
+        "bind": {
+          "dst": {
+            "state": "k_s"
+          },
+          "layer": "kind_layer",
+          "src": {
+            "buffer": "qkv"
+          }
+        },
+        "when": "kv_owner",
+        "layers": [
+          "sliding"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_v_write_s",
+        "grid": [
+          "kvh_s",
+          "rows"
+        ],
+        "bind": {
+          "dst": {
+            "state": "v_s"
+          },
+          "layer": "kind_layer",
+          "src": {
+            "buffer": "qkv"
+          }
+        },
+        "when": "kv_owner",
+        "layers": [
+          "sliding"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_attn_s",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "k_cache": {
+            "state": "k_s"
+          },
+          "layer": "kind_layer",
+          "v_cache": {
+            "state": "v_s"
+          },
+          "window": "window"
+        },
+        "layers": [
+          "sliding"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_q_norm_g",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "q_norm.weight",
+            "len": "hd_g"
+          },
+          "x": {
+            "buffer": "qkv"
+          }
+        },
+        "layers": [
+          "full"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_k_norm_g",
+        "grid": [
+          "kvh_g",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "k_norm.weight",
+            "len": "hd_g"
+          },
+          "x": {
+            "buffer": "qkv"
+          }
+        },
+        "when": "kv_owner",
+        "layers": [
+          "full"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_v_norm_g",
+        "grid": [
+          "kvh_g",
+          "rows"
+        ],
+        "bind": {
+          "x": {
+            "buffer": "qkv"
+          }
+        },
+        "when": "kv_owner",
+        "layers": [
+          "full"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_q_rope_g",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "x": {
+            "buffer": "qkv"
+          }
+        },
+        "layers": [
+          "full"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_k_rope_g",
+        "grid": [
+          "kvh_g",
+          "rows"
+        ],
+        "bind": {
+          "x": {
+            "buffer": "qkv"
+          }
+        },
+        "when": "kv_owner",
+        "layers": [
+          "full"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_k_write_g",
+        "grid": [
+          "kvh_g",
+          "rows"
+        ],
+        "bind": {
+          "dst": {
+            "state": "k_g"
+          },
+          "layer": "kind_layer",
+          "src": {
+            "buffer": "qkv"
+          }
+        },
+        "when": "kv_owner",
+        "layers": [
+          "full"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_v_write_g",
+        "grid": [
+          "kvh_g",
+          "rows"
+        ],
+        "bind": {
+          "dst": {
+            "state": "v_g"
+          },
+          "layer": "kind_layer",
+          "src": {
+            "buffer": "qkv"
+          }
+        },
+        "when": "kv_owner",
+        "layers": [
+          "full"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_attn_g",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "k_cache": {
+            "state": "k_g"
+          },
+          "layer": "kind_layer",
+          "v_cache": {
+            "state": "v_g"
+          }
+        },
+        "layers": [
+          "full"
+        ]
+      }
+    ],
+    "params": {
+      "angles_g": 16.0,
+      "angles_s": 16.0,
+      "hd_g": 32.0,
+      "hd_s": 32.0,
+      "heads_n": 4.0,
+      "k_eq_v": 0.0,
+      "k_w": 32.0,
+      "kv_w": 32.0,
+      "kvh_g": 1.0,
+      "kvh_global": 1.0,
+      "kvh_s": 1.0,
+      "q_w": 128.0,
+      "rotary_g": 1.0,
+      "theta_g": 1000000.0,
+      "theta_s": 10000.0,
+      "v_w": 32.0
+    },
+    "projection": [
+      {
+        "tensor": "q_proj",
+        "rows": "heads * hd_s",
+        "layers": [
+          "sliding"
+        ],
+        "slot": "q_w"
+      },
+      {
+        "tensor": "q_proj",
+        "rows": "heads * hd_g",
+        "layers": [
+          "full"
+        ],
+        "slot": "q_w"
+      },
+      {
+        "tensor": "k_proj",
+        "rows": "kvh_s * hd_s",
+        "kv_owner": true,
+        "layers": [
+          "sliding"
+        ],
+        "slot": "k_w"
+      },
+      {
+        "tensor": "k_proj",
+        "rows": "kvh_g * hd_g",
+        "kv_owner": true,
+        "layers": [
+          "full"
+        ],
+        "slot": "k_w"
+      },
+      {
+        "tensor": "v_proj",
+        "rows": "kvh_s * hd_s",
+        "kv_owner": true,
+        "layers": [
+          "sliding"
+        ],
+        "slot": "v_w"
+      },
+      {
+        "tensor": "v_proj",
+        "rows": "kvh_g * hd_g",
+        "kv_owner": true,
+        "layers": [
+          "full"
+        ],
+        "slot": "v_w",
+        "when": "!k_eq_v"
+      },
+      {
+        "tensor": "k_proj",
+        "rows": "kvh_g * hd_g",
+        "kv_owner": true,
+        "layers": [
+          "full"
+        ],
+        "slot": "v_w",
+        "when": "k_eq_v"
+      }
+    ],
+    "o_cols": "q_w",
+    "o_cols_by": [
+      {
+        "layers": [
+          "sliding"
+        ],
+        "cols": "heads * hd_s"
+      },
+      {
+        "layers": [
+          "full"
+        ],
+        "cols": "heads * hd_g"
+      }
+    ]
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 1000000.0,
+    "local_theta": 10000.0
+  },
+  "mlp": {
+    "activation": "geglu",
+    "stored_gate_up": true
+  },
+  "gated_residual": {
+    "streams": 4,
+    "module": ".",
+    "sites": [
+      "."
+    ],
+    "params": {
+      "laurel_rank": 8.0
+    },
+    "layer_params": {
+      "sparse_cut": [
+        1.644853625133699,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "sparse_on": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "scratch": {
+      "a1": "hidden",
+      "a2": "hidden",
+      "a3": "hidden",
+      "laurel_hi": "hidden",
+      "laurel_lo": "laurel_rank",
+      "mod": "hc_streams",
+      "pred": "hc_width"
+    },
+    "final_norm": true,
+    "node": [
+      {
+        "op": "expand",
+        "kernel": "g3n_alt_proj",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "altup_projections.0.weight",
+            "len": "hidden * hidden"
+          },
+          "x": {
+            "buffer": "x"
+          },
+          "y": {
+            "buffer": "a1"
+          }
+        }
+      },
+      {
+        "op": "expand",
+        "kernel": "g3n_alt_proj",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "altup_projections.1.weight",
+            "len": "hidden * hidden"
+          },
+          "x": {
+            "buffer": "x"
+          },
+          "y": {
+            "buffer": "a2"
+          }
+        }
+      },
+      {
+        "op": "expand",
+        "kernel": "g3n_alt_proj",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "altup_projections.2.weight",
+            "len": "hidden * hidden"
+          },
+          "x": {
+            "buffer": "x"
+          },
+          "y": {
+            "buffer": "a3"
+          }
+        }
+      },
+      {
+        "op": "expand",
+        "kernel": "g3n_expand",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "a1": {
+            "buffer": "a1"
+          },
+          "a2": {
+            "buffer": "a2"
+          },
+          "a3": {
+            "buffer": "a3"
+          },
+          "streams": {
+            "buffer": "streams"
+          },
+          "x": {
+            "buffer": "x"
+          }
+        }
+      },
+      {
+        "op": "predict",
+        "kernel": "g3n_router_s",
+        "grid": [
+          "hc_streams",
+          "rows"
+        ],
+        "bind": {
+          "m": {
+            "buffer": "mod"
+          },
+          "n": {
+            "weight": "altup.router_norm.weight",
+            "len": "hidden"
+          },
+          "w": {
+            "weight": "altup.modality_router.weight",
+            "len": "hc_streams * hidden"
+          },
+          "x": {
+            "buffer": "streams"
+          }
+        }
+      },
+      {
+        "op": "predict",
+        "kernel": "g3n_predict",
+        "grid": [
+          "hc_streams",
+          "rows"
+        ],
+        "bind": {
+          "m": {
+            "buffer": "mod"
+          },
+          "p": {
+            "weight": "altup.prediction_coefs.weight",
+            "len": "hc_streams * hc_streams * hc_streams"
+          },
+          "pred": {
+            "buffer": "pred"
+          },
+          "s": {
+            "buffer": "streams"
+          }
+        }
+      },
+      {
+        "op": "predict",
+        "kernel": "g3n_take",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "pred": {
+            "buffer": "pred"
+          },
+          "x": {
+            "buffer": "x"
+          }
+        }
+      },
+      {
+        "op": "laurel",
+        "kernel": "g3n_laurel_left",
+        "grid": [
+          "laurel_rank",
+          "rows"
+        ],
+        "bind": {
+          "lo": {
+            "buffer": "laurel_lo"
+          },
+          "n": {
+            "weight": "input_layernorm.weight",
+            "len": "hidden"
+          },
+          "w": {
+            "weight": "laurel.linear_left.weight",
+            "len": "laurel_rank * hidden"
+          },
+          "x": {
+            "buffer": "x"
+          }
+        }
+      },
+      {
+        "op": "laurel",
+        "kernel": "g3n_laurel_right",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "laurel.linear_right.weight",
+            "len": "hidden * laurel_rank"
+          },
+          "x": {
+            "buffer": "laurel_lo"
+          },
+          "y": {
+            "buffer": "laurel_hi"
+          }
+        }
+      },
+      {
+        "op": "laurel_add",
+        "kernel": "g3n_laurel_add",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "lr": {
+            "buffer": "laurel_hi"
+          },
+          "n": {
+            "weight": "input_layernorm.weight",
+            "len": "hidden"
+          },
+          "pn": {
+            "weight": "laurel.post_laurel_norm.weight",
+            "len": "hidden"
+          },
+          "pred": {
+            "buffer": "pred"
+          },
+          "x": {
+            "buffer": "x"
+          },
+          "xin": {
+            "buffer": "x"
+          }
+        }
+      },
+      {
+        "op": "act",
+        "kernel": "g3n_act",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "act_hi": {
+            "buffer": "act_hi"
+          },
+          "act_lo": {
+            "buffer": "act_lo"
+          },
+          "cut": "sparse_cut",
+          "gate": {
+            "buffer": "gate_up"
+          },
+          "on": "sparse_on"
+        }
+      },
+      {
+        "op": "correct",
+        "kernel": "g3n_router_x",
+        "grid": [
+          "hc_streams",
+          "rows"
+        ],
+        "bind": {
+          "m": {
+            "buffer": "mod"
+          },
+          "n": {
+            "weight": "altup.router_norm.weight",
+            "len": "hidden"
+          },
+          "w": {
+            "weight": "altup.modality_router.weight",
+            "len": "hc_streams * hidden"
+          },
+          "x": {
+            "buffer": "x"
+          }
+        }
+      },
+      {
+        "op": "correct",
+        "kernel": "g3n_correct",
+        "grid": [
+          "hc_streams",
+          "rows"
+        ],
+        "bind": {
+          "c": {
+            "weight": "altup.correction_coefs.weight",
+            "len": "hc_streams * hc_streams"
+          },
+          "m": {
+            "buffer": "mod"
+          },
+          "pred": {
+            "buffer": "pred"
+          },
+          "streams": {
+            "buffer": "streams"
+          },
+          "x": {
+            "buffer": "x"
+          }
+        }
+      },
+      {
+        "op": "collapse",
+        "kernel": "g3n_unembed_1",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "altup_unembed_projections.0.weight",
+            "len": "hidden * hidden"
+          },
+          "x": {
+            "buffer": "streams"
+          },
+          "y": {
+            "buffer": "a1"
+          }
+        }
+      },
+      {
+        "op": "collapse",
+        "kernel": "g3n_unembed_2",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "altup_unembed_projections.1.weight",
+            "len": "hidden * hidden"
+          },
+          "x": {
+            "buffer": "streams"
+          },
+          "y": {
+            "buffer": "a2"
+          }
+        }
+      },
+      {
+        "op": "collapse",
+        "kernel": "g3n_unembed_3",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "altup_unembed_projections.2.weight",
+            "len": "hidden * hidden"
+          },
+          "x": {
+            "buffer": "streams"
+          },
+          "y": {
+            "buffer": "a3"
+          }
+        }
+      },
+      {
+        "op": "collapse",
+        "kernel": "g3n_collapse",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "streams": {
+            "buffer": "streams"
+          },
+          "u1": {
+            "buffer": "a1"
+          },
+          "u2": {
+            "buffer": "a2"
+          },
+          "u3": {
+            "buffer": "a3"
+          },
+          "x": {
+            "buffer": "x"
+          }
+        }
+      }
+    ]
+  },
+  "per_layer": {
+    "dim": 16,
+    "params": {
+      "ple_dim": 16.0,
+      "ple_embed_scale": 4.0,
+      "ple_layers": 4.0,
+      "ple_mix_scale": 0.7071067811865476,
+      "ple_one": 1.0,
+      "ple_proj_scale": 0.08838834764831843,
+      "ple_vocab": 384.0,
+      "ple_width": 64.0
+    },
+    "scratch": {
+      "ple": "ple_width",
+      "ple_gate": "ple_dim",
+      "ple_out": "ple_dim",
+      "ple_proj": "ple_width",
+      "ple_x": "hidden"
+    },
+    "node": [
+      {
+        "op": "head",
+        "kernel": "g4_ple_proj",
+        "grid": [
+          "ple_one",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "per_layer_model_projection.weight",
+            "len": "ple_width * hidden"
+          },
+          "x": {
+            "buffer": "x"
+          },
+          "y": {
+            "buffer": "ple_proj"
+          }
+        }
+      },
+      {
+        "op": "head",
+        "kernel": "g3n_ple_mix",
+        "grid": [
+          "ple_layers",
+          "rows"
+        ],
+        "bind": {
+          "idx": {
+            "buffer": "tokens"
+          },
+          "ple": {
+            "buffer": "ple"
+          },
+          "proj": {
+            "buffer": "ple_proj"
+          },
+          "table": {
+            "weight": "embed_tokens_per_layer.weight",
+            "len": "ple_vocab * ple_width"
+          },
+          "w": {
+            "weight": "per_layer_projection_norm.weight",
+            "len": "ple_dim"
+          }
+        }
+      },
+      {
+        "op": "layer",
+        "kernel": "g3n_scaled",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "streams": {
+            "buffer": "streams"
+          },
+          "w": {
+            "weight": "altup.correct_output_scale",
+            "len": "hidden"
+          },
+          "x": {
+            "buffer": "ple_x"
+          }
+        }
+      },
+      {
+        "op": "layer",
+        "kernel": "g4_ple_gate",
+        "grid": [
+          "ple_one",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "per_layer_input_gate.weight",
+            "len": "ple_dim * hidden"
+          },
+          "x": {
+            "buffer": "ple_x"
+          },
+          "y": {
+            "buffer": "ple_gate"
+          }
+        }
+      },
+      {
+        "op": "layer",
+        "kernel": "g4_ple_act",
+        "grid": [
+          "ple_one",
+          "rows"
+        ],
+        "bind": {
+          "gate": {
+            "buffer": "ple_gate"
+          },
+          "gp": {
+            "buffer": "ple_gate"
+          },
+          "layer": "layer",
+          "ple": {
+            "buffer": "ple"
+          }
+        }
+      },
+      {
+        "op": "layer",
+        "kernel": "g4_ple_out",
+        "grid": [
+          "ple_one",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "per_layer_projection.weight",
+            "len": "ple_dim * hidden"
+          },
+          "x": {
+            "buffer": "ple_gate"
+          },
+          "y": {
+            "buffer": "ple_out"
+          }
+        }
+      },
+      {
+        "op": "layer",
+        "kernel": "g3n_ple_add",
+        "grid": [
+          "hc_streams - 1",
+          "rows"
+        ],
+        "bind": {
+          "pout": {
+            "buffer": "ple_out"
+          },
+          "sin": {
+            "buffer": "streams"
+          },
+          "streams": {
+            "buffer": "streams"
+          },
+          "w": {
+            "weight": "post_per_layer_input_norm.weight",
+            "len": "hidden"
+          }
+        }
+      }
+    ]
+  },
+  "state": [
+    {
+      "name": "k_s",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "kvh_s",
+        "hd_s"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional",
+      "blocks": [
+        "sliding"
+      ]
+    },
+    {
+      "name": "v_s",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "kvh_s",
+        "hd_s"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional",
+      "blocks": [
+        "sliding"
+      ]
+    },
+    {
+      "name": "k_g",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "kvh_g",
+        "hd_g"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional",
+      "blocks": [
+        "full"
+      ]
+    },
+    {
+      "name": "v_g",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "kvh_g",
+        "hd_g"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional",
+      "blocks": [
+        "full"
+      ]
+    }
+  ],
+  "tensors": {
+    ".experts.": ".mlp.experts.",
+    ".router.": ".mlp.router.",
+    "mlp.experts.down_proj": "mlp.experts.down_proj.weight",
+    "mlp.experts.gate_up_proj": "mlp.experts.gate_up_proj.weight"
+  },
+  "plain_activations": true
+}

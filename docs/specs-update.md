@@ -64,7 +64,7 @@ update lands.
 ## Specs for a newer engine
 
 A spec may set `min_engine`, a whole number that defaults to 0. The engine reads specs up to
-`SPEC_FORMAT` (`crates/specrt/src/spec.rs`, currently 15: 15 added the family `[quantization] per_tensor` (a MIXED_PRECISION checkpoint served from its `quant_map`) and `family-glm5_next.toml`, 14 added the per tensor `quant_map` and the family `[[quantization.tensor_rules]]`, 9 added `[[attention.node]]` and `[attention.params]`, 2 added hybrid linear attention, 3 added `quant = "fp8_block128"`, 4 added `quant = "fp8_channel"` and `[mlp] quant = "nvfp4_g16"` with `quant_until`, 8 added the family `[gguf]` name maps, `v_heads` and hybrid GGUF keys). A spec with a higher `min_engine` is
+`SPEC_FORMAT` (`crates/specrt/src/spec.rs`, currently 16: 16 added the family `[gated_residual] layer_params` and `final_norm`, tagged gated nodes and `[mlp] stored_gate_up` (`family-gemma3n.toml`), 15 added the family `[quantization] per_tensor` (a MIXED_PRECISION checkpoint served from its `quant_map`) and `family-glm5_next.toml`, 14 added the per tensor `quant_map` and the family `[[quantization.tensor_rules]]`, 9 added `[[attention.node]]` and `[attention.params]`, 2 added hybrid linear attention, 3 added `quant = "fp8_block128"`, 4 added `quant = "fp8_channel"` and `[mlp] quant = "nvfp4_g16"` with `quant_until`, 8 added the family `[gguf]` name maps, `v_heads` and hybrid GGUF keys). A spec with a higher `min_engine` is
 listed with "needs a newer inference-bench" and cannot be loaded; the app never tries to parse the
 parts it does not know. When a spec needs an engine change, raise `SPEC_FORMAT` in the same commit
 and set `min_engine` in the spec to the new value, so older apps skip it instead of failing.
