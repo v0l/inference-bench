@@ -305,13 +305,13 @@ pub fn joint_kernels() -> String {
     format!(
         r#"extern "C" __global__ void vis_axis_rope(const float* qkv, const float* qw_text, const float* kw_text, const float* qw_image, const float* kw_image,
                                          const float* cosv, const float* sinv, bf16_t* planes, int tokens, int heads, int head_dim,
-                                         int row_stride, int text_rows, float eps) {{
+                                         int row_stride, int text_rows, float eps, int seq_rows) {{
     __shared__ float red[32];
     int tok = blockIdx.x;
     int h = blockIdx.y;
     size_t plane = (size_t)heads * tokens * AT_HDP;
     size_t dst = ((size_t)h * tokens + tok) * AT_HDP;
-    bool text = tok < text_rows;
+    bool text = tok % seq_rows < text_rows;
     for (int part = 0; part < 3; part++) {{
         const float* src = qkv + (size_t)tok * row_stride + (size_t)part * heads * head_dim + (size_t)h * head_dim;
         const float* w = part == 0 ? (text ? qw_text : qw_image) : (text ? kw_text : kw_image);

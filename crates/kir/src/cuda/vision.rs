@@ -35,3 +35,29 @@ pub fn emit_vision(k: &VisionKernel) -> Result<crate::KirSource, VisionError> {
     }
     Ok(crate::KirSource::emitted(out))
 }
+
+pub fn step_gemm(k: &VisionKernel, rule: &crate::expr::Expr) -> Result<String, VisionError> {
+    let bad = |s: String| VisionError(format!("vision step gemm: {s}"));
+    let mut names = Vec::new();
+    rule.names(&mut names);
+    if let Some(n) = names.iter().find(|n| !["x", "v", "s0", "s1"].contains(&n.as_str())) {
+        return Err(bad(format!("the epilogue rule names {n:?}; it reads x, v, s0 and s1")));
+    }
+    let raw = |n: &str| Some(crate::expr::Expr::Raw(format!("st_{n}")));
+    let body = rule.subst(&raw).and_then(|e| e.lower(crate::layout::Dialect::Cuda, &[])).map_err(bad)?;
+    let plain = kernels::gemm_kernel(k);
+    let start = plain.find("extern \"C\"").ok_or_else(|| bad("no kernel entry".into()))?;
+    let resid = "                    if (resid) {\n                        v0 += resid[at];\n                        v1 += resid[at + 1];\n                    }\n";
+    let step = "                    v0 = gm_step(out[at], v0, resid[0], resid[1]);\n                    v1 = gm_step(out[at + 1], v1, resid[0], resid[1]);\n";
+    let text = &plain[start..];
+    if !text.contains(resid) || !text.contains(" vis_mma(") {
+        return Err(bad("the gemm store has no residual slot".into()));
+    }
+    Ok(format!("__device__ __forceinline__ float gm_step(float st_x, float st_v, float st_s0, float st_s1) {{\n    return {body};\n}}\n\n{}", text.replace(" vis_mma(", " vis_mma_step(").replace(resid, step)))
+}
+
+pub fn emit_vision_step(k: &VisionKernel, rule: &crate::expr::Expr) -> Result<crate::KirSource, VisionError> {
+    let mut out = emit_vision(k)?.into_string();
+    out += &step_gemm(k, rule)?;
+    Ok(crate::KirSource::emitted(out))
+}

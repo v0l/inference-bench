@@ -1194,8 +1194,8 @@ pub fn denoiser_fusion(graph: &crate::denoiser::DenoiserGraph, dspec: &crate::de
 
 fn split_streams(units: &mut [Unit]) {
     let tag = |t: &mut Tensor| {
-        if let (Place::Local(n), Rows::Image | Rows::Text) = (&t.place, t.rows) {
-            t.place = Place::Local(format!("{n} {}", if t.rows == Rows::Image { "image" } else { "text" }));
+        if let (Place::Local(n), Rows::Image | Rows::Text | Rows::Latent) = (&t.place, t.rows) {
+            t.place = Place::Local(format!("{n} {}", if t.rows == Rows::Text { "text" } else { "image" }));
         }
     };
     let mut joint: BTreeSet<String> = BTreeSet::new();
