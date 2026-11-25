@@ -279,6 +279,17 @@ pub fn describe(m: &crate::library::LocalModel) -> Result<Described, String> {
     }
 }
 
+pub fn as_served(m: &crate::library::LocalModel, d: &mut Described) {
+    if m.format != crate::library::Format::Safetensors {
+        return;
+    }
+    let Some(served) = std::fs::read_to_string(m.path.join("config.json")).ok().and_then(|t| specrt::spec::Spec::from_hf_config_serving(&t).ok()) else { return };
+    let mtp = if served.speculative().is_some() { d.anatomy.mtp_layers } else { 0 };
+    d.spec.mtp = served.mtp;
+    d.spec.mixer = served.mixer;
+    d.anatomy = ModelAnatomy::new(&d.spec, mtp, Some(d.anatomy.max_context));
+}
+
 pub fn describe_hf_config(name: &str, text: &str, mtp: usize, ctx: Option<usize>) -> Result<Described, String> {
     let mut spec = specrt::spec::Spec::describe_hf_config(text).map_err(|e| format!("{e:#}"))?;
     spec.name = name.to_string();

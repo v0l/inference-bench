@@ -3111,6 +3111,54 @@ fn the_server_tab_lists_saved_sessions_with_restore_strip_and_delete() {
     h.get_by_label("no saved sessions");
 }
 
+fn glm5_dialog_at(name: &str, size: egui::Vec2) -> Harness<'static, App> {
+    let mut h = harness_at(name, Tab::Models, size);
+    let free: u64 = (92.7 * (1u64 << 30) as f64) as u64;
+    let gpu = |uuid: &str| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: (96 << 30) - free, total_bytes: 96 << 30, util_percent: None, uuid: uuid.into(), own_bytes: 0, display: false, index: None };
+    {
+        let app = h.state_mut();
+        app.gpu = vec![gpu("GPU-fake-0"), gpu("GPU-fake-1")];
+        app.gpu_at = Some(Instant::now() + Duration::from_secs(600));
+        app.gpu_poll = Default::default();
+        let mut m = specrt::hardware::fake_gpus("desk", 2, true);
+        for g in &mut m.gpus {
+            g.free_bytes = free;
+        }
+        app.hardware.machine = Some(m);
+    }
+    let d = dir(&format!("{name}-model"));
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::copy(fixtures().join("glm5.3-flash.config.json"), d.join("config.json")).unwrap();
+    let mut m = model("GLM-5.3-Flash-FP4-Abliterated", true, "glm5_next");
+    (m.path, m.root) = (d.clone(), d);
+    (m.repo, m.architecture, m.quant, m.size_bytes) = ("Piecrust/GLM-5.3-Flash-FP4-Abliterated".into(), "Glm5NextForConditionalGeneration".into(), "MODELOPT".into(), 166_400_000_000);
+    m.context_length = None;
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().open_load_dialog(&m);
+    h.state_mut().load.as_mut().unwrap().ctx = 8192;
+    h.run();
+    h
+}
+
+#[test]
+fn glm5_flash_plans_across_two_cards_with_no_mtp_ticked() {
+    let mut h = glm5_dialog_at("glm5-two", egui::vec2(1280.0, 800.0));
+    let d = h.state().load.as_ref().unwrap();
+    assert!(d.view.as_ref().unwrap().spec.speculative().is_none(), "the engine refuses MTP for this family");
+    let solved = d.solved.clone().expect("a plan").unwrap_or_else(|e| panic!("{e}"));
+    assert!(!solved.mtp, "the plan turns MTP on");
+    assert_eq!(solved.placement.stages.len(), 2, "{}", solved.placement.render());
+    assert!(h.query_by_label_contains("does not fit").is_none());
+    assert!(h.query_by_label("mtp").is_none(), "the MTP row is shown in the common options");
+    assert!(!click_load_node(&mut h));
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    h.render().unwrap().save(out.join("glm5-load-1280x800.png")).unwrap();
+    let mut phone = glm5_dialog_at("glm5-phone", egui::vec2(390.0, 844.0));
+    phone.run();
+    phone.render().unwrap().save(out.join("glm5-load-390x844.png")).unwrap();
+}
+
 fn two_gpu_27b_dialog(name: &str) -> Harness<'static, App> {
     two_gpu_27b_dialog_at(name, egui::vec2(1280.0, 800.0))
 }
