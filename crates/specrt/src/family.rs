@@ -359,6 +359,40 @@ impl Default for FamilyNorm {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct FamilyStream {
+    pub name: String,
+    pub width: String,
+    pub mask: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyInputs {
+    pub streams: Vec<FamilyStream>,
+    pub params: std::collections::BTreeMap<String, ParamSource>,
+    pub scratch: std::collections::BTreeMap<String, String>,
+    pub node: Vec<crate::graph::Node>,
+}
+
+impl FamilyInputs {
+    pub fn read(&self, config: &serde_json::Value) -> Result<Option<crate::spec::Inputs>> {
+        if self.node.is_empty() {
+            return Ok(None);
+        }
+        let streams = self
+            .streams
+            .iter()
+            .map(|s| {
+                let width = dotted(config, &s.width).and_then(|v| v.as_u64()).with_context(|| format!("[[inputs.streams]] {} reads width {}, which the config does not hold", s.name, s.width))? as usize;
+                Ok(crate::spec::InputStream { name: s.name.clone(), width, mask: s.mask.clone() })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(crate::spec::Inputs { streams, params: read_params(&self.params, config)?, scratch: self.scratch.clone(), node: self.node.clone() }))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FamilyRefuse {
     pub when: String,
     pub message: String,
@@ -771,6 +805,8 @@ pub struct Family {
     pub min_engine: u32,
     #[serde(default)]
     pub extends: Option<String>,
+    #[serde(default)]
+    pub text_config: Option<String>,
     #[serde(default, rename = "match")]
     pub matches: Match,
     #[serde(default)]
@@ -824,6 +860,8 @@ pub struct Family {
     #[serde(default)]
     pub block_residual: FamilyBlockResidual,
     #[serde(default)]
+    pub inputs: FamilyInputs,
+    #[serde(default)]
     pub tensors: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub refuse: Vec<FamilyRefuse>,
@@ -846,7 +884,13 @@ impl Family {
                 push(a, &mut out);
             }
         }
-        for (_, key) in self.attention.params.iter().chain(self.mixer.params.iter()).chain(self.gated_residual.params.iter()).chain(self.per_layer.params.iter()).chain(self.prelude.params.iter()) {
+        if let Some(k) = self.text_config.as_deref() {
+            push(k, &mut out);
+        }
+        for s in &self.inputs.streams {
+            push(&s.width, &mut out);
+        }
+        for (_, key) in self.attention.params.iter().chain(self.mixer.params.iter()).chain(self.inputs.params.iter()).chain(self.gated_residual.params.iter()).chain(self.per_layer.params.iter()).chain(self.prelude.params.iter()) {
             match key {
                 ParamSource::Config { config, alt, .. } => {
                     push(config, &mut out);

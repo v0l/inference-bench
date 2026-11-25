@@ -253,7 +253,7 @@ fn the_lm_sub_config_is_a_qwen3_5_spec_the_engine_accepts_and_the_wrapper_is_ref
         assert_eq!(full * 4, spec.layers.pattern.len());
         assert_eq!(*spec.layers.pattern.last().unwrap(), Block::Full);
         assert!(spec.layers.pattern.iter().all(|b| b.is_linear() || *b == Block::Full));
-        assert!(Spec::from_hf_config(&config.to_string()).is_err(), "model_type haru has no family yet");
+        assert!(Spec::from_hf_config(&config.to_string()).is_err(), "model_type haru is refused until the whole chain runs");
     }
     let real = Spec::from_hf_config(&real_config()["lm"].to_string()).unwrap();
     assert_eq!((real.dims.hidden, real.dims.vocab, real.layers.count, real.attention.head_dim), (2560, 248320, 32, 256));
@@ -387,6 +387,80 @@ fn the_codec_streaming_state_is_a_fixed_tail_per_layer() {
     }
     let frame: usize = real_config()["codec"]["ratios"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).product();
     assert_eq!(frame, real_config()["frame_samples"].as_u64().unwrap() as usize);
+}
+
+fn unrefused() -> specrt::family::Registry {
+    let texts: Vec<String> = specrt::spec::EMBEDDED
+        .iter()
+        .map(|(_, text)| {
+            let mut table: toml::Table = toml::from_str(text).unwrap();
+            if table.get("name").and_then(|n| n.as_str()) == Some("haru") {
+                table.remove("refuse");
+            }
+            table.to_string()
+        })
+        .collect();
+    specrt::family::Registry::from_texts(texts.iter().map(String::as_str)).unwrap()
+}
+
+fn engine_spec() -> Spec {
+    let mut spec = Spec::from_hf_config_serving_in(&unrefused(), &tiny_config().to_string()).unwrap_or_else(|e| panic!("{e:#}"));
+    spec.repo = dir().join("tiny").display().to_string();
+    spec
+}
+
+#[test]
+fn the_haru_family_reads_the_lm_section_and_refuses_until_the_chain_runs() {
+    let err = format!("{:#}", Spec::from_hf_config(&real_config().to_string()).unwrap_err());
+    assert!(err.contains("MeanFlow") && err.contains("codec") && err.contains("#1430"), "{err}");
+    let family = specrt::family::Registry::embedded().for_model_type("haru").unwrap();
+    assert_eq!((family.name.as_str(), family.text_config.as_deref()), ("haru", Some("lm")));
+    let real = Spec::from_hf_config_serving_in(&unrefused(), &real_config().to_string()).unwrap();
+    let plain = Spec::from_hf_config_serving(&real_config()["lm"].to_string()).unwrap();
+    assert_eq!((real.dims.clone(), real.layers.clone(), real.attention.heads, real.attention.head_dim), (plain.dims.clone(), plain.layers.clone(), plain.attention.heads, plain.attention.head_dim));
+    assert_eq!(real.tensors.get("lm.").map(String::as_str), Some("model."));
+    let inputs = real.inputs.as_ref().unwrap();
+    let streams: Vec<(&str, usize, &str)> = inputs.streams.iter().map(|s| (s.name.as_str(), s.width, s.mask.as_str())).collect();
+    assert_eq!(streams, [("model_latent", 64, "model_mask"), ("user_latent", 64, "user_mask")]);
+    assert!(plain.inputs.is_none());
+}
+
+#[test]
+fn the_input_embedding_is_plan_ops_after_the_token_gather() {
+    use specrt::plan::{Op, Phase, Plan};
+    let spec = engine_spec();
+    let n = spec.inputs.as_ref().unwrap().node.len();
+    assert_eq!(n, 6);
+    for phase in [Phase::Prefill, Phase::Decode] {
+        let plan = Plan::build(&spec, phase, true);
+        let want: Vec<Op> = std::iter::once(Op::Embed).chain((0..n as u8).map(|node| Op::Input { node })).collect();
+        assert_eq!(plan.head, want, "{phase:?}");
+        let target = kir::Target::sm_120();
+        specrt::compile::compile(&spec, plan, &target, &specrt::compile::Options::planes(512)).unwrap_or_else(|e| panic!("{e:#}"));
+    }
+    let kernels = specrt::codegen::input_kernels(&spec, &kir::Target::sm_120()).unwrap();
+    let names: Vec<&str> = kernels.iter().map(|k| k.name).collect();
+    assert_eq!(names, ["latent_proj_in", "latent_proj_norm", "latent_proj_out", "latent_proj_in", "latent_proj_norm", "latent_proj_out"]);
+    let source = kir::cuda::emit_module(&kernels[..3]).unwrap().into_string();
+    assert!(source.contains("latent_proj_in") && source.contains("rsqrtf"), "{source}");
+    let plain = Spec::from_hf_config_serving(&tiny_config()["lm"].to_string()).unwrap();
+    assert_eq!(Plan::build(&plain, Phase::Prefill, true).head, [Op::Embed]);
+}
+
+#[test]
+fn the_lm_root_comes_from_the_family_rename_and_every_input_weight_loads() {
+    let spec = engine_spec();
+    let ck = specrt::weights::Checkpoint::for_repo(&spec.repo).unwrap().renamed(&spec.tensors);
+    assert_eq!(ck.root(), "model");
+    assert!(ck.has("model.embed_tokens.weight") && ck.has("model.layers.3.self_attn.q_proj.weight") && !ck.has("lm.norm.weight"));
+    let w = Weights::load();
+    let loaded = ck.input_weights(&spec).unwrap();
+    let names: BTreeSet<&str> = loaded.iter().map(|(n, _)| n.as_str()).collect();
+    let want: BTreeSet<&str> = w.tensors.keys().filter(|n| n.contains("audio_proj") || n.starts_with("latent_")).map(String::as_str).collect();
+    assert_eq!(names, want);
+    for (name, values) in &loaded {
+        assert_eq!(values.as_slice(), w.get(name), "{name}");
+    }
 }
 
 #[test]

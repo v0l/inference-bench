@@ -99,6 +99,7 @@ fn symbol(spec: &Spec, name: &str) -> Option<usize> {
                     .and_then(|m| m.params.get(other))
                     .or_else(|| spec.gated_residual().and_then(|h| h.params.get(other)))
                     .or_else(|| spec.per_layer().and_then(|p| p.params.get(other)))
+                    .or_else(|| spec.inputs.as_ref().and_then(|p| p.params.get(other)))
                     .or_else(|| spec.prelude.as_ref().and_then(|p| p.params.get(other)))
                 {
                     return (*v >= 0.0 && v.fract() == 0.0).then_some(*v as usize);

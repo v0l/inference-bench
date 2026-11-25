@@ -728,6 +728,49 @@ impl PerLayer {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputStream {
+    pub name: String,
+    pub width: usize,
+    pub mask: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Inputs {
+    pub streams: Vec<InputStream>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub params: std::collections::BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub scratch: std::collections::BTreeMap<String, String>,
+    pub node: Vec<crate::graph::Node>,
+}
+
+impl Inputs {
+    pub fn buffers(&self) -> Vec<(String, usize)> {
+        self.streams.iter().flat_map(|s| [(s.name.clone(), s.width), (s.mask.clone(), 1)]).collect()
+    }
+
+    pub fn width_of(&self, buffer: &str) -> Option<usize> {
+        self.buffers().into_iter().find(|(n, _)| n == buffer).map(|(_, w)| w)
+    }
+
+    pub fn weights(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for n in &self.node {
+            for b in n.bind.values() {
+                if let crate::graph::Bind::Weight { weight, len } = b
+                    && !out.iter().any(|(w, _)| w == weight)
+                {
+                    out.push((weight.clone(), len.clone()));
+                }
+            }
+        }
+        out
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RopeStyle {
@@ -1279,6 +1322,8 @@ pub struct Spec {
     pub per_layer: Option<PerLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_residual: Option<BlockResidual>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<Inputs>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtp: Option<Mtp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1990,9 +2035,11 @@ impl Spec {
 
     fn hf_config(registry: &crate::family::Registry, json: &str, strict: bool) -> Result<Self> {
         let mut value: serde_json::Value = serde_json::from_str(json)?;
+        let outer = value.clone();
         let quant_config = value.get("quantization_config").cloned();
         let outer_type = value.get("model_type").cloned();
-        if let Some(text) = value.get_mut("text_config").map(serde_json::Value::take) {
+        let text_key = outer_type.as_ref().and_then(|t| t.as_str()).and_then(|t| registry.for_model_type(t)).and_then(|f| f.text_config.clone()).unwrap_or_else(|| "text_config".into());
+        if let Some(text) = value.get_mut(&text_key).map(serde_json::Value::take) {
             value = text;
             if let Some(t) = outer_type {
                 value["model_type"] = t;
@@ -2323,6 +2370,7 @@ impl Spec {
             prelude: family.prelude.read(&value)?,
             per_layer: family.per_layer.read(&value)?,
             block_residual: family.block_residual.read(&value),
+            inputs: family.inputs.read(&outer)?,
             tensors: family.tensors.clone(),
             vision: if strict { crate::vision::Vision::from_hf_config(json)? } else { None },
             state: if family.state.is_empty() { crate::state::stock() } else { family.state.clone() },
@@ -2353,6 +2401,7 @@ impl Spec {
         self.validate_prelude()?;
         self.validate_per_layer()?;
         self.validate_block_residual()?;
+        self.validate_inputs()?;
         crate::state::validate(self)?;
         match self.head_quant {
             None | Some(Quant::Bf16) => {}
@@ -2613,6 +2662,42 @@ impl Spec {
 
     pub fn per_layer(&self) -> Option<&PerLayer> {
         self.per_layer.as_ref()
+    }
+
+    fn validate_inputs(&self) -> Result<()> {
+        let Some(p) = &self.inputs else { return Ok(()) };
+        ensure!(!p.streams.is_empty() && !p.node.is_empty(), "[inputs] needs streams and nodes");
+        ensure!(p.node.len() <= 64, "[[inputs.node]] has more than 64 nodes");
+        let builtin = |n: &str| matches!(n, "x" | "tokens");
+        for (n, w) in p.buffers() {
+            ensure!(w > 0 && !builtin(&n) && !p.scratch.contains_key(&n), "[[inputs.streams]] buffer {n} needs a positive width and a name of its own");
+        }
+        for (n, w) in &p.scratch {
+            ensure!(!builtin(n), "[inputs.scratch] {n} shadows a built in buffer");
+            crate::state::dim(self, w).with_context(|| format!("[inputs.scratch] {n}"))?;
+        }
+        for (i, n) in p.node.iter().enumerate() {
+            ensure!(n.op == "input" && n.kernel.is_some(), "[[inputs.node]] {i} must be an input node with `kernel`");
+            ensure!(!n.grid.is_empty() && n.grid.len() <= 3, "[[inputs.node]] {i} needs a grid of one to three symbols");
+            for g in n.grid.iter().filter(|g| *g != "rows") {
+                crate::state::dim(self, g).with_context(|| format!("[[inputs.node]] {i} grid symbol {g:?}"))?;
+            }
+            for b in n.bind.values() {
+                match b {
+                    crate::graph::Bind::Weight { len, .. } => {
+                        self.weight_len(len)?;
+                    }
+                    crate::graph::Bind::Buffer { buffer } => ensure!(
+                        builtin(buffer) || p.width_of(buffer).is_some() || p.scratch.contains_key(buffer),
+                        "[[inputs.node]] {i} binds buffer {buffer:?}, which is not x, tokens, a declared stream or mask, or an [inputs.scratch] entry"
+                    ),
+                    crate::graph::Bind::Number(_) => {}
+                    crate::graph::Bind::Name(n) => bail!("[[inputs.node]] {i} binds the name {n:?}; input nodes take numbers"),
+                    crate::graph::Bind::State { .. } => bail!("[[inputs.node]] {i} binds a state, which input nodes do not take"),
+                }
+            }
+        }
+        Ok(())
     }
 
     fn validate_per_layer(&self) -> Result<()> {

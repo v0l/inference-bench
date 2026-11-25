@@ -1,0 +1,82 @@
+kind = "kir-kernel"
+family = "group_map"
+name = "latent_proj_out"
+threads = 256
+
+[args]
+width = "hidden"
+
+[[param]]
+name = "h"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "w"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "b"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "m"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "xin"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "x"
+role = "activation"
+access = "write"
+
+[[stage]]
+op = "load"
+name = "hv"
+src = "h"
+row = "hidden"
+
+[[stage]]
+op = "load"
+name = "wv"
+src = "w"
+head = "hidden"
+
+[[stage]]
+op = "sum"
+name = "d"
+expr = "hv * wv"
+
+[[stage]]
+op = "pick"
+name = "bv"
+src = "b"
+row = 0
+head = 1
+
+[[stage]]
+op = "pick"
+name = "mv"
+src = "m"
+row = 1
+head = 0
+
+[[stage]]
+op = "pick"
+name = "xv"
+src = "xin"
+row = "hidden"
+head = 1
+
+[[stage]]
+op = "put"
+dst = "x"
+value = "xv + mv * (d + bv)"
+row = "hidden"
+head = 1

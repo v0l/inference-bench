@@ -32,7 +32,7 @@ pub const ELEMENT_SPAN: u32 = 8388608;
 pub fn kernels_for(op: &Op, spec: &Spec, tokens: usize) -> Result<Vec<&'static str>> {
     Ok(match op {
         Op::Embed => vec!["embed"],
-        Op::Splice => anyhow::bail!("vision is not yet on wgpu"),
+        Op::Splice | Op::Input { .. } => anyhow::bail!("vision and input streams are not yet on wgpu"),
         Op::Norm { .. } => vec!["rmsnorm"],
         Op::Linear { weight, .. } => {
             let mut k = vec![if tokens == 1 { "linear" } else if tokens >= TILE_MIN_TOKENS { "linear_tile" } else { "linear_t8" }];
@@ -71,6 +71,9 @@ pub fn unsupported(spec: &Spec) -> Option<String> {
     }
     if spec.gated_residual().is_some() || spec.per_layer().is_some() {
         return Some("described hyper-connections are not yet on wgpu".into());
+    }
+    if spec.inputs.is_some() {
+        return Some("input streams are not yet on wgpu".into());
     }
     if spec.mixer.is_some() {
         return Some("described mixers are not yet on wgpu".into());

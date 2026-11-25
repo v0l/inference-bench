@@ -146,10 +146,48 @@ impl Runtime {
             Op::Gemv { .. } | Op::GemvStore { .. } | Op::StepAttention | Op::GdnStep => unreachable!("{} runs on the single row plan", op.label()),
             Op::HyperExpand | Op::HyperPre { .. } | Op::HyperPost | Op::HyperMean => self.hyper_op(op, layer, n),
             Op::PerLayer { node, stage } => self.per_layer_op(node, stage, layer, run),
+            Op::Input { node } => self.input_op(node, run),
             Op::Dit(_) => anyhow::bail!("{} runs in the denoiser, not the token runtime", op.label()),
             Op::BlockRes { stage } => self.block_res_op(stage, layer, run),
             Op::LatentNorm => self.latent_norm_op(layer, run),
         }
+    }
+
+    fn input_op(&self, node: u8, run: &Run) -> Result<()> {
+        let ib = self.inputs.as_ref().context("the spec has no [inputs]")?;
+        let p = self.spec.inputs.as_ref().expect("input buffers need [inputs]");
+        let launch = &ib.launch[node as usize];
+        let spec_node = &p.node[node as usize];
+        let numbers: Vec<(i32, f32)> = launch
+            .params
+            .iter()
+            .map(|q| match spec_node.bind.get(q.name) {
+                Some(Bind::Number(v)) => (*v as i32, *v as f32),
+                _ => (0, 0.0),
+            })
+            .collect();
+        let mut b = self.launcher(self.kernel(launch.name));
+        for (i, param) in launch.params.iter().enumerate() {
+            match spec_node.bind.get(param.name) {
+                Some(Bind::Weight { weight, .. }) => b.arg(ib.weights.get(weight).with_context(|| format!("no input weight {weight}"))?),
+                Some(Bind::Buffer { buffer }) if buffer == "x" => b.arg(&self.pre.x),
+                Some(Bind::Buffer { buffer }) if buffer == "tokens" => b.arg(run.tokens),
+                Some(Bind::Buffer { buffer }) => b.arg(ib.streams.get(buffer).or_else(|| ib.scratch.get(buffer)).with_context(|| format!("no input buffer {buffer:?}"))?),
+                Some(Bind::Number(_)) if param.ty == kir::Scalar::F32 => b.arg(&numbers[i].1),
+                Some(Bind::Number(_)) => b.arg(&numbers[i].0),
+                _ => bail!("param {:?} of {} is not bound to a buffer, weight or number", param.name, launch.name),
+            };
+        }
+        let dim = |symbol: &String| -> Result<u32> {
+            Ok(match symbol.as_str() {
+                "rows" => run.n as u32,
+                other => crate::state::dim(&self.spec, other)? as u32,
+            })
+        };
+        let dims = spec_node.grid.iter().map(dim).collect::<Result<Vec<_>>>()?;
+        let config = LaunchConfig { grid_dim: (dims[0], dims.get(1).copied().unwrap_or(1), dims.get(2).copied().unwrap_or(1)), block_dim: (launch.threads, 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(config) }?;
+        Ok(())
     }
 
     fn per_layer_op(&self, node: u8, stage: u8, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {

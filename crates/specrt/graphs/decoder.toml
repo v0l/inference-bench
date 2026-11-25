@@ -6,6 +6,10 @@ op = "embed"
 out = "x"
 
 [[head]]
+op = "input_nodes"
+when = "inputs+tensor_core"
+
+[[head]]
 op = "per_layer_head"
 when = "ple"
 

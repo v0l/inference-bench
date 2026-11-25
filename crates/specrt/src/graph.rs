@@ -277,6 +277,7 @@ fn holds(when: Option<&str>, tensor_core: bool, spec: &Spec, tail: bool) -> bool
             "unstored" => !spec.mlp.stored_gate_up,
             "flat" => spec.gated_residual().is_none(),
             "ple" => spec.per_layer().is_some(),
+            "inputs" => spec.inputs.is_some(),
             "split" => spec.layers.split,
             "logit_softcap" => spec.dims.logit_softcap.is_some(),
             "logit_scale" => spec.dims.logit_scale.is_some(),
@@ -352,6 +353,11 @@ fn lower(nodes: &[Node], phase: Phase, tensor_core: bool, spec: &Spec, kind: Opt
             ensure!(site >= crate::plan::GATED_DRAFT || (site as usize) < h.sites.len(), "gated site {site} is not one of the {} [gated_residual] sites", h.sites.len());
             for (i, _) in h.nodes(stage) {
                 ops.push(Op::Gated { node: i as u8, site });
+            }
+        } else if n.op == "input_nodes" {
+            let p = spec.inputs.as_ref().context("input_nodes needs [inputs]")?;
+            for i in 0..p.node.len() {
+                ops.push(Op::Input { node: i as u8 });
             }
         } else if n.op == "prelude_nodes" {
             let count = spec.prelude.as_ref().map_or(0, |p| p.node.len());

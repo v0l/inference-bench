@@ -223,7 +223,7 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
             Op::Swiglu => be.dispatch(kernels[0], &[&m.scratch.gate_up, &m.scratch.act], [r, 0, 0, 0, 0, 0, 0, 0], grid_1d(rows * spec.dims.intermediate)),
             Op::Kernel { .. } | Op::MixKernel { .. } | Op::DecodeRope | Op::PerLayer { .. } | Op::Gated { .. } => bail!("described kernels are not yet on wgpu"),
             Op::NormAdd { .. } | Op::Clear { .. } | Op::Split { .. } | Op::QkNorm | Op::ScaledAdd { .. } | Op::LogitScale | Op::LogitSoftcap => bail!("{} is not yet on wgpu", op.label()),
-            Op::Splice => bail!("vision is not yet on wgpu"),
+            Op::Splice | Op::Input { .. } => bail!("vision and input streams are not yet on wgpu"),
             Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => bail!("delta-net is not yet on wgpu"),
             Op::MtpIn | Op::MtpGather | Op::MtpNorm | Op::MtpDraft => bail!("MTP is not yet on wgpu"),
             Op::MoeRoute | Op::MoeExperts | Op::MoeCombine | Op::MoeCombineInto { .. } => bail!("mixture of experts is not yet on wgpu"),

@@ -1604,6 +1604,11 @@ impl Checkpoint {
             .collect()
     }
 
+    pub fn input_weights(&self, spec: &Spec) -> Result<Vec<(String, Vec<f32>)>> {
+        let Some(p) = &spec.inputs else { return Ok(Vec::new()) };
+        p.weights().into_iter().map(|(w, len)| Ok((w.clone(), self.flat(&w, spec.weight_len(&len)?)?))).collect()
+    }
+
     pub fn ple_head(&self, spec: &Spec) -> Result<Vec<(String, Vec<f32>)>> {
         let Some(pl) = spec.per_layer() else { return Ok(Vec::new()) };
         pl.weights("head").into_iter().map(|(w, len)| Ok((w.clone(), self.flat(&format!("{}.{w}", self.root()), spec.weight_len(&len)?)?))).collect()

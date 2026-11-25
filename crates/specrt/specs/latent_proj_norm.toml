@@ -1,0 +1,53 @@
+kind = "kir-kernel"
+family = "group_map"
+name = "latent_proj_norm"
+threads = 256
+
+[args]
+width = "hidden"
+
+[[const]]
+name = "eps"
+value = "proj_eps"
+
+[[param]]
+name = "h"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "w"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "y"
+role = "activation"
+access = "write"
+
+[[stage]]
+op = "load"
+name = "v"
+src = "h"
+row = "hidden"
+
+[[stage]]
+op = "sum"
+name = "ss"
+expr = "v * v"
+
+[[stage]]
+op = "scalar"
+name = "inv"
+expr = "rsqrt(ss / width + eps)"
+
+[[stage]]
+op = "load"
+name = "g"
+src = "w"
+
+[[stage]]
+op = "store"
+dst = "y"
+value = "v * inv * g"
+row = "hidden"

@@ -1,0 +1,106 @@
+name = "haru"
+kind = "family"
+min_engine = 8
+extends = "qwen3_5"
+text_config = "lm"
+
+[match]
+model_types = ["haru"]
+architectures = ["HaruForConditionalGeneration"]
+
+[[refuse]]
+when = "hidden_size > 0"
+message = "Haru-4B full duplex speech is not runnable yet: the backbone and its three stream input run, the MeanFlow audio head (#1428), the streaming codec (#1429) and duplex sessions (#1430) are missing"
+
+[tensors]
+"lm." = "model."
+
+[[inputs.streams]]
+name = "model_latent"
+width = "latent_dim"
+mask = "model_mask"
+
+[[inputs.streams]]
+name = "user_latent"
+width = "latent_dim"
+mask = "user_mask"
+
+[inputs.params]
+latent_dim = { config = "latent_dim" }
+proj_eps = 1e-6
+
+[inputs.scratch]
+proj_h = "hidden"
+proj_n = "hidden"
+
+[[inputs.node]]
+op = "input"
+kernel = "latent_proj_in"
+grid = ["hidden", "rows"]
+
+[inputs.node.bind]
+raw = { buffer = "model_latent" }
+scale = { weight = "latent_scale", len = "1" }
+shift = { weight = "latent_bias", len = "1" }
+w = { weight = "model_audio_proj.fc1.weight", len = "hidden * latent_dim" }
+b = { weight = "model_audio_proj.fc1.bias", len = "hidden" }
+y = { buffer = "proj_h" }
+
+[[inputs.node]]
+op = "input"
+kernel = "latent_proj_norm"
+grid = ["1", "rows"]
+
+[inputs.node.bind]
+h = { buffer = "proj_h" }
+w = { weight = "model_audio_proj.norm.weight", len = "hidden" }
+y = { buffer = "proj_n" }
+
+[[inputs.node]]
+op = "input"
+kernel = "latent_proj_out"
+grid = ["hidden", "rows"]
+
+[inputs.node.bind]
+h = { buffer = "proj_n" }
+w = { weight = "model_audio_proj.fc2.weight", len = "hidden * hidden" }
+b = { weight = "model_audio_proj.fc2.bias", len = "hidden" }
+m = { buffer = "model_mask" }
+xin = { buffer = "x" }
+x = { buffer = "x" }
+
+[[inputs.node]]
+op = "input"
+kernel = "latent_proj_in"
+grid = ["hidden", "rows"]
+
+[inputs.node.bind]
+raw = { buffer = "user_latent" }
+scale = { weight = "latent_scale", len = "1" }
+shift = { weight = "latent_bias", len = "1" }
+w = { weight = "user_audio_proj.fc1.weight", len = "hidden * latent_dim" }
+b = { weight = "user_audio_proj.fc1.bias", len = "hidden" }
+y = { buffer = "proj_h" }
+
+[[inputs.node]]
+op = "input"
+kernel = "latent_proj_norm"
+grid = ["1", "rows"]
+
+[inputs.node.bind]
+h = { buffer = "proj_h" }
+w = { weight = "user_audio_proj.norm.weight", len = "hidden" }
+y = { buffer = "proj_n" }
+
+[[inputs.node]]
+op = "input"
+kernel = "latent_proj_out"
+grid = ["hidden", "rows"]
+
+[inputs.node.bind]
+h = { buffer = "proj_n" }
+w = { weight = "user_audio_proj.fc2.weight", len = "hidden * hidden" }
+b = { weight = "user_audio_proj.fc2.bias", len = "hidden" }
+m = { buffer = "user_mask" }
+xin = { buffer = "x" }
+x = { buffer = "x" }

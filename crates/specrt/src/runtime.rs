@@ -593,6 +593,13 @@ struct PleBuffers {
     head: PleWeights,
 }
 
+struct InputBuffers {
+    streams: std::collections::BTreeMap<String, CudaSlice<f32>>,
+    scratch: std::collections::BTreeMap<String, CudaSlice<f32>>,
+    launch: Vec<DescribedLaunch>,
+    weights: std::collections::BTreeMap<String, CudaSlice<f32>>,
+}
+
 struct GatedBuffers {
     streams: CudaSlice<f32>,
     scratch: std::collections::BTreeMap<String, CudaSlice<f32>>,
@@ -976,6 +983,7 @@ pub struct Runtime {
     gated: Option<GatedBuffers>,
     prelude: Option<PreludeBuffers>,
     ple: Option<PleBuffers>,
+    inputs: Option<InputBuffers>,
     residual: Option<ResidualBuffers>,
     moe: Option<moe::MoeBuffers>,
     fp8_act: Option<Fp8Act>,
@@ -1408,6 +1416,15 @@ impl Runtime {
                     head: ple_head,
                 }),
                 None => None,
+            },
+            inputs: match &spec.inputs {
+                Some(p) if role.first => Some(InputBuffers {
+                    streams: p.buffers().into_iter().map(|(n, w)| Ok((n, stream.alloc_zeros(chunk * w)?))).collect::<Result<_>>()?,
+                    scratch: p.scratch.iter().map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim(spec, w)?)?))).collect::<Result<_>>()?,
+                    launch: crate::codegen::input_kernels(spec, &target)?.into_iter().map(|k| DescribedLaunch { name: k.name, threads: k.threads, chunk: None, tile: false, params: k.params }).collect(),
+                    weights: checkpoint.input_weights(spec)?.iter().map(|(n, v)| Ok((n.clone(), stream.clone_htod(v)?))).collect::<Result<_>>()?,
+                }),
+                _ => None,
             },
             moe: match &spec.moe {
                 Some(_) => Some(moe::MoeBuffers::new(&stream, chunk, spec, crate::codegen::moe_mma_enabled(spec, &target), crate::codegen::moe_mma_fp8_enabled(spec, &target), crate::codegen::moe_mma_bf16_enabled(spec, &target))?),
@@ -2820,6 +2837,31 @@ impl Runtime {
 
     pub fn last_logits(&self) -> Result<Vec<f32>> {
         Ok(self.stream.clone_dtoh(&self.buf.logits)?)
+    }
+
+    pub fn set_inputs(&mut self, rows: usize, values: &[(&str, &[f32])]) -> Result<()> {
+        let p = self.spec.inputs.clone().context("the spec declares no [inputs]")?;
+        let ib = self.inputs.as_mut().context("this stage holds no input streams")?;
+        ensure!(rows <= self.chunk, "{rows} input rows for a chunk of {}", self.chunk);
+        for (name, _) in values {
+            ensure!(p.width_of(name).is_some(), "{name} is not a declared input stream or mask");
+        }
+        for (name, width) in p.buffers() {
+            let buf = ib.streams.get_mut(&name).expect("every declared input has a buffer");
+            self.stream.memset_zeros(buf)?;
+            if let Some((_, v)) = values.iter().find(|(n, _)| *n == name) {
+                ensure!(v.len() == rows * width, "{name} has {} values, not {rows} rows of {width}", v.len());
+                self.stream.memcpy_htod(*v, &mut buf.slice_mut(..v.len()))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn normed_rows(&self, rows: usize) -> Result<Vec<f32>> {
+        let n = rows * self.spec.dims.hidden;
+        let hi = self.stream.clone_dtoh(&self.pre.xn_planes.hi.slice(..n))?;
+        let lo = self.stream.clone_dtoh(&self.pre.xn_planes.lo.slice(..n))?;
+        Ok(hi.iter().zip(&lo).map(|(h, l)| crate::weights::bf16_to_f32(*h) + crate::weights::bf16_to_f32(*l)).collect())
     }
 
     pub fn linear_states(&self) -> Result<LinearStates> {

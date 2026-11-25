@@ -210,6 +210,7 @@ pub struct Signer<'a> {
     gated: Vec<kir::Kernel>,
     prelude: Vec<kir::Kernel>,
     per_layer: Vec<kir::Kernel>,
+    inputs: Vec<kir::Kernel>,
     ranked: bool,
 }
 
@@ -217,11 +218,26 @@ impl<'a> Signer<'a> {
     pub fn new(spec: &'a Spec) -> Result<Signer<'a>> {
         let target = crate::codegen::default_target();
         let ctx = crate::engine::DEFAULT_CTX;
-        Ok(Signer { spec, described: crate::codegen::described_kernels(spec, 1, ctx, &target)?, mixer: crate::codegen::mixer_kernels(spec, 1, ctx, &target)?, gated: crate::codegen::gated_kernels(spec, &target)?, prelude: crate::codegen::prelude_kernels(spec, ctx, &target)?, per_layer: crate::codegen::per_layer_kernels(spec, &target)?, ranked: false })
+        Ok(Signer { spec, described: crate::codegen::described_kernels(spec, 1, ctx, &target)?, mixer: crate::codegen::mixer_kernels(spec, 1, ctx, &target)?, gated: crate::codegen::gated_kernels(spec, &target)?, prelude: crate::codegen::prelude_kernels(spec, ctx, &target)?, per_layer: crate::codegen::per_layer_kernels(spec, &target)?, inputs: crate::codegen::input_kernels(spec, &target)?, ranked: false })
     }
 
     pub fn ranked(self, ranked: bool) -> Signer<'a> {
         Signer { ranked, ..self }
+    }
+
+    fn input_node(&self, node: u8) -> Result<Signature> {
+        let p = self.spec.inputs.as_ref().context("[inputs]")?;
+        let Some(kernel) = self.inputs.get(node as usize) else { bail!("input node {node} has no kernel") };
+        let defaults = |name: &str| -> Option<Tensor> {
+            match name {
+                "x" => Some(self.x()),
+                "tokens" => Some(Tensor::new(Place::Input("tokens"), Rows::Tokens, 1, Form::I32)),
+                other => p.width_of(other).map(|w| Tensor::new(Place::Input(kir::desc::intern_public(other)), Rows::Tokens, w, Form::F32)),
+            }
+        };
+        let mut sig = self.bound_stage(kernel, &p.node[node as usize], &p.scratch, &defaults)?;
+        sig.class = Class::RowReduce;
+        Ok(sig)
     }
 
     fn per_layer_node(&self, node: u8, stage: u8, layer: usize) -> Result<Signature> {
@@ -578,6 +594,7 @@ impl<'a> Signer<'a> {
         let sig = |class, reads, writes| Signature { class, reads, writes };
         Ok(match *op {
             Op::PerLayer { node, stage } => self.per_layer_node(node, stage, layer)?,
+            Op::Input { node } => self.input_node(node)?,
             Op::Embed => sig(Class::Gather, vec![tokens_in, Tensor::new(Place::Weight("embed_tokens.weight".into()), Rows::Tokens, h, Form::Bf16)], vec![self.x()]),
             Op::Splice => sig(Class::Gather, vec![Tensor::new(Place::Input("media"), Rows::Tokens, h, Form::F32)], vec![self.x()]),
             Op::Norm { which, into } => {

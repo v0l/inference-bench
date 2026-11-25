@@ -426,6 +426,48 @@ pub fn per_layer_symbols(spec: &Spec) -> kir::desc::Shape {
     symbols
 }
 
+pub fn input_symbols(spec: &Spec) -> kir::desc::Shape {
+    let mut symbols = per_layer_symbols(spec);
+    if let Some(p) = &spec.inputs {
+        for (n, v) in &p.params {
+            symbols = symbols.num(n, *v);
+        }
+    }
+    symbols
+}
+
+pub fn input_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::Kernel>> {
+    let Some(p) = &spec.inputs else { return Ok(Vec::new()) };
+    let symbols = input_symbols(spec);
+    let registry = crate::kir_kernel::Registry::active();
+    let mut built: BTreeMap<String, kir::Kernel> = BTreeMap::new();
+    let mut out = Vec::new();
+    for (i, node) in p.node.iter().enumerate() {
+        let name = node.kernel.as_deref().ok_or_else(|| anyhow::anyhow!("[[inputs.node]] {i} names no kernel"))?;
+        if !built.contains_key(name) {
+            let d = registry.get(name).ok_or_else(|| anyhow::anyhow!("[[inputs.node]] {i} names kernel {name:?}, which no kernel description provides"))?;
+            built.insert(name.to_string(), d.build(target, &symbols).map_err(|e| anyhow::anyhow!("[[inputs.node]] {i}: {e}"))?);
+        }
+        let kernel = &built[name];
+        for param in &kernel.params {
+            anyhow::ensure!(node.bind.contains_key(param.name), "[[inputs.node]] {i} does not bind {name} param {:?}", param.name);
+        }
+        for (b, v) in &node.bind {
+            let param = kernel.params.iter().find(|p| p.name == b).ok_or_else(|| anyhow::anyhow!("[[inputs.node]] {i} binds {b:?}, which {name} has no param for"))?;
+            let fits = match v {
+                crate::graph::Bind::Weight { .. } => param.role == kir::Role::Weight,
+                crate::graph::Bind::Buffer { buffer } if buffer == "tokens" => param.role == kir::Role::Activation && param.ty == kir::Scalar::I32,
+                crate::graph::Bind::Buffer { .. } => param.role == kir::Role::Activation && param.ty == kir::Scalar::F32,
+                crate::graph::Bind::Number(_) => param.role == kir::Role::Value,
+                _ => false,
+            };
+            anyhow::ensure!(fits, "[[inputs.node]] {i} binds {b:?} to the wrong kind of value");
+        }
+        out.push(kernel.clone());
+    }
+    Ok(out)
+}
+
 pub fn per_layer_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::Kernel>> {
     let Some(p) = spec.per_layer() else { return Ok(Vec::new()) };
     let symbols = per_layer_symbols(spec);
@@ -738,7 +780,7 @@ impl Module {
         let gemms = crate::gemm::gemm_kernels(spec, target)?;
         let described = described_kernels(spec, kv_planes, max_ctx, target)?;
         let mut distinct: Vec<kir::Kernel> = Vec::new();
-        for k in described.into_iter().flatten().chain(mixer_kernels(spec, kv_planes, max_ctx, target)?).chain(hyper_kernels(spec, target)?).chain(gated_kernels(spec, target)?).chain(per_layer_kernels(spec, target)?).chain(prelude_kernels(spec, max_ctx, target)?).chain(residual_kernels(spec, target)?) {
+        for k in described.into_iter().flatten().chain(mixer_kernels(spec, kv_planes, max_ctx, target)?).chain(hyper_kernels(spec, target)?).chain(gated_kernels(spec, target)?).chain(per_layer_kernels(spec, target)?).chain(input_kernels(spec, target)?).chain(prelude_kernels(spec, max_ctx, target)?).chain(residual_kernels(spec, target)?) {
             if !distinct.iter().any(|d| d.name == k.name) {
                 distinct.push(k);
             }

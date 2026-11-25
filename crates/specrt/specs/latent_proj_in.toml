@@ -1,0 +1,82 @@
+kind = "kir-kernel"
+family = "group_map"
+name = "latent_proj_in"
+threads = 64
+
+[args]
+width = "latent_dim"
+
+[[param]]
+name = "raw"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "scale"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "shift"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "w"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "b"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "y"
+role = "activation"
+access = "write"
+
+[[stage]]
+op = "pick"
+name = "ls"
+src = "scale"
+row = 0
+head = 0
+
+[[stage]]
+op = "pick"
+name = "lb"
+src = "shift"
+row = 0
+head = 0
+
+[[stage]]
+op = "load"
+name = "r"
+src = "raw"
+row = "latent_dim"
+
+[[stage]]
+op = "load"
+name = "wv"
+src = "w"
+head = "latent_dim"
+
+[[stage]]
+op = "sum"
+name = "d"
+expr = "(r + lb) * ls * wv"
+
+[[stage]]
+op = "pick"
+name = "bv"
+src = "b"
+row = 0
+head = 1
+
+[[stage]]
+op = "put"
+dst = "y"
+value = "d + bv"
+row = "hidden"
+head = 1

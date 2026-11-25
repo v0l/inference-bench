@@ -365,6 +365,7 @@ impl NormKind {
 pub enum Op {
     Embed,
     Splice,
+    Input { node: u8 },
     Norm { which: NormKind, into: Buf },
     NormAdd { which: NormKind, from: Buf, into: Buf },
     Clear { buf: Buf },
@@ -452,6 +453,7 @@ impl Op {
         match self {
             Op::Embed => "embed".into(),
             Op::Splice => "media splice".into(),
+            Op::Input { .. } => "input stream".into(),
             Op::Norm { which, .. } => match which {
                 NormKind::Input => "input norm".into(),
                 NormKind::PostAttention => "post attention norm".into(),
@@ -511,6 +513,7 @@ impl Op {
         match self {
             Op::Embed => "tokens to x".into(),
             Op::Splice => "media embeddings into x".into(),
+            Op::Input { .. } => "input streams and masks into x".into(),
             Op::Norm { into, .. } => format!("x to {}", into.label()),
             Op::NormAdd { from, into, .. } => format!("{} added to {}", from.label(), into.label()),
             Op::LogitSoftcap | Op::LogitScale => "logits to logits".into(),
@@ -618,6 +621,10 @@ impl Op {
                 crate::graph::Bind::Weight { weight, .. } => Some(weight.clone()),
                 _ => None,
             }).collect(),
+            Op::Input { node } => spec.inputs.as_ref().and_then(|p| p.node.get(*node as usize)).into_iter().flat_map(|n| n.bind.values()).filter_map(|b| match b {
+                crate::graph::Bind::Weight { weight, .. } => Some(weight.clone()),
+                _ => None,
+            }).collect(),
             Op::BlockRes { stage: ResStage::Enter } => spec.block_residual.iter().flat_map(|r| ["norm", "proj"].map(|t| format!("{}_{t}.weight", r.sites[0]))).collect(),
             Op::BlockRes { stage: ResStage::Mixed } => spec.block_residual.iter().flat_map(|r| ["norm", "proj"].map(|t| format!("{}_{t}.weight", r.sites[1]))).collect(),
             Op::BlockRes { stage: ResStage::Tail } => spec.block_residual.iter().flat_map(|r| ["norm", "proj"].map(|t| format!("{}_{t}.weight", r.output))).collect(),
@@ -628,6 +635,9 @@ impl Op {
 
     pub fn checkpoint_tensors(&self, spec: &Spec, root: &str, layer: Option<usize>) -> Vec<String> {
         let tied_or_root = |t: &str| format!("{root}.{t}");
+        if matches!(self, Op::Input { .. }) {
+            return self.tensors(spec);
+        }
         self.tensors(spec)
             .into_iter()
             .map(|t| match (layer, &t) {
@@ -660,6 +670,7 @@ impl Op {
         match self {
             Op::Embed => names(&["embed"]),
             Op::Splice => names(&["splice_rows", "add_rows"]),
+            Op::Input { node } => spec.inputs.as_ref().and_then(|p| p.node.get(*node as usize)).and_then(|n| n.kernel.clone()).into_iter().collect(),
             Op::Norm { into: Buf::XnPlanes, .. } => names(&["rms_split"]),
             Op::Norm { .. } => names(&["rmsnorm"]),
             Op::NormAdd { .. } => names(&["norm_add"]),

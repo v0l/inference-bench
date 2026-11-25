@@ -632,6 +632,7 @@ impl Gguf {
             refused: Vec::new(),
             per_layer: None,
             block_residual: None,
+            inputs: None,
             tensors: Default::default(),
             mtp: (family.mtp && nextn > 0).then(|| crate::spec::Mtp { head_quant: Some(Quant::Bf16), ..crate::spec::Mtp::new(nextn) }),
             vision: None,
