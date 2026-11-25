@@ -62,6 +62,45 @@ fn the_engine_wan_denoiser_matches_diffusers_cond_and_uncond_on_every_step() {
 
 #[test]
 #[ignore = "needs a GPU: ~/.agents/bin/gpu-run 1 -- cargo test --test wan_gpu -- --ignored --test-threads=1"]
+fn three_guided_steps_and_the_causal_vae_give_the_reference_video() {
+    use specrt::generate::{Generator, Plan, Request, VideoHooks, VideoRequest};
+    let (ctx, jit) = gpu();
+    let mut g = Generator::open(ctx, jit, &fixture(), 64).unwrap();
+    let prompt = |key: &str| specrt::sampler::Prompt { ids: floats(&format!("{key}.ids")).iter().map(|v| *v as u32).collect(), mask: floats(&format!("{key}.mask")).iter().map(|v| *v as u8).collect() };
+    let m = meta();
+    let request = Request { prompt: prompt("text"), negative: Some(prompt("negative")), height: 32, width: 32, steps: Some(3), guidance: Some(m["guidance"].as_f64().unwrap() as f32), seed: m["seed"].as_u64().unwrap() };
+    let req = VideoRequest { request, frames: 5 };
+    let mut steps = Vec::new();
+    let mut decoded = Vec::new();
+    let run = |g: &mut Generator, plan: Plan, steps: &mut Vec<(usize, usize)>, decoded: &mut Vec<(usize, usize)>| g.generate_video(&req, plan, &mut VideoHooks { on_step: &mut |i, n, _| { steps.push((i, n)); true }, on_frames: &mut |f, n| { decoded.push((f, n)); true } }).unwrap();
+    let v = run(&mut g, Plan::default(), &mut steps, &mut decoded);
+    assert_eq!(steps, vec![(1, 3), (2, 3), (3, 3)]);
+    assert_eq!(decoded, vec![(1, 5), (3, 5), (5, 5)], "one latent frame decodes to 1 then 2 output frames through the causal cache");
+    assert_eq!((v.frames.len(), v.height, v.width), (5, 32, 32));
+    for (i, l) in v.latents.iter().enumerate() {
+        let bf = max_diff(l, &floats(&format!("bf16.step{i}.latent")));
+        eprintln!("step {i}: latent {bf:e} to the bf16 weight run");
+        assert!(bf < VELOCITY_TOLERANCE, "step {i}: {bf}");
+    }
+    let got: Vec<f32> = v.frames.concat();
+    let want = floats("bf16.video");
+    let (d, db) = (max_diff(&got, &want), psnr(&got, &want));
+    eprintln!("video: {d:e} to the bf16 weight run, PSNR {db:.1} dB, f32 run {:e}; memory {:?}", max_diff(&got, &floats("video")), v.memory);
+    assert!(d < 1e-3 && db > 60.0, "{d} {db}");
+    assert!(!v.memory.encoder_resident_in_loop);
+    let seq = run(&mut g, Plan { sequential_cfg: true, vae_tile: None }, &mut Vec::new(), &mut Vec::new());
+    let ds = max_diff(&seq.frames.concat(), &got);
+    eprintln!("sequential guidance against batched: {ds:e}, arena {} against {}", seq.memory.arena, v.memory.arena);
+    assert!(ds < 1e-3 && seq.memory.arena < v.memory.arena);
+}
+
+fn psnr(a: &[f32], b: &[f32]) -> f64 {
+    let mse = a.iter().zip(b).map(|(x, y)| f64::from(x - y).powi(2)).sum::<f64>() / a.len() as f64;
+    10.0 * (1.0 / mse.max(1e-30)).log10()
+}
+
+#[test]
+#[ignore = "needs a GPU: ~/.agents/bin/gpu-run 1 -- cargo test --test wan_gpu -- --ignored --test-threads=1"]
 fn the_unipc_kernel_steps_the_latent_like_the_recorded_run() {
     let (ctx, jit) = gpu();
     let p = Pipeline::from_dir(&fixture()).unwrap();

@@ -56,6 +56,27 @@ pub struct Hooks<'a> {
     pub on_step: &'a mut dyn FnMut(usize, usize, &[f32]) -> bool,
 }
 
+pub struct VideoHooks<'a> {
+    pub on_step: &'a mut dyn FnMut(usize, usize, &[f32]) -> bool,
+    pub on_frames: &'a mut dyn FnMut(usize, usize) -> bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VideoRequest {
+    pub request: Request,
+    pub frames: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Video {
+    pub frames: Vec<Vec<f32>>,
+    pub height: usize,
+    pub width: usize,
+    pub latents: Vec<Vec<f32>>,
+    pub guided: bool,
+    pub memory: Memory,
+}
+
 #[derive(Debug)]
 pub struct Cancelled;
 
@@ -81,6 +102,7 @@ pub struct Generator {
     stream: Arc<CudaStream>,
     jit: Jit,
     encoder: Option<Runtime>,
+    graph_encoder: Option<crate::encoder::HostEncoder>,
     vae: Option<CudaVae>,
     denoiser: Option<Cached>,
     pub keep_denoiser: bool,
@@ -95,7 +117,7 @@ impl Generator {
     pub fn open(ctx: Arc<CudaContext>, jit: Jit, dir: &Path, max_tokens: usize) -> Result<Generator> {
         let pipeline = Pipeline::from_dir(dir)?;
         let stream = ctx.default_stream();
-        Ok(Generator { dir: dir.to_path_buf(), pipeline, ctx, stream, jit, encoder: None, vae: None, denoiser: None, keep_denoiser: false, max_tokens })
+        Ok(Generator { dir: dir.to_path_buf(), pipeline, ctx, stream, jit, encoder: None, graph_encoder: None, vae: None, denoiser: None, keep_denoiser: false, max_tokens })
     }
 
     pub fn context(&self) -> &Arc<CudaContext> {
@@ -122,7 +144,7 @@ impl Generator {
     }
 
     pub fn encoder_loaded(&self) -> bool {
-        self.encoder.is_some()
+        self.encoder.is_some() || self.graph_encoder.is_some()
     }
 
     pub fn vae_loaded(&self) -> bool {
@@ -130,6 +152,12 @@ impl Generator {
     }
 
     pub fn encode(&mut self, prompt: &Prompt) -> Result<Vec<f32>> {
+        if self.pipeline.encoder == crate::sampler::EncoderKind::Graph {
+            if self.graph_encoder.is_none() {
+                self.graph_encoder = Some(crate::encoder::HostEncoder::open(&self.dir.join("text_encoder"))?);
+            }
+            return self.graph_encoder.as_ref().unwrap().encode(&prompt.ids, &prompt.mask);
+        }
         let layers = self.pipeline.text_layers.clone();
         let masked = self.pipeline.masked_pad_keys;
         let rt = self.load_encoder()?;
@@ -147,6 +175,155 @@ impl Generator {
 
     fn release_encoder(&mut self) {
         self.encoder = None;
+        self.graph_encoder = None;
+    }
+
+    pub fn video_dims(&self, height: usize, width: usize, frames: usize) -> Result<Dims> {
+        let step = self.pipeline.values["pixel_step"] as usize;
+        let scale = self.pipeline.values["vae_scale"] as usize;
+        let ts = self.pipeline.values.get("temporal_scale").copied().unwrap_or(1.0) as usize;
+        ensure!(height > 0 && width > 0 && height.is_multiple_of(step) && width.is_multiple_of(step), "{height}x{width} is not a multiple of {step}");
+        ensure!(frames >= 1 && (frames - 1).is_multiple_of(ts), "{frames} frames is not 1 plus a multiple of {ts}");
+        Ok(Dims { t: (frames - 1) / ts + 1, h: height / scale, w: width / scale })
+    }
+
+    pub fn video_shapes(&self, d: Dims, text: usize) -> Shapes {
+        let patch = self.pipeline.values["latent_patch"] as usize;
+        let (ph, pw) = (d.h / patch, d.w / patch);
+        Shapes { image: d.t * ph * pw, text, patch_h: ph, patch_w: pw, frames: d.t }
+    }
+
+    fn video_denoiser(&mut self, shapes: Shapes, guided: bool, sequential: bool) -> Result<&Denoiser> {
+        let fits = self.denoiser.as_ref().is_some_and(|c| c.shapes == shapes && c.guided == guided && c.sequential == sequential);
+        if !fits {
+            self.denoiser = None;
+            let den = Denoiser::load_pipeline(&self.stream, &self.jit, &self.dir, shapes.clone(), &self.pipeline, guided && !sequential)?;
+            self.denoiser = Some(Cached { shapes, guided, sequential, den });
+        }
+        Ok(&self.denoiser.as_ref().unwrap().den)
+    }
+
+    pub fn generate_video(&mut self, req: &VideoRequest, plan: Plan, hooks: &mut VideoHooks) -> Result<Video> {
+        let p = self.pipeline.clone();
+        ensure!(p.multistep.is_some() && p.latent == crate::sampler::LatentLayout::Grid, "the {} pipeline is not a video pipeline", p.name);
+        let r = &req.request;
+        let steps = r.steps.unwrap_or(p.steps);
+        let guidance = r.guidance.unwrap_or(p.guidance);
+        let guided = p.guided(guidance)?;
+        let d = self.video_dims(r.height, r.width, req.frames)?;
+        let text = r.prompt.ids.len();
+        let shapes = self.video_shapes(d, text);
+        let sequential = guided && plan.sequential_cfg;
+        let mut memory = Memory { sequential_cfg: sequential, vae_tile: plan.vae_tile.map(|t| t.tile), ..Memory::default() };
+        let cond = self.encode(&r.prompt)?;
+        let uncond = if guided {
+            let neg = r.negative.as_ref().context("a guided run needs a negative prompt (the empty prompt when none is given)")?;
+            ensure!(neg.ids.len() == text, "the negative prompt is padded to {} tokens, the prompt to {text}", neg.ids.len());
+            Some(self.encode(neg)?)
+        } else {
+            None
+        };
+        memory.text_encoder = self.graph_encoder.as_ref().map_or(0, |e| e.weight_bytes);
+        if p.options.offload_text_encoder {
+            self.release_encoder();
+        }
+        if p.options.offload_vae {
+            self.vae = None;
+        }
+        let channels = p.values["latent_channels"] as usize;
+        let n = channels * d.t * d.h * d.w;
+        let start = noise(r.seed, n);
+        let sched = p.schedule(steps, shapes.image)?;
+        memory.encoder_resident_in_loop = self.encoder_loaded();
+        memory.vae_resident_in_loop = self.vae_loaded();
+        let mut latents = Vec::with_capacity(steps);
+        {
+            let den = self.video_denoiser(shapes.clone(), guided, sequential)?;
+            memory.denoiser_weights = den.weight_bytes as u64;
+            if sequential {
+                let mut a = den.arena_for(1)?;
+                memory.arena = a.bytes as u64;
+                let neg = uncond.as_deref().context("no negative embedding")?;
+                let mut x = start.clone();
+                let mut state = p.new_state(n);
+                for i in 0..steps {
+                    let t = sched.model_timestep(i);
+                    den.prepare(&mut a, &[cond.as_slice()])?;
+                    let c = den.forward(&mut a, &x, t, None)?;
+                    den.prepare(&mut a, &[neg])?;
+                    let u = den.forward(&mut a, &x, t, None)?;
+                    p.step_host_state(&mut x, &mut state, &c, Some(&u), &sched, i, guidance)?;
+                    if !(hooks.on_step)(i + 1, steps, &x) {
+                        return Err(Cancelled.into());
+                    }
+                    latents.push(x.clone());
+                }
+            } else {
+                let mut a = den.arena_for(if guided { 2 } else { 1 })?;
+                memory.arena = a.bytes as u64;
+                let texts: Vec<&[f32]> = std::iter::once(cond.as_slice()).chain(uncond.as_deref()).collect();
+                den.prepare(&mut a, &texts)?;
+                den.set_latent(&mut a, &start)?;
+                den.reset_state(&mut a)?;
+                for i in 0..steps {
+                    let scalars = p.multistep_scalars(&sched, i)?;
+                    den.multistep(&mut a, sched.model_timestep(i), &scalars, guidance)?;
+                    let l = den.latent(&a)?;
+                    if !(hooks.on_step)(i + 1, steps, &l) {
+                        return Err(Cancelled.into());
+                    }
+                    latents.push(l);
+                }
+            }
+        }
+        if !self.keep_denoiser {
+            self.denoiser = None;
+        }
+        let mut x = latents.last().cloned().context("no steps ran")?;
+        p.denormalise_channels(&mut x, d.t * d.h * d.w)?;
+        let grid = Grid::from_channels_first(&x, channels, d.t, d.h, d.w);
+        let frame_dims = Dims { t: 1, h: d.h, w: d.w };
+        let scale = p.values["vae_scale"] as usize;
+        let target = crate::codegen::cuda_target(&self.ctx)?;
+        let vae = self.load_vae(frame_dims)?;
+        let total = vae.plan().output_frames(d.t);
+        let mut decoded: Option<Grid> = None;
+        match plan.vae_tile {
+            Some(t) => {
+                decoded = Some(crate::vae::tiled::decode_tiled(&grid, scale, t, &mut |g| vae.decode(g))?);
+                (hooks.on_frames)(total, total);
+            }
+            None => {
+                let mut cache = vae.new_stream();
+                for f in 0..d.t {
+                    let y = vae.run(&grid.frames(f, 1), &mut cache, f == 0)?;
+                    let done = match &mut decoded {
+                        Some(o) => {
+                            o.append_frames(&y);
+                            o.t
+                        }
+                        None => {
+                            let t = y.t;
+                            decoded = Some(y);
+                            t
+                        }
+                    };
+                    if !(hooks.on_frames)(done, total) {
+                        return Err(Cancelled.into());
+                    }
+                }
+            }
+        }
+        let out = decoded.context("an empty latent")?;
+        let arena_dims = plan.vae_tile.map_or(frame_dims, |t| Dims { t: 1, h: t.tile.min(d.h), w: t.tile.min(d.w) });
+        memory.vae_arena = crate::vae::tiled::arena_bytes(vae.plan(), &target, arena_dims.h, arena_dims.w)?;
+        let pixels = p.postprocess(&out.to_channels_first())?;
+        let (c, t, hw) = (out.c, out.t, out.h * out.w);
+        let frames = (0..t).map(|f| (0..c).flat_map(|ch| pixels[(ch * t + f) * hw..(ch * t + f + 1) * hw].iter().copied()).collect()).collect();
+        if p.options.offload_vae {
+            self.vae = None;
+        }
+        Ok(Video { frames, height: out.h, width: out.w, latents, guided, memory })
     }
 
     fn vae_dims(&self, height: usize, width: usize) -> Result<Dims> {
