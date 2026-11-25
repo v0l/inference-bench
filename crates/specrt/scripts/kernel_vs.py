@@ -641,13 +641,14 @@ def measure(sides, iters, warmup):
             fn()
     torch.cuda.synchronize()
     reps = {label: chain_len(fn) for label, fn in sides}
+    small = min(r for r in reps.values()) > 8
     enqueue = {label: [] for label, _ in sides}
     out = {label: {} for label, _ in sides}
     rng = torch.Generator()
     rng.manual_seed(SEED)
     for mode in ("warm", "cold"):
         times = {label: [] for label, _ in sides}
-        for i in range(iters):
+        for i in range(iters * (5 if mode == "cold" and small else 1)):
             order = [sides[j] for j in torch.randperm(len(sides), generator=rng).tolist()]
             pending = []
             for label, fn in order:
@@ -693,13 +694,29 @@ def verdict(r):
     return "behind"
 
 
+def resources(cubin):
+    out = {}
+    cur = None
+    text = subprocess.run(["cuobjdump", "--dump-resource-usage", str(cubin)], capture_output=True, text=True).stdout
+    for line in text.splitlines():
+        m = re.match(r"\s*Function (\S+):", line)
+        if m:
+            cur = m.group(1)
+        elif cur and "REG:" in line:
+            v = dict(re.findall(r"(\w+):(\d+)", line))
+            out[cur] = {"regs": int(v.get("REG", 0)), "spill": int(v.get("LOCAL", 0)) + int(v.get("STACK", 0))}
+            cur = None
+    return out
+
+
 def run(args):
     root = Path(args.dir)
     manifest = json.loads((root / "manifest.json").read_text())
+    res = {name: resources(root / m["cubin"]) for name, m in manifest["modules"].items()}
     torch.cuda.init()
     torch.zeros(1, device="cuda")
     cub = Cubins(root, manifest)
-    results = {"date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), "commit": args.commit, "command": args.command, "card": CARD, "iters": args.iters, "warmup": args.warmup, "spin_cycles": SPIN, "flush_bytes": FLUSH_BYTES, "before": gpu_state(), "versions": {}, "cases": []}
+    results = {"date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), "commit": args.commit, "command": args.command, "compile_jobs": manifest.get("compile_jobs"), "card": CARD, "iters": args.iters, "warmup": args.warmup, "spin_cycles": SPIN, "flush_bytes": FLUSH_BYTES, "before": gpu_state(), "versions": {}, "cases": []}
     import flashinfer as fi
     import triton
     import vllm
@@ -725,7 +742,7 @@ def run(args):
         kind, amount = case.roof
         peak = {"bw": CARD["bw_gbs"] * 1e9, "bf16": CARD["bf16_tflops"] * 1e12, "fp4": CARD["fp4_tflops"] * 1e12}[kind]
         floor_us = amount / peak * 1e6
-        entry = {"name": c["name"], "row": c["row"], "params": c["params"], "launches": c["launches"], "ours": ours_label, "sides": {}, "control": control, "control_ok": ok, "notes": case.notes, "roof": {"kind": kind, "floor_us": floor_us}}
+        entry = {"name": c["name"], "row": c["row"], "params": c["params"], "launches": c["launches"], "resources": {l["kernel"]: res[c["module"]].get(l["kernel"]) for l in c["launches"]}, "ours": ours_label, "sides": {}, "control": control, "control_ok": ok, "notes": case.notes, "roof": {"kind": kind, "floor_us": floor_us}}
         for label, _ in sides:
             t = timed[label]
             w = case.work.get(label, {})
@@ -793,6 +810,7 @@ def report(args):
     out.append("")
     out.append(f"- Date {r['date']}, commit {r['commit']}.")
     out.append(f"- Command: `{r['command']}`")
+    out.append(f"- Our modules compiled with NVRTC `--split-compile={r.get('compile_jobs')}`, as the runtime JIT does (register counts and spills per kernel are in the ours rows; they depend on this setting, see kernel-static.md rank 6).")
     v = r["versions"]
     out.append(f"- torch {v['torch']} (CUDA {v['cuda']}), FlashInfer {v['flashinfer']}, Triton {v['triton']}, vLLM {v['vllm']}, NVRTC {v['nvrtc']}.")
     out.append(f"- {r['iters']} timed launches per side and mode after {r['warmup']} warmup launches, sides alternated launch by launch with a rotating start. Warm: the side runs once untimed right before each timed launch. Cold: a {r['flush_bytes'] >> 20} MB buffer is zeroed before each timed launch. A {r['spin_cycles']} cycle GPU spin precedes each timed launch so host enqueue time is not counted.")
@@ -815,7 +833,8 @@ def report(args):
             for label, s in c["sides"].items():
                 ours = label == c["ours"]
                 if ours:
-                    roof = f"floor {c['roof']['floor_us']:.1f} us, {s['warm']['of_roofline']:.0%} / {s['cold']['of_roofline']:.0%} of roofline"
+                    regs = ", ".join(f"{k} {v['regs']} regs {v['spill']} B spill" for k, v in c.get("resources", {}).items() if v)
+                    roof = f"floor {c['roof']['floor_us']:.1f} us, {s['warm']['of_roofline']:.0%} / {s['cold']['of_roofline']:.0%} of roofline; {regs}"
                     out.append(f"| {c['name']} | {label} | {fmt_us(s['warm'])} | {fmt_us(s['cold'])} | {rate(s['warm'], label)} | {rate(s['cold'], label)} | {err_text(s['error'])} | {roof} | | | {c['control']['warm']:.3f} / {c['control']['cold']:.3f} |")
                 else:
                     out.append(f"| | {label} | {fmt_us(s['warm'])} | {fmt_us(s['cold'])} | {rate(s['warm'], label)} | {rate(s['cold'], label)} | {err_text(s['error'])} | {s['warm']['ours_vs_theirs']:.2f} | {s['cold']['ours_vs_theirs']:.2f} | {s['warm']['verdict']} / {s['cold']['verdict']} | |")

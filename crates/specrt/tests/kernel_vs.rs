@@ -201,7 +201,7 @@ fn dump_vs_kernels() {
     let Some(out) = std::env::var_os("KERNEL_VS_OUT") else { return };
     let out = PathBuf::from(out);
     std::fs::create_dir_all(&out).unwrap();
-    let jobs = specrt::jit::default_compile_jobs();
+    let jobs = std::env::var("KERNEL_VS_JOBS").ok().and_then(|j| j.parse().ok()).unwrap_or_else(specrt::jit::default_compile_jobs);
     let mut m = manifest(Some(&out), jobs);
     let (major, minor) = specrt::jit::nvrtc_version().unwrap();
     m["nvrtc"] = json!(format!("{major}.{minor}"));
