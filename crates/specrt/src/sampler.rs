@@ -419,6 +419,17 @@ impl PromptEncoder {
     }
 }
 
+pub fn stack_layers(states: &[f32], layers: usize, rows: usize, hidden: usize) -> Vec<f32> {
+    let mut out = vec![0f32; states.len()];
+    for l in 0..layers {
+        for r in 0..rows {
+            let src = &states[(l * rows + r) * hidden..(l * rows + r + 1) * hidden];
+            out[(r * layers + l) * hidden..(r * layers + l + 1) * hidden].copy_from_slice(src);
+        }
+    }
+    out
+}
+
 fn splitmix(seed: u64, i: u64) -> f64 {
     let mut z = seed.wrapping_add(i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);

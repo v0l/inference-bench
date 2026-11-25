@@ -961,6 +961,7 @@ pub struct Runtime {
     partial: CudaSlice<f32>,
     head_part: Option<CudaSlice<f32>>,
     comm: Option<crate::allreduce::Comm>,
+    key_limit: i32,
 }
 
 const HEAD_PART_ROWS: usize = 64;
@@ -1363,6 +1364,7 @@ impl Runtime {
                 _ => None,
             },
             comm,
+            key_limit: i32::MAX,
             role,
             spec: spec.clone(),
             max_ctx,
@@ -2259,7 +2261,8 @@ impl Runtime {
             .arg(&mm_stride)
             .arg(&self.seq)
             .arg(&l.window)
-            .arg(&self.mm_bidi);
+            .arg(&self.mm_bidi)
+            .arg(&self.key_limit);
         let rows = crate::codegen::flash_rows(a.head_dim, self.kv_planes);
         let config = LaunchConfig {
             grid_dim: (grid(n, rows), a.heads as u32, 1),
@@ -2748,6 +2751,52 @@ impl Runtime {
             conv: self.stream.clone_dtoh(&gb.conv_state.slice(..conv))?,
             state: self.stream.clone_dtoh(&gb.ssm_state.slice(..ssm))?,
         })
+    }
+
+    pub fn hidden_states(&mut self, tokens: &[u32], real: usize, layers: &[usize]) -> Result<Vec<f32>> {
+        let n = tokens.len();
+        let h = self.spec.dims.hidden;
+        let count = self.spec.layers.count;
+        ensure!(n >= 2 && n <= self.prefill_limit, "a hidden state run takes 2 to {} tokens, not {n}", self.prefill_limit);
+        ensure!(real >= 1 && real <= n, "{real} real tokens of {n}");
+        ensure!(layers.iter().all(|&l| l < count), "hidden states {layers:?} must come before the final norm (layer {count})");
+        ensure!(self.spec.hyper.is_none() && self.gated.is_none() && self.role.first, "hidden states read the single residual stream");
+        let last = layers.iter().copied().max().context("no hidden state layers")?;
+        self.check_tokens(tokens)?;
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        self.stream.memcpy_htod(&ids, &mut self.pre.tokens.slice_mut(..n))?;
+        self.stream.memcpy_htod(&[0i32], &mut self.buf.pos)?;
+        self.reset_linear_state()?;
+        let out = self.stream.alloc_zeros::<f32>(layers.len() * n * h)?;
+        self.key_limit = real as i32;
+        let ran = self.hidden_rows(n, last, layers, &out);
+        self.key_limit = i32::MAX;
+        ran?;
+        Ok(self.stream.clone_dtoh(&out)?)
+    }
+
+    fn hidden_rows(&self, n: usize, last: usize, layers: &[usize], out: &CudaSlice<f32>) -> Result<()> {
+        use crate::executor::{PlanBackend, run_ops};
+        let per = n * self.spec.dims.hidden;
+        let keep = |after: usize| -> Result<()> {
+            for (slot, _) in layers.iter().enumerate().filter(|(_, l)| **l == after) {
+                self.copy_rows(&self.pre.x.slice(..per), &out.slice(slot * per..(slot + 1) * per), per)?;
+            }
+            Ok(())
+        };
+        let plan = &self.plans.prefill;
+        let run = exec::Run { n, tokens: &self.pre.tokens, logits: &self.buf.logits, rows: n - 1..n, bb: None, start: Some(0), qlen: 1, mtp: None };
+        run_ops(self, &plan.head, None, &run)?;
+        keep(0)?;
+        for i in 0..last {
+            let be: &dyn PlanBackend<exec::Run<'_>> = self;
+            be.enter_layer(i)?;
+            run_ops(self, plan.layer_for(be.block(i), be.sparse(i), be.tail(i)), Some(i), &run)?;
+            run_ops(self, &plan.per_layer, Some(i), &run)?;
+            be.leave_layer(i)?;
+            keep(i + 1)?;
+        }
+        Ok(())
     }
 
     pub fn trace_prefill(&mut self, tokens: &[u32]) -> Result<Trace> {

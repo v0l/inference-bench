@@ -630,7 +630,7 @@ __device__ __forceinline__ void fm_cp_async4(void* smem, const void* gmem) {
 extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const float* qkv, const float* q_norm, const bf16_t* k_cache,
                                      const bf16_t* v_cache, const int* block_table, const int* pos_ptr, int layer,
                                      bf16_t* out_hi, bf16_t* out_lo, int tokens,
-                                     const int* mm_meta, const int* mm_table, int mm_stride, int mm_slot, int window, const int* bidi) {
+                                     const int* mm_meta, const int* mm_table, int mm_stride, int mm_slot, int window, const int* bidi, int key_limit) {
     constexpr int CPR = HEAD_DIM / 8;
     constexpr int PLANE = FM_BK * HEAD_DIM;
     static_assert(FM_BQ * HEAD_DIM * 2 <= FM_SMEM, "Q staging fits");
@@ -723,6 +723,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
         key_end = min(max(key_end, span_end(mm_meta, bidi, mm_stride, mm_slot, base + last) + 1), base + tokens);
         warp_last = max(warp_last, span_end(mm_meta, bidi, mm_stride, mm_slot, min(warp_last, base + tokens - 1)));
     }
+    key_end = min(key_end, key_limit);
     int tiles = (key_end + FM_BK - 1) / FM_BK;
     constexpr int PLANE_BYTES = PLANE * 2;
     float* kv_scales = (float*)(fm_smem + FM_STAGES * 2 * PLANE_BYTES);
