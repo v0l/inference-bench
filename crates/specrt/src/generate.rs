@@ -116,7 +116,7 @@ impl Generator {
     fn vae_dims(&self, height: usize, width: usize) -> Result<Dims> {
         let step = self.pipeline.values["pixel_step"] as usize;
         let scale = self.pipeline.values["vae_scale"] as usize;
-        ensure!(height > 0 && width > 0 && height % step == 0 && width % step == 0, "{height}x{width} is not a multiple of {step}");
+        ensure!(height > 0 && width > 0 && height.is_multiple_of(step) && width.is_multiple_of(step), "{height}x{width} is not a multiple of {step}");
         Ok(Dims { t: 1, h: height / scale, w: width / scale })
     }
 
