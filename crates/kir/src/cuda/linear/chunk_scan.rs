@@ -11,10 +11,9 @@ pub fn body() -> String {
     constexpr int NT = LA_COLS / 8;
     constexpr int KD = LA_D / 16;
     constexpr int KC = C / 16;
-    constexpr int DPW = KD / WARPS;
+    constexpr int DPW = (KD + WARPS - 1) / WARPS;
     constexpr int SP = LA_D + 8;
     constexpr int VP = C + 8;
-    static_assert(KD % WARPS == 0, \"state tiles per warp\");
     __shared__ unsigned short sh[LA_COLS * SP];
     __shared__ unsigned short sl[LA_COLS * SP];
     __shared__ unsigned short vh[LA_COLS * VP];
@@ -55,6 +54,7 @@ for (int c = 0; c < chunks; c++) {
         8,
         "#pragma unroll
 for (int j = 0; j < DPW; j++) {
+    if (warp + j * WARPS >= KD) continue;
     const uint4* kj = kp + ch * (C * LA_D / 4) + 2 * ((warp + j * WARPS) * KC * 32 + lane);
     float a2[NT][4];
 ",

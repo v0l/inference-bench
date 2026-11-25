@@ -329,10 +329,9 @@ extern "C" __global__ void __launch_bounds__(LA_CHUNK * 2) gdn_chunk_scan(const 
     constexpr int NT = LA_COLS / 8;
     constexpr int KD = LA_D / 16;
     constexpr int KC = C / 16;
-    constexpr int DPW = KD / WARPS;
+    constexpr int DPW = (KD + WARPS - 1) / WARPS;
     constexpr int SP = LA_D + 8;
     constexpr int VP = C + 8;
-    static_assert(KD % WARPS == 0, "state tiles per warp");
     __shared__ unsigned short sh[LA_COLS * SP];
     __shared__ unsigned short sl[LA_COLS * SP];
     __shared__ unsigned short vh[LA_COLS * VP];
@@ -352,6 +351,7 @@ extern "C" __global__ void __launch_bounds__(LA_CHUNK * 2) gdn_chunk_scan(const 
 #pragma unroll
             for (int e = 0; e < 4; e++) {
                 int d = (warp + j * WARPS) * 16 + g + (e >> 1) * 8;
+                if (warp + j * WARPS >= KD) continue;
                 sr[j][n][e] = st[(size_t)d * LA_D + c0 + n * 8 + 2 * t4 + (e & 1)];
             }
     auto store_state_planes = [&]() {
@@ -362,6 +362,7 @@ extern "C" __global__ void __launch_bounds__(LA_CHUNK * 2) gdn_chunk_scan(const 
 #pragma unroll
                 for (int e = 0; e < 4; e++) {
                     int d = (warp + j * WARPS) * 16 + g + (e >> 1) * 8;
+                    if (warp + j * WARPS >= KD) continue;
                     int col = n * 8 + 2 * t4 + (e & 1);
                     unsigned hi, lo;
                     split_hi_lo(sr[j][n][e], hi, lo);
@@ -416,6 +417,7 @@ extern "C" __global__ void __launch_bounds__(LA_CHUNK * 2) gdn_chunk_scan(const 
             }
 #pragma unroll
         for (int j = 0; j < DPW; j++) {
+            if (warp + j * WARPS >= KD) continue;
             const uint4* kj = kp + ch * (C * LA_D / 4) + 2 * ((warp + j * WARPS) * KC * 32 + lane);
             float a2[NT][4];
 #pragma unroll
@@ -439,6 +441,7 @@ extern "C" __global__ void __launch_bounds__(LA_CHUNK * 2) gdn_chunk_scan(const 
 #pragma unroll
             for (int e = 0; e < 4; e++) {
                 int d = (warp + j * WARPS) * 16 + g + (e >> 1) * 8;
+                if (warp + j * WARPS >= KD) continue;
                 st[(size_t)d * LA_D + c0 + n * 8 + 2 * t4 + (e & 1)] = sr[j][n][e];
             }
 }
@@ -449,10 +452,12 @@ extern "C" __global__ void gdn_gated_norm(const float* o, const float* lin, cons
     int h = blockIdx.x;
     int t = blockIdx.y;
     int d = 2 * threadIdx.x;
+    bool live = d < LA_D;
     const float* src = o + ((size_t)t * LA_VH + h) * LA_D;
-    float a = src[d];
-    float b = src[d + 1];
+    float a = live ? src[d] : 0.0f;
+    float b = live ? src[d + 1] : 0.0f;
     float inv = rsqrtf(block_reduce<false>(a * a + b * b, scratch) / LA_D + EPS);
+    if (!live) return;
     const float* z = lin + (size_t)t * LA_IN_ROWS + LA_Z_OFF + h * LA_D;
     split_store2(hi, lo, (size_t)t * LA_VALUE_DIM + h * LA_D + d, norm_w[d] * (a * inv) * silu(z[d]),
                  norm_w[d + 1] * (b * inv) * silu(z[d + 1]));

@@ -173,11 +173,11 @@ pub const FRAG_ROW: &str = "int d = (warp + j * WARPS) * 16 + g + (e >> 1) * 8;"
 pub const FRAG_COL: &str = "int col = n * 8 + 2 * t4 + (e & 1);";
 
 pub fn state_tile_load(n: usize) -> String {
-    nest(n, &FRAG, &format!("{FRAG_ROW}\nsr[j][n][e] = st[(size_t)d * LA_D + c0 + n * 8 + 2 * t4 + (e & 1)];\n"))
+    nest(n, &FRAG, &format!("{FRAG_ROW}\nif (warp + j * WARPS >= KD) continue;\nsr[j][n][e] = st[(size_t)d * LA_D + c0 + n * 8 + 2 * t4 + (e & 1)];\n"))
 }
 
 pub fn state_tile_store(n: usize) -> String {
-    nest(n, &FRAG, &format!("{FRAG_ROW}\nst[(size_t)d * LA_D + c0 + n * 8 + 2 * t4 + (e & 1)] = sr[j][n][e];\n"))
+    nest(n, &FRAG, &format!("{FRAG_ROW}\nif (warp + j * WARPS >= KD) continue;\nst[(size_t)d * LA_D + c0 + n * 8 + 2 * t4 + (e & 1)] = sr[j][n][e];\n"))
 }
 
 pub fn split_plane_store(n: usize, hi: &str, lo: &str, pitch: &str, row: &str, col: &str, value: &str) -> String {
@@ -195,7 +195,7 @@ split_hi_lo({value}, hi, lo);
 
 pub fn store_state_planes(n: usize) -> String {
     let mut o = at(n, "auto store_state_planes = [&]() {\n");
-    let body = format!("{FRAG_ROW}\n{FRAG_COL}\n{}", split_plane_store(0, "sh", "sl", "SP", "d", "col", "sr[j][n][e]"));
+    let body = format!("{FRAG_ROW}\nif (warp + j * WARPS >= KD) continue;\n{FRAG_COL}\n{}", split_plane_store(0, "sh", "sl", "SP", "d", "col", "sr[j][n][e]"));
     o += &nest(n + 4, &FRAG, &body);
     o += &at(n, "};\n");
     o
