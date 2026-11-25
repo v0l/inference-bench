@@ -1,6 +1,6 @@
 name = "kimi_k3"
 kind = "family"
-min_engine = 15
+min_engine = 17
 extends = "kimi_linear"
 
 [match]
