@@ -215,6 +215,7 @@ pub struct Checkpoint {
     gguf: Option<std::sync::Arc<Gguf>>,
     shards: std::sync::Arc<Vec<Shard>>,
     names: std::sync::Arc<HashMap<String, (usize, String)>>,
+    joined: std::sync::Arc<HashMap<String, Vec<String>>>,
     staged: Option<crate::loader::Batch>,
     cut: Option<std::sync::Arc<crate::tp::RankCut>>,
     owned: std::sync::Arc<std::sync::Mutex<Vec<Box<[u8]>>>>,
@@ -225,6 +226,43 @@ pub struct View<'a> {
     pub dtype: Dtype,
     pub shape: Vec<usize>,
     pub data: &'a [u8],
+}
+
+pub struct StoredParts<'a> {
+    pub elem: usize,
+    pub parts: Vec<&'a [u8]>,
+}
+
+fn row_shard(name: &str) -> Option<(String, usize)> {
+    let at = name.find(".shard_")?;
+    let rest = &name[at + ".shard_".len()..];
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let leaf = rest[digits..].strip_prefix('.')?;
+    if digits == 0 || leaf.is_empty() {
+        return None;
+    }
+    Some((format!("{}.{leaf}", &name[..at]), rest[..digits].parse().ok()?))
+}
+
+fn join_row_shards(names: &HashMap<String, (usize, String)>) -> HashMap<String, Vec<String>> {
+    joined_names(names.keys(), |n| names.contains_key(n))
+}
+
+pub fn joined_names<'a>(names: impl Iterator<Item = &'a String>, stored: impl Fn(&str) -> bool) -> HashMap<String, Vec<String>> {
+    let mut groups: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    for name in names {
+        if let Some((whole, i)) = row_shard(name) {
+            groups.entry(whole).or_default().push((i, name.clone()));
+        }
+    }
+    groups
+        .into_iter()
+        .filter_map(|(whole, mut parts)| {
+            parts.sort_unstable();
+            let complete = parts.iter().enumerate().all(|(k, (i, _))| k == *i) && !stored(&whole);
+            complete.then(|| (whole, parts.into_iter().map(|(_, n)| n).collect()))
+        })
+        .collect()
 }
 
 fn shard_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -247,7 +285,7 @@ fn shard_files(dir: &Path) -> Result<Vec<PathBuf>> {
 impl Checkpoint {
     pub fn open(dir: &Path) -> Result<Self> {
         if dir.extension().is_some_and(|e| e == "gguf") {
-            return Ok(Checkpoint { gguf: Some(std::sync::Arc::new(Gguf::open(dir)?)), shards: Default::default(), names: Default::default(), staged: None, cut: None, owned: Default::default(), files: vec![dir.to_path_buf()] });
+            return Ok(Checkpoint { gguf: Some(std::sync::Arc::new(Gguf::open(dir)?)), shards: Default::default(), names: Default::default(), joined: Default::default(), staged: None, cut: None, owned: Default::default(), files: vec![dir.to_path_buf()] });
         }
         let files = shard_files(dir)?;
         let mut shards = Vec::with_capacity(files.len());
@@ -264,7 +302,8 @@ impl Checkpoint {
             }
             shards.push(Shard { map, data_start: 8 + header, meta });
         }
-        Ok(Checkpoint { gguf: None, shards: std::sync::Arc::new(shards), names: std::sync::Arc::new(names), staged: None, cut: None, owned: Default::default(), files })
+        let joined = std::sync::Arc::new(join_row_shards(&names));
+        Ok(Checkpoint { gguf: None, shards: std::sync::Arc::new(shards), names: std::sync::Arc::new(names), joined, staged: None, cut: None, owned: Default::default(), files })
     }
 
     pub fn for_rank(&self, cut: crate::tp::RankCut) -> Result<Checkpoint> {
@@ -302,6 +341,7 @@ impl Checkpoint {
             }
             names.insert(public, at.clone());
         }
+        self.joined = std::sync::Arc::new(join_row_shards(&names));
         self.names = std::sync::Arc::new(names);
         self
     }
@@ -309,8 +349,48 @@ impl Checkpoint {
     pub fn has(&self, name: &str) -> bool {
         match &self.gguf {
             Some(g) => g.tensor_for_hf(name).is_some_and(|n| g.tensors.contains_key(&n)),
-            None => self.names.contains_key(name),
+            None => self.names.contains_key(name) || self.joined.contains_key(name),
         }
+    }
+
+    pub fn parts(&self, name: &str) -> Vec<String> {
+        match self.joined.get(name) {
+            Some(parts) => parts.clone(),
+            None => vec![name.to_string()],
+        }
+    }
+
+    pub fn is_part(&self, name: &str) -> bool {
+        row_shard(name).is_some_and(|(whole, _)| self.joined.contains_key(&whole))
+    }
+
+    pub fn joined(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.joined.keys().cloned().collect();
+        out.sort();
+        out
+    }
+
+    pub fn dtype_of(&self, name: &str) -> Result<Dtype> {
+        let first = &self.parts(name)[0];
+        let (i, stored) = self.names.get(first).with_context(|| format!("{name} is not in the checkpoint"))?;
+        Ok(self.shards[*i].meta.info(stored).context("tensor info")?.dtype)
+    }
+
+    fn joined_info(&self, name: &str, parts: &[String]) -> Result<(Dtype, Vec<usize>)> {
+        let mut rows = 0;
+        let mut head: Option<(Dtype, Vec<usize>)> = None;
+        for part in parts {
+            let (i, stored) = self.names.get(part).with_context(|| format!("{part} is not in the checkpoint"))?;
+            let info = self.shards[*i].meta.info(stored).context("tensor info")?;
+            ensure!(!info.shape.is_empty(), "{part} is a scalar and cannot be joined along rows");
+            rows += info.shape[0];
+            match &head {
+                None => head = Some((info.dtype, info.shape[1..].to_vec())),
+                Some((dtype, tail)) => ensure!(*dtype == info.dtype && tail[..] == info.shape[1..], "{part} is {:?} {:?}, unlike the first part of {name} ({dtype:?} [_, {tail:?}])", info.dtype, info.shape),
+            }
+        }
+        let (dtype, tail) = head.with_context(|| format!("{name} has no parts"))?;
+        Ok((dtype, std::iter::once(rows).chain(tail).collect()))
     }
 
     pub fn view(&self, name: &str) -> Result<View<'_>> {
@@ -323,11 +403,22 @@ impl Checkpoint {
     }
 
     pub fn shape_of(&self, name: &str) -> Result<Vec<usize>> {
+        if let Some(parts) = self.joined.get(name) {
+            return Ok(self.joined_info(name, parts)?.1);
+        }
         let (i, stored) = self.names.get(name).with_context(|| format!("{name} is not in the checkpoint"))?;
         Ok(self.shards[*i].meta.info(stored).context("tensor info")?.shape.clone())
     }
 
     fn full_view(&self, name: &str) -> Result<View<'_>> {
+        if let Some(parts) = self.joined.get(name) {
+            let (dtype, shape) = self.joined_info(name, parts)?;
+            let mut bytes = Vec::new();
+            for part in parts {
+                bytes.extend_from_slice(self.full_view(part)?.data);
+            }
+            return Ok(View { dtype, shape, data: self.keep(bytes) });
+        }
         let (i, stored) = self.names.get(name).with_context(|| format!("{name} is not in the checkpoint"))?;
         let shard = &self.shards[*i];
         let info = shard.meta.info(stored).context("tensor info")?;
@@ -449,7 +540,7 @@ impl Checkpoint {
     }
 
     pub fn with_staged(&self, batch: Option<crate::loader::Batch>) -> Checkpoint {
-        Checkpoint { gguf: self.gguf.clone(), shards: self.shards.clone(), names: self.names.clone(), staged: batch, cut: self.cut.clone(), owned: Default::default(), files: self.files.clone() }
+        Checkpoint { gguf: self.gguf.clone(), shards: self.shards.clone(), names: self.names.clone(), joined: self.joined.clone(), staged: batch, cut: self.cut.clone(), owned: Default::default(), files: self.files.clone() }
     }
 
     pub fn release(&self) {
@@ -1354,7 +1445,59 @@ impl Checkpoint {
 
     fn prelude_weights(&self, spec: &Spec, i: usize, p: &str) -> Result<Vec<(String, Vec<f32>)>> {
         let Some(pre) = spec.prelude.as_ref().filter(|pre| pre.slot(i).is_some()) else { return Ok(Vec::new()) };
-        pre.weights().into_iter().map(|(w, len)| Ok((w.clone(), self.flat(&format!("{p}.{}.{w}", pre.module), spec.weight_len(&len)?)?))).collect()
+        pre.weights()
+            .into_iter()
+            .filter(|(w, _)| pre.stored_as(w).is_none_or(|(_, dtype)| dtype == "f32"))
+            .map(|(w, len)| Ok((w.clone(), self.flat(&format!("{p}.{}.{w}", pre.module), spec.weight_len(&len)?)?)))
+            .collect()
+    }
+
+    pub fn stored_prelude(&self, spec: &Spec, i: usize, global: usize) -> Result<Vec<(String, StoredParts<'_>)>> {
+        let Some(pre) = spec.prelude.as_ref().filter(|pre| pre.slot(i).is_some()) else { return Ok(Vec::new()) };
+        let p = format!("{}.layers.{global}.{}", self.root(), pre.module);
+        let mut out = Vec::new();
+        for (w, len) in pre.weights() {
+            let Some((_, dtype)) = pre.stored_as(&w).filter(|(_, d)| *d != "f32") else { continue };
+            let name = format!("{p}.{w}");
+            let want = match dtype {
+                "bf16" => Dtype::BF16,
+                "fp8" => Dtype::F8_E4M3,
+                o => bail!("{name} is stored as {o:?}, which the loader does not keep"),
+            };
+            let parts: Vec<&[u8]> = self.parts(&name).iter().map(|n| self.full_view(n)).map(|v| v.and_then(|v| if v.dtype == want { Ok(v.data) } else { bail!("{name} holds {:?}, not {want:?}", v.dtype) })).collect::<Result<_>>()?;
+            let bytes: usize = parts.iter().map(|b| b.len()).sum();
+            let elem = want.bitsize() / 8;
+            ensure!(bytes == spec.weight_len(&len)? * elem, "{name} holds {} values, expected {}", bytes / elem, spec.weight_len(&len)?);
+            out.push((w, StoredParts { elem, parts }));
+        }
+        Ok(out)
+    }
+
+    pub fn complete_prelude(&self, spec: &mut Spec, first_layer: usize) -> Result<()> {
+        let root = self.root();
+        let Some(pre) = spec.prelude.as_mut() else { return Ok(()) };
+        let Some(&local) = pre.layers.first() else { return Ok(()) };
+        let layer = first_layer + local;
+        for (prefix, weight) in pre.stored.clone() {
+            let name = format!("{root}.layers.{layer}.{}.{weight}", pre.module);
+            if self.gguf.is_some() || !self.has(&name) {
+                continue;
+            }
+            let dtype = match self.dtype_of(&name)? {
+                Dtype::BF16 => "bf16",
+                Dtype::F8_E4M3 => "fp8",
+                _ => "f32",
+            };
+            pre.words.insert(format!("{prefix}_dtype"), dtype.into());
+            pre.params.remove(&format!("{prefix}_scale"));
+            if dtype == "fp8" {
+                let scale_name = format!("{name}_scale");
+                let s = self.floats(&scale_name, &self.view(&scale_name).with_context(|| format!("{name} is fp8 with no {scale_name} beside it"))?.shape)?;
+                ensure!(s.len() == 1 && s[0].is_finite() && s[0] > 0.0, "{scale_name} is {s:?}, expected one positive scale for the whole table");
+                pre.params.insert(format!("{prefix}_scale"), s[0] as f64);
+            }
+        }
+        Ok(())
     }
 
     pub fn gated_head(&self, spec: &Spec) -> Result<Vec<(String, Vec<f32>)>> {
@@ -1516,13 +1659,14 @@ impl Checkpoint {
                 }
                 (Stacked::Bf16(gate), Stacked::Bf16(up), Stacked::Bf16(down))
             }
-            None if m.fused_experts && self.has(&format!("{p}.mlp.experts.gate_up_proj.weight")) => {
+            None if m.fused_experts && self.fused_expert_name(p, "gate_up_proj").is_some() => {
                 ensure!(quant == Quant::Bf16, "fused experts are bf16 only");
                 let shared = m.shared_intermediate;
-                let fused = self.bf16(&format!("{p}.mlp.experts.gate_up_proj.weight"), &[e, 2 * inter, h])?;
+                let fused = self.bf16(&self.fused_expert_name(p, "gate_up_proj").unwrap_or_default(), &[e, 2 * inter, h])?;
                 let (mut gate, mut up) = split_gate_up(&fused, h, e, inter, false);
-                let mut down = self.bf16(&format!("{p}.mlp.experts.down_proj.weight"), &[e, h, inter])?.into_owned();
-                if shared > 0 {
+                let down_name = self.fused_expert_name(p, "down_proj").with_context(|| format!("{p}.mlp.experts has a fused gate_up_proj but no fused down_proj"))?;
+                let mut down = self.bf16(&down_name, &[e, h, inter])?.into_owned();
+                if shared > 0 && self.has(&format!("{shared_module}.input_linear.weight")) {
                     let both = self.bf16(&format!("{shared_module}.input_linear.weight"), &[2 * shared, h])?;
                     gate.extend_from_slice(&both[..shared * h]);
                     up.extend_from_slice(&both[shared * h..]);
@@ -1533,6 +1677,11 @@ impl Checkpoint {
                             down.extend_from_slice(&all[start..start + inter]);
                         }
                     }
+                } else if shared > 0 {
+                    ensure!(shared_slots == 1, "fused experts take one shared expert of the routed width");
+                    gate.extend_from_slice(&self.bf16(&format!("{shared_module}.gate_proj.weight"), &[inter, h])?);
+                    up.extend_from_slice(&self.bf16(&format!("{shared_module}.up_proj.weight"), &[inter, h])?);
+                    down.extend_from_slice(&self.bf16(&format!("{shared_module}.down_proj.weight"), &[h, inter])?);
                 }
                 (Stacked::Bf16(gate), Stacked::Bf16(up), Stacked::Bf16(down))
             }
@@ -1555,6 +1704,11 @@ impl Checkpoint {
             up,
             down,
         })
+    }
+
+    fn fused_expert_name(&self, p: &str, which: &str) -> Option<String> {
+        let bare = format!("{p}.mlp.experts.{which}");
+        [format!("{bare}.weight"), bare].into_iter().find(|n| self.has(n))
     }
 
     fn parallel_norms(&self, spec: &Spec, m: &crate::spec::Moe, p: &str) -> Result<ParallelNorms> {
@@ -2008,7 +2162,7 @@ mod tests {
         let m = spec.moe.as_ref().unwrap();
         assert_eq!((m.experts, m.top_k(), m.expert_intermediate, m.shared_intermediate, m.shared_gate), (e, 2, inter, inter, true));
         spec.check_moe_runnable().unwrap();
-        let ck = Checkpoint { gguf: Some(std::sync::Arc::new(g)), shards: Default::default(), names: Default::default(), staged: None, cut: None, owned: Default::default(), files: Vec::new() };
+        let ck = Checkpoint { gguf: Some(std::sync::Arc::new(g)), shards: Default::default(), names: Default::default(), joined: Default::default(), staged: None, cut: None, owned: Default::default(), files: Vec::new() };
         let w = ck.moe_layer(&spec, "model.layers.0", Quant::Bf16).unwrap();
         let Stacked::Bf16(gate) = &w.gate else { panic!("bf16 stack") };
         assert_eq!(gate.len(), (e + 1) * inter * h);

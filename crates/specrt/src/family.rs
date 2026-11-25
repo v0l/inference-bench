@@ -211,6 +211,7 @@ pub struct FamilyPrelude {
     pub params: std::collections::BTreeMap<String, ParamSource>,
     pub scratch: std::collections::BTreeMap<String, String>,
     pub int_scratch: std::collections::BTreeMap<String, String>,
+    pub stored: std::collections::BTreeMap<String, String>,
     pub node: Vec<crate::graph::Node>,
 }
 
@@ -236,6 +237,8 @@ impl FamilyPrelude {
             params: read_params(&self.params, config)?,
             scratch: self.scratch.clone(),
             int_scratch: self.int_scratch.clone(),
+            stored: self.stored.clone(),
+            words: Default::default(),
             node: self.node.clone(),
         }))
     }

@@ -146,7 +146,8 @@
     "active": 2,
     "expert_intermediate": 32,
     "shared_intermediate": 32,
-    "shared_gate": true
+    "shared_gate": true,
+    "fused_experts": true
   },
   "linear_attention": {
     "kind": "gated_delta_net",
@@ -366,6 +367,9 @@
     },
     "int_scratch": {
       "ple_ids": "ngram_heads"
+    },
+    "stored": {
+      "ple_table": "ple_embedding.ngram_embedding.weight"
     },
     "node": [
       {

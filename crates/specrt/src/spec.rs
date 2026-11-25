@@ -540,11 +540,20 @@ pub struct Prelude {
     pub scratch: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub int_scratch: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub stored: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub words: std::collections::BTreeMap<String, String>,
     pub node: Vec<crate::graph::Node>,
 }
 
 impl Prelude {
     pub const BUFFERS: [&'static str; 3] = ["x", "streams", "tokens"];
+
+    pub fn stored_as(&self, weight: &str) -> Option<(&str, &str)> {
+        let (prefix, _) = self.stored.iter().find(|(_, w)| *w == weight)?;
+        Some((prefix.as_str(), self.words.get(&format!("{prefix}_dtype")).map_or("f32", String::as_str)))
+    }
 
     pub fn slot(&self, layer: usize) -> Option<usize> {
         self.layers.iter().position(|&l| l == layer)
@@ -2531,6 +2540,14 @@ impl Spec {
             crate::state::dim(self, w).with_context(|| format!("[prelude] scratch {n}"))?;
         }
         ensure!(p.int_scratch.keys().all(|n| !p.scratch.contains_key(n)), "[prelude.int_scratch] repeats a [prelude.scratch] name");
+        let weights = p.weights();
+        for (prefix, w) in &p.stored {
+            ensure!(weights.iter().any(|(n, _)| n == w), "[prelude.stored] {prefix} names {w:?}, which no [[prelude.node]] binds as a weight");
+        }
+        for (k, v) in &p.words {
+            let prefix = k.strip_suffix("_dtype").filter(|pre| p.stored.contains_key(*pre));
+            ensure!(prefix.is_some() && matches!(v.as_str(), "f32" | "bf16" | "fp8"), "[prelude.words] {k} = {v:?} is not the f32, bf16 or fp8 dtype of a [prelude.stored] weight");
+        }
         for (i, n) in p.node.iter().enumerate() {
             ensure!(n.op == "kernel" && n.kernel.is_some(), "[[prelude.node]] {i} must be a kernel node with `kernel`");
             ensure!(!n.grid.is_empty() && n.grid.len() <= 3, "[[prelude.node]] {i} needs a grid of one to three symbols");

@@ -16,6 +16,7 @@ access = "read"
 name = "table"
 role = "weight"
 access = "read"
+stored = "ple_table"
 
 [[param]]
 name = "emb"

@@ -308,6 +308,8 @@ pub struct ParamDesc {
     pub access: String,
     #[serde(default, rename = "type")]
     pub ty: Option<String>,
+    #[serde(default)]
+    pub stored: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
@@ -558,6 +560,38 @@ impl Description {
         })
     }
 
+    fn stored(&self, shape: &Shape, params: &mut [Param]) -> Result<Vec<(String, f32)>, String> {
+        let mut scales = Vec::new();
+        for (p, q) in self.param.iter().zip(params.iter_mut()) {
+            let Some(prefix) = &p.stored else { continue };
+            if p.ty.as_deref().is_some_and(|t| t != "f32") || p.role != "weight" || p.access != "read" {
+                return Err(format!("{}: stored param {:?} must be a read f32 weight in the description", self.name, p.name));
+            }
+            let dtype = match shape.get(&format!("{prefix}_dtype")) {
+                None => "f32".to_string(),
+                Some(Value::String(s)) => s.clone(),
+                Some(v) => return Err(format!("{}: {prefix}_dtype is {v}, not a dtype word", self.name)),
+            };
+            q.ty = match dtype.as_str() {
+                "f32" => Scalar::F32,
+                "bf16" => Scalar::Bf16,
+                "fp8" => Scalar::U8,
+                o => return Err(format!("{}: {prefix}_dtype {o:?} is not f32, bf16 or fp8", self.name)),
+            };
+            let scale = match shape.get(&format!("{prefix}_scale")) {
+                None => 1.0,
+                Some(Value::Float(f)) => *f as f32,
+                Some(Value::Integer(i)) => *i as f32,
+                Some(v) => return Err(format!("{}: {prefix}_scale is {v}, not a number", self.name)),
+            };
+            if !scale.is_finite() || scale <= 0.0 || (q.ty != Scalar::U8 && scale != 1.0) {
+                return Err(format!("{}: {prefix}_scale {scale} needs a positive scale, and only fp8 takes one other than 1", self.name));
+            }
+            scales.push((p.name.clone(), scale));
+        }
+        Ok(scales)
+    }
+
     fn scalar(&self, p: &ParamDesc) -> Result<Scalar, String> {
         Ok(match p.ty.as_deref() {
             None | Some("f32") => Scalar::F32,
@@ -767,8 +801,9 @@ impl Description {
         Ok(crate::hash::TokenHash { context: n["context"], heads: n["heads"], out_row: n["out_row"], layers: n["layers"], blank: n["blank"] as u64, per_head, lets, index: index.fold().map_err(|e| format!("{}: index: {e}", self.name))? })
     }
 
-    fn group_map(&self, shape: &Shape, words: &[(String, String)]) -> Result<crate::group::GroupMap, String> {
+    fn group_map(&self, shape: &Shape, words: &[(String, String)], params: &mut [Param]) -> Result<crate::group::GroupMap, String> {
         use crate::group::GroupStage;
+        let scales = self.stored(shape, params)?;
         let n = self.sizes(shape, &self.args, &["width"], "[args]")?;
         let mut consts = Vec::new();
         for c in &self.consts {
@@ -805,7 +840,7 @@ impl Description {
                 o => return Err(format!("{}: group_map stage op {o:?} is not load, gather, gather_row, value, sum, scalar or store", self.name)),
             });
         }
-        Ok(crate::group::GroupMap { width: n["width"], consts, stages })
+        Ok(crate::group::GroupMap { width: n["width"], consts, stages, scales })
     }
 
     fn seq_kernel(&self, t: &Target, shape: &Shape) -> Result<Kernel, String> {
@@ -827,7 +862,8 @@ impl Description {
                 Kernel::seq(t, intern(&self.name), self.threads(shape)?, params, body).map_err(fail)
             }
             "group_map" => {
-                let body = SeqBody::GroupMap(self.group_map(shape, &words)?);
+                let mut params = params;
+                let body = SeqBody::GroupMap(self.group_map(shape, &words, &mut params)?);
                 Kernel::seq(t, intern(&self.name), self.threads(shape)?, params, body).map_err(fail)
             }
             "group_norm" => {
@@ -1142,6 +1178,9 @@ impl Description {
         }
         if self.family != "token_hash" && !self.int.is_empty() {
             return Err(format!("{}: only family token_hash takes [[int]]", self.name));
+        }
+        if self.family != "group_map" && self.param.iter().any(|p| p.stored.is_some()) {
+            return Err(format!("{}: only family group_map takes a stored param", self.name));
         }
         match self.family.as_str() {
             "compose" => self.compose(t, shape),

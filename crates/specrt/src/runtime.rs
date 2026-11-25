@@ -57,7 +57,7 @@ fn weight_plan(ck: &Checkpoint, spec: &Spec, range: StageRange, role: StageRole)
     let layers: Vec<usize> = (0..spec.layers.count).collect();
     let half = layers.len() / 2;
     for &i in &layers[..half] {
-        push(ck.names_under(&format!("{root}.layers.{}.", range.start + i)), Work::Layer(i));
+        push(layer_names(ck, &format!("{root}.layers.{}.", range.start + i)), Work::Layer(i));
     }
     if role.first && !(tied && role.last) {
         push(ck.tensor_names(&[embed]), Work::Embed);
@@ -70,9 +70,13 @@ fn weight_plan(ck: &Checkpoint, spec: &Spec, range: StageRange, role: StageRole)
         push(names, Work::Mtp);
     }
     for &i in &layers[half..] {
-        push(ck.names_under(&format!("{root}.layers.{}.", range.start + i)), Work::Layer(i));
+        push(layer_names(ck, &format!("{root}.layers.{}.", range.start + i)), Work::Layer(i));
     }
     plan
+}
+
+fn layer_names(ck: &Checkpoint, prefix: &str) -> Vec<String> {
+    ck.names_under(prefix).into_iter().filter(|n| !ck.is_part(n)).collect()
 }
 
 #[derive(Clone, Copy)]
@@ -102,6 +106,30 @@ struct Weights {
 }
 
 type GatedWeights = std::collections::BTreeMap<String, CudaSlice<f32>>;
+type StoredWeights = std::collections::BTreeMap<String, CudaSlice<u8>>;
+
+fn upload_stored(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, i: usize, global: usize) -> Result<StoredWeights> {
+    let mut out = StoredWeights::new();
+    for (name, s) in ck.stored_prelude(spec, i, global)? {
+        let bytes: usize = s.parts.iter().map(|p| p.len()).sum();
+        let mut dst = stream.alloc_zeros::<u8>(bytes)?;
+        let mut at = 0;
+        for part in &s.parts {
+            stream.memcpy_htod(*part, &mut dst.slice_mut(at..at + part.len()))?;
+            stream.synchronize()?;
+            at += part.len();
+        }
+        out.insert(name, dst);
+    }
+    if !out.is_empty() {
+        let pre = spec.prelude.as_ref().expect("stored weights come from a prelude");
+        let module = format!("{}.layers.{global}.{}", ck.root(), pre.module);
+        for w in out.keys() {
+            ck.release_names(&ck.parts(&format!("{module}.{w}")));
+        }
+    }
+    Ok(out)
+}
 
 fn upload_gated(stream: &Arc<CudaStream>, weights: &[(String, Vec<f32>)]) -> Result<GatedWeights> {
     weights.iter().map(|(n, v)| Ok((n.clone(), stream.clone_htod(v)?))).collect()
@@ -161,7 +189,7 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, store: &
             slot: before(true),
         }),
     };
-    let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, ln_pre_mlp: up_opt(&l.ln_pre_mlp)?, ln_post_mlp: up_opt(&l.ln_post_mlp)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)?, moe: l.moe.as_ref().map(|m| moe::DeviceMoe::upload(stream, m, i, cached.as_ref().map(|(p, n)| (*p, *n)))).transpose()?, hyper: l.hyper.iter().map(|v| Ok(stream.clone_htod(v)?)).collect::<Result<_>>()?, gated: l.gated.iter().map(|s| upload_gated(stream, s)).collect::<Result<_>>()?, prelude: spec.prelude_slot(i).map(|s| Ok::<_, anyhow::Error>((s as i32, upload_gated(stream, &l.prelude)?))).transpose()?, ple: upload_ple(stream, &l.ple)?, ple_at: i as i32 };
+    let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, ln_pre_mlp: up_opt(&l.ln_pre_mlp)?, ln_post_mlp: up_opt(&l.ln_post_mlp)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)?, moe: l.moe.as_ref().map(|m| moe::DeviceMoe::upload(stream, m, i, cached.as_ref().map(|(p, n)| (*p, *n)))).transpose()?, hyper: l.hyper.iter().map(|v| Ok(stream.clone_htod(v)?)).collect::<Result<_>>()?, gated: l.gated.iter().map(|s| upload_gated(stream, s)).collect::<Result<_>>()?, prelude: spec.prelude_slot(i).map(|s| Ok::<_, anyhow::Error>((s as i32, upload_gated(stream, &l.prelude)?))).transpose()?, prelude_stored: upload_stored(stream, ck, spec, i, global)?, ple: upload_ple(stream, &l.ple)?, ple_at: i as i32 };
     copied(stream)?;
     Ok(layer)
 }
@@ -615,6 +643,7 @@ struct DeviceLayer {
     hyper: Vec<CudaSlice<f32>>,
     gated: Vec<GatedWeights>,
     prelude: Option<(i32, GatedWeights)>,
+    prelude_stored: StoredWeights,
     ple: PleWeights,
     ple_at: i32,
 }
@@ -657,6 +686,7 @@ impl DeviceLayer {
             + (self.ln1.num_bytes() + self.ln2.num_bytes()) as u64
             + self.hyper.iter().map(|v| v.num_bytes() as u64).sum::<u64>()
             + self.gated.iter().flat_map(|g| g.values()).chain(self.prelude.iter().flat_map(|(_, w)| w.values())).map(|v| v.num_bytes() as u64).sum::<u64>()
+            + self.prelude_stored.values().map(|v| v.num_bytes() as u64).sum::<u64>()
             + self.ple.values().map(|v| v.num_bytes() as u64).sum::<u64>()
     }
 }
@@ -1122,6 +1152,9 @@ impl Runtime {
         let mut staged = staged;
         if staged.runtime.offload.enabled() {
             staged.runtime.graphs = false;
+        }
+        if staged.prelude.is_some() {
+            Checkpoint::for_repo(&staged.repo)?.renamed(&staged.tensors).complete_prelude(&mut staged, range.start)?;
         }
         let spec = &staged;
         ensure!(layout.slots >= 1, "need at least one slot");

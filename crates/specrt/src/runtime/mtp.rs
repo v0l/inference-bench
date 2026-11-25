@@ -43,6 +43,7 @@ impl DeviceMtp {
             ln_post_mlp: None,
             gated: Vec::new(),
             prelude: None,
+            prelude_stored: Default::default(),
             ple: crate::runtime::PleWeights::new(),
             ple_at: -1,
             mixer: DeviceMixer::Attention(DeviceAttn {
