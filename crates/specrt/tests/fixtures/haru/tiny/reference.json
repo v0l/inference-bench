@@ -75,6 +75,19 @@
     64
    ]
   },
+  "session.user_noise": {
+   "file": "session.user_noise.bin",
+   "shape": [
+    6,
+    64
+   ]
+  },
+  "session.user_scale": {
+   "file": "session.user_scale.bin",
+   "shape": [
+    6
+   ]
+  },
   "session.user_latent": {
    "file": "session.user_latent.bin",
    "shape": [
@@ -205,7 +218,7 @@
  },
  "checks": {
   "chunked_prefill_max_diff": 5.036592483520508e-06,
-  "stream_decode_vs_whole": 4.706302661361406e-06,
+  "stream_decode_vs_whole": 2.7486141789268004e-06,
   "stream_encode_vs_whole": 9.377312721881026e-07,
   "clip_encode_stream_vs_whole": 7.828026582501479e-07,
   "clip_decode_stream_vs_whole": 6.040243079041829e-06

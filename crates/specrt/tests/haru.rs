@@ -290,6 +290,12 @@ fn the_three_streams_sum_into_one_position() {
     let (session_tokens, _) = reference("session.token");
     let (latents, _) = reference("session.latent");
     let (users, _) = reference("session.user_latent");
+    let (means, _) = reference("session.user_mean");
+    let (noise, _) = reference("session.user_noise");
+    let (scales, _) = reference("session.user_scale");
+    let latent_std = config["codec"]["latent_std"].as_f64().unwrap() as f32;
+    let drawn: Vec<f32> = means.iter().zip(&noise).enumerate().map(|(i, (m, n))| m + scales[i / d] * (latent_std / 0.8) * n).collect();
+    assert!(max_rel(&drawn, &users) < 1e-6, "user latents are the encoder mean plus scaled noise");
     let (want, _) = reference("session.embeds");
     let mut got = Vec::new();
     for i in 0..users.len() / d {

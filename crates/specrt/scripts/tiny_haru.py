@@ -218,9 +218,10 @@ def build(args):
 
         token, latent = emit(last, 0)
         user_noise = torch.randn(STEPS, d, generator=g)
+        user_scale = torch.randn(STEPS, generator=g)
         for i in range(STEPS):
             mean = stream.encode(user_audio[i : i + 1])[0]
-            user_latent = mean + (config.codec.latent_std / 0.8) * user_noise[i : i + 1]
+            user_latent = mean + user_scale[i] * (config.codec.latent_std / 0.8) * user_noise[i : i + 1]
             e = model.embed(token[None], latent[None], user_latent[None])
             h = model(e, cache)[:, -1]
             frames["user_mean"].append(mean[0])
@@ -264,6 +265,8 @@ def build(args):
     ref.put("prompt.logits", stream_logits(model, prompt_hidden[0]))
     ref.put("session.user_audio", user_audio)
     ref.put("session.user_mean", stream_mean)
+    ref.put("session.user_noise", user_noise)
+    ref.put("session.user_scale", user_scale)
     ref.put("session.user_latent", torch.stack(frames["user_latent"]))
     ref.put("session.embeds", torch.stack(frames["embeds"]))
     ref.put("session.head_noise", head_noise)
