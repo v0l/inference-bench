@@ -234,6 +234,7 @@ impl<'a> Signer<'a> {
             match name {
                 "x" => Some(self.x()),
                 "tokens" => Some(Tensor::new(Place::Input("tokens"), Rows::Tokens, 1, Form::I32)),
+                "streams" => self.spec.gated_residual().map(|h| Tensor::new(Place::Local("streams".into()), Rows::Tokens, h.width(self.hidden()), Form::F32)),
                 _ => None,
             }
         };
@@ -322,6 +323,12 @@ impl<'a> Signer<'a> {
     fn linear(&self, weight: Weight, quant: crate::plan::QuantSource, input: Buf, output: Buf, layer: usize) -> Signature {
         let s = crate::gemm::linear_shape(self.spec, weight.name());
         let q = quant.resolve_for(self.spec, layer, weight);
+        if weight == Weight::MtpFcHidden {
+            let width = self.spec.draft_width();
+            let streams = Tensor::new(Place::Local("streams".into()), Rows::Tokens, width, Form::F32);
+            let reads = vec![Tensor::buf(input, Rows::Tokens, width), Tensor::weight(weight.name(), weight.rows(self.spec), s.k, Form::Weight(q)), streams.clone()];
+            return Signature { class: Class::Gemm, reads, writes: vec![streams] };
+        }
         let head = matches!(weight, Weight::LmHead | Weight::MtpHead);
         let rows = if weight == Weight::LmHead { Rows::Out } else { Rows::Tokens };
         let out_cols = match s.epi {
@@ -426,16 +433,25 @@ impl<'a> Signer<'a> {
         let mut bind = h.node[node as usize].bind.clone();
         for b in bind.values_mut() {
             if let Bind::Weight { weight, .. } = b {
-                *weight = format!("{module}.{weight}");
+                *weight = if module == crate::spec::GATED_ROOT { weight.clone() } else { format!("{module}.{weight}") };
             }
         }
         let streams = Tensor::new(Place::Local("streams".into()), Rows::Tokens, h.width(self.hidden()), Form::F32);
         let mut sig = Signature { class: class_of(&kernel.body), reads: Vec::new(), writes: Vec::new() };
+        let mut planes = false;
         for p in kernel.params.iter().filter(|p| p.role != kir::Role::Value) {
             let t = match &bind[p.name] {
                 Bind::Weight { weight, len } => Tensor::weight(weight.clone(), 1, self.spec.weight_len(len)?, Form::F32),
                 Bind::Buffer { buffer } if buffer == "x" => self.x(),
                 Bind::Buffer { buffer } if buffer == "streams" => streams.clone(),
+                Bind::Buffer { buffer } if buffer == "gate_up" => Tensor::buf(Buf::GateUp, Rows::Tokens, crate::gemm::linear_shape(self.spec, "gate_up").n),
+                Bind::Buffer { buffer } if matches!(buffer.as_str(), "act_hi" | "act_lo") => {
+                    if planes {
+                        continue;
+                    }
+                    planes = true;
+                    Tensor::buf(Buf::ActPlanes, Rows::Tokens, self.spec.dims.intermediate)
+                }
                 Bind::Buffer { buffer } => Tensor::new(Place::Local(buffer.clone()), Rows::Tokens, crate::state::dim(self.spec, &h.scratch[buffer])?, Form::F32),
                 _ => bail!("gated node {node} binds {:?} to a state or a number", p.name),
             };
@@ -617,6 +633,18 @@ impl<'a> Signer<'a> {
             Op::Prelude { node } => self.prelude_node(node)?,
             Op::Swiglu => sig(Class::Elementwise, vec![Tensor::buf(Buf::GateUp, Rows::Tokens, 2 * spec.dims.intermediate)], vec![Tensor::buf(Buf::Act, Rows::Tokens, spec.dims.intermediate)]),
             Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => self.gdn(),
+            Op::MtpIn if spec.streamed_mtp() => {
+                let width = spec.draft_width();
+                sig(
+                    Class::Gather,
+                    vec![tokens_in, Tensor::new(Place::Input("hidden"), Rows::Tokens, width, Form::F32), Tensor::new(Place::Weight("embed_tokens.weight".into()), Rows::Tokens, h, Form::Bf16), Tensor::weight("mtp norms", 1, h + width, Form::F32)],
+                    vec![Tensor::buf(Buf::FcPlanes, Rows::Tokens, h), Tensor::buf(Buf::DraftPlanes, Rows::Tokens, width)],
+                )
+            }
+            Op::MtpGather if spec.streamed_mtp() => {
+                let streams = Tensor::new(Place::Local("streams".into()), Rows::Tokens, spec.draft_width(), Form::F32);
+                sig(Class::Gather, vec![streams.clone()], vec![streams])
+            }
             Op::MtpIn => sig(
                 Class::Gather,
                 vec![tokens_in, Tensor::new(Place::Input("hidden"), Rows::Tokens, h, Form::F32), Tensor::new(Place::Weight("embed_tokens.weight".into()), Rows::Tokens, h, Form::Bf16), Tensor::weight("mtp norms", 2, h, Form::F32)],

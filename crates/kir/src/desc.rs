@@ -358,6 +358,10 @@ pub struct StageDesc {
     #[serde(default)]
     pub shift: Option<String>,
     #[serde(default)]
+    pub step: Option<Value>,
+    #[serde(default)]
+    pub limit: Option<Value>,
+    #[serde(default)]
     pub lo: Option<String>,
 }
 
@@ -820,15 +824,17 @@ impl Description {
             stages.push(match s.op.as_str() {
                 "load" => {
                     let (row, group, offset) = at()?;
-                    GroupStage::Load { dst: dst()?, src: need(&s.src, "src", &s.op)?, row, group, offset, index: None, shift: s.shift.clone(), by_row: false }
+                    let step = s.step.as_ref().map_or(Ok(1), |v| self.size(shape, v, "step"))?;
+                    GroupStage::Load { dst: dst()?, src: need(&s.src, "src", &s.op)?, row, group, offset, index: None, shift: s.shift.clone(), by_row: false, step, limit: None }
                 }
-                "gather" => {
+                "gather" | "gather_row" => {
                     let (row, group, offset) = at()?;
-                    GroupStage::Load { dst: dst()?, src: need(&s.src, "src", &s.op)?, row, group, offset, index: Some(need(&s.index, "index", &s.op)?), shift: None, by_row: false }
+                    let limit = s.limit.as_ref().map(|v| self.size(shape, v, "limit")).transpose()?;
+                    GroupStage::Load { dst: dst()?, src: need(&s.src, "src", &s.op)?, row, group, offset, index: Some(need(&s.index, "index", &s.op)?), shift: None, by_row: s.op == "gather_row", step: 1, limit }
                 }
-                "gather_row" => {
+                "pick" => {
                     let (row, group, offset) = at()?;
-                    GroupStage::Load { dst: dst()?, src: need(&s.src, "src", &s.op)?, row, group, offset, index: Some(need(&s.index, "index", &s.op)?), shift: None, by_row: true }
+                    GroupStage::Pick { dst: dst()?, src: need(&s.src, "src", &s.op)?, row, group, offset }
                 }
                 "value" => GroupStage::Value { dst: dst()?, expr: e()? },
                 "sum" => GroupStage::Sum { dst: dst()?, expr: e()? },
@@ -837,11 +843,15 @@ impl Description {
                     let (row, group, offset) = at()?;
                     GroupStage::Store { dst: need(&s.dst, "dst", &s.op)?, value: parse(need(&s.value, "value", &s.op)?)?, row, group, offset }
                 }
+                "put" => {
+                    let (row, group, offset) = at()?;
+                    GroupStage::Put { dst: need(&s.dst, "dst", &s.op)?, value: parse(need(&s.value, "value", &s.op)?)?, row, group, offset }
+                }
                 "planes" => {
                     let (row, group, offset) = at()?;
                     GroupStage::Planes { value: parse(need(&s.value, "value", &s.op)?)?, row, group, offset }
                 }
-                o => return Err(format!("{}: group_map stage op {o:?} is not load, gather, gather_row, value, sum, scalar, store or planes", self.name)),
+                o => return Err(format!("{}: group_map stage op {o:?} is not load, gather, gather_row, pick, value, sum, scalar, store, put or planes", self.name)),
             });
         }
         Ok(crate::group::GroupMap { width: n["width"], consts, stages, scales })

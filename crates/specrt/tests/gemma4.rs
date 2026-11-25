@@ -53,8 +53,8 @@ fn the_parts_not_built_yet_are_refused_by_name() {
     assert!(!e4b.mlp.wide_shared_tail, "E4B does not use the double wide mlp");
     assert_eq!((e4b.layers.count, e4b.layers.shared_tail, e4b.per_layer().unwrap().dim), (42, 18, 256));
     assert_eq!((param(&e4b, "hd_s"), param(&e4b, "hd_g")), (256.0, 512.0));
-    let gemma3n = Spec::from_hf_config_serving(&popular("google__gemma-3n-E2B-it")).unwrap_err().to_string();
-    assert!(gemma3n.contains("altup_num_inputs"), "{gemma3n}");
+    let gemma3n = Spec::from_hf_config_serving(&popular("google__gemma-3n-E2B-it")).unwrap();
+    assert!(gemma3n.gated_residual().is_some() && gemma3n.per_layer().is_some(), "gemma-3n is its own family on the same per layer inputs");
 }
 
 fn unrefused() -> specrt::family::Registry {

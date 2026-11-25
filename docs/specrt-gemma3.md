@@ -16,6 +16,12 @@ Both the language model and the SigLIP image path are covered here, with the com
 - Single-stream decode runs the same sandwich norms and final soft-cap as prefill (`tests/gemma3.rs`
   `gemma3_single_stream_decode_matches_prefill`).
 
+## Gemma 3n text
+
+`family-gemma3n.toml` extends `gemma4` (per-layer inputs, KV sharing, described attention with no query scale) and adds a `[gated_residual]` with tagged node groups run by the `gated_sandwich` decoder block: `predict` (router, 4x4 coefficient mix, stream 0 into x), `laurel`, `laurel_add` (attention residual plus Laurel, times `1/sqrt(2)`), `act` (stored `gate_up`, row mean and std cut by `probit(p)` on layers with sparsity, gelu times up into the act planes) and `correct`. `expand` and `collapse` nodes rescale streams 1 to 3 to stream 0's magnitude. Per-layer sparsity is `[gated_residual.layer_params]`, read from the config array. The per-layer residual adds to streams 1 to 3. All kernels are kir descriptions `specs/g3n_*.toml`; no Rust names the architecture.
+
+Tiny fixture (`scripts/tiny_gemma3n.py`, 4 layers, 2 shared KV layers, laurel rank 8, per-layer input 16, sparsity on layer 0) on GPU1: streams after every layer within 9e-5, logits 1.2e-4, greedy and two-slot serving equal. Dropping sparsity gives 6.5 and dropping Laurel 7.9 on the logits.
+
 ## Image path
 
 The tower is the generic `pooled` kind of vision config, selected by `[vision] pooled = true` in the family:

@@ -1,0 +1,39 @@
+kind = "kir-kernel"
+family = "group_map"
+name = "g3n_scaled"
+threads = 256
+
+[args]
+width = "hidden"
+
+[[param]]
+name = "streams"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "w"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "x"
+role = "activation"
+access = "write"
+
+[[stage]]
+op = "load"
+name = "v"
+src = "streams"
+row = "hc_width"
+
+[[stage]]
+op = "load"
+name = "wv"
+src = "w"
+
+[[stage]]
+op = "store"
+dst = "x"
+value = "v * wv"
+row = "hidden"

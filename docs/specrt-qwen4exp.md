@@ -15,7 +15,7 @@ The config adds four things to `family-qwen3_5.toml`. Two of them are not the me
 | 5 | Gated attention output | `q_proj` is 2 x heads x head_dim, sigmoid gate on the attention output | `attn_output_gate` read, qwen3_5 path | exists |
 | 6 | Gated delta-net | same math as qwen3_5 (`linear_*` keys, 16 key and 48 value heads in the real model) | qwen3_5 | exists |
 | 7 | MoE | softmax router, top k, optional renorm, shared expert with sigmoid gate, `silu` | qwen3_5_moe | exists |
-| 8 | MTP | `mtp` object with `hybrid` true and `layer_types ["full_attention"]`, one layer, weights excluded from the NVFP4 quantisation | `[mtp]` on qwen3_5. The MTP layer also carries an indexer and hyper-connection weights are not listed for it | needs a check against a real shard (the HF model ignores `mtp.*`) |
+| 8 | MTP | `mtp` object with `hybrid` true and `layer_types ["full_attention"]`, one layer, weights excluded from the NVFP4 quantisation | `[mtp_layout]` in `family-qwen4_exp.toml` with `fc_hidden` and `mixer` | **done (#1350)**, see below |
 | 9 | Vision tower | `Qwen4ExpVisionModel` | qwen3_5 vision | out of scope for this issue (text first) |
 
 Layer I/O names for the family spec: attention `self_attn.{q,k,v,o}_proj`, `q_norm`, `k_norm`, `self_attn.indexer.{index_qk_proj,q_layernorm,k_layernorm}`, delta-net `linear_attn.*` as qwen3_5, `mlp.gate`, `mlp.experts.N.{gate,up,down}_proj`, `mlp.shared_expert*`, `{attn,mlp}_hyper_connection.{hc_norm,input_mix_weight_down,input_mix_weight_up,block_inject_weight}`, `ple.{ple_embedding.ngram_embedding,key_proj,value_proj,norm_key,norm_query,norm_conv,conv1d}`, model level `hyper_connection_mixer.*`. The NVFP4 copy excludes attention, delta-net, router, shared expert, hyper-connections, `ple` and embeddings, so only routed experts are 4 bit.
@@ -80,7 +80,31 @@ Tests: `crates/kir/tests/ple.rs` (CPU: integer semantics, the hash description a
 - `[gated_residual]` from #1277 (copied from the old test harness, now removed).
 - The QSA indexer from #1278: `[attention.params]` read from the config (`index_groups = indexer_budget / indexer_compress_ratio`, `index_out = indexer_budget + indexer_compress_ratio - 1`, `index_scale = rsqrt(indexer_head_dim)`), the appended `index_qk_proj` projection, the `index_raw` and `index_pool` per token states and the four kernel nodes. No `layers = ["full"]` is needed: attention nodes only run on attention layers.
 - The PLE from #1279 as a `[prelude]`: a new spec table of described kernel nodes that run at the start of each layer named by `ple_layer_ids` (1 based), before the attn gated residual. Its seven nodes are the `specs/ple_*` descriptions in the order of `Qwen4ExpTextPLELayer.forward`: hash, gather, key and value projections, gate, dilated conv, add into the streams. `ngram_history` and `ple_conv` are `layers = "prelude"` per sequence states, zeroed on reset and carried in state snapshots (the slot pending section), swap and sessions. The table row count is an `{ int = ... }` param: `ceil(prime_sum(ngram_vocab_size_base - 1, 1, ngram_heads) / 128) * 128`, 4096 on the tiny config and 320001536 on the real one (128 shards of 2500012).
-- The vision tower is ignored (text only, #1237). The MTP layer is refused by name with `[[refuse]] part = "mtp"` (#1350): the spec drops `[mtp]` and records the message, so text serves and `[speculative] enabled = true` fails with it.
+- The vision tower is ignored (text only, #1237). The MTP layer is served since #1350 (below).
+
+## MTP layer (#1350)
+
+`transformers` ignores `mtp.*`, so the formulation comes from vLLM `vllm/models/qwen4_exp/nvidia/mtp.py`, the shard headers of Qwen/Qwen3.8-Flash-Next and RadixArk/Qwen3.8-Flash-Next-NVFP4 (both list the same 31 `mtp.*` tensors, bf16 in both) and `fused_pre_fc_norms_split`:
+
+```
+e      = fc_embedding(norm_embed(embed(token)))                 [hidden]
+streams = fc_hidden(norm_hidden(previous streams) per stream)  [4, hidden], norm over all 4 x hidden
+x      = streams + e on every stream
+out    = one Qwen4Exp decoder layer (gated residual sites, indexed attention, MoE), no PLE
+logits = lm_head(hyper_connection_mixer(out))                   the mixer has no inject weights
+```
+
+The previous streams are the target's streams after its last layer and before its final mixer on the first draft step, then the draft layer's own output streams on later steps. Norms use `(1 + w)`.
+
+Spec side, as data: `[mtp_layout]` names `fc` (fc_embedding), `fc_hidden`, `norm_embed`, `norm_hidden` and `mixer`, and has no `norm`. `Spec::streamed_mtp` and `draft_width` (4 x hidden) follow from it. The `[[refuse]] part = "mtp"` rule is gone, so `[speculative] enabled = true` works.
+
+Plan: `decoder.toml` has a `gated` copy of the `[[mtp]]` and `[[mtp_head]]` sections (the flat ones are now `+flat` and unchanged for qwen3_5): `mtp_in` (kir `mtp_streams_in`: both norms, embedding planes and the 4 x hidden planes), `mtp_fc` into `x`, `gated_expand` into the streams, `mtp_fc_hidden` added into the streams (residual epilogue over 4 x rows), then the same gated attention plus MoE body as the target layers, using the MTP layer's `attn_hyper_connection` and `mlp_hyper_connection`. The head gathers the wide rows, runs `gated_collapse` with `weight = "draft"` (site `GATED_DRAFT`, the `mtp.hyper_connection_mixer` weights), `split` and the draft head.
+
+Speculation: verify rows run the PLE prelude, whose n-gram history and dilated conv window are per sequence state with no per row log. A round saves those states per sequence before verify, and after acceptance restores them and replays the stateful prelude nodes (hash and conv) one position at a time on the accepted tokens; rejected rows go to the pad slot. Without the replay, greedy diverges at the second token (checked red once).
+
+Tests (`tests/qwen4_exp_mtp.rs`, GPU1 shared with the user's app): draft logits against the reference at 1.4e-4 (k = 2) and 1.2e-4 (k = 3) with equal drafts `[74, 354, 501]`; speculative greedy equals plain greedy over 6 prompts x 40 tokens for k = 1 to 3, batch 1 and 2, with MTP drafts, oracle drafts and rotating wrong drafts. The random tiny MTP weights accept no MTP drafts, which is expected; acceptance on the real model needs its weights. Regenerate the fixture and reference with `~/.venv-vllm/bin/python crates/specrt/scripts/tiny_qwen4_exp.py mtp`.
+
+The real 360 GB model still waits on the loader work in #1349 and a both-card window.
 
 The gated residual has no fused prefill plus decode step and no single row plan, so the scheduler runs prefill and decode as separate steps.
 
@@ -114,6 +138,57 @@ Read from the three repos' shard headers (no download); names, dtypes, shapes, t
 Tests (`tests/qwen4_exp_checkpoint.rs`): CPU, the real header names join into the table the family reads with the folded `ngram_rows`; the hash constants equal the real buffers; an fp8 sharded copy of the tiny table loads through the name map in its stored bytes; bad `[prelude.stored]` or dtype words are refused; fused bf16 experts load identical stacks to the per expert copy. GPU1: the fp8 gather equals the f32 gather of the decoded table, and the bf16 gather reads the table bit for bit; the engine on bf16 shards and on fused experts gives logits identical to the original fixture, and on fp8 shards identical to the decoded f32 table.
 
 The real load itself needs both cards and a window (#1353).
+
+## Real checkpoint
+
+NVFP4 copy (`RadixArk/Qwen3.8-Flash-Next-NVFP4`, 206 shards, all present in the index), loaded across both desktop cards by the planner, text only. Engine commit 18a8755e (branch issue-1353). Numbers were taken on quiet GPUs: no other job held a GPU lock during the runs.
+
+```
+export CARGO_TARGET_DIR=/mnt/data/cargo-target/inference-bench-qwen4exp-real
+cargo build --release -p inference-bench-cli
+B=$CARGO_TARGET_DIR/release/inference-bench
+hf download RadixArk/Qwen3.8-Flash-Next-NVFP4 --local-dir ~/models/Qwen3.8-Flash-Next-NVFP4
+$B spec --model ~/models/Qwen3.8-Flash-Next-NVFP4 --out /tmp/q48-nvfp4.toml
+$B plan --spec /tmp/q48-nvfp4.toml --config docs/qwen4exp-real/server.toml --objective latency
+~/.agents/bin/gpu-run all -- $B serve --config docs/qwen4exp-real/server.toml --bind 127.0.0.1:18480
+curl -s localhost:18480/v1/completions -H 'content-type: application/json' -d '{"model":"qwen3.8-flash-next","prompt":"The capital of France is","max_tokens":32,"temperature":0,"logprobs":20}'
+```
+
+`docs/qwen4exp-real/server.toml` is 4 slots x 32 K context, 2 x 89.4 GiB, 2 GiB reserve, 9.9 GiB host offload per card.
+
+Placement (planner, matches the run): gpu0 layers 0..2 (51.82 GiB of weights, includes the 51 GB fp8 n-gram table), gpu1 layers 2..48 (67.66 GiB), planned 36.5 ms per decode step. Measured memory per card with the model resident and the KV pool allocated: gpu0 55.7 GB (weights 55.8 GB), gpu1 95.9 GB (weights 74.2 GB plus the KV pool and scratch).
+
+Load: 21.3 s for stage 0, 20.3 s for stage 1, 42 to 46 s from the first request to a loaded model (JIT cache warm; the server listens after 2 s and loads on the first request).
+
+Speed, greedy, 64 new tokens with `ignore_eos`, one request at a time (time to first token from the server log, decode tok/s from the log):
+
+| prompt tokens | prefill (time to first token) | prefill tok/s | decode tok/s |
+| --- | --- | --- | --- |
+| 20 | 0.29 s | 70 | 3.7 |
+| 200 | 0.60 s | 330 | 3.7 |
+| 2000 | 4.24 s | 470 | 3.5 |
+
+Decode is 270 ms a step against the planned 36.5 ms: the pipelined path runs one stream through both stages a row at a time. That gap is the next speed item, not a correctness problem.
+
+Text check: "The capital of France is" gives " Paris. Paris is the capital of France. The capital of Germany is Berlin. Berlin is the capital of Germany. The capital of Italy is Rome. Rome is" (32 tokens). The 32 greedy tokens and the top 20 logprobs per step are saved for the vLLM comparison in `docs/qwen4exp-real/nvfp4-france.json` and, for a 200 token plain text prompt (`docs/qwen4exp-real/prompt200.json`), `docs/qwen4exp-real/nvfp4-prompt200.json` (OpenAI `logprobs.tokens` and `logprobs.top_logprobs`). The long one stopped after 20 tokens on a natural end of text. The same request against vLLM `/v1/completions` with `"logprobs":20`, `temperature` 0 gives the files to diff.
+
+### FP8 copy (`Qwen/Qwen3.8-Flash-Next-FP8`, 131 shards, all in the index)
+
+Same prompt, greedy: " Paris. The capital of Germany is Berlin. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of Portugal is Lisbon. The capital" (coherent). The FP8 repo keeps attention, shared experts and the router in bf16 (`modules_to_not_convert`); an FP8 spec now requantises those to 128x128 FP8 blocks at load (`quantize_fp8_block128`). `serve` solves its own split from the device list and put 11 layers on gpu0, which left gpu1 with no KV room, so the run pins the planner's split in the server config:
+
+```
+[[placement.stages]]
+device = "gpu0"
+layers = [0, 14]
+
+[[placement.stages]]
+device = "gpu1"
+layers = [14, 48]
+```
+
+Planner: gpu0 layers 0..14 (82.90 GiB), gpu1 14..48 (83.74 GiB), 35.8 ms per step. Measured: gpu0 95.8 GB, gpu1 95.9 GB (weights 89.5 GB and 90.8 GB, rest KV and scratch). Load 61 s for stage 0, 47 s for stage 1, 109 s from the first request. Prefill and decode match the NVFP4 numbers above (0.29 s, 0.63 s, 4.36 s to first token for 20, 200, 2000 tokens; 3.5 to 3.6 decode tok/s). The FP8 copy was deleted after the run.
+
+Stages cannot start in front of a prelude layer (the PLE layer reads the token history only the first stage keeps): `StageRange::check` and the planner refuse it by name.
 
 ## History: why the family came last
 

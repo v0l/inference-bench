@@ -369,9 +369,15 @@ pub fn residual_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::Ke
 pub fn gated_symbols(spec: &Spec) -> kir::desc::Shape {
     let mut symbols = kir_shape(spec);
     if let Some(h) = spec.gated_residual() {
-        symbols = symbols.num("hc_streams", h.streams as f64).num("hc_width", h.width(spec.dims.hidden) as f64);
+        symbols = symbols.num("hc_streams", h.streams as f64).num("hc_width", h.width(spec.dims.hidden) as f64).num("gate_up_rows", crate::gemm::linear_shape(spec, "gate_up").n as f64);
         for (n, v) in &h.params {
             symbols = symbols.num(n, *v);
+        }
+        if let Some(p) = spec.per_layer() {
+            symbols = symbols.num("ple_dim", p.dim as f64).num("ple_width", (p.dim * spec.layers.count) as f64);
+            for (n, v) in &p.params {
+                symbols = symbols.num(n, *v);
+            }
         }
     }
     symbols
@@ -397,7 +403,9 @@ pub fn gated_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::Kerne
             let param = kernel.params.iter().find(|p| p.name == b).ok_or_else(|| anyhow::anyhow!("[[gated_residual.node]] {i} binds {b:?}, which {name} has no param for"))?;
             let fits = match v {
                 crate::graph::Bind::Weight { .. } => param.role == kir::Role::Weight,
+                crate::graph::Bind::Buffer { buffer } if matches!(buffer.as_str(), "act_hi" | "act_lo") => param.role == kir::Role::Activation && param.ty == kir::Scalar::Bf16,
                 crate::graph::Bind::Buffer { .. } => param.role == kir::Role::Activation && param.ty == kir::Scalar::F32,
+                crate::graph::Bind::Name(_) | crate::graph::Bind::Number(_) => param.role == kir::Role::Value,
                 _ => false,
             };
             anyhow::ensure!(fits, "[[gated_residual.node]] {i} binds {b:?} to the wrong kind of value");
@@ -408,7 +416,7 @@ pub fn gated_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::Kerne
 }
 
 pub fn per_layer_symbols(spec: &Spec) -> kir::desc::Shape {
-    let mut symbols = kir_shape(spec);
+    let mut symbols = gated_symbols(spec);
     if let Some(p) = spec.per_layer() {
         symbols = symbols.num("ple_dim", p.dim as f64).num("ple_width", (p.dim * spec.layers.count) as f64);
         for (n, v) in &p.params {
@@ -519,6 +527,9 @@ pub fn linear_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::line
         if needed {
             out.push(kir::linear::LinearKernel::new(target, f, shape.clone()).map_err(anyhow::Error::msg)?);
         }
+    }
+    if spec.streamed_mtp() && spec.speculative().is_some() {
+        out.push(kir::linear::LinearKernel::new(target, kir::linear::Family::DraftStreams, shape).map_err(anyhow::Error::msg)?);
     }
     Ok(out)
 }

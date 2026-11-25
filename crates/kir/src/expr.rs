@@ -278,6 +278,10 @@ impl Parser<'_> {
             want(3)?;
             return Ok(Expr::Call("select", args));
         }
+        if id == "probit" {
+            want(1)?;
+            return Ok(Expr::Call("probit", args));
+        }
         if let Some((n, _, _)) = UNARY.iter().find(|(n, _, _)| *n == id && *n != "neg") {
             want(1)?;
             return Ok(Expr::Call(n, args));
@@ -342,6 +346,9 @@ impl Expr {
                     Op::Or => truth(a != 0.0 || b != 0.0),
                 }
             }
+            Expr::Call("select", args) if args.len() == 3 => {
+                return if args[0].eval(env)? != 0.0 { args[1].eval(env) } else { args[2].eval(env) };
+            }
             Expr::Call(f, args) => {
                 let v: Vec<f64> = args.iter().map(|a| a.eval(env)).collect::<Option<_>>()?;
                 match (*f, v.as_slice()) {
@@ -357,6 +364,7 @@ impl Expr {
                     ("rsqrt", [a]) => 1.0 / a.sqrt(),
                     ("sqrt", [a]) => a.sqrt(),
                     ("abs", [a]) => a.abs(),
+                    ("probit", [p]) => probit(*p)?,
                     _ => return None,
                 }
             }
@@ -443,6 +451,7 @@ impl Expr {
                 let parts: Result<Vec<String>, String> = args.iter().map(|a| child(a, false)).collect();
                 format!("{cu}({})", parts?.join(", "))
             }
+            Expr::Call("probit", _) => return Err("probit is evaluated when the spec is read and has no device lowering".into()),
             Expr::Call(f, args) => {
                 let (_, cu, wg) = UNARY.iter().chain(BINARY.iter()).find(|(n, _, _)| n == f).ok_or_else(|| format!("unknown function {f}"))?;
                 let parts: Result<Vec<String>, String> = args.iter().map(|a| child(a, false)).collect();
@@ -450,6 +459,26 @@ impl Expr {
             }
         })
     }
+}
+
+pub fn probit(p: f64) -> Option<f64> {
+    if !(p > 0.0 && p < 1.0) {
+        return None;
+    }
+    const A: [f64; 6] = [-3.969683028665376e1, 2.209460984245205e2, -2.759285104469687e2, 1.383577518672690e2, -3.066479806614716e1, 2.506628277459239];
+    const B: [f64; 5] = [-5.447609879822406e1, 1.615858368580409e2, -1.556989798598866e2, 6.680131188771972e1, -1.328068155288572e1];
+    const C: [f64; 6] = [-7.784894002430293e-3, -3.223964580411365e-1, -2.400758277161838, -2.549732539343734, 4.374664141464968, 2.938163982698783];
+    const D: [f64; 4] = [7.784695709041462e-3, 3.224671290700398e-1, 2.445134137142996, 3.754408661907416];
+    let tail = |q: f64| (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5]) / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0);
+    Some(if p < 0.02425 {
+        tail((-2.0 * p.ln()).sqrt())
+    } else if p > 1.0 - 0.02425 {
+        -tail((-2.0 * (1.0 - p).ln()).sqrt())
+    } else {
+        let q = p - 0.5;
+        let r = q * q;
+        (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q / (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0)
+    })
 }
 
 impl std::fmt::Display for Expr {

@@ -4,12 +4,14 @@ use crate::{Access, Kernel, Language, Param, Role, Scalar, Target};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum GroupStage {
-    Load { dst: String, src: String, row: u32, group: u32, offset: u32, index: Option<String>, shift: Option<String>, by_row: bool },
+    Load { dst: String, src: String, row: u32, group: u32, offset: u32, index: Option<String>, shift: Option<String>, by_row: bool, step: u32, limit: Option<u32> },
+    Pick { dst: String, src: String, row: u32, group: u32, offset: u32 },
     Value { dst: String, expr: Expr },
     Sum { dst: String, expr: Expr },
     Scalar { dst: String, expr: Expr },
     Store { dst: String, value: Expr, row: u32, group: u32, offset: u32 },
     Planes { value: Expr, row: u32, group: u32, offset: u32 },
+    Put { dst: String, value: Expr, row: u32, group: u32, offset: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -25,6 +27,10 @@ const RESERVED: [&str; 8] = ["i", "row", "grp", "scratch", "WIDTH", "width", "hi
 const PLANES: [&str; 2] = ["out_hi", "out_lo"];
 
 fn address(row: u32, group: u32, offset: u32) -> String {
+    stepped(row, group, offset, 1)
+}
+
+fn stepped(row: u32, group: u32, offset: u32, step: u32) -> String {
     let mut terms = Vec::new();
     if row != 0 {
         terms.push(format!("(size_t)row * {row}"));
@@ -35,7 +41,15 @@ fn address(row: u32, group: u32, offset: u32) -> String {
     if offset != 0 {
         terms.push(offset.to_string());
     }
-    terms.push("i".into());
+    terms.push(if step == 1 { "i".into() } else { format!("(size_t)i * {step}") });
+    terms.join(" + ")
+}
+
+fn fixed(row: u32, group: u32, offset: u32) -> String {
+    let mut terms = vec![format!("(size_t)row * {row}"), format!("(size_t)grp * {group}")];
+    if offset != 0 {
+        terms.push(offset.to_string());
+    }
     terms.join(" + ")
 }
 
@@ -88,7 +102,7 @@ impl GroupMap {
         if planes != PLANES.iter().all(|n| params.iter().any(|p| p.name == *n)) || PLANES.iter().filter(|n| params.iter().any(|p| p.name == **n)).count() == 1 {
             return Err("group_map stores to planes through a planes stage with both out_hi and out_lo params".into());
         }
-        if !self.stages.iter().any(|s| matches!(s, GroupStage::Store { .. } | GroupStage::Planes { .. })) {
+        if !self.stages.iter().any(|s| matches!(s, GroupStage::Store { .. } | GroupStage::Planes { .. } | GroupStage::Put { .. })) {
             return Err("group_map has no store".into());
         }
         self.body(params)?;
@@ -111,6 +125,7 @@ impl GroupMap {
                 && !self.consts.iter().any(|c| c.name == n)
                 && !defined.iter().any(|d| d == n)
         };
+        let readable = |src: &str| matches!(params.iter().find(|p| p.name == src), Some(p) if p.role != Role::Value && p.access == Access::Read && p.ty == Scalar::F32);
         let loop_head = "    for (int i = threadIdx.x; i < WIDTH; i += blockDim.x)";
         for s in &self.stages {
             let element = |e: &Expr, elements: &[(String, Expr)], scalars: &[String]| -> Result<String, String> {
@@ -118,7 +133,7 @@ impl GroupMap {
                 e.clone().bind(&self.consts).subst(&env)?.lower(Dialect::Cuda, &[])
             };
             match s {
-                GroupStage::Load { dst, src, row, group, offset, index, shift, by_row } => {
+                GroupStage::Load { dst, src, row, group, offset, index, shift, by_row, step, limit } => {
                     if !ok(dst, &defined) {
                         return Err(format!("group_map name {dst:?} is not usable or is defined twice"));
                     }
@@ -126,28 +141,47 @@ impl GroupMap {
                         Some(p) if p.role != Role::Value && p.access == Access::Read && (p.ty == Scalar::F32 || self.stored(p)) => p,
                         _ => return Err(format!("group_map load from {src:?}, which is not a read f32 or stored weight param")),
                     };
+                    if *step == 0 || (*step != 1 && index.is_some()) || (limit.is_some() && index.is_none()) {
+                        return Err(format!("group_map load {dst:?}: a step is positive and only on plain loads, a limit only on gathers"));
+                    }
                     let at = match index {
                         None => match shift {
-                            None => address(*row, *group, *offset),
+                            None => stepped(*row, *group, *offset, *step),
                             Some(s) => {
                                 if !params.iter().any(|p| p.name == s && p.role == Role::Value) {
                                     return Err(format!("group_map shift {s:?} is not a value param"));
                                 }
-                                format!("{} + (size_t){s} * WIDTH", address(*row, *group, *offset))
+                                format!("{} + (size_t){s} * WIDTH", stepped(*row, *group, *offset, *step))
                             }
                         },
                         Some(ix) => {
                             if !params.iter().any(|p| p.name == ix) {
                                 return Err(format!("group_map gather index {ix:?} is not a param"));
                             }
+                            let at = if *by_row { format!("{ix}[row]") } else { format!("{ix}[(size_t)row * {row} + grp]") };
+                            let at = match limit {
+                                Some(l) => format!("({at} < {l} ? {at} : 0)"),
+                                None => at,
+                            };
                             if *by_row {
-                                format!("(size_t){ix}[row] * {row} + (size_t)grp * {group} + {offset} + i")
+                                format!("(size_t){at} * {row} + (size_t)grp * {group} + {offset} + i")
                             } else {
-                                format!("(size_t){ix}[(size_t)row * {row} + grp] * {group} + {offset} + i")
+                                format!("(size_t){at} * {group} + {offset} + i")
                             }
                         }
                     };
                     elements.push((dst.clone(), Expr::Raw(self.element(source, &at))));
+                    defined.push(dst.clone());
+                }
+                GroupStage::Pick { dst, src, row, group, offset } => {
+                    if !ok(dst, &defined) {
+                        return Err(format!("group_map name {dst:?} is not usable or is defined twice"));
+                    }
+                    if !readable(src) {
+                        return Err(format!("group_map pick from {src:?}, which is not a read f32 buffer param"));
+                    }
+                    out.push_str(&format!("    const float {dst} = {src}[{}];\n", fixed(*row, *group, *offset)));
+                    scalars.push(dst.clone());
                     defined.push(dst.clone());
                 }
                 GroupStage::Value { dst, expr } => {
@@ -175,6 +209,14 @@ impl GroupMap {
                     out.push_str(&format!("    const float {dst} = {text};\n"));
                     scalars.push(dst.clone());
                     defined.push(dst.clone());
+                }
+                GroupStage::Put { dst, value, row, group, offset } => {
+                    match params.iter().find(|p| p.name == dst) {
+                        Some(p) if p.role == Role::Activation && p.access == Access::Write && p.ty == Scalar::F32 => {}
+                        _ => return Err(format!("group_map put to {dst:?}, which is not a written f32 activation param")),
+                    }
+                    let text = element(value, &[], &scalars).map_err(|e| format!("group_map put {dst:?}: {e}"))?;
+                    out.push_str(&format!("    if (threadIdx.x == 0) {dst}[{}] = {text};\n", fixed(*row, *group, *offset)));
                 }
                 GroupStage::Store { dst, value, row, group, offset } => {
                     match params.iter().find(|p| p.name == dst) {

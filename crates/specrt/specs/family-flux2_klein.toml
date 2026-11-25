@@ -1,6 +1,6 @@
 name = "flux2_klein"
 kind = "family"
-min_engine = 18
+min_engine = 20
 
 [match]
 pipelines = ["Flux2KleinPipeline"]

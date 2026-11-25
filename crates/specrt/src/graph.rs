@@ -101,6 +101,8 @@ fn buffer(name: &str) -> Result<Buf> {
         "branch" => Buf::Branch,
         "merged" => Buf::Merged,
         "fc_planes" => Buf::FcPlanes,
+        "draft_planes" => Buf::DraftPlanes,
+        "streams" => Buf::Streams,
         "mtp_logits" => Buf::MtpLogits,
         "latent" => Buf::Latent,
         "latent_planes" => Buf::LatentPlanes,
@@ -123,6 +125,7 @@ fn weight(name: &str) -> Result<Weight> {
         "mix_out" => Weight::MixOut,
         "lm_head" => Weight::LmHead,
         "mtp_fc" => Weight::MtpFc,
+        "mtp_fc_hidden" => Weight::MtpFcHidden,
         "mtp_qkv" => Weight::MtpQkv,
         "mtp_o" => Weight::MtpO,
         "mtp_gate_up" => Weight::MtpGateUp,
@@ -259,13 +262,19 @@ fn holds(when: Option<&str>, tensor_core: bool, spec: &Spec, tail: bool) -> bool
             "pre" => spec.norm.pre,
             "nopre" => !spec.norm.pre,
             "qk_norm_full" => spec.attention.qk_norm_full,
-            "branch" => spec.uses_branch() && !spec.layers.split && spec.hyper.is_none(),
+            "branch" => spec.uses_branch() && !spec.layers.split && spec.hyper.is_none() && spec.gated_residual().is_none(),
             "plain" => !spec.uses_branch() && !spec.layers.split && spec.hyper.is_none() && spec.gated_residual().is_none() && spec.block_residual.is_none(),
             "blockres" => spec.block_residual.is_some(),
             "latent" => spec.moe.as_ref().is_some_and(|m| m.latent.is_some()),
             "flatmoe" => spec.moe.as_ref().is_some_and(|m| m.latent.is_none()),
             "hyper" => spec.hyper.is_some(),
             "gated" => spec.gated_residual().is_some(),
+            "untagged" => spec.gated_residual().is_some_and(|h| h.tags().is_empty()),
+            "tagged" => spec.gated_residual().is_some_and(|h| !h.tags().is_empty()),
+            "gated_norm" => spec.gated_residual().is_some_and(|h| h.final_norm),
+            "bare" => spec.gated_residual().is_some_and(|h| !h.final_norm),
+            "stored" => spec.mlp.stored_gate_up,
+            "unstored" => !spec.mlp.stored_gate_up,
             "flat" => spec.gated_residual().is_none(),
             "ple" => spec.per_layer().is_some(),
             "split" => spec.layers.split,
@@ -327,13 +336,20 @@ fn lower(nodes: &[Node], phase: Phase, tensor_core: bool, spec: &Spec, kind: Opt
             for (i, _) in p.nodes(if stage == crate::plan::PLE_HEAD { "head" } else { "layer" }) {
                 ops.push(Op::PerLayer { node: i as u8, stage });
             }
+        } else if n.op == "gated_at" {
+            let h = spec.gated_residual().context("gated_at needs a [gated_residual]")?;
+            let tag = n.weight.as_deref().context("a gated_at node names its tag in weight")?;
+            for (i, _) in h.tagged(tag) {
+                ops.push(Op::Gated { node: i as u8, site: 0 });
+            }
         } else if let Some(stage) = gated_stage(&n.op) {
             let h = spec.gated_residual().with_context(|| format!("{} needs a [gated_residual]", n.op))?;
             let site = match stage {
                 GatedStage::Pre | GatedStage::Post => n.weight.as_deref().context("a gated pre or post node names its site in weight")?.parse::<u8>().context("gated site")?,
+                GatedStage::Collapse if n.weight.as_deref() == Some("draft") => crate::plan::GATED_DRAFT,
                 GatedStage::Expand | GatedStage::Collapse => GATED_MODULE,
             };
-            ensure!(site == GATED_MODULE || (site as usize) < h.sites.len(), "gated site {site} is not one of the {} [gated_residual] sites", h.sites.len());
+            ensure!(site >= crate::plan::GATED_DRAFT || (site as usize) < h.sites.len(), "gated site {site} is not one of the {} [gated_residual] sites", h.sites.len());
             for (i, _) in h.nodes(stage) {
                 ops.push(Op::Gated { node: i as u8, site });
             }

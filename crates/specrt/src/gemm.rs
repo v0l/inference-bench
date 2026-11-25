@@ -115,7 +115,13 @@ fn act(spec: &Spec) -> kir::Activation {
 }
 
 fn gate_up_epilogue(spec: &Spec) -> Epilogue {
-    if spec.mlp.mapped.is_some() { Epilogue::Map } else { Epilogue::Act }
+    if spec.mlp.mapped.is_some() {
+        Epilogue::Map
+    } else if spec.mlp.stored_gate_up {
+        Epilogue::Store
+    } else {
+        Epilogue::Act
+    }
 }
 
 pub fn linear_shape(spec: &Spec, linear: &str) -> GemmShape {
@@ -133,7 +139,9 @@ pub fn linear_shape(spec: &Spec, linear: &str) -> GemmShape {
         "lin_out" => (d.hidden, la.map_or(0, |l| l.value_dim()), Epilogue::Residual, false),
         "mix_in" => (spec.mix_in_rows(), d.hidden, Epilogue::Store, false),
         "mix_out" => (d.hidden, spec.mix_out_cols(), Epilogue::Residual, false),
+        "mtp_fc" if spec.streamed_mtp() => (d.hidden, d.hidden, Epilogue::Store, false),
         "mtp_fc" => (d.hidden, 2 * d.hidden, Epilogue::Store, false),
+        "mtp_fc_hidden" => (d.hidden, d.hidden, Epilogue::Residual, false),
         "mtp_qkv" => (spec.qkv_rows(), d.hidden, Epilogue::Store, false),
         "mtp_o" => (d.hidden, spec.q_dim(), Epilogue::Residual, false),
         "mtp_gate_up" => (2 * d.intermediate, d.hidden, Epilogue::Act, false),
@@ -426,7 +434,7 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
         }
     }
     if spec.speculative().is_some() {
-        for linear in crate::mtp::MTP_LINEARS {
+        for linear in crate::mtp::linears(spec) {
             set.tiles(t, &format!("{linear}_mma"), linear_shape(spec, linear), WeightFormat::Bf16, split(spec, linear, WeightFormat::Bf16), false, &tuning)?;
         }
     }

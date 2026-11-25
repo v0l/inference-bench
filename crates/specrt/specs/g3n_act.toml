@@ -1,0 +1,79 @@
+kind = "kir-kernel"
+family = "group_map"
+name = "g3n_act"
+threads = 256
+
+[args]
+width = "inter"
+
+[[param]]
+name = "gate"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "on"
+role = "value"
+access = "read"
+
+[[param]]
+name = "cut"
+role = "value"
+access = "read"
+
+[[param]]
+name = "out_hi"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "out_lo"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[stage]]
+op = "load"
+name = "g"
+src = "gate"
+row = "gate_up_rows"
+step = 2
+
+[[stage]]
+op = "load"
+name = "u"
+src = "gate"
+row = "gate_up_rows"
+offset = 1
+step = 2
+
+[[stage]]
+op = "sum"
+name = "sg"
+expr = "g"
+
+[[stage]]
+op = "scalar"
+name = "mean"
+expr = "sg / width"
+
+[[stage]]
+op = "sum"
+name = "sq"
+expr = "(g - mean) * (g - mean)"
+
+[[stage]]
+op = "scalar"
+name = "edge"
+expr = "mean + sqrt(sq / width) * cut"
+
+[[stage]]
+op = "value"
+name = "kept"
+expr = "select(on > 0.5, max(g - edge, 0.0), g)"
+
+[[stage]]
+op = "planes"
+value = "gelu_tanh(kept) * u"
+row = "inter"

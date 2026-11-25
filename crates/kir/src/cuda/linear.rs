@@ -6,6 +6,7 @@ mod common;
 mod conv;
 mod prim;
 mod draft;
+mod draft_streams;
 mod ssd;
 mod step;
 mod verify;
@@ -64,6 +65,9 @@ pub fn emit_linear(kernels: &[LinearKernel]) -> Result<crate::KirSource, LinearE
     }
     if has(Family::Draft) {
         push(&draft::body());
+    }
+    if has(Family::DraftStreams) {
+        push(&draft_streams::body());
     }
     Ok(crate::KirSource::emitted(out))
 }
