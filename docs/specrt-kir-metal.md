@@ -214,16 +214,16 @@ Filed as issues (goal g4, high model), chained by `depends_on`. No per architect
 
 | Slice | Issue | Depends on |
 |---|---|---|
-| M0 Target, `Language::Msl`, `Dialect::Msl`, features, `validate` refusals | ISSUE_M0 | |
-| M1 MSL emitter for the description bodies, goldens | ISSUE_M1 | M0 |
-| Metal backend behind `Backend`, compile and numerics tests on the Mac | ISSUE_BE | M1 |
-| M2 prims and ggml row decoders | ISSUE_M2 | M1 |
-| M3 GEMV family through `Heavy`, function constants for shapes | ISSUE_M3 | M2, backend |
-| M4 decode attention and rope KV write, first end to end decode, A/B | ISSUE_M4 | M3 |
-| M5 simdgroup GEMM and flash prefill, the TFLOP/s A/B | ISSUE_M5 | M4 |
-| MLX affine description, loader, CUDA and MSL GEMV decode | ISSUE_AF | M3 |
-| R1 and R2: pipelined step and indirect command buffer | ISSUE_R12 | M4 |
-| R3 and R4: NoCopy weights, residency sets, keep warm | ISSUE_R34 | backend |
-| `NeuralAccel` on M5 | ISSUE_NAX | M5 |
+| M0 Target, `Language::Msl`, `Dialect::Msl`, features, `validate` refusals | #1371 | |
+| M1 MSL emitter for the description bodies, goldens | #1372 | #1371 |
+| Metal backend behind `Backend`, compile and numerics tests on the Mac | #1373 | #1372 |
+| M2 prims and ggml row decoders | #1374 | #1372 |
+| M3 GEMV family through `Heavy`, function constants for shapes | #1375 | #1374, #1373 |
+| M4 decode attention and rope KV write, first end to end decode, A/B | #1376 | #1375 |
+| M5 simdgroup GEMM and flash prefill, the TFLOP/s A/B | #1379 | #1376 |
+| MLX affine description, loader, CUDA and MSL GEMV decode | #1377 | #1375 |
+| R1 and R2: pipelined step and indirect command buffer | #1380 | #1376 |
+| R3 and R4: NoCopy weights, residency sets, keep warm | #1378 | #1373 |
+| `NeuralAccel` on M5 (needs an M5 Mac) | #1381 | #1379 |
 
-#869 (find why emitted WGSL `linear_coop` loses to hand MSL) is answered by section 1 and replaced by M5.
+#869 (find why emitted WGSL `linear_coop` loses to hand MSL) is answered by section 1 and replaced by M5 (#1379).
