@@ -1402,7 +1402,7 @@ impl Checkpoint {
         };
         let mlp = spec.mlp_quant(i);
         let served = spec.served_mlp_quant(i);
-        let sparse = spec.moe.as_ref().is_some_and(|m| m.is_sparse(global)) && spec.has_mlp(i);
+        let sparse = spec.moe.as_ref().is_some_and(|m| m.is_sparse(i)) && spec.has_mlp(i);
         let moe = if sparse { Some(self.moe_layer(spec, &p, mlp)?) } else { None };
         let none = || (Matrix::Bf16(Cow::Owned(vec![0; 8])), Matrix::Bf16(Cow::Owned(vec![0; 8])));
         let dense_beside = sparse && spec.parallel_moe();
@@ -1890,7 +1890,7 @@ impl Checkpoint {
     fn require_activation_scales(&self, spec: &Spec, i: usize, global: usize, p: &str) -> Result<()> {
         use crate::spec::ActQuant;
         let mut modules: Vec<String> = Vec::new();
-        if spec.mlp.act_quant == ActQuant::Fp4 && spec.mlp_quant(i) == Quant::Nvfp4G16 && !spec.moe.as_ref().is_some_and(|m| m.is_sparse(global)) {
+        if spec.mlp.act_quant == ActQuant::Fp4 && spec.mlp_quant(i) == Quant::Nvfp4G16 && !spec.moe.as_ref().is_some_and(|m| m.is_sparse(i)) {
             modules.extend(["gate_proj", "up_proj", "down_proj"].map(|m| format!("{p}.mlp.{m}")));
         }
         if let Some(missing) = modules.iter().find(|m| !self.has_input_scale(m)) {

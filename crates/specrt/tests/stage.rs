@@ -153,6 +153,24 @@ fn moe_stage_specs_keep_the_output_gate_and_drop_unused_attention_nodes() {
 }
 
 #[test]
+fn stage_specs_renumber_dense_moe_layers_and_nope_layers() {
+    let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5.3-flash.config.json")).unwrap();
+    let spec = Spec::from_hf_config_serving(&json).unwrap();
+    assert_eq!(spec.moe.as_ref().unwrap().dense_layers, vec![0, 1, 2]);
+    let head = spec.stage(0, 23);
+    let tail = spec.stage(23, 45);
+    assert_eq!(head.moe.as_ref().unwrap().dense_layers, vec![0, 1, 2]);
+    assert!(tail.moe.as_ref().unwrap().dense_layers.is_empty());
+    assert!((0..22).all(|l| tail.moe.as_ref().unwrap().is_sparse(l)));
+    assert_eq!(tail.rope.nope_layers, (0..22).collect::<Vec<_>>());
+    let middle = spec.stage(2, 5);
+    assert_eq!(middle.moe.as_ref().unwrap().dense_layers, vec![0]);
+    for (start, end) in [(0, 23), (23, 45), (2, 5)] {
+        specrt::runtime::StageRange { device: 0, start, end }.check(&spec).unwrap();
+    }
+}
+
+#[test]
 fn stage_specs_cut_the_pattern_and_the_quant_boundary() {
     let spec = Spec::load(&fixture_dir("qwen3.8-27b-nvfp4.toml")).unwrap();
     let tail = spec.stage(40, 64);

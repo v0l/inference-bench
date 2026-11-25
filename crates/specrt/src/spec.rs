@@ -2576,6 +2576,11 @@ impl Spec {
         s.layers.count = end - start;
         s.mlp.quant_until = self.mlp.quant_until.map(|u| u.saturating_sub(start));
         s.quant_map = self.quant_map.stage(start, end);
+        s.rope.nope_layers = (start..end).filter(|&l| self.nope(l)).map(|l| l - start).collect();
+        if let (Some(m), Some(whole)) = (s.moe.as_mut(), self.moe.as_ref()) {
+            m.dense_layers = (start..end).filter(|&l| !whole.is_sparse(l)).map(|l| l - start).collect();
+            m.sparse_step = 1;
+        }
         if let Some(p) = s.prelude.as_mut() {
             p.layers = p.layers.iter().filter(|&&l| (start..end).contains(&l)).map(|l| l - start).collect();
         }

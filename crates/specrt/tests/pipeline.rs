@@ -107,6 +107,18 @@ fn tiny_hybrid_pipeline_is_bit_identical_to_the_single_runtime() {
 
 #[test]
 #[ignore = "needs a CUDA GPU"]
+fn moe_with_dense_first_layers_and_hyper_streams_pipeline_is_bit_identical_to_the_single_runtime() {
+    let dir = "tiny-glm5-next";
+    let json = std::fs::read_to_string(fixture_dir(dir).join("config.json")).unwrap();
+    let mut spec = Spec::from_hf_config_serving(&json).unwrap();
+    spec.name = dir.into();
+    spec.repo = fixture_dir(dir).display().to_string();
+    assert_eq!(spec.moe.as_ref().unwrap().dense_layers, vec![0]);
+    bit_identical(&spec);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
 fn tiny_hybrid_hd256_pipeline_is_bit_identical_to_the_single_runtime() {
     bit_identical(&tiny("tiny-qwen3.5-hd256"));
 }
