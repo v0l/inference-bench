@@ -1,3 +1,5 @@
+pub mod compile;
+pub mod cuda;
 pub mod graph;
 pub mod host;
 

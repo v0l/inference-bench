@@ -94,14 +94,14 @@ fn short(name: &str) -> String {
 
 pub fn conv_shape(op: &VaeOp, upsample: bool) -> Option<ConvShape> {
     match op {
-        VaeOp::Conv { cin, cout, k, kt, .. } => Some(ConvShape { cin: *cin, cout: *cout, k: *k, kt: *kt, upsample, interleave: false }),
-        VaeOp::TimeUp { channels, .. } => Some(ConvShape { cin: *channels, cout: 2 * channels, k: 1, kt: 3, upsample: false, interleave: true }),
+        VaeOp::Conv { cin, cout, k, kt, .. } => Some(ConvShape::grid(*cin, *cout, *k, *kt, upsample, false)),
+        VaeOp::TimeUp { channels, .. } => Some(ConvShape::grid(*channels, 2 * channels, 1, 3, false, true)),
         _ => None,
     }
 }
 
 fn geometry(t: &kir::Target, shape: ConvShape) -> Option<Geometry> {
-    let k = ConvKernel::new(t, shape, ConvPrologue::None, ConvEpilogue { residual: false, stats: None }).ok()?;
+    let k = ConvKernel::new(t, shape, ConvPrologue::None, ConvEpilogue { residual: false, stats: None, gelu: false }).ok()?;
     Some(match k.family {
         ConvFamily::Tile => Geometry { col_blocks: shape.cout.div_ceil(k.tile.bn), rows_block: k.tile.bm, owner: Owner::Tile { cols: k.tile.bn }, smem: k.smem_bytes() as u64, regs: k.regs(), k_tile: Some(k.tile.bk) },
         ConvFamily::Direct => Geometry { col_blocks: shape.cout, rows_block: kir::conv::THREADS as usize, owner: Owner::Tile { cols: 1 }, smem: k.smem_bytes() as u64, regs: k.regs(), k_tile: Some(1) },
@@ -202,7 +202,7 @@ pub fn library(plan: &VaePlan, target: &kir::Target, units: &[&Unit]) -> Fit {
     }
     let shape = conv_shape(op, up).unwrap();
     let prologue = apply.map_or(ConvPrologue::None, |(groups, silu)| ConvPrologue::GroupApply { groups, silu });
-    match ConvKernel::new(target, shape, prologue, ConvEpilogue { residual: residual == 1, stats }) {
+    match ConvKernel::new(target, shape, prologue, ConvEpilogue { residual: residual == 1, stats, gelu: false }) {
         Ok(_) => Fit::Kernel,
         Err(_) => Fit::None,
     }
