@@ -160,7 +160,7 @@ $PY crates/specrt/scripts/reference.py tiny-mtp crates/specrt/tests/fixtures/tin
 | `vision.rs` | image and video preprocessing, mrope positions | CPU | 0 | none | none, 6 s |
 | `fp4_gemv.rs` | NVFP4 GEMV against a CUDA reference | not ignored, but it opens the GPU, so it needs one in tier 1 | 0 | none | small, 10 s |
 | `quant_search.rs` | load time scale search (#1417) for nvfp4_g16 and fp8_channel, bit for bit against `scripts/quant_search_reference.py` | CPU | 0 | none | none, 0.1 s |
-| `quant_search_gpu.rs` | the kir scale search kernels (`kir::weight_quant::ScaleSearch`) bit for bit against the CPU search on the numpy case, mixed and zero rows and the tiny fixture head | not ignored, opens the GPU (GPU1) | 0 | none | small, 1 s |
+| `quant_search_gpu.rs` | the kir scale search kernels (`kir::weight_quant::ScaleSearch`) bit for bit against the CPU search on the numpy case, mixed and zero rows and the tiny fixture head | 2, 3 ign, run with `-- --ignored` under `~/.agents/bin/gpu-run 1 --min-free 2000 --` | 3 | none | small, 1 s |
 | `prefix.rs` | prefix cache, snapshots, block tables | CPU, 2 ign | 2 | none | none, 0.4 s |
 | `yarn.rs` | YaRN rope against `yarn_reference.json` | CPU, 1 ign | 1 | none | 2 GB |
 | `gguf.rs` | GGUF parse, spec from GGUF | CPU, 3 ign | 3 | GGUF files in `~/.cache/specrt-gguf` | 2 GB |

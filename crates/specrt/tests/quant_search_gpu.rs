@@ -50,12 +50,14 @@ fn check(w: &[u16], cols: usize) {
 }
 
 #[test]
+#[ignore = "needs a GPU"]
 fn device_scale_search_matches_the_cpu_search_on_the_reference_case() {
     let (w, cols) = case();
     check(&w, cols);
 }
 
 #[test]
+#[ignore = "needs a GPU"]
 fn device_scale_search_matches_the_cpu_search_on_mixed_rows() {
     check(&rows_of(37, 64), 64);
     check(&rows_of(4099, 128), 128);
@@ -63,6 +65,7 @@ fn device_scale_search_matches_the_cpu_search_on_mixed_rows() {
 }
 
 #[test]
+#[ignore = "needs a GPU"]
 fn device_scale_search_matches_the_cpu_search_on_the_tiny_fixture() {
     let (w, cols) = tiny_fixture_weight();
     check(&w, cols);
