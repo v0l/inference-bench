@@ -144,8 +144,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     Line::new().legend("model").column(ui, 120.0).value(&l.display).wrapped(ui);
                     Line::new().legend("sessions").column(ui, 120.0).value(l.max_num_seqs.to_string()).wrapped(ui);
                     Line::new().legend("context").column(ui, 120.0).value(format!("{} frames", l.ctx)).wrapped(ui);
-                    for (gpu, bytes) in &l.landed {
-                        Line::new().legend(gpu).column(ui, 120.0).value(human_size(*bytes)).wrapped(ui);
+                    if let Some(landing) = app.landing(&l) {
+                        Line::new().legend("gpu").column(ui, 120.0).value(landing.text.trim_start_matches("running on ")).wrapped(ui);
                     }
                 });
                 section(ui, "connect", "stream audio to it", |ui| {

@@ -80,6 +80,10 @@ pub fn footprint(dir: &Path, max_ctx: usize) -> Result<Footprint> {
     let spec = crate::spec::Spec::from_hf_config_duplex(&text)?;
     let d = spec.duplex.as_ref().context("no [duplex] section")?;
     let weights: u64 = std::fs::read_dir(dir)?.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "safetensors")).filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum();
+    let config: serde_json::Value = serde_json::from_str(&text)?;
+    let codec = crate::codec::graph::plan(&config)?;
+    let codec_f32_extra = ((codec.encoder.params() + codec.decoder.params()) * 2) as u64;
+    let weights = weights + codec_f32_extra;
     let pages = max_ctx.div_ceil(crate::codegen::PAGE);
     let kv = (pages * crate::runtime::kv_block_bytes(&spec, 2)) as u64;
     let per_session = kv + crate::serve::slot_state_bytes(&spec) + (2 << 20);
@@ -235,6 +239,23 @@ impl Drop for Service {
 
 pub fn out_of(f: Frame) -> Out {
     Out { audio: f.audio, token: Some(f.token), text: f.text, index: f.index, late: false, done: f.done, error: None, input: None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_footprint_counts_the_f32_codec_and_grows_with_context() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/haru/tiny");
+        let small = footprint(&dir, 256).unwrap();
+        let big = footprint(&dir, 4096).unwrap();
+        let file = std::fs::metadata(dir.join("model.safetensors")).unwrap().len();
+        assert!(small.weights > file, "the codec runs in f32, so it holds more than the bf16 file");
+        assert!(big.per_session > small.per_session && big.weights == small.weights);
+        assert_eq!(small.total(3), small.weights + 3 * small.per_session);
+        assert_eq!((small.sample_rate, small.card_fields.len()), (24000, 7));
+    }
 }
 
 pub struct Hosted {

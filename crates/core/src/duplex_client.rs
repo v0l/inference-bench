@@ -166,7 +166,9 @@ pub fn stream(o: &Options, input: &[f32]) -> Result<Run> {
         }
     };
     let mut skip = 0;
+    let mut first_sent = None;
     if o.realtime {
+        first_sent = Some(Instant::now());
         c.sent.push(Instant::now());
         s.send(message(&padded[..samples]))?;
         skip = 1;
@@ -180,11 +182,11 @@ pub fn stream(o: &Options, input: &[f32]) -> Result<Run> {
             c.take(m)?;
         }
     }
-    let started = Instant::now();
+    let started = first_sent.unwrap_or_else(Instant::now);
     set_timeout(&s, Some(Duration::from_millis(2)))?;
     let mut open = true;
     for (i, chunk) in padded.chunks(samples).enumerate().skip(skip) {
-        let due = started + frame * (i - skip) as u32;
+        let due = started + frame * i as u32;
         while open && o.paced && Instant::now() < due {
             if let Some(m) = read(&mut s)? {
                 open = c.take(m)?;
