@@ -177,6 +177,41 @@ fn say(dir: &Path, a: &mut Args) -> Result<()> {
     Ok(())
 }
 
+fn validate(dir: &Path, a: &mut Args) -> Result<()> {
+    use specrt::duplex::validate::{self, Trace};
+    let traces: Vec<PathBuf> = a.value("--trace").context("--trace <dir>[,<dir>...]")?.split(',').map(PathBuf::from).collect();
+    let out = PathBuf::from(a.value("--out").context("--out <dir>")?);
+    let frames: Option<usize> = a.value("--frames").map(|v| v.parse()).transpose()?;
+    let free = a.flag("--free");
+    let seed: u64 = a.parse("--seed", 0)?;
+    a.done()?;
+    std::fs::create_dir_all(&out)?;
+    let first = Trace::open(&traces[0])?;
+    let layers = first.layers();
+    let mut e = Engine::load(dir, EngineOptions { slots: 1, max_ctx: 8192, trace_layers: layers.clone(), ..EngineOptions::default() })?;
+    for path in &traces {
+        let t = Trace::open(path)?;
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let check = validate::prompt_check(&e, &t)?;
+        eprintln!("{name}: prompt {}", serde_json::to_string(&check)?);
+        let started = Instant::now();
+        let r = validate::teacher_forced(&mut e, &t, frames)?;
+        eprintln!("{name}: teacher forced {} frames in {:.1} s", r.rows.len(), started.elapsed().as_secs_f64());
+        println!("## {name} teacher forced\n\n{}", validate::markdown(&r, &layers));
+        write_wav(&out.join(format!("{name}.teacher.wav")), &r.audio, e.duplex.sample_rate as u32)?;
+        let mut doc = serde_json::json!({"trace": path.display().to_string(), "prompt": check, "teacher": r});
+        if free {
+            let run = validate::free_running(&mut e, &t, seed)?;
+            println!("## {name} free running\n\nfirst divergence {:?}, voiced {} vs {}, agreement {:.3}\n{}\n", run.first_divergence, run.voiced_frames, run.want_voiced_frames, run.voiced_agreement, run.text);
+            write_wav(&out.join(format!("{name}.free.wav")), &run.audio, e.duplex.sample_rate as u32)?;
+            doc["free"] = serde_json::to_value(&run)?;
+        }
+        doc["teacher"]["audio"] = serde_json::Value::Null;
+        std::fs::write(out.join(format!("{name}.json")), serde_json::to_string(&doc)?)?;
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
     ensure!(argv.len() >= 2, "usage: haru <bench|run|say> <model dir> [options]");
@@ -187,6 +222,7 @@ fn main() -> Result<()> {
         "bench" => bench(&dir, &mut a),
         "run" => run(&dir, &mut a),
         "say" => say(&dir, &mut a),
-        other => bail!("unknown command {other}; use bench, run or say"),
+        "validate" => validate(&dir, &mut a),
+        other => bail!("unknown command {other}; use bench, run, say or validate"),
     }
 }

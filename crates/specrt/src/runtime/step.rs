@@ -247,6 +247,29 @@ impl Runtime {
         self.decode_rows(&st.bb, n)
     }
 
+    pub fn forward_rows_traced(&self, st: &Stepper, n: usize, layers: &[usize], out: &CudaSlice<f32>) -> Result<()> {
+        use crate::executor::{PlanBackend, run_ops};
+        let per = n * self.spec.dims.hidden;
+        ensure!(out.len() >= (layers.len() + 1) * per, "a layer trace of {} floats for {} rows", out.len(), n);
+        ensure!(layers.iter().all(|&l| l < self.spec.layers.count), "trace layers {layers:?} past the last layer");
+        let plan = &self.plans.decode;
+        let run = super::exec::Run { n, tokens: &st.bb.tokens, logits: &st.bb.logits, rows: 0..n, bb: Some(&st.bb), start: None, qlen: 1, mtp: None };
+        let keep = |slot: usize| self.copy_rows(&self.pre.x.slice(..per), &out.slice(slot * per..(slot + 1) * per), per);
+        run_ops(self, &plan.head, None, &run)?;
+        keep(0)?;
+        for i in 0..self.spec.layers.count {
+            let be: &dyn PlanBackend<super::exec::Run<'_>> = self;
+            be.enter_layer(i)?;
+            run_ops(self, plan.layer_for(be.block(i), be.sparse(i), be.tail(i)), Some(i), &run)?;
+            run_ops(self, &plan.per_layer, Some(i), &run)?;
+            be.leave_layer(i)?;
+            for (k, _) in layers.iter().enumerate().filter(|(_, l)| **l == i) {
+                keep(k + 1)?;
+            }
+        }
+        run_ops(self, &plan.tail, None, &run)
+    }
+
     pub fn sample_staged(&self, st: &Stepper, n: usize) -> Result<()> {
         let mut b = self.launcher(self.kernel("sample_rows"));
         b.arg(&st.bb.logits).arg(&st.bb.tokens).arg(&st.params);
