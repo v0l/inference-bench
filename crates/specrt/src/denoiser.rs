@@ -66,6 +66,10 @@ pub struct DitNode {
     pub kv: Option<String>,
     #[serde(default)]
     pub channels_last: bool,
+    #[serde(default)]
+    pub norm: Option<String>,
+    #[serde(default)]
+    pub expr: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -107,6 +111,16 @@ pub struct DenoiserGraph {
     pub tail: Vec<DitNode>,
     #[serde(default)]
     pub step: Vec<DitNode>,
+    #[serde(default)]
+    pub frame: Vec<String>,
+    #[serde(default)]
+    pub scalars: BTreeMap<String, String>,
+    #[serde(default)]
+    pub constants: Vec<String>,
+    #[serde(default)]
+    pub start: Vec<DitNode>,
+    #[serde(default)]
+    pub finish: Vec<DitNode>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -189,6 +203,10 @@ impl DenoiserSpec {
         }
         values.entry("time_scale".into()).or_insert(1000.0);
         values.entry("latent_patch".into()).or_insert(1.0);
+        Self::from_values(graph, values, axes)
+    }
+
+    pub fn from_values(graph: &DenoiserGraph, mut values: BTreeMap<String, f64>, axes: Vec<usize>) -> Result<DenoiserSpec> {
         let mut pending: Vec<(&String, kir::expr::Expr, &String)> = Vec::new();
         for (name, text) in &graph.symbols {
             pending.push((name, kir::expr::Expr::parse(text).map_err(anyhow::Error::msg)?, text));
@@ -216,7 +234,9 @@ impl DenoiserSpec {
             let e = kir::expr::Expr::parse(c).map_err(anyhow::Error::msg)?;
             ensure!(e.eval(&|n| spec.values.get(n).copied()).is_some_and(|v| v != 0.0), "the {} denoiser graph needs {c}", graph.name);
         }
-        ensure!(spec.size("head_dim")? == spec.axes.iter().sum::<usize>(), "rope axes {:?} do not add up to head_dim {}", spec.axes, spec.size("head_dim")?);
+        if spec.values.contains_key("head_dim") {
+            ensure!(spec.size("head_dim")? == spec.axes.iter().sum::<usize>(), "rope axes {:?} do not add up to head_dim {}", spec.axes, spec.size("head_dim")?);
+        }
         ensure!(spec.axes.iter().all(|a| a % 2 == 0), "rope axes {:?} must be even", spec.axes);
         Ok(spec)
     }
@@ -301,7 +321,20 @@ impl DitNode {
                 let weight = intern(&w.split('+').map(|part| full(part)).collect::<Vec<_>>().join("+"));
                 DitOp::Linear { weight, input: from()?, output: into()?, rows: self.rows()?, add: self.add, bias: self.bias, act }
             }
-            "modulate" => DitOp::Modulate { from: from()?, into: into()?, rows: self.rows()?, set: set()?, shift: self.shift.context("modulate needs shift")?, scale: self.scale.context("modulate needs scale")? },
+            "modulate" => {
+                let rms = match self.norm.as_deref() {
+                    None | Some("layer") => false,
+                    Some("rms") => true,
+                    Some(other) => bail!("modulate norm {other:?} is not layer or rms"),
+                };
+                ensure!(rms || self.weight.is_none(), "a layer norm modulate takes no weight");
+                DitOp::Modulate { from: from()?, into: into()?, rows: self.rows()?, set: set()?, shift: self.shift.context("modulate needs shift")?, scale: self.scale.context("modulate needs scale")?, rms, weight: self.weight.as_deref().map(|w| intern(&full(w))) }
+            }
+            "map" => {
+                let text = self.need(&self.expr, "expr")?;
+                let e = kir::expr::Expr::parse(text).map_err(anyhow::Error::msg)?;
+                DitOp::Map { into: into()?, rows: self.rows()?, expr: intern(&e.to_string()) }
+            }
             "gated_add" => DitOp::GatedAdd { from: from()?, into: intern("x"), rows: self.rows()?, set: set()?, gate: self.gate.context("gated_add needs gate")? },
             "glu" => DitOp::Glu { from: from()?, into: into()?, rows: self.rows()?, offset: intern(self.offset.as_deref().unwrap_or("0")) },
             "axis_rope" => DitOp::AxisRope { from: from()?, text: intern(&full(self.need(&self.text, "text")?)), image: intern(&full(self.need(&self.image, "image")?)) },
@@ -327,8 +360,12 @@ pub fn pack_parts(norms: &str) -> Vec<&str> {
 
 impl DenoiserGraph {
     pub fn parse(text: &str) -> Result<DenoiserGraph> {
+        Self::parse_kind(text, "denoiser-graph")
+    }
+
+    pub fn parse_kind(text: &str, kind: &str) -> Result<DenoiserGraph> {
         let g: DenoiserGraph = toml::from_str(text)?;
-        ensure!(g.kind == "denoiser-graph", "{} is not a denoiser graph", g.name);
+        ensure!(g.kind == kind, "{} is not a {kind}", g.name);
         Ok(g)
     }
 
@@ -507,7 +544,33 @@ impl Signer<'_> {
                 }
                 sig(Class::Gemm, reads, vec![out], (2 * n * k) as u64)
             }
-            DitOp::Modulate { from, into, rows, set, .. } => sig(Class::RowReduce, vec![self.t(from, Some(rows))?, self.t(set, None)?], vec![self.t(into, Some(rows))?], 0),
+            DitOp::Modulate { from, into, rows, set, weight: w, .. } => {
+                let mut reads = vec![self.t(from, Some(rows))?, self.t(set, None)?];
+                if let Some(w) = w {
+                    reads.push(weight(&format!("{w}.weight"), 1, h));
+                }
+                sig(Class::RowReduce, reads, vec![self.t(into, Some(rows))?], 0)
+            }
+            DitOp::Map { into, rows, expr } => {
+                let e = kir::expr::Expr::parse(expr).map_err(anyhow::Error::msg)?;
+                let mut names = Vec::new();
+                e.names(&mut names);
+                let out = self.t(into, Some(rows))?;
+                let mut reads = Vec::new();
+                for n in &names {
+                    match name_kind(self.graph, self.spec, n) {
+                        NameKind::Value => {}
+                        NameKind::Constant => reads.push(weight(n, 1, 1)),
+                        NameKind::Buffer => {
+                            let t = self.t(n, Some(rows))?;
+                            ensure!(t.cols == out.cols || t.cols == 1, "map {expr:?} reads {n} ({} wide) into {into} ({} wide)", t.cols, out.cols);
+                            reads.push(t);
+                        }
+                        NameKind::Unknown => bail!("map {expr:?} reads {n}, which is neither a buffer, a constant nor a graph value"),
+                    }
+                }
+                sig(Class::Elementwise, reads, vec![out], 0)
+            }
             DitOp::GatedAdd { from, into, rows, set, .. } => {
                 let x = self.t(into, Some(rows))?;
                 sig(Class::Elementwise, vec![self.t(from, Some(rows))?, self.t(set, None)?, x.clone()], vec![x], 0)
@@ -852,6 +915,16 @@ pub fn kernel_key(op: &DitOp, graph: &DenoiserGraph, spec: &DenoiserSpec) -> Res
             let w = width(from)?;
             (format!("dit_glu_{w}_{off}"), "dit_glu".into(), vec![("glu_stride".into(), w), ("glu_offset".into(), off)])
         }
+        DitOp::Modulate { rms: true, set, weight, .. } => {
+            let s = width(set)?;
+            let base = if weight.is_some() { "dit_rms_modulate_w" } else { "dit_rms_modulate" };
+            (format!("{base}_{s}"), base.into(), vec![("mod_stride".into(), s)])
+        }
+        DitOp::GatedAdd { rows: Stream::Seqs, set, .. } => {
+            let s = width(set)?;
+            (format!("dit_row_gated_add_{s}"), "dit_row_gated_add".into(), vec![("mod_stride".into(), s)])
+        }
+        DitOp::Map { into, expr, .. } => (format!("dit_map_{}", &kir::fnv_hash(&format!("{into} {expr}"))[..8]), "dit_map".into(), Vec::new()),
         DitOp::Modulate { .. } => ("dit_modulate".into(), "dit_modulate".into(), Vec::new()),
         DitOp::GatedAdd { .. } => ("dit_gated_add".into(), "dit_gated_add".into(), Vec::new()),
         DitOp::TimestepEmbed { .. } => ("dit_timestep".into(), "dit_timestep".into(), Vec::new()),
@@ -867,6 +940,108 @@ pub fn kernel_key(op: &DitOp, graph: &DenoiserGraph, spec: &DenoiserSpec) -> Res
         DitOp::LayerNorm { .. } => ("dit_layernorm".into(), "dit_layernorm".into(), Vec::new()),
         DitOp::Linear { .. } | DitOp::AxisRope { .. } | DitOp::JointAttention { .. } | DitOp::Pack { .. } | DitOp::CrossAttention { .. } => return Ok(None),
     }))
+}
+
+pub fn map_description(op: &DitOp, graph: &DenoiserGraph, spec: &DenoiserSpec) -> Result<String> {
+    let DitOp::Map { into, expr, .. } = *op else { bail!("{} is not a map", op.label()) };
+    let decl = graph.decl(into).with_context(|| format!("no buffer {into}"))?;
+    let width = &decl.cols;
+    let e = kir::expr::Expr::parse(expr).map_err(anyhow::Error::msg)?;
+    let mut names = Vec::new();
+    e.names(&mut names);
+    let wide = spec.size(width)?;
+    let mut rows: Vec<String> = Vec::new();
+    let mut scalar: Vec<String> = Vec::new();
+    let mut consts: Vec<String> = Vec::new();
+    for n in &names {
+        match name_kind(graph, spec, n) {
+            NameKind::Value => {}
+            NameKind::Constant => consts.push(n.clone()),
+            NameKind::Buffer => {
+                let d = graph.decl(n).unwrap();
+                ensure!(!d.planes, "map {expr:?} reads {n}, which is held as planes");
+                if spec.size(&d.cols)? == wide { rows.push(n.clone()) } else { scalar.push(n.clone()) }
+            }
+            NameKind::Unknown => bail!("map {expr:?} reads {n}, which the graph does not declare"),
+        }
+    }
+    let outs: Vec<String> = if decl.planes { vec!["p_out_hi".into(), "p_out_lo".into()] } else { vec!["p_out".into()] };
+    let per_row: Vec<String> = outs.iter().cloned().chain(rows.iter().filter(|n| n.as_str() != into).map(|n| format!("p_{n}"))).collect();
+    let mut t = format!("kind = \"kir-kernel\"\nfamily = \"compose\"\nname = \"dit_map\"\nthreads = 256\n\n[args]\nwidth = \"{width}\"\n\n[rows]\niter = \"grid\"\naddress = \"advance\"\nper_row = [{}]\n", per_row.iter().map(|p| format!("\"{p}\"")).collect::<Vec<_>>().join(", "));
+    if !scalar.is_empty() {
+        t.push_str("\n[rows.stride]\n");
+        for s in &scalar {
+            t.push_str(&format!("p_{s} = 1\n"));
+        }
+    }
+    for o in &outs {
+        t.push_str(&format!("\n[[param]]\nname = \"{o}\"\n{}role = \"activation\"\naccess = \"write\"\n", if decl.planes { "type = \"bf16\"\n" } else { "" }));
+    }
+    for n in rows.iter().filter(|n| n.as_str() != into).chain(&scalar).chain(&consts) {
+        t.push_str(&format!("\n[[param]]\nname = \"p_{n}\"\nrole = \"activation\"\naccess = \"read\"\n"));
+    }
+    for n in &rows {
+        let src = if n == into { "p_out".to_string() } else { format!("p_{n}") };
+        t.push_str(&format!("\n[[stage]]\nop = \"tile_load\"\nname = \"v_{n}\"\nsrc = \"{src}\"\n"));
+    }
+    for n in scalar.iter().chain(&consts) {
+        t.push_str(&format!("\n[[stage]]\nop = \"tile_load\"\nname = \"v_{n}\"\nsrc = \"p_{n}\"\nlayout = \"(width):(0)\"\nat = [\"i\"]\n"));
+    }
+    let body = e.subst(&|n| match name_kind(graph, spec, n) {
+        NameKind::Value => spec.get(n).ok().map(|v| kir::expr::Expr::Lit(format!("{v:?}"))),
+        _ => Some(kir::expr::Expr::Name(format!("v_{n}"))),
+    }).map_err(anyhow::Error::msg)?;
+    t.push_str(&format!("\n[[stage]]\nop = \"epilogue\"\nname = \"y\"\nexpr = \"{body}\"\n"));
+    if decl.planes {
+        t.push_str("\n[[stage]]\nop = \"split_store\"\ndst = \"p_out_hi\"\nlo = \"p_out_lo\"\nvalue = \"y\"\n");
+    } else {
+        t.push_str("\n[[stage]]\nop = \"tile_store\"\ndst = \"p_out\"\nvalue = \"y\"\n");
+    }
+    Ok(t)
+}
+
+pub fn map_params(op: &DitOp, graph: &DenoiserGraph, spec: &DenoiserSpec) -> Result<Vec<&'static str>> {
+    let DitOp::Map { into, expr, .. } = *op else { bail!("{} is not a map", op.label()) };
+    let wide = spec.size(&graph.decl(into).with_context(|| format!("no buffer {into}"))?.cols)?;
+    let e = kir::expr::Expr::parse(expr).map_err(anyhow::Error::msg)?;
+    let mut names = Vec::new();
+    e.names(&mut names);
+    let mut rows = Vec::new();
+    let mut scalar = Vec::new();
+    let mut consts = Vec::new();
+    for n in names.iter().filter(|n| n.as_str() != into) {
+        match name_kind(graph, spec, n) {
+            NameKind::Buffer => {
+                let d = graph.decl(n).unwrap();
+                if spec.size(&d.cols)? == wide { rows.push(intern(n)) } else { scalar.push(intern(n)) }
+            }
+            NameKind::Constant => consts.push(intern(n)),
+            _ => {}
+        }
+    }
+    rows.extend(scalar);
+    rows.extend(consts);
+    Ok(rows)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameKind {
+    Buffer,
+    Constant,
+    Value,
+    Unknown,
+}
+
+pub fn name_kind(graph: &DenoiserGraph, spec: &DenoiserSpec, name: &str) -> NameKind {
+    if graph.decl(name).is_some() {
+        NameKind::Buffer
+    } else if graph.constants.iter().any(|c| c == name) {
+        NameKind::Constant
+    } else if spec.values.contains_key(name) {
+        NameKind::Value
+    } else {
+        NameKind::Unknown
+    }
 }
 
 pub fn step_description(op: &DitOp, graph: &DenoiserGraph) -> Result<String> {

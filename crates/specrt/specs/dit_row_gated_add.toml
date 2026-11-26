@@ -1,0 +1,55 @@
+kind = "kir-kernel"
+family = "compose"
+name = "dit_row_gated_add"
+threads = 256
+
+[args]
+width = "hidden"
+
+[rows]
+iter = "grid"
+address = "advance"
+per_row = ["x", "branch"]
+
+[rows.stride]
+gate = "mod_stride"
+
+[[param]]
+name = "x"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "branch"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "gate"
+role = "activation"
+access = "read"
+
+[[stage]]
+op = "tile_load"
+name = "r"
+src = "x"
+
+[[stage]]
+op = "tile_load"
+name = "b"
+src = "branch"
+
+[[stage]]
+op = "tile_load"
+name = "g"
+src = "gate"
+
+[[stage]]
+op = "epilogue"
+name = "y"
+expr = "r + g * b"
+
+[[stage]]
+op = "tile_store"
+dst = "x"
+value = "y"
