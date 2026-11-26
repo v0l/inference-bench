@@ -71,6 +71,53 @@ Load on GPU1 (warm page cache, one run after a warm up load):
 
 The bytes read are the same with the option on and off: the bf16 checkpoint is read once either way. The device bytes include the bf16 embedding table (0.31 GB) and the four kept layers. On a cold JIT cache the first quantised load took 4.5 s.
 
+## quantcheck: a per layer recipe
+
+```bash
+inference-bench quantcheck <model> [--formats nvfp4,fp8] [--kl 0.02[,0.05,...]] [--budget-gb N] [--out PATH] [--max-ctx 512]
+```
+
+It loads the bf16 model once on one GPU with the kernels for every format it tries planned in (`quant_plan.kernels`), runs the shipped prompt set (`quantcheck/prompts.toml`) once for the reference logits, then for each layer and each format, with search and with plain rounding, swaps that one layer in place (`Runtime::requantize_layer`, which re-reads the layer from the checkpoint) and measures mean KL, max KL and top-1 of every position against bf16. A swapped layer gives the same logits and bytes as a fresh load of that plan, bit for bit (`tests/quantcheck_gpu.rs`).
+
+Choosing:
+
+- Per layer and format it keeps the rounding with the lower `mean KL + 0.01 * max KL` (`MAX_KL_WEIGHT`). This is what finding 2 of slice 1d asked for: the scale search lowers squared weight error, and on 6 of 28 layers of Qwen3-0.6B at KL 0.1 the measured logits preferred plain rounding (layer 0 nvfp4: search 0.0184 mean and 0.70 max, plain 0.0153 and 0.34).
+- Greedy: every layer starts at its lowest bit format; the layer with the largest score moves up one format (nvfp4, fp8, bf16) until the summed per layer mean KL is inside the budget, or the next move would pass `--budget-gb`.
+- The per layer KLs do not add up exactly, so the chosen recipe is checked by one whole model run against bf16. If that is over the budget the target is scaled down and greedy runs again (up to 4 rounds). On Qwen3-0.6B the sum was slightly pessimistic every time (estimated 0.0977, measured 0.0912 at budget 0.1), so one round was enough.
+- The keep list's edge layers (first and last two) are not forced to bf16 under a recipe: quantcheck measures them like any other layer. The named and sensitive tensors (embeddings, head, norms, routers, `sensitive`) still stay bf16.
+
+The recipe, `<model>.quantrecipe.toml`, is about 4 KB for 28 layers: recipe version, model, engine commit, `FORMAT_VERSION`, prompt set hash, positions, budgets, total and bf16 bytes, the estimated and checked KL, and per layer the format, search or plain, its own mean and max KL and its bytes. `Recipe::plan()` turns it into a `quant_plan`, the spec field the loader reads per layer (step 3 adds `quantize = "recipe"` with the path). A model of `n` layers with `f` formats costs `2fn` probes; each probe is one layer re-read and one pass over 353 positions.
+
+For a model that does not fit one card, quantcheck still needs every layer resident: run it on a stage, or wait for the streaming variant; `requantize_layer` refuses offloaded or tensor parallel runtimes.
+
+Spec changes: `quant_plan` with `layers` (format and `search` per layer) and `kernels` (formats to plan kernels for even where no layer uses them yet). A plan needs a bf16 checkpoint and `quantize = "off"`. fp8_channel layers beside bf16 layers get their own kernel names (`<linear>_f8w*` tiles and `_f8b*` batch kernels) so they do not collide with the bf16 `_mma` tiles; the single stream gemv path refuses a mixed fp8 layer and the plan path runs it.
+
+### Qwen3-0.6B
+
+`inference-bench quantcheck crates/specrt/specs/qwen3-0.6b.toml --kl 0.01,0.02,0.05,0.1` on GPU1, 36 s for 112 probes. Weights are the device bytes of all weights, including the 0.31 GB bf16 embedding (tied head); bf16 is 1.503 GB.
+
+| choice | layers | weights | mean KL | max KL | top-1 |
+|---|---|---|---|---|---|
+| recipe KL 0.01 | 5 bf16, 23 fp8 | 1.154 GB | 0.0092 | 0.079 | 95.8% |
+| recipe KL 0.02 | 26 fp8, 2 nvfp4 | 1.063 GB | 0.0174 | 0.121 | 94.1% |
+| recipe KL 0.05 | 17 fp8, 11 nvfp4 | 0.996 GB | 0.0475 | 0.310 | 87.3% |
+| recipe KL 0.1 | 8 fp8, 20 nvfp4 | 0.930 GB | 0.0912 | 0.857 | 85.6% |
+| blanket fp8_channel, edges bf16 | 4 bf16, 24 fp8 | 1.139 GB | 0.0107 | 0.132 | 96.0% |
+| blanket nvfp4_g16, edges bf16 | 4 bf16, 24 nvfp4 | 0.961 GB | 0.1384 | 6.19 | 79.0% |
+
+The KL 0.1 recipe is 3% smaller than blanket nvfp4 with 6.6 points more top-1, a third less mean KL and a seventh of the worst position (`tests/quantize_qwen3.rs`, `a_quantcheck_recipe_beats_blanket_nvfp4_*`, which also checks a fresh load of the recipe reproduces the recorded KL exactly and batch decode equals single). The KL 0.02 recipe beats blanket fp8 on size (1.063 against 1.139 GB) at the same KL class. The damaging layers are the last one (nvfp4 max KL 2.1) and the first three; quantising the last layer in fp8 and the middle in nvfp4 is what the recipe buys over the fixed keep list.
+
+Speed at this size does not move (single run each, GPU1, prompt 1024 for prefill, 128 plus 255 tokens for decode):
+
+| weights | prefill tok/s | decode b1 | decode b8 |
+|---|---|---|---|
+| bf16 | 3275 | 388 | 3078 |
+| fp8_channel | 3174 | 387 | 3065 |
+| nvfp4_g16 | 3236 | 393 | 3118 |
+| recipe KL 0.1 | 3249 | 396 | 3139 |
+
+All inside 3%: a 0.6B model is launch bound, so the win here is memory only. The 27B class numbers are the next measurement (needs a supervisor window).
+
 ## Trade off
 
 Quantising on the fly reads the full bf16 model from disk on every start, against a stored NVFP4 copy that reads a quarter of that. It saves disk and costs load time. The planned `quantize_cache` option (step 3) stores the result next to the model for the second start.

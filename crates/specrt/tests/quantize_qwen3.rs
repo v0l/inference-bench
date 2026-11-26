@@ -70,6 +70,41 @@ fn a_quantcheck_recipe_beats_blanket_nvfp4_on_top1_at_a_similar_size_on_qwen3_0_
 
 #[test]
 #[ignore = "needs a CUDA GPU and Qwen/Qwen3-0.6B"]
+fn quantised_prefill_and_decode_speed_on_qwen3_0_6b() {
+    use specrt::quantcheck::{Budget, Options, run};
+    use specrt::spec::{Quant, QuantPlan};
+    let base = spec(QuantizeChoice::Off);
+    let opts = Options { formats: vec![Quant::Nvfp4G16, Quant::Fp8Channel], budgets: vec![Budget { kl: 0.1, bytes: None }], max_ctx: 512, tokens: None };
+    let recipe = run(&base, &opts, &mut |_| {}).unwrap().recipes.remove(0);
+    let mut planned = base.clone();
+    planned.quant_plan = QuantPlan { layers: recipe.plan().layers, kernels: Vec::new() };
+    let prompt: Vec<u32> = (0..1024u32).map(|i| 1000 + (i * 37) % 30000).collect();
+    for (name, s) in [("off", base.clone()), ("fp8_channel", spec(QuantizeChoice::Fp8Channel)), ("nvfp4_g16", spec(QuantizeChoice::Nvfp4G16)), ("recipe kl 0.1", planned)] {
+        let mut rt = Runtime::load(&s, 2048).unwrap();
+        rt.prompt_logits(&prompt).unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..5 {
+            rt.prompt_logits(&prompt).unwrap();
+        }
+        let prefill = 5.0 * prompt.len() as f64 / started.elapsed().as_secs_f64();
+        let weights = rt.weight_bytes;
+        drop(rt);
+        let mut line = format!("{name}: weights {:.3} GB, prefill {prefill:.0} tok/s", weights as f64 / 1e9);
+        for batch in [1usize, 8] {
+            let mut rt = Runtime::load_batched(&s, 512, batch).unwrap();
+            let prompts = vec![prompt[..128].to_vec(); batch];
+            rt.generate_batch(&prompts, 16).unwrap();
+            let g = rt.generate_batch(&prompts, 256).unwrap();
+            let rate = batch as f64 * 255.0 / g.decode_secs;
+            assert!(rate > 0.0);
+            line += &format!(", decode batch {batch} {rate:.0} tok/s");
+        }
+        eprintln!("{line}");
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and Qwen/Qwen3-0.6B"]
 fn quantize_at_load_stays_inside_its_kl_bound_on_qwen3_0_6b() {
     let base = spec(QuantizeChoice::Off);
     let vocab = base.dims.vocab;
