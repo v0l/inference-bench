@@ -10,7 +10,26 @@ architectures = ["HaruForConditionalGeneration"]
 
 [[refuse]]
 when = "hidden_size > 0"
-message = "Haru-4B full duplex speech is not runnable yet: the backbone and its three stream input run, the MeanFlow audio head (#1428), the streaming codec (#1429) and duplex sessions (#1430) are missing"
+message = "Haru-4B full duplex speech is not runnable yet: the backbone, its three stream input, the MeanFlow audio head and the streaming codec run, duplex sessions (#1430) are missing"
+
+[head]
+graph = "meanflow"
+root = "head"
+
+[head.params]
+hidden = { config = "head.hidden_size" }
+latent_dim = { config = "head.latent_dim" }
+layers = { config = "head.num_layers" }
+ffn_ratio = { config = "head.ffn_ratio" }
+mlp = { expr = "floor(hidden * ffn_ratio)" }
+norm_eps = { config = "head.norm_eps" }
+interval_embed = { config = "head.interval_embed" }
+num_steps = { config = "head.num_steps", default = 1 }
+guidance = { config = "head.guidance_scale" }
+guidance_min = { config = "head.guidance_range.0" }
+guidance_max = { config = "head.guidance_range.1" }
+freq = 256
+time_scale = 1
 
 [tensors]
 "lm." = "model."

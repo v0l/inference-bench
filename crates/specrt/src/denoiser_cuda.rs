@@ -732,7 +732,8 @@ impl Denoiser {
                 }
                 unsafe { b.launch(Self::row_grid(a.bufs[into].cols, rows)) }?;
             }
-            DitOp::Modulate { from, into, rows, set, shift, scale } => {
+            DitOp::Modulate { rms: true, .. } | DitOp::Map { .. } => bail!("{} runs in the flow head runner (flow_head), not the DiT denoiser", d.label()),
+            DitOp::Modulate { from, into, rows, set, shift, scale, .. } => {
                 let (r0, r1) = self.span(a, from, rows, seq);
                 let x = self.ptr_f32(a, from, r0)?;
                 let base = self.ptr_f32(a, set, seq)?;

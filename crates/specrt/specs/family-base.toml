@@ -44,6 +44,12 @@ mlp_marker = "mlp."
 group_error = "compressed-tensors group {name} is not supported (fp8 per-channel and nvfp4 group 16 are)"
 flat_error = "quantization {q} is not supported (fp8 e4m3 with 128x128 blocks and compressed-tensors fp8/nvfp4 are)"
 
+[quantization.keep]
+first_layers = 2
+last_layers = 2
+tensors = ["embed_tokens", "lm_head", "norm", "mlp.gate.weight", "router", "shared_expert_gate"]
+sensitive = []
+
 [[quantization.group_rules]]
 quant = "fp8_channel"
 when = { format = "float-quantized", "weights.type" = "float", "weights.num_bits" = 8, "weights.strategy" = "channel", "weights.symmetric" = true }

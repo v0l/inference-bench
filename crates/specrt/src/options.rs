@@ -397,6 +397,7 @@ const META: &[Meta] = &[
     Meta { key: "runtime.requant.o", label: "requant attention out", group: Group::Runtime, help: "Reformat the attention output projections at load. Auto keeps the checkpoint format.", choices: &["fp8_channel", "nvfp4_g16"], range: (0, 0) },
     Meta { key: "runtime.requant.mlp_tail", label: "requant tail mlps", group: Group::Runtime, help: "Reformat the MLPs the checkpoint stores as FP8 (the last 8 layers of the 27B) at load. Auto keeps the checkpoint format.", choices: &["fp8_channel", "nvfp4_g16"], range: (0, 0) },
     Meta { key: "runtime.requant.lm_head", label: "requant lm head", group: Group::Runtime, help: "Reformat the output head at load. Auto keeps the checkpoint format.", choices: QUANTS, range: (0, 0) },
+    Meta { key: "runtime.quantize", label: "quantize at load", group: Group::Runtime, help: "Quantise the large linear and expert weights of a bf16 checkpoint while they load, with a small scale search per group. Embeddings, the output head, routers, norms and the first and last two layers stay bf16. Off keeps the checkpoint format; auto picks nvfp4_g16.", choices: &["off", "auto", "nvfp4_g16", "fp8_channel"], range: (0, 0) },
     Meta { key: "runtime.cache_dir", label: "kernel cache", group: Group::Runtime, help: "Where compiled kernels are kept. Auto uses the user cache folder.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.cache_max_bytes", label: "kernel cache size", group: Group::Runtime, help: "Most bytes of compiled kernels to keep. The oldest are deleted after a new one is written. Auto keeps 4 GB.", choices: &[], range: (1, u64::MAX) },
     Meta { key: "runtime.compile_jobs", label: "compile jobs", group: Group::Runtime, help: "Threads NVRTC may use to compile one kernel module. Auto uses the CPU count, at most 8.", choices: &[], range: (1, 64) },
@@ -480,6 +481,7 @@ fn populated_runtime() -> RuntimeOptions {
         offload: crate::offload::OffloadSettings { vram_budget: 1, host_budget: 1, nvme_path: Some("x".into()), prefetch_depth: 2, policy: crate::offload::Policy::Frequency, expert_slots: 3, pointer_table: true, hotlist: Some("x".into()), promote_margin: 1.5, score_half_life: 8, promote_per_step: 4 },
         vision: crate::spec::VisionOptions { precision: crate::vision_encoder::VisionPrecision::Exact, cache_mb: 1, max_batch: 1, pan_and_scan: false },
         requant: crate::spec::Requant { lin_in: Some(Quant::Bf16), lin_out: Some(Quant::Bf16), qkv: Some(Quant::Bf16), o: Some(Quant::Bf16), mlp_tail: Some(Quant::Bf16), lm_head: Some(Quant::Bf16) },
+        quantize: crate::spec::QuantizeChoice::Auto,
     }
 }
 
@@ -658,6 +660,21 @@ mod tests {
         assert_eq!(exact.requant, crate::spec::Requant::default());
         let max = EngineChoice::default().apply(ServeOptions::default()).unwrap().runtime.unwrap();
         assert_eq!(max.requant, crate::spec::Requant::default());
+    }
+
+    #[test]
+    fn quantize_is_one_runtime_option_that_is_off_unless_chosen() {
+        let field = schema().into_iter().find(|f| f.key == "runtime.quantize").expect("runtime.quantize is listed");
+        assert_eq!(field.group, Group::Runtime);
+        assert_eq!(field.kind, Kind::Choice(&["off", "auto", "nvfp4_g16", "fp8_channel"]));
+        let plain = EngineChoice::default().apply(ServeOptions::default()).unwrap().runtime.unwrap();
+        assert_eq!(plain.quantize, crate::spec::QuantizeChoice::Off);
+        let mut c = EngineChoice::default();
+        c.set("runtime.quantize", json!("fp8_channel"));
+        let rt = c.apply(ServeOptions::default()).unwrap().runtime.unwrap();
+        assert_eq!(rt.quantize, crate::spec::QuantizeChoice::Fp8Channel);
+        assert_eq!(rt.quantize.format(), Some(Quant::Fp8Channel));
+        assert_eq!(crate::spec::QuantizeChoice::Auto.format(), Some(Quant::Nvfp4G16));
     }
 
     #[test]

@@ -42,7 +42,7 @@ pub enum DitOp {
     Copy { from: &'static str, into: &'static str, rows: Stream },
     TimestepEmbed { from: &'static str, into: &'static str },
     Linear { weight: &'static str, input: &'static str, output: &'static str, rows: Stream, add: bool, bias: bool, act: u8 },
-    Modulate { from: &'static str, into: &'static str, rows: Stream, set: &'static str, shift: u8, scale: u8 },
+    Modulate { from: &'static str, into: &'static str, rows: Stream, set: &'static str, shift: u8, scale: u8, rms: bool, weight: Option<&'static str> },
     GatedAdd { from: &'static str, into: &'static str, rows: Stream, set: &'static str, gate: u8 },
     Glu { from: &'static str, into: &'static str, rows: Stream, offset: &'static str },
     AxisRope { from: &'static str, text: &'static str, image: &'static str },
@@ -53,6 +53,7 @@ pub enum DitOp {
     CrossAttention { into: &'static str, rows: Stream, kv: &'static str },
     Step { from: &'static str, into: &'static str, rule: &'static str, guided: bool },
     MultiStep { from: &'static str, into: &'static str, rule: &'static str, state: &'static str, scalars: &'static str, guided: bool },
+    Map { into: &'static str, rows: Stream, expr: &'static str },
 }
 
 impl DitOp {
@@ -65,6 +66,7 @@ impl DitOp {
             DitOp::Copy { from, .. } => format!("copy {from}"),
             DitOp::TimestepEmbed { .. } => "timestep embed".into(),
             DitOp::Linear { weight, rows, .. } => format!("{} ({})", short(weight), rows.label()),
+            DitOp::Modulate { rows, set, shift, scale, rms: true, .. } => format!("{} rms modulate {set}[{shift},{scale}]", rows.label()),
             DitOp::Modulate { rows, set, shift, scale, .. } => format!("{} modulate {set}[{shift},{scale}]", rows.label()),
             DitOp::GatedAdd { rows, from, set, gate, .. } => format!("{} gated add {from} {set}[{gate}]", rows.label()),
             DitOp::Glu { from, rows, .. } => format!("{} swiglu {from}", rows.label()),
@@ -78,6 +80,7 @@ impl DitOp {
             DitOp::CrossAttention { rows, kv, .. } => format!("{} cross attention to {kv}", rows.label()),
             DitOp::Step { guided: true, .. } | DitOp::MultiStep { guided: true, .. } => "guided scheduler step".into(),
             DitOp::Step { .. } | DitOp::MultiStep { .. } => "scheduler step".into(),
+            DitOp::Map { into, rows, .. } => format!("{} map into {into}", rows.label()),
         }
     }
 
@@ -93,6 +96,7 @@ impl DitOp {
             DitOp::JointAttention { into, .. } => format!("attention planes to {into}"),
             DitOp::CrossAttention { into, kv, .. } => format!("attention planes and {kv} to {into}"),
             DitOp::Step { from, into, .. } | DitOp::MultiStep { from, into, .. } => format!("{into} and {from} to {into}"),
+            DitOp::Map { into, expr, .. } => format!("{expr} to {into}"),
         }
     }
 
@@ -106,7 +110,9 @@ impl DitOp {
             DitOp::Copy { .. } => "dit_copy",
             DitOp::TimestepEmbed { .. } => "dit_timestep",
             DitOp::Linear { .. } => "vis_mma",
+            DitOp::Modulate { rms: true, .. } => "dit_rms_modulate",
             DitOp::Modulate { .. } => "dit_modulate",
+            DitOp::GatedAdd { rows: Stream::Seqs, .. } => "dit_row_gated_add",
             DitOp::GatedAdd { .. } => "dit_gated_add",
             DitOp::Glu { .. } => "dit_glu",
             DitOp::AxisRope { .. } => "vis_axis_rope",
@@ -116,6 +122,7 @@ impl DitOp {
             DitOp::Pack { .. } => "vis_qk_pack",
             DitOp::CrossAttention { .. } => "vis_flash_kv",
             DitOp::Step { .. } | DitOp::MultiStep { .. } => "dit_step",
+            DitOp::Map { .. } => "dit_map",
         }
     }
 }
