@@ -1,0 +1,74 @@
+{
+  "alignment_heads": [
+    [
+      1,
+      0
+    ],
+    [
+      1,
+      1
+    ]
+  ],
+  "begin_suppress_tokens": [
+    220,
+    512
+  ],
+  "bos_token_id": 512,
+  "decoder_start_token_id": 513,
+  "eos_token_id": 512,
+  "forced_decoder_ids": [
+    [
+      1,
+      null
+    ],
+    [
+      2,
+      519
+    ]
+  ],
+  "is_multilingual": true,
+  "lang_to_id": {
+    "<|de|>": 515,
+    "<|en|>": 514,
+    "<|es|>": 517,
+    "<|fr|>": 516
+  },
+  "max_initial_timestamp_index": 50,
+  "max_length": 64,
+  "no_timestamps_token_id": 523,
+  "pad_token_id": 512,
+  "prev_sot_token_id": 521,
+  "suppress_tokens": [
+    1,
+    2,
+    7,
+    8,
+    9,
+    10,
+    14,
+    25,
+    26,
+    27,
+    28,
+    29,
+    31,
+    58,
+    59,
+    60,
+    61,
+    62,
+    63,
+    90,
+    91,
+    92,
+    93,
+    518,
+    520,
+    521,
+    522
+  ],
+  "task_to_id": {
+    "transcribe": 519,
+    "translate": 518
+  }
+}

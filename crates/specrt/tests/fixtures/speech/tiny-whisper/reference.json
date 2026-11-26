@@ -1,0 +1,110 @@
+{
+  "detected_language": 515,
+  "files": {
+    "audio.full": {
+      "file": "audio.full.bin",
+      "shape": [
+        16000
+      ]
+    },
+    "audio.short": {
+      "file": "audio.short.bin",
+      "shape": [
+        9600
+      ]
+    },
+    "encoder.out": {
+      "file": "encoder.out.bin",
+      "shape": [
+        50,
+        64
+      ]
+    },
+    "encoder.stem": {
+      "file": "encoder.stem.bin",
+      "shape": [
+        50,
+        64
+      ]
+    },
+    "greedy.logits": {
+      "file": "greedy.logits.bin",
+      "shape": [
+        12,
+        588
+      ]
+    },
+    "language.logits": {
+      "file": "language.logits.bin",
+      "shape": [
+        588
+      ]
+    },
+    "mel.filters": {
+      "file": "mel.filters.bin",
+      "shape": [
+        201,
+        80
+      ]
+    },
+    "mel.full": {
+      "file": "mel.full.bin",
+      "shape": [
+        80,
+        100
+      ]
+    },
+    "mel.short": {
+      "file": "mel.short.bin",
+      "shape": [
+        80,
+        100
+      ]
+    },
+    "prefix.logits": {
+      "file": "prefix.logits.bin",
+      "shape": [
+        4,
+        588
+      ]
+    }
+  },
+  "generate": [
+    501,
+    257,
+    121,
+    291,
+    138,
+    315,
+    291,
+    377,
+    377,
+    257,
+    315,
+    315
+  ],
+  "greedy": [
+    501,
+    257,
+    121,
+    291,
+    138,
+    315,
+    291,
+    377,
+    377,
+    257,
+    315,
+    315
+  ],
+  "prefix": [
+    513,
+    514,
+    519,
+    523
+  ],
+  "seed": 0,
+  "torch": "2.14.0+cu130",
+  "transformers": "5.23.0",
+  "window_samples": 16000
+}

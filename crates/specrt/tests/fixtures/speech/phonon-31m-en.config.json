@@ -1,0 +1,134 @@
+{
+  "languages": [
+    "en"
+  ],
+  "embeddings_ext": [
+    "ba7a5a45@300"
+  ],
+  "flow_lm": {
+    "d_model": 512,
+    "num_heads": 8,
+    "num_layers": 6,
+    "dim_feedforward": 2048,
+    "max_period": 10000.0,
+    "n_bins": 4000,
+    "lut_dim": 512,
+    "flow_dim": 512,
+    "flow_depth": 6,
+    "ldim": 32,
+    "time_rms_norm": "rms",
+    "gelu": "erf"
+  },
+  "mimi": {
+    "channels": 1,
+    "sample_rate": 24000,
+    "frame_rate": 12.5,
+    "dimension": 512,
+    "quantizer_dimension": 32,
+    "quantizer_output_dimension": 512,
+    "n_filters": 64,
+    "n_residual_layers": 1,
+    "ratios": [
+      6,
+      5,
+      4
+    ],
+    "kernel_size": 7,
+    "last_kernel_size": 3,
+    "residual_kernel_size": 3,
+    "dilation_base": 2,
+    "compress": 2,
+    "transformer_d_model": 512,
+    "transformer_num_heads": 8,
+    "transformer_num_layers": 2,
+    "transformer_layer_scale": 0.01,
+    "transformer_context": 250,
+    "transformer_max_period": 10000.0,
+    "transformer_dim_feedforward": 2048,
+    "gelu": "erf"
+  },
+  "temp": 0.8,
+  "lsd_decode_steps": 1,
+  "eos_threshold": 4.0,
+  "model_id": {
+    "sig": "5f0a2aab",
+    "epoch": 200,
+    "mimi_sig": "b77c7ffa",
+    "mimi_epoch": 150
+  },
+  "weights_name": "model.safetensors",
+  "tokenizer_name": "tokenizer.model",
+  "conditioners": [
+    {
+      "type": "lut",
+      "lut": {
+        "n_bins": 31,
+        "dim": 16,
+        "tokenizer": "noop",
+        "possible_values": [
+          "0",
+          "1",
+          "2"
+        ]
+      },
+      "name": "num_speakers"
+    },
+    {
+      "type": "continuous",
+      "continuous": {
+        "scale_factor": 1000.0,
+        "dim": 128,
+        "max_period": 10000.0
+      },
+      "name": "duration_delta"
+    }
+  ],
+  "fuser": {
+    "cross_attention_pos_emb": false,
+    "cross_attention_pos_emb_scale": 1,
+    "sum": [
+      "num_speakers",
+      "duration_delta"
+    ],
+    "streaming_sum": [],
+    "prepend": [
+      "transcript_in_segment",
+      "speaker_wavs"
+    ],
+    "cross": [],
+    "pad_prepend": false
+  },
+  "speaker_mimi": {
+    "prefix": "mimi_speaker",
+    "mimi": {
+      "channels": 1,
+      "sample_rate": 24000,
+      "frame_rate": 12.5,
+      "dimension": 512,
+      "quantizer_dimension": 256,
+      "quantizer_output_dimension": 512,
+      "n_filters": 64,
+      "n_residual_layers": 1,
+      "ratios": [
+        8,
+        6,
+        5,
+        4
+      ],
+      "kernel_size": 7,
+      "last_kernel_size": 3,
+      "residual_kernel_size": 3,
+      "dilation_base": 2,
+      "compress": 2,
+      "transformer_d_model": 512,
+      "transformer_num_heads": 8,
+      "transformer_num_layers": 8,
+      "transformer_layer_scale": 0.01,
+      "transformer_context": 250,
+      "transformer_max_period": 10000.0,
+      "transformer_dim_feedforward": 2048,
+      "gelu": "erf"
+    }
+  },
+  "audio_prompt_min_duration": 2.5
+}
