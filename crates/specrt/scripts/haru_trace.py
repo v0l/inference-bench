@@ -323,9 +323,50 @@ def say(args):
     (out / "say.json").write_text(json.dumps(report, indent=2))
 
 
+def diff(args):
+    def load(d):
+        index = json.loads((Path(d) / "index.json").read_text())
+        return lambda k: np.fromfile(Path(d) / index["files"][k]["file"], dtype=np.float32).reshape(index["files"][k]["shape"])
+
+    got, want = load(args.got), load(args.want)
+
+    def rel(a, b):
+        return float(np.abs(a - b).max() / max(np.abs(b).max(), 1e-12))
+
+    def cos(a, b):
+        return float((a * b).sum() / max(np.sqrt((a * a).sum() * (b * b).sum()), 1e-30))
+
+    def soft(v):
+        e = np.exp(v - v.max())
+        return e / e.sum()
+
+    hidden_g, hidden_w = got("frame.hidden"), want("frame.hidden")
+    layers_g, layers_w = got("frame.layers"), want("frame.layers")
+    tl, wl, wi = got("frame.teacher_logits"), want("frame.top_logits"), want("frame.top_ids")
+    gi = got("frame.top_ids")
+    n = hidden_w.shape[0]
+    kl = [float((soft(wl[i]) * np.log(soft(wl[i]) / np.maximum(soft(tl[i]), 1e-30))).sum()) for i in range(n)]
+    out = {
+        "frames": n,
+        "top1_rate": float(np.mean(gi[:, 0] == wi[:, 0])),
+        "kl_mean": float(np.mean(kl)),
+        "kl_max": float(np.max(kl)),
+        "hidden_rel_max": max(rel(hidden_g[i], hidden_w[i]) for i in range(n)),
+        "hidden_rel_mean": float(np.mean([rel(hidden_g[i], hidden_w[i]) for i in range(n)])),
+        "hidden_cos_min": min(cos(hidden_g[i], hidden_w[i]) for i in range(n)),
+        "layer_rel_max": [max(rel(layers_g[i, k], layers_w[i, k]) for i in range(n)) for k in range(layers_w.shape[1])],
+        "layer_cos_min": [min(cos(layers_g[i, k], layers_w[i, k]) for i in range(n)) for k in range(layers_w.shape[1])],
+        "latent_rel_mean": float(np.mean([rel(got("frame.latent")[i], want("frame.latent")[i]) for i in range(n)])),
+    }
+    print(json.dumps(out))
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
+    d = sub.add_parser("diff")
+    d.add_argument("got")
+    d.add_argument("want")
     for name in ("trace", "say"):
         p = sub.add_parser(name)
         p.add_argument("--haru", required=True)
@@ -349,6 +390,8 @@ def main():
     s.add_argument("--tail-frames", type=int, default=12)
     s.add_argument("--max-frames", type=int, default=600)
     args = parser.parse_args()
+    if args.cmd == "diff":
+        return diff(args)
     with torch.no_grad():
         {"trace": trace, "say": say}[args.cmd](args)
 

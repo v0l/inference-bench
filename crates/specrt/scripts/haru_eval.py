@@ -88,8 +88,22 @@ def say_wer(report_path):
     Path(report_path).with_name("say_wer.json").write_text(json.dumps(report, indent=2))
 
 
+def pairs(paths):
+    import jiwer
+
+    asr = whisper()
+    norm = jiwer.Compose([jiwer.ToLowerCase(), jiwer.RemovePunctuation(), jiwer.RemoveMultipleSpaces(), jiwer.Strip(), jiwer.ReduceToListOfListOfWords()])
+    for pair in paths:
+        a, b = pair.split(",")
+        ta, tb = (asr(read(p), generate_kwargs={"language": "en"}, return_timestamps=True)["text"].strip() for p in (a, b))
+        va, vb = (float((20 * np.log10(envelope(read(p)) + 1e-9) > -40).mean()) for p in (a, b))
+        wer = jiwer.wer(tb, ta, reference_transform=norm, hypothesis_transform=norm) if tb.strip() else float(bool(ta.strip()))
+        print(json.dumps({"engine": a, "reference": b, "engine_text": ta, "reference_text": tb, "wer": wer, "voiced": [va, vb]}))
+
+
 if __name__ == "__main__":
     commands = {
+        "pairs": lambda: pairs(sys.argv[2:]),
         "build": lambda: build_user(sys.argv[2]),
         "compare": lambda: compare(sys.argv[2], sys.argv[3], sys.argv[4]),
         "transcribe": lambda: transcribe(sys.argv[2:]),

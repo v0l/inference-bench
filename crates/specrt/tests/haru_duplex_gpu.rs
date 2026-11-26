@@ -95,6 +95,27 @@ fn a_voice_reference_that_ends_mid_frame_encodes_like_the_reference_whole_clip()
     assert!(max_rel(&got, &want) < 1e-4, "codec.clip_mean through the prompt encoder {}", max_rel(&got, &want));
 }
 
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn sampled_text_depends_on_the_session_seed() {
+    let mut e = engine(1, true);
+    let user = reference("session.user_audio");
+    let mut runs = Vec::new();
+    for seed in [1u64, 2, 3, 4] {
+        let (id, first) = e.start_prompt(&prompt(), StartOptions { seed, ..StartOptions::default() }).unwrap();
+        let mut tokens = vec![first.token];
+        for f in user.chunks(3200).cycle().take(24) {
+            tokens.push(e.step(&[(id, f.to_vec())]).unwrap()[0].token);
+        }
+        e.end(id).unwrap();
+        runs.push(tokens);
+    }
+    eprintln!("sampled tokens per seed {runs:?}");
+    for i in 1..runs.len() {
+        assert_ne!(runs[i], runs[0], "seed {} samples the same text as seed 1", i + 1);
+    }
+}
+
 fn prompt() -> Prompt {
     Prompt {
         tokens: reference("prompt.tokens").iter().map(|&t| t as u32).collect(),
