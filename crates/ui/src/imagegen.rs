@@ -138,7 +138,7 @@ impl GenerateState {
     }
 }
 
-fn dice() -> u64 {
+pub fn dice() -> u64 {
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(7);
     (t ^ (t >> 29)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 24
 }
@@ -346,16 +346,24 @@ fn enlarged(app: &mut App, ctx: &egui::Context) {
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let Some(l) = app.loaded() else { return };
     let Some(info) = l.media.clone() else { return };
+    let video = info.kind == ModelKind::Video;
     let defaults = app.settings.model_image.get(&l.display).cloned().unwrap_or_else(|| ImageDefaults::from_info(&info));
-    app.generate.follow(&l.display, &info, &defaults);
-    app.generate.pump(ui.ctx());
-    if app.generate.busy() {
+    if video {
+        app.generate_video.follow(&l.display, &info, &defaults);
+        if let Some(n) = app.generate_video.pump(ui.ctx()) {
+            app.notice = Some(n);
+        }
+    } else {
+        app.generate.follow(&l.display, &info, &defaults);
+        app.generate.pump(ui.ctx());
+    }
+    if app.generate.busy() || app.generate_video.busy() || app.generate_video.play.playing {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
     }
     let model = l.display.clone();
     let narrow = ui.available_width() < NARROW;
     let frame = egui::Frame::NONE.inner_margin(egui::Margin::symmetric(16, 10));
-    egui::Panel::top("gen-header").frame(frame).show_inside(ui, |ui| crate::modelbar::draw(app, ui, app.generate.busy(), |_| {}));
+    egui::Panel::top("gen-header").frame(frame).show_inside(ui, |ui| crate::modelbar::draw(app, ui, app.generate.busy() || app.generate_video.busy(), |_| {}));
     if narrow {
         egui::CentralPanel::no_frame().show_inside(ui, |ui| {
             egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 4)).show(ui, |ui| {
@@ -363,9 +371,14 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     ui.set_max_width(w);
                     ui.spacing_mut().item_spacing.y = 8.0;
-                    controls(app, ui, &info, &model);
-                    results(app, ui, 1);
-                    requests(ui, &app.generate.rows);
+                    if video {
+                        crate::videogen::controls(app, ui, &info, &model);
+                        crate::videogen::results(app, ui);
+                    } else {
+                        controls(app, ui, &info, &model);
+                        results(app, ui, 1);
+                        requests(ui, &app.generate.rows);
+                    }
                 });
             });
         });
@@ -373,7 +386,11 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         egui::Panel::left("gen-controls").exact_size(340.0).resizable(false).frame(egui::Frame::NONE.fill(CHASSIS).inner_margin(egui::Margin { left: 12, right: 8, top: 4, bottom: 4 })).show_inside(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 8.0;
-                controls(app, ui, &info, &model);
+                if video {
+                    crate::videogen::controls(app, ui, &info, &model);
+                } else {
+                    controls(app, ui, &info, &model);
+                }
             });
         });
         egui::CentralPanel::no_frame().show_inside(ui, |ui| {
@@ -382,9 +399,13 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     ui.set_max_width(w);
                     ui.spacing_mut().item_spacing.y = 8.0;
-                    let columns = ((w / 260.0).floor() as usize).clamp(1, 4);
-                    results(app, ui, columns);
-                    requests(ui, &app.generate.rows);
+                    if video {
+                        crate::videogen::results(app, ui);
+                    } else {
+                        let columns = ((w / 260.0).floor() as usize).clamp(1, 4);
+                        results(app, ui, columns);
+                        requests(ui, &app.generate.rows);
+                    }
                 });
             });
         });
@@ -499,6 +520,7 @@ pub fn load_page(app: &mut App, ui: &mut egui::Ui) -> bool {
         app.settings.model_image.insert(d.model.name.clone(), d.defaults.clone());
         let _ = app.settings.save(&app.dir);
         app.generate.for_model.clear();
+        app.generate_video.for_model.clear();
         let mut engine = app.settings.engine_for(&d.model.name);
         if let Some(dev) = d.device {
             engine.overrides.insert(specrt::media::DEVICE_KEY.into(), serde_json::json!(dev));

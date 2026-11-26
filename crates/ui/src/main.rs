@@ -10,6 +10,7 @@ mod engine;
 mod fmt;
 mod hardware;
 mod imagegen;
+mod videogen;
 mod strip;
 mod job;
 mod load;
@@ -79,6 +80,7 @@ pub struct App {
     pub load: Option<load::LoadDialog>,
     pub image_load: Option<imagegen::ImageLoad>,
     pub generate: imagegen::GenerateState,
+    pub generate_video: videogen::VideoState,
     pub picker_query: String,
     pub chat_model: Option<String>,
 }
@@ -121,6 +123,7 @@ impl App {
             load: None,
             image_load: None,
             generate: imagegen::GenerateState::default(),
+            generate_video: videogen::VideoState::default(),
             picker_query: String::new(),
             chat_model: None,
             settings,
@@ -372,3 +375,5 @@ fn main() -> eframe::Result<()> {
 mod tests;
 #[cfg(test)]
 mod tests_images;
+#[cfg(test)]
+mod tests_video;
