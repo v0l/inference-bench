@@ -837,8 +837,10 @@ fn parse_params(state: &AppState, body: &Value, chat: bool) -> Result<Params, Ap
         return Err(ApiError::bad_request("max_tokens must be at least 1"));
     }
     let defaults = Sampling::default();
+    let temperature = body["temperature"].as_f64().map(|t| t as f32).or(state.config.temperature);
     let sampling = Sampling {
-        temperature: body["temperature"].as_f64().map(|t| t as f32).unwrap_or(0.0),
+        temperature: temperature.unwrap_or(0.0),
+        explicit_temperature: temperature.is_some(),
         top_p: body["top_p"].as_f64().map(|t| t as f32).or(state.config.top_p).or(defaults.top_p),
         top_k: body["top_k"].as_u64().map(|t| t as u32).or(state.config.top_k).or(defaults.top_k),
         min_p: body["min_p"].as_f64().map(|t| t as f32).or(state.config.min_p).or(defaults.min_p),
@@ -1261,8 +1263,10 @@ pub(crate) async fn prepare(state: Arc<AppState>, body: Value, chat: bool, salt:
     let mut receivers = Vec::with_capacity(p.n);
     for i in 0..p.n {
         let mut one = request.clone();
-        if i > 0 {
-            one.sampling.seed = Some(request.sampling.seed.unwrap_or(0).wrapping_add(i as u64));
+        if i > 0
+            && let Some(seed) = request.sampling.seed
+        {
+            one.sampling.seed = Some(seed.wrapping_add(i as u64));
         }
         receivers.push(start_generation(&state, p.model.clone(), one, max_tokens, p.stop.clone(), p.n > 1, p.think.clone())?);
     }

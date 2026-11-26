@@ -298,7 +298,7 @@ mod tests {
         let server = FakeServer::start(script());
         let mut b = OpenAi::new("fake".into(), &server.url, None);
         b.load("qwen3").unwrap();
-        let sampling = Sampling { temperature: 0.3, top_p: Some(0.9), top_k: None, min_p: None, seed: Some(5), max_tokens: 6 };
+        let sampling = Sampling { temperature: 0.3, top_p: Some(0.9), seed: Some(5), max_tokens: 6, ..Sampling::default() };
         let request = ChatRequest::new(vec![Message::new(Role::User, "hi")], sampling);
         let mut streamed = String::new();
         let g = b.chat(&request, &mut |t| streamed.push_str(t)).unwrap();
