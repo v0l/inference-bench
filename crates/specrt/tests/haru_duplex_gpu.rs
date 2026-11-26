@@ -82,6 +82,19 @@ fn free_running_drift_comes_from_the_backbone_floor_not_from_session_state() {
     assert!(free[0].0 < 3.0 * BACKBONE_BF16_TOLERANCE, "the first fed back frame starts at the backbone floor");
 }
 
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn a_voice_reference_that_ends_mid_frame_encodes_like_the_reference_whole_clip() {
+    let e = engine(1, false);
+    let clip = reference("codec.clip");
+    assert_ne!(clip.len() % 3200, 0, "the fixture clip ends mid frame");
+    let got = e.encode_clip(&clip).unwrap();
+    let want = reference("codec.clip_mean");
+    let last = max_rel(&got[got.len() - 64..], &want[want.len() - 64..]);
+    eprintln!("reference clip mean {:.2e}, last frame {last:.2e}", max_rel(&got, &want));
+    assert!(max_rel(&got, &want) < 1e-4, "codec.clip_mean through the prompt encoder {}", max_rel(&got, &want));
+}
+
 fn prompt() -> Prompt {
     Prompt {
         tokens: reference("prompt.tokens").iter().map(|&t| t as u32).collect(),
