@@ -11,7 +11,7 @@ architectures = ["HaruForConditionalGeneration"]
 [[refuse]]
 when = "hidden_size > 0"
 part = "text"
-message = "Haru-4B is a full duplex speech model: it runs as duplex sessions (frames of audio in and out), not as text chat; the audio API that serves it is #1431"
+message = "Haru-4B is a full duplex speech model: it runs as duplex sessions over the /v1/duplex websocket (frames of audio in and out), not as text chat"
 
 [duplex]
 card_template = "<|im_start|>system\n{card}<|im_end|>\n"

@@ -30,11 +30,12 @@ pub struct EngineOptions {
     pub max_frames: Option<usize>,
     pub window_frames: Option<usize>,
     pub kv_bytes: Option<usize>,
+    pub device: usize,
 }
 
 impl Default for EngineOptions {
     fn default() -> EngineOptions {
-        EngineOptions { slots: 1, max_ctx: 4096, graphs: true, temperature: None, top_k: None, max_frames: None, window_frames: None, kv_bytes: None }
+        EngineOptions { slots: 1, max_ctx: 4096, graphs: true, temperature: None, top_k: None, max_frames: None, window_frames: None, kv_bytes: None, device: 0 }
     }
 }
 
@@ -175,7 +176,7 @@ impl Engine {
             None => opts.slots * pages,
         };
         let layout = Layout { max_ctx: opts.max_ctx, slots: opts.slots, kv_blocks, prefill_chunk: duplex.prefill_chunk.min(opts.max_ctx), kv_planes: 2, kv_headroom: 0, state_on_demand: false };
-        let rt = Runtime::load_layout(&spec, layout)?;
+        let rt = Runtime::load_stage(&spec, layout, crate::runtime::StageRange { device: opts.device, ..crate::runtime::StageRange::whole(&spec) })?;
         let st = rt.stepper()?;
         let stream = rt.stream().clone();
         let cache = spec.runtime.cache_dir.clone().unwrap_or_else(crate::jit::default_cache_dir);
