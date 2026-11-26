@@ -1213,6 +1213,13 @@ fn the_quantised_table_lists_rows_that_move_with_their_tiers() {
 }
 
 #[test]
+fn the_committed_doc_has_the_quantised_table_the_planner_gives_now() {
+    let committed = std::fs::read_to_string(root().join("../../docs/specrt-model-coverage.md")).unwrap();
+    let now = report().doc;
+    assert_eq!(section(&committed, "Would load if quantised"), section(&now, "Would load if quantised"), "rerun crates/specrt/scripts/model_coverage.sh and commit the new doc");
+}
+
+#[test]
 fn a_planted_keep_list_change_changes_the_table() {
     let before = report().doc;
     KEEP_OVERRIDE.with(|k| *k.borrow_mut() = Some(QuantKeep { first_layers: 1000, last_layers: 1000, ..QuantKeep::default() }));
