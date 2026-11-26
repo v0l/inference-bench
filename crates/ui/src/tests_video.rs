@@ -163,6 +163,48 @@ fn save_as_mp4_downloads_the_content_and_writes_a_file_with_the_clips_frames_and
 }
 
 #[test]
+#[ignore = "needs a GPU: SHOTS=dir ~/.agents/bin/gpu-run 1 --min-free 2000 -- <ui test binary> tests_video::the_real_engine --ignored"]
+fn the_real_engine_generates_plays_and_saves_the_tiny_wan_clip() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    let mut h = harness_at("vid-real", Tab::Models, egui::vec2(1280.0, 800.0));
+    with_gpu(&mut h, 0, 96 << 30);
+    let wake = h.state().wake.clone();
+    h.state_mut().engine = inference_bench_core::engine::Engine::with_factories_sampled(wake, inference_bench_core::native::specrt_factory(), Arc::new(|_| None), inference_bench_core::engine::no_gpu_sampler());
+    h.state_mut().library.push(video_model());
+    h.state_mut().open_load_dialog(&video_model());
+    h.run();
+    h.get_by_label("load model").click();
+    h.run();
+    pump_until(&mut h, 120, "real load", |a| a.loaded().is_some());
+    h.run();
+    h.state_mut().generate_video.seconds = 1.0;
+    h.state_mut().generate_video.fps = 8;
+    h.state_mut().generate_video.prompt = "w176 w476 w100".into();
+    h.state_mut().generate_video.size = "32x32".into();
+    h.state_mut().generate_video.steps = 3;
+    h.run();
+    h.get_by_label("generate video").click();
+    h.run();
+    pump_until(&mut h, 120, "real generation", |a| !a.generate_video.busy());
+    h.run();
+    let g = &h.state().generate_video;
+    assert!(g.error.is_none(), "{:?}", g.error);
+    let row = g.rows.last().unwrap();
+    eprintln!("real run: {} frames at {} fps, {:.2} s", row.frames, row.fps, row.total_secs);
+    h.get_by_label("play").click();
+    pump_until(&mut h, 20, "playing", |a| a.generate_video.play.frame > 0);
+    h.get_by_label("save as mp4").click();
+    h.run();
+    pump_until(&mut h, 20, "saved", |a| a.notice.as_ref().is_some_and(|n| n.1.starts_with("saved ")));
+    let file = std::fs::read_dir(h.state().dir.join("videos")).unwrap().next().unwrap().unwrap().path();
+    let kept = out.join("real-wan.mp4");
+    std::fs::copy(&file, &kept).unwrap();
+    eprintln!("saved {}", kept.display());
+    h.render().unwrap().save(out.join("video-generate-real-engine-1280x800.png")).unwrap();
+}
+
+#[test]
 fn play_steps_frames_at_the_clips_fps_and_stops_on_the_last() {
     let mut p = crate::videogen::Playback::new();
     p.playing = true;
