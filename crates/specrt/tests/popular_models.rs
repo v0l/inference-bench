@@ -572,7 +572,7 @@ fn quantised_section(rows: &[Row], verdicts: &[Verdict], skip: &BTreeSet<String>
 
 fn classify_pipeline(row: &Row, m: &Machine, committed_only: bool) -> Option<Verdict> {
     let names = ["model_index.json", "scheduler/scheduler_config.json", "text_encoder/config.json", "transformer/config.json", "vae/config.json"];
-    let dir = std::env::temp_dir().join(format!("popular-pipeline-{}-{}", std::process::id(), slug(row.repo())));
+    let dir = std::env::temp_dir().join(format!("popular-pipeline-{}-{:?}-{}", std::process::id(), std::thread::current().id(), slug(row.repo())));
     for n in names {
         let text = if committed_only { committed(row.repo(), n) } else { fetched(row.repo(), n) };
         let Some(text) = text else { continue };
@@ -1226,6 +1226,19 @@ fn a_planted_keep_list_change_changes_the_table() {
     let after = report().doc;
     KEEP_OVERRIDE.with(|k| *k.borrow_mut() = None);
     assert_ne!(section(&before, "Would load if quantised"), section(&after, "Would load if quantised"));
+}
+
+#[test]
+fn classifying_the_same_pipeline_from_many_threads_gives_one_verdict() {
+    let man = manifest();
+    let mach = machine(&man);
+    let m = man["models"].as_array().unwrap().iter().find(|m| m["repo"] == "black-forest-labs/FLUX.2-klein-4B").unwrap();
+    let verdicts: Vec<(Class, String)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..8).map(|_| s.spawn(|| { let v = classify(&Row { m }, &mach, true).unwrap(); (v.class, v.why) })).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert!(verdicts.iter().all(|v| *v == verdicts[0]), "{verdicts:?}");
+    assert_eq!(verdicts[0].0, Class::Loads);
 }
 
 #[test]
