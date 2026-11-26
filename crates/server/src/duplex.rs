@@ -97,7 +97,23 @@ fn pcm_of(bytes: &[u8], what: &str) -> Result<Vec<f32>, String> {
     Ok(wav::pcm16_to_f32(bytes))
 }
 
-fn read_voice(state: &State, v: &Value, rate: usize) -> Result<Option<Vec<f32>>, String> {
+fn check_voice_length(samples: usize, rate: usize, max: f64) -> Result<(), String> {
+    let seconds = samples as f64 / rate.max(1) as f64;
+    if seconds > max {
+        return Err(format!("the voice reference is {seconds:.1} s and this server takes at most {max} s (duplex.max_voice_seconds); every session prefills it"));
+    }
+    Ok(())
+}
+
+fn read_voice(state: &State, v: &Value, rate: usize, max_seconds: f64) -> Result<Option<Vec<f32>>, String> {
+    let voice = read_voice_any(state, v, rate)?;
+    if let Some(s) = &voice {
+        check_voice_length(s.len(), rate, max_seconds)?;
+    }
+    Ok(voice)
+}
+
+fn read_voice_any(state: &State, v: &Value, rate: usize) -> Result<Option<Vec<f32>>, String> {
     match v {
         Value::Null => Ok(None),
         Value::String(s) => pcm_of(&decode_b64(s, "voice")?, "voice").map(Some),
@@ -127,7 +143,7 @@ pub struct Parsed {
     pub request: StartRequest,
 }
 
-pub fn parse_start(state: &State, body: &Value, rate: usize, allow_replay: bool) -> Result<Parsed, String> {
+pub fn parse_start(state: &State, body: &Value, rate: usize, limits: &crate::config::DuplexSection) -> Result<Parsed, String> {
     let obj = body.as_object().ok_or("the start message is a JSON object")?;
     if body["type"].as_str() != Some("start") {
         return Err(format!("the first message must be {{\"type\": \"start\", ...}}, not {}", body["type"]));
@@ -147,7 +163,7 @@ pub fn parse_start(state: &State, body: &Value, rate: usize, allow_replay: bool)
         }
         _ => return Err("card is text or an object of card fields".into()),
     }
-    options.reference = read_voice(state, &body["voice"], rate)?;
+    options.reference = read_voice(state, &body["voice"], rate, limits.max_voice_seconds)?;
     options.speak_first = body["speak_first"].as_bool().unwrap_or(false);
     options.guidance = match &body["guidance"] {
         Value::Null => None,
@@ -170,7 +186,7 @@ pub fn parse_start(state: &State, body: &Value, rate: usize, allow_replay: bool)
     };
     let mut prompt = None;
     if !body["replay"].is_null() {
-        if !allow_replay {
+        if !limits.allow_replay {
             return Err("replay is a test hook; it needs duplex.allow_replay in the server config".into());
         }
         let r = &body["replay"];
@@ -566,9 +582,8 @@ pub async fn native(AxState(state): AxState<Arc<AppState>>, Extension(rid): Exte
             Err(m) => return refuse(&mut socket, &state, "invalid", m).await,
         };
         let model = body["model"].as_str().map(String::from);
-        let allow = state.config.duplex.allow_replay;
         let st = state.clone();
-        let Some(mut live) = open_session(&mut socket, &state, model.as_deref(), |svc| parse_start(&st.duplex, &body, svc.info.sample_rate, allow).map(|p| p.request)).await else { return };
+        let Some(mut live) = open_session(&mut socket, &state, model.as_deref(), |svc| parse_start(&st.duplex, &body, svc.info.sample_rate, &st.config.duplex).map(|p| p.request)).await else { return };
         let first = std::mem::replace(&mut live.session.first, Out { audio: Vec::new(), token: None, text: String::new(), index: 0, late: false, done: false, error: None, input: None });
         pump(&mut socket, &state, live, first, &mut NativeDialect, &rid.0, "/v1/duplex").await;
     })
@@ -702,6 +717,7 @@ pub async fn upload_voice(AxState(state): AxState<Arc<AppState>>, Json(body): Js
     if samples.is_empty() {
         return Err(ApiError::bad_request("the voice reference is empty"));
     }
+    check_voice_length(samples.len(), rate as usize, state.config.duplex.max_voice_seconds).map_err(|e| ApiError::bad_request(e).with_code("invalid_value", "audio"))?;
     let id = format!("voice_{}", &uuid::Uuid::new_v4().simple().to_string()[..20]);
     let seconds = samples.len() as f64 / rate.max(1) as f64;
     let mut voices = state.duplex.voices.lock().unwrap();
@@ -720,11 +736,11 @@ mod tests {
     fn a_start_message_reads_card_text_or_fields_voice_and_sampling() {
         let s = State::default();
         let pcm = base64::engine::general_purpose::STANDARD.encode(wav::f32_to_pcm16(&[0.5, -0.5]));
-        let p = parse_start(&s, &json!({"type": "start", "model": "haru", "card": "Be calm.", "voice": pcm, "speak_first": true, "guidance": 1.5, "temperature": 0.5, "mode": "relay", "seed": 7}), 24000, false).unwrap();
+        let p = parse_start(&s, &json!({"type": "start", "model": "haru", "card": "Be calm.", "voice": pcm, "speak_first": true, "guidance": 1.5, "temperature": 0.5, "mode": "relay", "seed": 7}), 24000, &Default::default()).unwrap();
         let o = &p.request.options;
         assert_eq!((p.model.as_deref(), o.card.as_str(), o.speak_first, o.guidance, o.temperature, o.mode, o.seed), (Some("haru"), "Be calm.", true, Some(1.5), Some(0.5), Mode::Relay, 7));
         assert_eq!(o.reference.as_ref().unwrap().len(), 2);
-        let f = parse_start(&s, &json!({"type": "start", "card": {"name": "Haru", "backchannel": "mid"}}), 24000, false).unwrap();
+        let f = parse_start(&s, &json!({"type": "start", "card": {"name": "Haru", "backchannel": "mid"}}), 24000, &Default::default()).unwrap();
         assert_eq!(f.request.card_fields.get("name").map(String::as_str), Some("Haru"));
         assert!(f.request.options.card.is_empty());
     }
@@ -741,7 +757,7 @@ mod tests {
             (json!({"type": "start", "voice": "AAAA"}), "odd byte count"),
             (json!({"type": "start", "replay": {}}), "allow_replay"),
         ] {
-            let e = parse_start(&s, &body, 24000, false).err().unwrap_or_else(|| panic!("{body} was accepted"));
+            let e = parse_start(&s, &body, 24000, &Default::default()).err().unwrap_or_else(|| panic!("{body} was accepted"));
             assert!(e.contains(word), "{body}: {e}");
         }
     }
@@ -750,9 +766,9 @@ mod tests {
     fn an_uploaded_voice_at_another_rate_is_refused() {
         let s = State::default();
         s.voices.lock().unwrap().push_back(("voice_a".into(), Arc::new(Voice { samples: vec![0.1; 8], rate: 16000 })));
-        let e = parse_start(&s, &json!({"type": "start", "voice": {"id": "voice_a"}}), 24000, false).err().unwrap();
+        let e = parse_start(&s, &json!({"type": "start", "voice": {"id": "voice_a"}}), 24000, &Default::default()).err().unwrap();
         assert!(e.contains("16000 Hz"), "{e}");
-        assert_eq!(parse_start(&s, &json!({"type": "start", "voice": {"id": "voice_a"}}), 16000, false).unwrap().request.options.reference.unwrap().len(), 8);
+        assert_eq!(parse_start(&s, &json!({"type": "start", "voice": {"id": "voice_a"}}), 16000, &Default::default()).unwrap().request.options.reference.unwrap().len(), 8);
     }
 
     #[test]

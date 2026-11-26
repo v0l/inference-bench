@@ -250,6 +250,26 @@ fn the_route_needs_the_api_key_like_chat() {
 }
 
 #[test]
+fn the_realtime_route_and_the_voice_upload_need_the_api_key() {
+    let (rig, _) = rig(1, "api_keys = [\"sk-1\"]\n", false);
+    let refused = {
+        use tungstenite::client::IntoClientRequest;
+        let mut r = duplex_client::ws_url(&rig.url, "/v1/realtime?model=haru").into_client_request().unwrap();
+        r.headers_mut().insert("sec-websocket-protocol", "realtime".parse().unwrap());
+        tungstenite::connect(r).err().unwrap()
+    };
+    assert!(matches!(refused, tungstenite::Error::Http(ref r) if r.status() == 401), "{refused:?}");
+    let mut s = socket(&rig, "/v1/realtime?model=haru", Some("sk-1"), Some("realtime"));
+    assert_eq!(next_json(&mut s)["type"], "session.created");
+    let pcm = base64::engine::general_purpose::STANDARD.encode(wav::f32_to_pcm16(&[0.1; 1600]));
+    let voice = json!({"audio": pcm, "sample_rate": 16000});
+    let (status, body, _) = rig.post("/v1/duplex/voices", None, voice.clone());
+    assert_eq!(status, 401, "{body}");
+    let (status, body, _) = rig.post("/v1/duplex/voices", Some("sk-1"), voice);
+    assert_eq!(status, 200, "{body}");
+}
+
+#[test]
 fn a_dropped_session_is_parked_when_keep_idle_is_set_and_resumes_by_token() {
     let (rig, seen) = rig(1, "[duplex]\nkeep_idle_secs = 60\n", true);
     let mut s = socket(&rig, "/v1/duplex", None, None);
@@ -334,6 +354,24 @@ fn capabilities_list_the_duplex_routes_and_the_realtime_limits() {
     let rt = routes.iter().find(|r| r["path"] == "/v1/realtime").unwrap();
     assert!(rt["unsupported"].as_str().unwrap().contains("response.create"));
     assert!(routes.iter().any(|r| r["path"] == "/v1/duplex/voices"));
+}
+
+#[test]
+fn a_voice_longer_than_max_voice_seconds_is_refused_naming_the_setting() {
+    let (rig, seen) = rig(1, "[duplex]\nmax_voice_seconds = 2\n", false);
+    let long = base64::engine::general_purpose::STANDARD.encode(wav::f32_to_pcm16(&vec![0.1; 16000 * 3]));
+    let (status, body, _) = rig.post("/v1/duplex/voices", None, json!({"audio": long, "sample_rate": 16000}));
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("duplex.max_voice_seconds") && body.contains("3.0 s"), "{body}");
+    let fits = base64::engine::general_purpose::STANDARD.encode(wav::f32_to_pcm16(&vec![0.1; 16000 * 2]));
+    let (status, body, _) = rig.post("/v1/duplex/voices", None, json!({"audio": fits, "sample_rate": 16000}));
+    assert_eq!(status, 200, "{body}");
+    let inline = base64::engine::general_purpose::STANDARD.encode(wav::f32_to_pcm16(&vec![0.1; 16000 * 3]));
+    let mut s = socket(&rig, "/v1/duplex", None, None);
+    send(&mut s, json!({"type": "start", "voice": inline}));
+    let e = next_json(&mut s);
+    assert!(e["message"].as_str().unwrap().contains("duplex.max_voice_seconds"), "{e}");
+    assert!(seen.started.lock().unwrap().is_empty());
 }
 
 #[test]

@@ -188,12 +188,13 @@ pub struct DuplexSection {
     pub max_input_frames: usize,
     pub snapshot_dir: Option<PathBuf>,
     pub max_voices: usize,
+    pub max_voice_seconds: f64,
     pub allow_replay: bool,
 }
 
 impl Default for DuplexSection {
     fn default() -> Self {
-        Self { sessions_per_gpu: 4, queue_depth: 0, keep_idle_secs: 0, max_ctx: 8192, max_input_frames: 8, snapshot_dir: None, max_voices: 64, allow_replay: false }
+        Self { sessions_per_gpu: 4, queue_depth: 0, keep_idle_secs: 0, max_ctx: 8192, max_input_frames: 8, snapshot_dir: None, max_voices: 64, max_voice_seconds: 60.0, allow_replay: false }
     }
 }
 
