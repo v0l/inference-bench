@@ -1391,6 +1391,8 @@ pub struct Spec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inputs: Option<Inputs>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duplex: Option<Duplex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtp: Option<Mtp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<crate::vision::Vision>,
@@ -1417,6 +1419,97 @@ pub struct Spec {
 pub struct Refusal {
     pub part: String,
     pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DryOptions {
+    pub multiplier: f64,
+    pub base: f64,
+    pub allowed_length: usize,
+    pub lookback: usize,
+    pub max_match: usize,
+    pub max_penalty: f64,
+    #[serde(default)]
+    pub exempt: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exempt_ids: Vec<u32>,
+}
+
+impl DryOptions {
+    pub fn history_size(&self) -> usize {
+        self.lookback + self.max_match + 1
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DuplexSampling {
+    pub temperature: f32,
+    pub top_k: u32,
+    pub top_p: f32,
+    pub eop_bias: f32,
+    pub forced_text: u32,
+    pub exact: Vec<u32>,
+    pub silent: Vec<u32>,
+    pub forced_bans: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry: Option<DryOptions>,
+}
+
+pub const DUPLEX_STATE: &[&str] = &["kv", "recurrent", "codec", "sampler", "frame"];
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Duplex {
+    pub frame_samples: usize,
+    pub sample_rate: usize,
+    pub latent_dim: usize,
+    pub latent_std: f64,
+    pub noise_divisor: f64,
+    pub guidance: f64,
+    pub max_frames: usize,
+    pub window_frames: usize,
+    pub prefill_chunk: usize,
+    pub reference_seconds: f64,
+    pub silence_frames: usize,
+    pub trim_dbfs: f64,
+    pub trim_margin_seconds: f64,
+    pub pad: u32,
+    pub eop: u32,
+    pub card_template: String,
+    pub state: Vec<String>,
+    pub sampling: DuplexSampling,
+}
+
+impl Duplex {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(self.frame_samples > 0 && self.sample_rate > 0 && self.latent_dim > 0, "[duplex] needs a frame, a rate and a latent width");
+        ensure!(self.max_frames > 0, "[duplex] max_frames is 0");
+        ensure!(self.noise_divisor > 0.0, "[duplex] noise_divisor must be positive");
+        ensure!(self.prefill_chunk > 0 && self.silence_frames > 0, "[duplex] prefill_chunk and silence_frames must be positive");
+        ensure!(self.card_template.contains("{card}"), "[duplex] card_template must hold {{card}}");
+        for s in &self.state {
+            ensure!(DUPLEX_STATE.contains(&s.as_str()), "[duplex] state {s:?} is not one of {DUPLEX_STATE:?}");
+        }
+        for s in DUPLEX_STATE {
+            ensure!(self.state.iter().any(|x| x == s), "[duplex] state does not declare {s}");
+        }
+        ensure!(self.sampling.silent.contains(&self.pad) && self.sampling.silent.contains(&self.eop), "[duplex.sampling] silent must hold pad and eop");
+        ensure!(self.sampling.temperature >= 0.0 && self.sampling.top_p > 0.0 && self.sampling.top_p <= 1.0, "[duplex.sampling] temperature or top_p out of range");
+        if let Some(d) = &self.sampling.dry {
+            ensure!(d.base > 0.0 && d.multiplier >= 0.0 && d.max_match >= 1 && d.lookback >= 1, "[duplex.sampling.dry] has a bad value");
+        }
+        Ok(())
+    }
+
+    pub fn frame_seconds(&self) -> f64 {
+        self.frame_samples as f64 / self.sample_rate as f64
+    }
+
+    pub fn noise_scale(&self) -> f32 {
+        (self.latent_std / self.noise_divisor) as f32
+    }
 }
 
 impl Spec {
@@ -2015,6 +2108,20 @@ impl Spec {
     }
 
     pub fn from_hf_config_serving_in(registry: &crate::family::Registry, json: &str) -> Result<Self> {
+        let spec = Self::duplex_in(registry, json)?;
+        if let Some(why) = spec.refused_part("text") {
+            bail!("{why}");
+        }
+        Ok(spec)
+    }
+
+    pub fn from_hf_config_duplex(json: &str) -> Result<Self> {
+        let spec = Self::duplex_in(&crate::family::active(), json)?;
+        ensure!(spec.duplex.is_some(), "the {} family declares no [duplex] section", spec.name);
+        Ok(spec)
+    }
+
+    fn duplex_in(registry: &crate::family::Registry, json: &str) -> Result<Self> {
         let spec = Self::hf_config(registry, json, true)?;
         spec.validate()?;
         spec.check_moe_runnable()?;
@@ -2135,7 +2242,12 @@ impl Spec {
                             refused.push(Refusal { part: "mtp".into(), message: r.message.clone() });
                         }
                     }
-                    Some(other) => bail!("[[refuse]] part {other:?} is not mtp"),
+                    Some("text") => {
+                        if r.hits(&value)? {
+                            refused.push(Refusal { part: "text".into(), message: r.message.clone() });
+                        }
+                    }
+                    Some(other) => bail!("[[refuse]] part {other:?} is not mtp or text"),
                 }
             }
         }
@@ -2439,6 +2551,7 @@ impl Spec {
             per_layer: family.per_layer.read(&value)?,
             block_residual: family.block_residual.read(&value),
             inputs: family.inputs.read(&outer)?,
+            duplex: family.duplex.read(&outer)?,
             tensors: family.tensors.clone(),
             vision: if strict { crate::vision::Vision::from_hf_config(json)? } else { None },
             state: if family.state.is_empty() { crate::state::stock() } else { family.state.clone() },

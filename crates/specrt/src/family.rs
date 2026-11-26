@@ -808,6 +808,90 @@ pub struct FamilyHead {
     pub params: std::collections::BTreeMap<String, ParamSource>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyDuplex {
+    pub params: std::collections::BTreeMap<String, ParamSource>,
+    pub tokens: std::collections::BTreeMap<String, ParamSource>,
+    pub card_template: String,
+    pub state: Vec<String>,
+    pub sampling: FamilyDuplexSampling,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyDuplexSampling {
+    pub temperature: f64,
+    pub top_k: u32,
+    pub top_p: f64,
+    pub eop_bias: f64,
+    pub forced_text: u32,
+    pub exact: Vec<String>,
+    pub silent: Vec<String>,
+    pub forced_bans: Vec<String>,
+    pub dry: Option<crate::spec::DryOptions>,
+}
+
+impl FamilyDuplex {
+    pub fn is_set(&self) -> bool {
+        !self.params.is_empty()
+    }
+
+    pub fn read(&self, config: &serde_json::Value) -> Result<Option<crate::spec::Duplex>> {
+        if !self.is_set() {
+            return Ok(None);
+        }
+        let p = read_params(&self.params, config).context("[duplex.params]")?;
+        let tokens: std::collections::BTreeMap<String, u32> = read_params(&self.tokens, config).context("[duplex.tokens]")?.into_iter().map(|(k, v)| (k, v as u32)).collect();
+        let ids = |names: &[String], what: &str| -> Result<Vec<u32>> {
+            names.iter().map(|n| tokens.get(n).copied().with_context(|| format!("[duplex.sampling] {what} names token {n:?}, which [duplex.tokens] does not declare"))).collect()
+        };
+        let get = |k: &str| p.get(k).copied().with_context(|| format!("[duplex.params] has no {k}"));
+        let whole = |k: &str| -> Result<usize> {
+            let v = get(k)?;
+            ensure!(v >= 0.0 && v.fract() == 0.0, "[duplex.params] {k} = {v} is not a whole number");
+            Ok(v as usize)
+        };
+        let s = &self.sampling;
+        let mut dry = s.dry.clone();
+        if let Some(d) = dry.as_mut() {
+            d.exempt_ids = ids(&d.exempt, "dry.exempt")?;
+        }
+        let duplex = crate::spec::Duplex {
+            frame_samples: whole("frame_samples")?,
+            sample_rate: whole("sample_rate")?,
+            latent_dim: whole("latent_dim")?,
+            latent_std: get("latent_std")?,
+            noise_divisor: get("noise_divisor")?,
+            guidance: get("guidance")?,
+            max_frames: whole("max_frames")?,
+            window_frames: whole("window_frames")?,
+            prefill_chunk: whole("prefill_chunk")?,
+            reference_seconds: get("reference_seconds")?,
+            silence_frames: whole("silence_frames")?,
+            trim_dbfs: get("trim_dbfs")?,
+            trim_margin_seconds: get("trim_margin_seconds")?,
+            pad: *tokens.get("pad").context("[duplex.tokens] has no pad")?,
+            eop: *tokens.get("eop").context("[duplex.tokens] has no eop")?,
+            card_template: self.card_template.clone(),
+            state: self.state.clone(),
+            sampling: crate::spec::DuplexSampling {
+                temperature: s.temperature as f32,
+                top_k: s.top_k,
+                top_p: s.top_p as f32,
+                eop_bias: s.eop_bias as f32,
+                forced_text: s.forced_text,
+                exact: ids(&s.exact, "exact")?,
+                silent: ids(&s.silent, "silent")?,
+                forced_bans: ids(&s.forced_bans, "forced_bans")?,
+                dry,
+            },
+        };
+        duplex.validate()?;
+        Ok(Some(duplex))
+    }
+}
+
 impl FamilyHead {
     pub fn is_set(&self) -> bool {
         !self.graph.is_empty()
@@ -886,6 +970,8 @@ pub struct Family {
     #[serde(default)]
     pub head: FamilyHead,
     #[serde(default)]
+    pub duplex: FamilyDuplex,
+    #[serde(default)]
     pub tensors: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub refuse: Vec<FamilyRefuse>,
@@ -914,7 +1000,7 @@ impl Family {
         for s in &self.inputs.streams {
             push(&s.width, &mut out);
         }
-        for (_, key) in self.attention.params.iter().chain(self.mixer.params.iter()).chain(self.inputs.params.iter()).chain(self.gated_residual.params.iter()).chain(self.per_layer.params.iter()).chain(self.prelude.params.iter()).chain(self.head.params.iter()) {
+        for (_, key) in self.attention.params.iter().chain(self.mixer.params.iter()).chain(self.inputs.params.iter()).chain(self.gated_residual.params.iter()).chain(self.per_layer.params.iter()).chain(self.prelude.params.iter()).chain(self.head.params.iter()).chain(self.duplex.params.iter()).chain(self.duplex.tokens.iter()) {
             match key {
                 ParamSource::Config { config, alt, .. } => {
                     push(config, &mut out);

@@ -189,6 +189,21 @@ impl CudaHead {
         s.launches = 0;
         self.upload(s, "hidden", hidden)?;
         self.upload(s, "noise", noise)?;
+        self.run_frame(s)?;
+        let out = &s.bufs[self.head.graph.output[0].name.as_str()];
+        Ok(self.stream.clone_dtoh(out.f32.as_ref().unwrap())?)
+    }
+
+    pub fn input_mut<'a>(&self, s: &'a mut CudaSession, name: &str) -> Result<&'a mut CudaSlice<f32>> {
+        s.bufs.get_mut(name).with_context(|| format!("no buffer {name}"))?.f32.as_mut().with_context(|| format!("{name} is held as planes"))
+    }
+
+    pub fn output<'a>(&self, s: &'a CudaSession) -> &'a CudaSlice<f32> {
+        s.bufs[self.head.graph.output[0].name.as_str()].f32.as_ref().expect("the head output is f32")
+    }
+
+    pub fn run_frame(&self, s: &mut CudaSession) -> Result<()> {
+        s.launches = 0;
         for op in &self.head.start {
             self.run(dit(op)?, None, false, s)?;
         }
@@ -230,8 +245,7 @@ impl CudaHead {
         for op in &self.head.finish {
             self.run(dit(op)?, None, false, s)?;
         }
-        let out = &s.bufs[self.head.graph.output[0].name.as_str()];
-        Ok(self.stream.clone_dtoh(out.f32.as_ref().unwrap())?)
+        Ok(())
     }
 
     fn f32_ptr(&self, s: &CudaSession, name: &str) -> Result<u64> {

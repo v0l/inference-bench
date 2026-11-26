@@ -10,7 +10,51 @@ architectures = ["HaruForConditionalGeneration"]
 
 [[refuse]]
 when = "hidden_size > 0"
-message = "Haru-4B full duplex speech is not runnable yet: the backbone, its three stream input, the MeanFlow audio head and the streaming codec run, duplex sessions (#1430) are missing"
+part = "text"
+message = "Haru-4B is a full duplex speech model: it runs as duplex sessions (frames of audio in and out), not as text chat; the audio API that serves it is #1431"
+
+[duplex]
+card_template = "<|im_start|>system\n{card}<|im_end|>\n"
+state = ["kv", "recurrent", "codec", "sampler", "frame"]
+
+[duplex.params]
+frame_samples = { config = "frame_samples" }
+sample_rate = { config = "sample_rate" }
+latent_dim = { config = "latent_dim" }
+latent_std = { config = "codec.latent_std" }
+noise_divisor = 0.8
+guidance = { config = "head.guidance_scale" }
+max_frames = 27000
+window_frames = 0
+prefill_chunk = 512
+reference_seconds = 180
+silence_frames = 16
+trim_dbfs = -45
+trim_margin_seconds = 0.2
+
+[duplex.tokens]
+pad = { config = "pad_token_id" }
+eop = { config = "eop_token_id" }
+eos = { config = "lm.eos_token_id" }
+
+[duplex.sampling]
+temperature = 0.7
+top_k = 25
+top_p = 1.0
+eop_bias = 0.0
+forced_text = 1
+exact = ["pad", "eop"]
+silent = ["pad", "eop"]
+forced_bans = ["pad", "eop", "eos"]
+
+[duplex.sampling.dry]
+multiplier = 0.8
+base = 1.75
+allowed_length = 1
+lookback = 1024
+max_match = 32
+max_penalty = 32.0
+exempt = ["pad", "eop", "eos"]
 
 [head]
 graph = "meanflow"

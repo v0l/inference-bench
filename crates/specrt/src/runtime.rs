@@ -21,7 +21,7 @@ mod mtp;
 mod single;
 pub(crate) mod snapshot;
 mod stage;
-mod step;
+pub mod step;
 mod stream;
 pub use fused::PrefillPart;
 use exec::Plans;
@@ -1598,6 +1598,10 @@ impl Runtime {
         self.scan_launches.each_ref().map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
     }
 
+    pub fn module_kernel(&self, name: &str) -> Result<&CudaFunction> {
+        self.kernels.get(name).with_context(|| format!("kernel {name} is not in the module"))
+    }
+
     fn kernel(&self, name: &str) -> &CudaFunction {
         self.kernels.get(name).unwrap_or_else(|| panic!("kernel {name} is not in the module"))
     }
@@ -2857,6 +2861,39 @@ impl Runtime {
                 self.stream.memcpy_htod(*v, &mut buf.slice_mut(..v.len()))?;
             }
         }
+        Ok(())
+    }
+
+    pub fn input_buffer(&mut self, name: &str) -> Result<&mut CudaSlice<f32>> {
+        let ib = self.inputs.as_mut().context("this stage holds no input streams")?;
+        ib.streams.get_mut(name).with_context(|| format!("{name} is not a declared input stream or mask"))
+    }
+
+    pub fn input_capacity(&self) -> usize {
+        self.chunk
+    }
+
+    pub fn normed_planes(&self) -> (&CudaSlice<u16>, &CudaSlice<u16>) {
+        (&self.pre.xn_planes.hi, &self.pre.xn_planes.lo)
+    }
+
+    pub fn embed_table(&self) -> &CudaSlice<u16> {
+        &self.embed
+    }
+
+    pub fn kv_pages(&self) -> usize {
+        self.pages
+    }
+
+    pub fn block_table_of(&self, slot: usize) -> Vec<u32> {
+        self.tables[slot * self.pages..(slot + 1) * self.pages].iter().map(|&b| b as u32).collect()
+    }
+
+    pub fn set_position_offset(&mut self, slot: usize, delta: i32) -> Result<()> {
+        ensure!(slot < self.slots, "slot {slot} out of {}", self.slots);
+        ensure!(delta == 0 || self.spec.rope.mrope.is_some(), "a rope position offset needs the mrope position table");
+        ensure!(self.media.get(slot).is_none_or(Option::is_none), "slot {slot} holds media positions");
+        self.stream.memcpy_htod(&[0i32, delta], &mut self.mm_meta.slice_mut(2 * slot..2 * slot + 2))?;
         Ok(())
     }
 

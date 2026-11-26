@@ -21,6 +21,7 @@ pub mod denoiser_host;
 pub mod encoder;
 pub mod mp4;
 pub mod denoiser_cuda;
+pub mod duplex;
 pub mod gemm;
 pub mod generate;
 pub mod engine;
