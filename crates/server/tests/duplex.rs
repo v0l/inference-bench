@@ -318,6 +318,9 @@ fn the_realtime_subset_takes_instructions_and_appended_audio_and_sends_deltas() 
     assert_eq!(seen.started.lock().unwrap()[0].options.card, "You are Haru.");
     send(&mut s, json!({"type": "session.update", "session": {"instructions": "Someone else."}}));
     assert_eq!(until(&mut s, "error")["error"]["code"], "instructions_fixed");
+    drop(s);
+    wait_for("the realtime session ends", || !seen.ended.lock().unwrap().is_empty());
+    wait_for("frames out are counted for realtime deltas", || !rig.metrics().contains("inference_duplex_frames_out_total 0"));
 }
 
 #[test]

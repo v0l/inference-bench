@@ -455,8 +455,10 @@ async fn pump<D: Dialect>(ws: &mut WebSocket, state: &AppState, mut live: Live, 
                 break Ending::Failed(e.clone());
             }
             let (audio, events) = dialect.frame(&o);
-            if let Some(a) = audio {
+            if !o.audio.is_empty() {
                 tally.frames_out += 1;
+            }
+            if let Some(a) = audio {
                 if ws.send(a).await.is_err() {
                     break Ending::Dropped;
                 }
