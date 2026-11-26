@@ -26,6 +26,7 @@ agent-core = { git = "https://github.com/v0l/agentbench", rev = "8865c7f", featu
 agent-ui = { git = "https://github.com/v0l/agentbench", rev = "8865c7f", features = ["sandbox"] }
 serde_json.workspace = true
 chrono.workspace = true
+ureq.workspace = true
 
 serde.workspace = true
 
@@ -36,5 +37,4 @@ specrt = { package = "inference-bench-specrt", path = "../specrt", features = ["
 toml.workspace = true
 tracing-subscriber.workspace = true
 egui_kittest = { version = "0.37", features = ["eframe", "wgpu"] }
-ureq.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }

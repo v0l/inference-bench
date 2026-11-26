@@ -51,6 +51,7 @@ pub mod options;
 pub mod pairing;
 pub mod csf;
 pub mod quant_map;
+pub mod quantize;
 pub mod fusion;
 pub mod pipeline;
 pub mod diskio;

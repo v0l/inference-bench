@@ -220,9 +220,61 @@ pub fn header(mp4: &[u8]) -> Result<Header> {
     })
 }
 
+pub fn decode(mp4: &[u8]) -> Result<(Header, Vec<Vec<u8>>)> {
+    use openh264::decoder::Decoder;
+    let head = header(mp4)?;
+    let stbl = find(mp4, &[b"moov", b"trak", b"mdia", b"minf", b"stbl"]).context("no stbl box")?;
+    let stsz = find(stbl, &[b"stsz"]).context("no stsz box")?;
+    let stco = find(stbl, &[b"stco"]).context("no stco box")?;
+    let stsd = find(stbl, &[b"stsd"]).context("no stsd box")?;
+    let avc1 = stsd.get(16..).context("short stsd")?;
+    let (_, avcc) = children(avc1.get(78..).context("short avc1")?).into_iter().find(|(k, _)| k == b"avcC").context("no avcC box")?;
+    let sps_len = usize::from(u16::from_be_bytes(avcc.get(6..8).context("short avcC")?.try_into()?));
+    let sps = avcc.get(8..8 + sps_len).context("short sps")?;
+    let pps_len = usize::from(u16::from_be_bytes(avcc.get(9 + sps_len..11 + sps_len).context("short avcC")?.try_into()?));
+    let pps = avcc.get(11 + sps_len..11 + sps_len + pps_len).context("short pps")?;
+    let mut at = u32_at(stco, 8).context("short stco")? as usize;
+    let mut decoder = Decoder::new().context("open the H.264 decoder")?;
+    let mut headers = vec![0, 0, 0, 1];
+    headers.extend_from_slice(sps);
+    headers.extend_from_slice(&[0, 0, 0, 1]);
+    headers.extend_from_slice(pps);
+    decoder.decode(&headers).context("decode the stream headers")?;
+    let mut frames = Vec::new();
+    let (w, h) = (head.width as usize, head.height as usize);
+    for i in 0..head.frames as usize {
+        let size = u32_at(stsz, 12 + i * 4).context("short stsz")? as usize;
+        let sample = mp4.get(at..at + size).with_context(|| format!("sample {i} is outside the file"))?;
+        at += size;
+        let mut annex = Vec::with_capacity(size);
+        let mut p = 0;
+        while p + 4 <= sample.len() {
+            let n = u32_at(sample, p).context("short nal")? as usize;
+            annex.extend_from_slice(&[0, 0, 0, 1]);
+            annex.extend_from_slice(sample.get(p + 4..p + 4 + n).context("nal past the sample")?);
+            p += 4 + n;
+        }
+        let picture = decoder.decode(&annex).with_context(|| format!("decode frame {i}"))?.with_context(|| format!("frame {i} gave no picture"))?;
+        let mut rgb = vec![0u8; w * h * 3];
+        picture.write_rgb8(&mut rgb);
+        frames.push(rgb);
+    }
+    Ok((head, frames))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_returns_every_frame_at_the_encoded_size() {
+        let src = frames(5, 32, 32);
+        let (h, out) = decode(&encode(&src, 32, 32, 16).unwrap().mp4()).unwrap();
+        assert_eq!((h.frames, out.len()), (5, 5));
+        assert!(out.iter().all(|f| f.len() == 32 * 32 * 3));
+        let err = out.concat().iter().zip(src.concat().iter()).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).max().unwrap();
+        assert!(err < 40, "{err}");
+    }
 
     fn frames(n: usize, w: usize, h: usize) -> Vec<Vec<u8>> {
         (0..n).map(|f| (0..w * h * 3).map(|i| ((i / 3 % w) * 255 / w + f * 20) as u8).collect()).collect()

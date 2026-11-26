@@ -194,6 +194,72 @@ pub struct RuntimeOptions {
     pub offload: crate::offload::OffloadSettings,
     #[serde(skip_serializing_if = "Requant::is_default")]
     pub requant: Requant,
+    #[serde(skip_serializing_if = "QuantizeChoice::is_off")]
+    pub quantize: QuantizeChoice,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuantizeChoice {
+    #[default]
+    Off,
+    Auto,
+    #[serde(rename = "nvfp4_g16")]
+    Nvfp4G16,
+    #[serde(rename = "fp8_channel")]
+    Fp8Channel,
+}
+
+impl QuantizeChoice {
+    pub fn is_off(&self) -> bool {
+        *self == QuantizeChoice::Off
+    }
+
+    pub fn format(self) -> Option<Quant> {
+        match self {
+            QuantizeChoice::Off => None,
+            QuantizeChoice::Auto | QuantizeChoice::Nvfp4G16 => Some(Quant::Nvfp4G16),
+            QuantizeChoice::Fp8Channel => Some(Quant::Fp8Channel),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct QuantKeep {
+    pub first_layers: usize,
+    pub last_layers: usize,
+    pub tensors: Vec<String>,
+    pub sensitive: Vec<String>,
+}
+
+impl Default for QuantKeep {
+    fn default() -> Self {
+        QuantKeep {
+            first_layers: 2,
+            last_layers: 2,
+            tensors: ["embed_tokens", "lm_head", "norm", "mlp.gate.weight", "router", "shared_expert_gate"].map(String::from).to_vec(),
+            sensitive: Vec::new(),
+        }
+    }
+}
+
+impl QuantKeep {
+    pub fn is_default(&self) -> bool {
+        *self == QuantKeep::default()
+    }
+
+    pub fn keeps_layer(&self, layer: usize, layers: usize) -> bool {
+        layer < self.first_layers || layer + self.last_layers >= layers
+    }
+
+    pub fn keeps_tensor(&self, name: &str) -> bool {
+        self.tensors.iter().chain(&self.sensitive).any(|t| name.contains(t.as_str()))
+    }
+
+    pub fn keeps(&self, layer: Option<usize>, layers: usize, name: &str) -> bool {
+        layer.is_none_or(|l| self.keeps_layer(l, layers)) || self.keeps_tensor(name)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -338,7 +404,7 @@ impl PrefixCacheOptions {
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, pdl: false, fuse: true, store_epilogue: false, pdl_hoist: false, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp8_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), split_activations: None, gemm_fp32: false, chunked_scan: true, kv_dtype: KvDtype::F16, kv_f16_layers: None, rope_extension: None, cache_dir: None, cache_max_bytes: None, compile_jobs: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default(), offload: crate::offload::OffloadSettings::default(), requant: Requant::default() }
+        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, pdl: false, fuse: true, store_epilogue: false, pdl_hoist: false, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp8_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), split_activations: None, gemm_fp32: false, chunked_scan: true, kv_dtype: KvDtype::F16, kv_f16_layers: None, rope_extension: None, cache_dir: None, cache_max_bytes: None, compile_jobs: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default(), offload: crate::offload::OffloadSettings::default(), requant: Requant::default(), quantize: QuantizeChoice::Off }
     }
 }
 
@@ -1340,6 +1406,8 @@ pub struct Spec {
     pub iq_quants: bool,
     #[serde(default, skip_serializing_if = "crate::quant_map::QuantMap::is_empty")]
     pub quant_map: crate::quant_map::QuantMap,
+    #[serde(default, skip_serializing_if = "QuantKeep::is_default")]
+    pub quant_keep: QuantKeep,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refused: Vec<Refusal>,
 }
@@ -2378,6 +2446,7 @@ impl Spec {
             plain_activations: !family.runtime.split_activations,
             iq_quants: false,
             quant_map,
+            quant_keep: family.quantization.keep.clone(),
             refused,
         };
         Ok(spec)

@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-const ACCEPTED: &[&str] = &["model", "prompt", "seconds", "size", "seed", "negative_prompt", "steps", "guidance", "fps", "frames", "sampler", "user"];
+const ACCEPTED: &[&str] = &["model", "prompt", "seconds", "size", "seed", "negative_prompt", "steps", "guidance", "fps", "frames", "sampler", "sequential_cfg", "tiled_vae", "user"];
 const KEEP: usize = 64;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -165,6 +165,8 @@ pub fn parse(body: &Value) -> Result<VideoRequest, ApiError> {
         frames: int(&body["frames"], "frames")?.map(|f| f as usize),
         preview_every: None,
         offload_text_encoder: None,
+        sequential_cfg: body["sequential_cfg"].as_bool(),
+        tiled_vae: body["tiled_vae"].as_bool(),
         fps: int(&body["fps"], "fps")?.map(|f| f as u32),
     };
     Ok(VideoRequest { model: body["model"].as_str().map(String::from), job, seconds })
@@ -237,7 +239,10 @@ pub async fn create(State(state): State<Arc<AppState>>, Json(body): Json<Value>)
 }
 
 pub async fn get_one(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Response, ApiError> {
-    let v = state.videos.with(&id, |j| j.json()).ok_or_else(|| ApiError::not_found(format!("no video {id}")))?;
+    let mut v = state.videos.with(&id, |j| j.json()).ok_or_else(|| ApiError::not_found(format!("no video {id}")))?;
+    if v["status"] == "queued" {
+        v["queue_position"] = json!(state.images.waiting());
+    }
     Ok(Json(v).into_response())
 }
 

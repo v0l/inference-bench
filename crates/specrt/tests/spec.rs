@@ -801,3 +801,28 @@ fn qwen3_next_nvfp4_config_reads_fp4_experts_and_fused_linear_projections() {
     assert_eq!(tensors, vec!["linear_attn.in_proj_qkvz.weight".to_string()]);
     assert_eq!(specrt::plan::Weight::LinBa.tensors(&spec), vec!["linear_attn.in_proj_ba.weight".to_string()]);
 }
+
+#[test]
+fn the_quantize_keep_list_comes_from_the_family_and_keeps_edges_embeddings_heads_routers_and_norms() {
+    let spec = derived("qwen3-0.6b.config.json");
+    let keep = &spec.quant_keep;
+    assert_eq!(keep, &specrt::spec::QuantKeep::default());
+    let layers = spec.layers.count;
+    assert_eq!(layers, 28);
+    assert!(keep.keeps_layer(0, layers) && keep.keeps_layer(1, layers));
+    assert!(!keep.keeps_layer(2, layers) && !keep.keeps_layer(25, layers));
+    assert!(keep.keeps_layer(26, layers) && keep.keeps_layer(27, layers));
+    for name in ["model.embed_tokens.weight", "lm_head.weight", "model.norm.weight", "model.layers.9.input_layernorm.weight", "model.layers.9.mlp.gate.weight", "model.layers.9.mlp.shared_expert_gate.weight"] {
+        assert!(keep.keeps(Some(9), layers, name), "{name} should stay bf16");
+    }
+    for name in ["model.layers.9.self_attn.q_proj.weight", "model.layers.9.mlp.gate_proj.weight", "model.layers.9.mlp.experts.3.down_proj.weight"] {
+        assert!(!keep.keeps(Some(9), layers, name), "{name} should be quantised");
+    }
+    assert!(keep.keeps(None, layers, "model.layers.9.self_attn.q_proj.weight"));
+    let mut marked = keep.clone();
+    marked.sensitive.push("self_attn.v_proj".into());
+    assert!(marked.keeps(Some(9), layers, "model.layers.9.self_attn.v_proj.weight"));
+    let text = spec.to_toml().unwrap();
+    assert!(!text.contains("quant_keep"), "the default keep list is not written into a spec");
+    assert_eq!(Spec::parse(&text).unwrap().quant_keep, *keep);
+}
