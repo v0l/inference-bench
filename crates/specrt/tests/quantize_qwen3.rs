@@ -48,10 +48,16 @@ fn a_quantcheck_recipe_beats_blanket_nvfp4_on_top1_at_a_similar_size_on_qwen3_0_
     assert!(check.mean_kl <= 0.1 && check.mean_kl < blanket.mean_kl && check.max_kl < blanket.max_kl);
     let text = recipe.to_toml().unwrap();
     assert!(text.len() < 8192);
+    let path = std::env::temp_dir().join(format!("qwen3-0.6b-{}.quantrecipe.toml", std::process::id()));
+    recipe.save(&path).unwrap();
+    let mut from_file = base.clone();
+    from_file.runtime.quantize = QuantizeChoice::Recipe;
+    from_file.runtime.quantize_recipe = Some(path.clone());
     let mut planned = base.clone();
     planned.quant_plan = QuantPlan { layers: recipe.plan().layers, kernels: Vec::new() };
     let prompts = prompts(&planned);
-    let fresh = load(&planned, &prompts);
+    let fresh = load(&from_file, &prompts);
+    std::fs::remove_file(&path).ok();
     assert_eq!(fresh.weight_bytes, recipe.bytes, "a fresh load of the recipe places the bytes quantcheck counted");
     let reference = load(&base, &prompts);
     let a: Vec<&[f32]> = reference.logits.iter().map(Vec::as_slice).collect();

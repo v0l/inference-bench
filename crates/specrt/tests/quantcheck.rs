@@ -156,6 +156,10 @@ fn a_recipe_for_another_model_layer_count_or_format_version_is_refused() {
     };
     let err = refused(Recipe { model: "Qwen/Qwen3-0.6B".into(), ..good.clone() }, "model");
     assert!(err.contains("Qwen/Qwen3-0.6B") && err.contains("tiny-qwen3.5"), "{err}");
+    let (other, path) = recipe_spec(&spec, &Recipe { model: "Qwen/Qwen3-0.6B".into(), ..good.clone() }, "runtime");
+    let err = format!("{:#}", specrt::runtime::Runtime::load(&other, 256).err().expect("the runtime refuses a recipe for another model"));
+    std::fs::remove_file(&path).ok();
+    assert!(err.contains("does not fit this model") && err.contains("Qwen/Qwen3-0.6B"), "{err}");
     let mut short = good.clone();
     short.layers.pop();
     assert!(refused(short, "layers").contains(&format!("has {} layers", spec.layers.count - 1)));

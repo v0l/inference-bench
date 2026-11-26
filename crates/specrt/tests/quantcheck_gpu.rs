@@ -67,9 +67,14 @@ fn quantcheck_on_the_tiny_fixture_writes_a_recipe_that_meets_its_budget_when_che
     assert!(tight.bytes < report.bf16_bytes);
     assert!(loose.layers.iter().all(|l| l.format == Quant::Nvfp4G16), "a loose budget leaves every layer at the lowest bits");
     assert!(loose.bytes <= tight.bytes);
+    let path = std::env::temp_dir().join(format!("quantcheck-gpu-{}.quantrecipe.toml", std::process::id()));
+    tight.save(&path).unwrap();
     let mut s = spec.clone();
-    s.quant_plan = tight.plan();
+    s.runtime.quantize = specrt::spec::QuantizeChoice::Recipe;
+    s.runtime.quantize_recipe = Some(path.clone());
     let mut rt = Runtime::load(&s, 256).unwrap();
+    std::fs::remove_file(&path).ok();
+    assert_eq!(rt.weight_bytes, tight.bytes, "loading the recipe file places the bytes quantcheck counted");
     let mut reference = Runtime::load(&spec, 256).unwrap();
     let a: Vec<Vec<f32>> = prompts().iter().map(|p| reference.prompt_logits(p).unwrap()).collect();
     let b: Vec<Vec<f32>> = prompts().iter().map(|p| rt.prompt_logits(p).unwrap()).collect();
