@@ -19,6 +19,7 @@ pub mod int;
 pub mod iq_tables;
 pub mod layout;
 pub mod linear;
+pub mod mel;
 pub mod moe;
 pub mod ops;
 pub mod prims;
