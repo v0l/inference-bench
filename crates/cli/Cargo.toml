@@ -42,6 +42,7 @@ serde.workspace = true
 toml.workspace = true
 ureq.workspace = true
 libc = "0.2"
+base64 = "0.22"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 specrt = { package = "inference-bench-specrt", path = "../specrt", features = ["wgpu"] }

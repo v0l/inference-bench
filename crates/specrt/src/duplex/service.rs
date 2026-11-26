@@ -60,6 +60,32 @@ pub fn is_duplex_config(config: &str) -> bool {
     crate::spec::Spec::from_hf_config_duplex(config).is_ok()
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Footprint {
+    pub weights: u64,
+    pub per_session: u64,
+    pub frame_seconds: f64,
+    pub sample_rate: usize,
+    pub card_fields: Vec<String>,
+}
+
+impl Footprint {
+    pub fn total(&self, sessions: usize) -> u64 {
+        self.weights + self.per_session * sessions as u64
+    }
+}
+
+pub fn footprint(dir: &Path, max_ctx: usize) -> Result<Footprint> {
+    let text = std::fs::read_to_string(dir.join("config.json")).with_context(|| format!("{}/config.json", dir.display()))?;
+    let spec = crate::spec::Spec::from_hf_config_duplex(&text)?;
+    let d = spec.duplex.as_ref().context("no [duplex] section")?;
+    let weights: u64 = std::fs::read_dir(dir)?.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "safetensors")).filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum();
+    let pages = max_ctx.div_ceil(crate::codegen::PAGE);
+    let kv = (pages * crate::runtime::kv_block_bytes(&spec, 2)) as u64;
+    let per_session = kv + crate::serve::slot_state_bytes(&spec) + (2 << 20);
+    Ok(Footprint { weights, per_session, frame_seconds: d.frame_seconds(), sample_rate: d.sample_rate, card_fields: d.card.fields.iter().map(|f| f.name.clone()).collect() })
+}
+
 pub struct Service {
     events: Mutex<Sender<Event>>,
     pub info: ServiceInfo,

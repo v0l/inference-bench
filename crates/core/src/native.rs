@@ -141,6 +141,11 @@ impl Model for specrt::Engine {
 }
 
 pub type Factory = Arc<dyn Fn(&str, Option<usize>) -> anyhow::Result<Box<dyn Model>> + Send + Sync>;
+pub type DuplexLoader = Arc<dyn Fn(&std::path::Path, specrt::duplex::service::ServiceOptions, usize) -> anyhow::Result<Arc<specrt::duplex::service::Service>> + Send + Sync>;
+
+pub fn specrt_duplex_loader() -> DuplexLoader {
+    Arc::new(|dir, opts, device| specrt::duplex::service::Service::load(dir, opts, device))
+}
 
 pub fn specrt_factory() -> Factory {
     specrt_factory_with(None)
@@ -184,6 +189,7 @@ pub struct Native {
     device: Option<usize>,
     duplex: Option<Arc<specrt::duplex::service::Service>>,
     duplex_options: specrt::duplex::service::ServiceOptions,
+    duplex_loader: DuplexLoader,
 }
 
 impl Native {
@@ -196,7 +202,12 @@ impl Native {
     }
 
     pub fn with_factory(max_ctx: Option<usize>, factory: Factory) -> Self {
-        Self { max_ctx, factory, worker: None, vision: false, thinking: Default::default(), tools: Default::default(), progress: None, media: None, device: None, duplex: None, duplex_options: Default::default() }
+        Self { max_ctx, factory, worker: None, vision: false, thinking: Default::default(), tools: Default::default(), progress: None, media: None, device: None, duplex: None, duplex_options: Default::default(), duplex_loader: specrt_duplex_loader() }
+    }
+
+    pub fn with_duplex_loader(mut self, loader: DuplexLoader) -> Self {
+        self.duplex_loader = loader;
+        self
     }
 
     pub fn on_device(mut self, device: Option<usize>) -> Self {
@@ -394,7 +405,8 @@ impl Target for Native {
             let opts = self.duplex_options.clone();
             let device = self.device.unwrap_or(0);
             let progress = self.progress.clone();
-            let loaded = catch_unwind(AssertUnwindSafe(|| specrt::progress::with_sink(progress, || specrt::duplex::service::Service::load(&dir, opts, device))));
+            let loader = self.duplex_loader.clone();
+            let loaded = catch_unwind(AssertUnwindSafe(|| specrt::progress::with_sink(progress, || loader(&dir, opts, device))));
             return match loaded {
                 Ok(Ok(s)) => {
                     self.duplex = Some(s);

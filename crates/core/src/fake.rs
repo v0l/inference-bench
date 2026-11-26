@@ -435,6 +435,39 @@ pub fn tiny_video_pipeline() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures/tiny-wan21")
 }
 
+pub fn tiny_haru() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures/haru/tiny")
+}
+
+pub struct EchoDuplex {
+    next: u64,
+    samples: usize,
+}
+
+impl specrt::duplex::clock::FrameEngine for EchoDuplex {
+    fn step(&mut self, frames: &[(u64, Vec<f32>)]) -> anyhow::Result<Vec<(u64, specrt::duplex::clock::Out)>> {
+        Ok(frames.iter().map(|(id, f)| (*id, specrt::duplex::clock::Out { audio: f.iter().map(|v| v * 0.5).collect(), token: Some(1), text: "a ".into(), index: 1, late: false, done: false, error: None })).collect())
+    }
+
+    fn start(&mut self, _: specrt::duplex::clock::StartRequest) -> anyhow::Result<(u64, specrt::duplex::clock::Out)> {
+        self.next += 1;
+        Ok((self.next, specrt::duplex::clock::Out { audio: vec![0.0; self.samples], token: Some(0), text: String::new(), index: 0, late: false, done: false, error: None }))
+    }
+}
+
+pub fn echo_duplex_loader(loads: Arc<std::sync::atomic::AtomicUsize>) -> crate::native::DuplexLoader {
+    Arc::new(move |dir, opts, device| {
+        let text = std::fs::read_to_string(dir.join("config.json"))?;
+        let d = specrt::spec::Spec::from_hf_config_duplex(&text)?.duplex.unwrap();
+        loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (samples, rate, slots, max_ctx) = (d.frame_samples, d.sample_rate, opts.slots, opts.max_ctx);
+        specrt::duplex::service::Service::spawn(Duration::from_secs_f64(d.frame_seconds()), samples, 8, move || {
+            let info = specrt::duplex::service::ServiceInfo { name: "echo".into(), sample_rate: rate, frame_samples: samples, slots, max_ctx, device, snapshots: false };
+            Ok((Box::new(EchoDuplex { next: 0, samples }) as Box<dyn specrt::duplex::clock::FrameEngine>, info))
+        })
+    })
+}
+
 pub struct FakeImage {
     pub info: specrt::media::MediaInfo,
     pub step_ms: u64,

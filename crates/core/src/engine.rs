@@ -122,6 +122,7 @@ pub struct Engine {
     max_loaded: Arc<AtomicUsize>,
     duplexes: DuplexList,
     duplex_options: Arc<Mutex<specrt::duplex::service::ServiceOptions>>,
+    duplex_loader: Arc<Mutex<crate::native::DuplexLoader>>,
 }
 
 #[derive(Clone)]
@@ -331,11 +332,12 @@ impl Engine {
         let stats: StatsSource = Arc::default();
         let duplexes: DuplexList = Arc::default();
         let duplex_options = Arc::new(Mutex::new(specrt::duplex::service::ServiceOptions::default()));
+        let duplex_loader = Arc::new(Mutex::new(crate::native::specrt_duplex_loader()));
         let max_loaded = Arc::new(AtomicUsize::new(DEFAULT_MAX_LOADED));
         let watching = Arc::new(AtomicBool::new(false));
         let stop_sampler = Arc::new(AtomicBool::new(false));
-        let shared = Shared { loaded: loaded.clone(), suspended: suspended.clone(), lives: lives.clone(), stats: stats.clone(), max_loaded: max_loaded.clone(), duplexes: duplexes.clone(), duplex_options: duplex_options.clone() };
-        let this = Self { commands, events, loaded, suspended, lives, idle, stats, watching, stop_sampler, max_loaded, duplexes, duplex_options };
+        let shared = Shared { loaded: loaded.clone(), suspended: suspended.clone(), lives: lives.clone(), stats: stats.clone(), max_loaded: max_loaded.clone(), duplexes: duplexes.clone(), duplex_options: duplex_options.clone(), duplex_loader: duplex_loader.clone() };
+        let this = Self { commands, events, loaded, suspended, lives, idle, stats, watching, stop_sampler, max_loaded, duplexes, duplex_options, duplex_loader };
         let handle = this.handle();
         let (stop, wake_sampler) = (this.stop_sampler.clone(), wake.clone());
         std::thread::spawn(move || run(inbox, events_tx, shared, wake, factory, serving, gpu));
@@ -358,6 +360,10 @@ impl Engine {
 
     pub fn set_duplex_options(&self, options: specrt::duplex::service::ServiceOptions) {
         *self.duplex_options.lock().unwrap() = options;
+    }
+
+    pub fn set_duplex_loader(&self, loader: crate::native::DuplexLoader) {
+        *self.duplex_loader.lock().unwrap() = loader;
     }
 
     pub fn reading(&self) -> Reading {
@@ -416,6 +422,7 @@ struct Shared {
     max_loaded: Arc<AtomicUsize>,
     duplexes: DuplexList,
     duplex_options: Arc<Mutex<specrt::duplex::service::ServiceOptions>>,
+    duplex_loader: Arc<Mutex<crate::native::DuplexLoader>>,
 }
 
 struct Slot {
@@ -512,6 +519,7 @@ fn open(
     serving: &ServingFactory,
     progress: &specrt::progress::Sink,
     duplex: &specrt::duplex::service::ServiceOptions,
+    duplex_loader: &crate::native::DuplexLoader,
 ) -> Result<Opened, BackendError> {
     if specrt::duplex::service::resolve_dir(model_id).is_some() {
         let device = engine.overrides.get(specrt::media::DEVICE_KEY).and_then(|v| v.as_u64()).map(|d| d as usize);
@@ -519,7 +527,7 @@ fn open(
         if let Some(c) = max_ctx {
             opts.max_ctx = c;
         }
-        let mut native = Native::with_factory(max_ctx, factory.clone()).on_device(device);
+        let mut native = Native::with_factory(max_ctx, factory.clone()).on_device(device).with_duplex_loader(duplex_loader.clone());
         native.set_duplex(opts.clone());
         native.set_progress(Some(progress.clone()));
         native.load(model_id)?;
@@ -735,7 +743,8 @@ fn run(
                 if let Some(n) = max_num_seqs {
                     duplex_options.slots = n.max(1);
                 }
-                match open(&model_id, max_ctx, seqs, kv_cache_bytes, &engine, &factory, &serving, &sink, &duplex_options) {
+                let duplex_loader = shared.duplex_loader.lock().unwrap().clone();
+                match open(&model_id, max_ctx, seqs, kv_cache_bytes, &engine, &factory, &serving, &sink, &duplex_options, &duplex_loader) {
                     Ok(o) => {
                         let ctx = engine.solved.as_ref().map(|s| s.context).or(max_ctx).unwrap_or(specrt::engine::DEFAULT_CTX);
                         let after = gpu();
@@ -1016,6 +1025,28 @@ mod tests {
             }
         }
         (text, done, failed)
+    }
+
+    #[test]
+    fn a_duplex_model_loads_on_the_chosen_device_with_its_sessions_and_refuses_text() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let e = engine();
+        e.set_duplex_loader(crate::fake::echo_duplex_loader(loads.clone()));
+        let dir = crate::fake::tiny_haru().display().to_string();
+        let mut engine_choice = specrt::options::EngineChoice::default();
+        engine_choice.overrides.insert(specrt::media::DEVICE_KEY.into(), serde_json::json!(1));
+        e.send(Command::Load { model_id: dir.clone(), display: "tiny-haru".into(), max_ctx: Some(1024), max_num_seqs: Some(3), kv_cache_bytes: None, served_names: Vec::new(), engine: engine_choice, alongside: false });
+        assert!(matches!(wait_event(&e), EngineEvent::Loading(_)));
+        let EngineEvent::Loaded(l) = wait_event(&e) else { panic!("not loaded") };
+        assert_eq!((l.kind, l.max_num_seqs, l.ctx), (specrt::media::ModelKind::Duplex, 3, 1024));
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        let s = e.handle().duplex_of(Some("tiny-haru")).expect("the service is reachable by the display name");
+        assert_eq!((s.info.slots, s.info.max_ctx, s.info.device, s.info.frame_samples), (3, 1024, 1, 3200));
+        let (_, _, failed) = ask(&e.handle(), "hi");
+        assert!(failed.unwrap().message.contains("/v1/duplex"));
+        e.send(Command::Unload { model: None });
+        assert!(matches!(wait_event(&e), EngineEvent::Unloaded));
+        assert!(e.handle().duplex_of(None).is_none());
     }
 
     #[test]
