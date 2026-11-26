@@ -187,6 +187,16 @@ impl HostDecoder {
         Ok(())
     }
 
+    pub fn attend_cross(&self, seq: &Sequence, layer: usize, q: &[f32]) -> Result<Vec<f32>> {
+        let c = self.spec.cross.as_ref().context("no [cross] section")?;
+        let qd = self.spec.q_dim();
+        let kv = &seq.cross_kv[layer];
+        ensure!(kv.len() == c.rows * 2 * qd, "layer {layer}: the sequence has no {} state; run the window first", c.state);
+        let keys: Vec<f32> = kv.chunks(2 * qd).flat_map(|r| r[..qd].to_vec()).collect();
+        let values: Vec<f32> = kv.chunks(2 * qd).flat_map(|r| r[qd..].to_vec()).collect();
+        Ok(self.attend(q, &keys, &values, c.rows, None))
+    }
+
     fn attend(&self, q: &[f32], keys: &[f32], values: &[f32], n_keys: usize, causal_from: Option<usize>) -> Vec<f32> {
         let a = &self.spec.attention;
         let (hd, heads) = (a.head_dim, a.heads);
@@ -295,15 +305,10 @@ impl HostDecoder {
             }
             Op::CrossAttention { .. } => {
                 let i = layer.context("cross attention runs inside a layer")?;
-                let c = self.spec.cross.as_ref().context("no [cross] section")?;
                 let q = bufs[&Buf::Qkv].clone();
                 let mut out = Vec::with_capacity(total * qd);
                 for (s, part) in rows.seqs.iter().zip(Self::per_seq(&rows.tokens, &q, qd)) {
-                    let kv = &s.cross_kv[i];
-                    ensure!(kv.len() == c.rows * 2 * qd, "layer {i}: the sequence has no {} state; run the window first", c.state);
-                    let keys: Vec<f32> = kv.chunks(2 * qd).flat_map(|r| r[..qd].to_vec()).collect();
-                    let values: Vec<f32> = kv.chunks(2 * qd).flat_map(|r| r[qd..].to_vec()).collect();
-                    out.extend(self.attend(part, &keys, &values, c.rows, None));
+                    out.extend(self.attend_cross(s, i, part)?);
                 }
                 bufs.insert(Buf::AttnPlanes, out);
             }

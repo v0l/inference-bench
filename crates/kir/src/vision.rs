@@ -11,7 +11,12 @@ pub const MAX_HEAD_DIM: usize = 128;
 
 pub const KERNELS: &[&str] = &["vis_mma", "vis_split", "vis_layernorm", "vis_pos", "vis_rope_pack", "vis_flash", "vis_to_f16", "vis_pool"];
 pub const TILED_KERNELS: &[&str] = &["vis_assemble", "vis_rope_pairs", "vis_layernorm_f32", "vis_shuffle_norm"];
-pub const JOINT_KERNELS: &[&str] = &["vis_axis_rope", "vis_qk_pack", "vis_flash_kv"];
+pub const JOINT_KERNELS: &[&str] = &["vis_axis_rope", "vis_qk_pack", "vis_flash_kv", "vis_flash_kv_rows"];
+pub const ROWS_THREADS: u32 = 256;
+
+pub fn cross_rows_smem(kv_rows: usize) -> u32 {
+    ((kv_rows + 32) * 4) as u32
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct VisionKernel {

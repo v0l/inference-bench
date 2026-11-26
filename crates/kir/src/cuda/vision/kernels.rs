@@ -394,6 +394,57 @@ pub fn cross_attention_kernel(k: &VisionKernel) -> Result<String, String> {
     Ok(text)
 }
 
+pub fn cross_attention_rows_kernel() -> String {
+    r#"
+__device__ __forceinline__ float rows_block_max(float v, float* red) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    __syncthreads();
+    if (lane == 0) red[warp] = v;
+    __syncthreads();
+    float t = red[0];
+    for (int i = 1; i < blockDim.x / 32; i++) t = fmaxf(t, red[i]);
+    return t;
+}
+
+extern "C" __global__ void vis_flash_kv_rows(const float* q, const float* kv, float* out, int kv_rows, int heads, int head_dim,
+                                           long long seq_stride, float scale) {
+    extern __shared__ float kr_smem[];
+    float* p = kr_smem;
+    float* red = kr_smem + kv_rows;
+    int head = blockIdx.x;
+    int seq = blockIdx.y;
+    size_t width = (size_t)heads * head_dim;
+    const float* qr = q + (size_t)seq * width + (size_t)head * head_dim;
+    const float* base = kv + (size_t)seq * (size_t)seq_stride;
+    float mx = -3.0e38f;
+    for (int k = threadIdx.x; k < kv_rows; k += blockDim.x) {
+        const float* kr = base + (size_t)k * 2 * width + (size_t)head * head_dim;
+        float s = 0.0f;
+        for (int d = 0; d < head_dim; d++) s += qr[d] * kr[d];
+        s *= scale;
+        p[k] = s;
+        mx = fmaxf(mx, s);
+    }
+    mx = rows_block_max(mx, red);
+    float z = 0.0f;
+    for (int k = threadIdx.x; k < kv_rows; k += blockDim.x) {
+        float e = expf(p[k] - mx);
+        p[k] = e;
+        z += e;
+    }
+    z = block_sum(z, red);
+    __syncthreads();
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int k = 0; k < kv_rows; k++) acc += p[k] * base[(size_t)k * 2 * width + width + (size_t)head * head_dim + d];
+        out[(size_t)seq * width + (size_t)head * head_dim + d] = acc / z;
+    }
+}
+"#
+    .to_string()
+}
+
 pub fn tiled_kernels() -> String {
     format!(
         r#"

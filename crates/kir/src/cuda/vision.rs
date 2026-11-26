@@ -33,6 +33,7 @@ pub fn emit_vision(k: &VisionKernel) -> Result<crate::KirSource, VisionError> {
     if k.joint {
         out += &kernels::joint_kernels();
         out += &kernels::cross_attention_kernel(k).map_err(VisionError)?;
+        out += &kernels::cross_attention_rows_kernel();
     }
     Ok(crate::KirSource::emitted(out))
 }

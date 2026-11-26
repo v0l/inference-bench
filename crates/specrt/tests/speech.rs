@@ -582,6 +582,40 @@ fn every_speech_kernel_compiles_with_nvrtc() {
     for name in &m.kernels {
         assert!(ptx.contains(&format!(".entry {name}(")), "{name} missing from the PTX");
     }
+    let vk = kir::vision::VisionKernel::new(&kir::Target::sm_120(), 32, true).unwrap().joint();
+    let src = kir::cuda::emit_vision(&vk).unwrap();
+    let opts = cudarc::nvrtc::CompileOptions { arch: Some("compute_120"), options: vec!["--std=c++17".into()], ..Default::default() };
+    let ptx = cudarc::nvrtc::compile_ptx_with_opts(src.as_str(), opts).unwrap().to_src();
+    for name in kir::vision::JOINT_KERNELS {
+        assert!(ptx.contains(&format!(".entry {name}(")), "{name} missing from the PTX");
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn the_gpu_cross_attention_rows_match_the_host_on_two_sequences() {
+    let states = encoder_states();
+    let dec = specrt::speech::decoder::HostDecoder::open(&tiny(), false).unwrap();
+    let quiet: Vec<f32> = states.iter().enumerate().map(|(i, v)| v * 0.5 + (i % 7) as f32 * 0.01).collect();
+    let (mut a, mut b) = (dec.new_sequence(), dec.new_sequence());
+    dec.window(&mut a, &states).unwrap();
+    dec.window(&mut b, &quiet).unwrap();
+    let ctx = cudarc::driver::CudaContext::new(0).unwrap();
+    let cache = std::env::var_os("SPECRT_CACHE").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("specrt-speech-jit"));
+    let jit = specrt::jit::Jit::new(ctx.clone(), cache).unwrap();
+    let gpu = specrt::speech::cuda::CudaCrossRows::load(&ctx.default_stream(), &jit, &dec.spec).unwrap();
+    let qd = dec.spec.q_dim();
+    let q: Vec<f32> = (0..2 * qd).map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.03).collect();
+    for layer in 0..dec.spec.layers.count {
+        let got = gpu.run(&q, &[&a.cross_kv[layer], &b.cross_kv[layer]]).unwrap();
+        let mut want = dec.attend_cross(&a, layer, &q[..qd]).unwrap();
+        want.extend(dec.attend_cross(&b, layer, &q[qd..]).unwrap());
+        let err = max_rel(&got, &want);
+        println!("gpu cross attention rows layer {layer}: max rel {err:.2e}");
+        assert!(err < 1e-5, "layer {layer}: {err}");
+        let alone = gpu.run(&q[qd..], &[&b.cross_kv[layer]]).unwrap();
+        assert_eq!(&got[qd..], &alone[..], "layer {layer}: sequence b batched differs from alone");
+    }
 }
 
 #[test]

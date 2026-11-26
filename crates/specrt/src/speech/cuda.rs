@@ -3,7 +3,7 @@ use super::graph::SpeechOp;
 use super::host::HostSpeech;
 use crate::codegen::Module;
 use crate::jit::Jit;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
 use kir::conv::ConvKernel;
 use std::collections::BTreeMap;
@@ -23,6 +23,49 @@ pub fn module(host: &HostSpeech, target: &kir::Target) -> Result<(Module, Vec<St
     names.dedup();
     let kir_hash = kir::fold_hashes(convs.iter().map(ConvKernel::hash).chain([host.plan.mel.hash()]));
     Ok((Module { source, kernels: names, smem: BTreeMap::new(), arch_features: false, kir_hash }, steps, convs))
+}
+
+pub struct CudaCrossRows {
+    stream: Arc<CudaStream>,
+    f: CudaFunction,
+    heads: usize,
+    head_dim: usize,
+    rows: usize,
+}
+
+impl CudaCrossRows {
+    pub fn load(stream: &Arc<CudaStream>, jit: &Jit, spec: &crate::spec::Spec) -> Result<CudaCrossRows> {
+        let c = spec.cross.as_ref().context("the spec has no [cross] section")?;
+        let target = crate::codegen::cuda_target(&stream.context())?;
+        let vk = kir::vision::VisionKernel::new(&target, spec.attention.head_dim, true).map_err(anyhow::Error::msg)?.joint();
+        let mut names = kir::vision::KERNELS.to_vec();
+        names.extend_from_slice(kir::vision::JOINT_KERNELS);
+        let source = kir::cuda::emit_vision(&vk).map_err(anyhow::Error::msg)?;
+        let loaded = jit.load(&Module { source, kernels: names, smem: BTreeMap::new(), arch_features: false, kir_hash: kir::fnv_hash(&vk.hash()) })?;
+        let f = loaded.function("vis_flash_kv_rows")?;
+        use cudarc::driver::sys::CUfunction_attribute as A;
+        f.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, kir::vision::cross_rows_smem(c.rows) as i32)?;
+        Ok(CudaCrossRows { stream: stream.clone(), f, heads: spec.attention.heads, head_dim: spec.attention.head_dim, rows: c.rows })
+    }
+
+    pub fn run(&self, q: &[f32], cross_kv: &[&[f32]]) -> Result<Vec<f32>> {
+        let s = &self.stream;
+        let width = self.heads * self.head_dim;
+        let seqs = cross_kv.len();
+        ensure!(q.len() == seqs * width, "{} query values for {seqs} rows of {width}", q.len());
+        let stride = self.rows * 2 * width;
+        ensure!(cross_kv.iter().all(|k| k.len() == stride), "a sequence has no cross_kv state of {stride} values");
+        let packed: Vec<f32> = cross_kv.iter().flat_map(|k| k.iter().copied()).collect();
+        let (qd, kvd) = (s.clone_htod(q)?, s.clone_htod(&packed)?);
+        let out = s.alloc_zeros::<f32>(seqs * width)?;
+        let (qp, kp, op) = (qd.device_ptr(s).0, kvd.device_ptr(s).0, out.device_ptr(s).0);
+        let (r, h, hd, st) = (self.rows as i32, self.heads as i32, self.head_dim as i32, stride as i64);
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+        let mut b = s.launch_builder(&self.f);
+        b.arg(&qp).arg(&kp).arg(&op).arg(&r).arg(&h).arg(&hd).arg(&st).arg(&scale);
+        unsafe { b.launch(LaunchConfig { grid_dim: (self.heads as u32, seqs as u32, 1), block_dim: (kir::vision::ROWS_THREADS, 1, 1), shared_mem_bytes: kir::vision::cross_rows_smem(self.rows) }) }?;
+        Ok(s.clone_dtoh(&out)?)
+    }
 }
 
 struct Gemm {
