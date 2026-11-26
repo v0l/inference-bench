@@ -183,7 +183,7 @@ fn validate(dir: &Path, a: &mut Args) -> Result<()> {
     let out = PathBuf::from(a.value("--out").context("--out <dir>")?);
     let frames: Option<usize> = a.value("--frames").map(|v| v.parse()).transpose()?;
     let free = a.flag("--free");
-    let seed: u64 = a.parse("--seed", 0)?;
+    let seed: Option<u64> = a.value("--seed").map(|v| v.parse()).transpose()?;
     a.done()?;
     std::fs::create_dir_all(&out)?;
     let first = Trace::open(&traces[0])?;
@@ -201,7 +201,7 @@ fn validate(dir: &Path, a: &mut Args) -> Result<()> {
         write_wav(&out.join(format!("{name}.teacher.wav")), &r.audio, e.duplex.sample_rate as u32)?;
         let mut doc = serde_json::json!({"trace": path.display().to_string(), "prompt": check, "teacher": r});
         if free {
-            let run = validate::free_running(&mut e, &t, seed)?;
+            let run = validate::free_running(&mut e, &t, seed.unwrap_or_else(|| t.meta()["seed"].as_u64().unwrap_or(0)))?;
             println!("## {name} free running\n\nfirst divergence {:?}, voiced {} vs {}, agreement {:.3}\n{}\n", run.first_divergence, run.voiced_frames, run.want_voiced_frames, run.voiced_agreement, run.text);
             write_wav(&out.join(format!("{name}.free.wav")), &run.audio, e.duplex.sample_rate as u32)?;
             doc["free"] = serde_json::to_value(&run)?;
