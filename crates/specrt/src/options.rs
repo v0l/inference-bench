@@ -677,10 +677,10 @@ mod tests {
         }
         let mut r = EngineChoice::default();
         r.set("runtime.quantize", json!("recipe"));
-        r.set("runtime.quantize_recipe", json!("/m/Qwen3-0.6B.quantrecipe.toml"));
+        r.set("runtime.quantize_recipe", json!("/m/model.quantrecipe.toml"));
         r.set("runtime.quantize_cache", json!(true));
         let rt = r.apply(ServeOptions::default()).unwrap().runtime.unwrap();
-        assert_eq!((rt.quantize, rt.quantize_recipe.as_deref(), rt.quantize_cache), (crate::spec::QuantizeChoice::Recipe, Some(std::path::Path::new("/m/Qwen3-0.6B.quantrecipe.toml")), true));
+        assert_eq!((rt.quantize, rt.quantize_recipe.as_deref(), rt.quantize_cache), (crate::spec::QuantizeChoice::Recipe, Some(std::path::Path::new("/m/model.quantrecipe.toml")), true));
         let plain = EngineChoice::default().apply(ServeOptions::default()).unwrap().runtime.unwrap();
         assert!(!plain.quantize_cache && plain.quantize_recipe.is_none());
         assert_eq!(plain.quantize, crate::spec::QuantizeChoice::Off);
