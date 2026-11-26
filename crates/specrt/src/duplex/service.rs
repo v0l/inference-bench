@@ -234,7 +234,7 @@ impl Drop for Service {
 }
 
 pub fn out_of(f: Frame) -> Out {
-    Out { audio: f.audio, token: Some(f.token), text: f.text, index: f.index, late: false, done: f.done, error: None }
+    Out { audio: f.audio, token: Some(f.token), text: f.text, index: f.index, late: false, done: f.done, error: None, input: None }
 }
 
 pub struct Hosted {
@@ -276,7 +276,7 @@ impl FrameEngine for Hosted {
             let id = self.engine.resume(store, &key, now())?;
             let _ = store.delete(&key);
             let index = self.engine.live(id)?.frame;
-            return Ok((id, Out { audio: Vec::new(), token: None, text: String::new(), index, late: false, done: false, error: None }));
+            return Ok((id, Out { audio: Vec::new(), token: None, text: String::new(), index, late: false, done: false, error: None, input: None }));
         }
         let mut options = request.options;
         if let Some(p) = request.prompt {

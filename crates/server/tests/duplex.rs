@@ -43,7 +43,7 @@ impl FrameEngine for Echo {
                 let n = self.frames.entry(*id).or_default();
                 *n += 1;
                 let text = if *n % 2 == 0 { format!("w{n} ") } else { String::new() };
-                (*id, Out { audio: f.iter().map(|v| v * 0.5).collect(), token: Some(1), text, index: *n, late: false, done: limit > 0 && *n >= limit, error: None })
+                (*id, Out { audio: f.iter().map(|v| v * 0.5).collect(), token: Some(1), text, index: *n, late: false, done: limit > 0 && *n >= limit, error: None, input: None })
             })
             .collect())
     }
@@ -56,7 +56,7 @@ impl FrameEngine for Echo {
         self.seen.started.lock().unwrap().push(StartRequest { options: r.options.clone(), card_fields: r.card_fields.clone(), prompt: None, resume: r.resume.clone() });
         self.next += 1;
         self.frames.insert(self.next, 0);
-        Ok((self.next, Out { audio: vec![0.25; SAMPLES], token: Some(0), text: "hi".into(), index: 0, late: false, done: false, error: None }))
+        Ok((self.next, Out { audio: vec![0.25; SAMPLES], token: Some(0), text: "hi".into(), index: 0, late: false, done: false, error: None, input: None }))
     }
 
     fn control(&mut self, _id: SessionId, c: Control) -> anyhow::Result<Reply> {
@@ -146,7 +146,7 @@ fn a_session_streams_frames_both_ways_with_text_events_and_logs_like_chat() {
     }
     assert!(run.text.starts_with("hiw2 w4 "), "{}", run.text);
     assert!(!run.events.iter().any(|e| e["type"] == "text" && e["text"] == ""), "empty frames send no text event");
-    assert_eq!(run.latency_ms.len(), run.frames.len() - 1);
+    assert_eq!(run.latency_ms.len(), 4 + 2, "one latency per user frame the engine consumed, matched by its index");
     let started = seen.started.lock().unwrap();
     assert_eq!((started[0].options.card.as_str(), started[0].options.temperature, started[0].options.seed), ("Be calm.", Some(0.4), 9));
     wait_for("session end", || !seen.ended.lock().unwrap().is_empty());

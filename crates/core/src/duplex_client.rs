@@ -78,22 +78,37 @@ struct Collector {
     run: Run,
     realtime: bool,
     sent: Vec<Instant>,
+    last_audio: Instant,
 }
 
 impl Collector {
     fn take(&mut self, m: Message) -> Result<bool> {
         let now = Instant::now();
         match m {
-            Message::Binary(b) => self.frame(pcm(&b), now),
+            Message::Binary(b) => {
+                self.last_audio = now;
+                self.run.audio.extend(pcm(&b));
+                self.run.frames.push(pcm(&b));
+            }
             Message::Text(t) => {
                 let v: Value = serde_json::from_str(&t).with_context(|| format!("not JSON: {t}"))?;
                 match v["type"].as_str().unwrap_or("") {
                     "error" => bail!("server error: {}", v.get("message").or(v["error"].get("message")).cloned().unwrap_or(v.clone())),
                     "late" => self.run.late += 1,
                     "text" => self.run.text.push_str(v["text"].as_str().unwrap_or("")),
+                    "frame" => {
+                        if let Some(t) = v["input"].as_u64().and_then(|i| self.sent.get(i as usize)) {
+                            self.run.latency_ms.push(self.last_audio.duration_since(*t).as_secs_f64() * 1e3);
+                        }
+                        return Ok(true);
+                    }
                     "response.output_audio.delta" if self.realtime => {
                         let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, v["delta"].as_str().unwrap_or(""))?;
-                        self.frame(pcm(&bytes), now);
+                        self.run.audio.extend(pcm(&bytes));
+                        self.run.frames.push(pcm(&bytes));
+                        if let Some(t) = v["input_frame"].as_u64().and_then(|i| self.sent.get(i as usize)) {
+                            self.run.latency_ms.push(now.duration_since(*t).as_secs_f64() * 1e3);
+                        }
                     }
                     "response.output_audio_transcript.delta" => self.run.text.push_str(v["delta"].as_str().unwrap_or("")),
                     "end" => {
@@ -111,22 +126,11 @@ impl Collector {
         }
         Ok(true)
     }
-
-    fn frame(&mut self, f: Vec<f32>, now: Instant) {
-        let n = self.run.frames.len();
-        if n >= 1
-            && let Some(t) = self.sent.get(n - 1)
-        {
-            self.run.latency_ms.push(now.duration_since(*t).as_secs_f64() * 1e3);
-        }
-        self.run.audio.extend(&f);
-        self.run.frames.push(f);
-    }
 }
 
 pub fn stream(o: &Options, input: &[f32]) -> Result<Run> {
     let mut s = connect(o)?;
-    let mut c = Collector { run: Run::default(), realtime: o.realtime, sent: Vec::new() };
+    let mut c = Collector { run: Run::default(), realtime: o.realtime, sent: Vec::new(), last_audio: Instant::now() };
     if o.realtime {
         s.send(Message::Text(json!({"type": "session.update", "session": {"instructions": o.start["card"].as_str().unwrap_or("")}}).to_string().into()))?;
     } else {
@@ -154,11 +158,33 @@ pub fn stream(o: &Options, input: &[f32]) -> Result<Run> {
     let count = input.len().div_ceil(samples) + o.tail_frames;
     let mut padded = input.to_vec();
     padded.resize(count * samples, 0.0);
+    let message = |chunk: &[f32]| {
+        let bytes = specrt::duplex::wav::f32_to_pcm16(chunk);
+        match o.realtime {
+            true => Message::Text(json!({"type": "input_audio_buffer.append", "audio": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)}).to_string().into()),
+            false => Message::Binary(bytes.into()),
+        }
+    };
+    let mut skip = 0;
+    if o.realtime {
+        c.sent.push(Instant::now());
+        s.send(message(&padded[..samples]))?;
+        skip = 1;
+        loop {
+            let m = read(&mut s)?.context("no response.created after the first append")?;
+            if let Message::Text(t) = &m
+                && serde_json::from_str::<Value>(t).is_ok_and(|v| v["type"] == "response.created")
+            {
+                break;
+            }
+            c.take(m)?;
+        }
+    }
     let started = Instant::now();
     set_timeout(&s, Some(Duration::from_millis(2)))?;
     let mut open = true;
-    for (i, chunk) in padded.chunks(samples).enumerate() {
-        let due = started + frame * i as u32;
+    for (i, chunk) in padded.chunks(samples).enumerate().skip(skip) {
+        let due = started + frame * (i - skip) as u32;
         while open && o.paced && Instant::now() < due {
             if let Some(m) = read(&mut s)? {
                 open = c.take(m)?;
@@ -167,13 +193,8 @@ pub fn stream(o: &Options, input: &[f32]) -> Result<Run> {
         if !open {
             break;
         }
-        let bytes = specrt::duplex::wav::f32_to_pcm16(chunk);
-        let msg = match o.realtime {
-            true => Message::Text(json!({"type": "input_audio_buffer.append", "audio": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)}).to_string().into()),
-            false => Message::Binary(bytes.into()),
-        };
         c.sent.push(Instant::now());
-        s.send(msg)?;
+        s.send(message(chunk))?;
     }
     let want = count + 1;
     let deadline = Instant::now() + frame * 4 + Duration::from_secs(10);

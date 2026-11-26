@@ -396,6 +396,9 @@ impl Dialect for NativeDialect {
 
     fn frame(&mut self, o: &Out) -> (Option<Message>, Vec<Value>) {
         let mut events = Vec::new();
+        if let Some(i) = o.input {
+            events.push(json!({"type": "frame", "frame": o.index, "input": i}));
+        }
         if !o.text.is_empty() {
             events.push(json!({"type": "text", "frame": o.index, "text": o.text}));
         }
@@ -566,7 +569,7 @@ pub async fn native(AxState(state): AxState<Arc<AppState>>, Extension(rid): Exte
         let allow = state.config.duplex.allow_replay;
         let st = state.clone();
         let Some(mut live) = open_session(&mut socket, &state, model.as_deref(), |svc| parse_start(&st.duplex, &body, svc.info.sample_rate, allow).map(|p| p.request)).await else { return };
-        let first = std::mem::replace(&mut live.session.first, Out { audio: Vec::new(), token: None, text: String::new(), index: 0, late: false, done: false, error: None });
+        let first = std::mem::replace(&mut live.session.first, Out { audio: Vec::new(), token: None, text: String::new(), index: 0, late: false, done: false, error: None, input: None });
         pump(&mut socket, &state, live, first, &mut NativeDialect, &rid.0, "/v1/duplex").await;
     })
 }
@@ -610,7 +613,10 @@ impl Dialect for RealtimeDialect {
         let mut events = Vec::new();
         if !o.audio.is_empty() {
             let delta = base64::engine::general_purpose::STANDARD.encode(wav::f32_to_pcm16(&o.audio));
-            let e = json!({"type": "response.output_audio.delta", "response_id": self.response, "item_id": self.item, "output_index": 0, "content_index": 0, "delta": delta});
+            let mut e = json!({"type": "response.output_audio.delta", "response_id": self.response, "item_id": self.item, "output_index": 0, "content_index": 0, "delta": delta});
+            if let Some(i) = o.input {
+                e["input_frame"] = json!(i);
+            }
             events.push(self.event(e));
         }
         if !o.text.is_empty() {
@@ -680,7 +686,7 @@ pub async fn realtime(AxState(state): AxState<Arc<AppState>>, Extension(rid): Ex
         let card = dialect.instructions.clone();
         let Some(mut live) = open_session(&mut socket, &state, q.model.as_deref(), |_| Ok(StartRequest { options: StartOptions { card, seed: uuid::Uuid::new_v4().as_u64_pair().0 >> 12, ..StartOptions::default() }, card_fields: BTreeMap::new(), prompt: None, resume: None })).await else { return };
         let _ = live.session.handle().audio(early_audio);
-        let first = std::mem::replace(&mut live.session.first, Out { audio: Vec::new(), token: None, text: String::new(), index: 0, late: false, done: false, error: None });
+        let first = std::mem::replace(&mut live.session.first, Out { audio: Vec::new(), token: None, text: String::new(), index: 0, late: false, done: false, error: None, input: None });
         pump(&mut socket, &state, live, first, &mut dialect, &rid.0, "/v1/realtime").await;
     })
 }

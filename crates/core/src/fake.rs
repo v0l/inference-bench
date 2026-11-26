@@ -446,12 +446,12 @@ pub struct EchoDuplex {
 
 impl specrt::duplex::clock::FrameEngine for EchoDuplex {
     fn step(&mut self, frames: &[(u64, Vec<f32>)]) -> anyhow::Result<Vec<(u64, specrt::duplex::clock::Out)>> {
-        Ok(frames.iter().map(|(id, f)| (*id, specrt::duplex::clock::Out { audio: f.iter().map(|v| v * 0.5).collect(), token: Some(1), text: "a ".into(), index: 1, late: false, done: false, error: None })).collect())
+        Ok(frames.iter().map(|(id, f)| (*id, specrt::duplex::clock::Out { audio: f.iter().map(|v| v * 0.5).collect(), token: Some(1), text: "a ".into(), index: 1, late: false, done: false, error: None, input: None })).collect())
     }
 
     fn start(&mut self, _: specrt::duplex::clock::StartRequest) -> anyhow::Result<(u64, specrt::duplex::clock::Out)> {
         self.next += 1;
-        Ok((self.next, specrt::duplex::clock::Out { audio: vec![0.0; self.samples], token: Some(0), text: String::new(), index: 0, late: false, done: false, error: None }))
+        Ok((self.next, specrt::duplex::clock::Out { audio: vec![0.0; self.samples], token: Some(0), text: String::new(), index: 0, late: false, done: false, error: None, input: None }))
     }
 }
 

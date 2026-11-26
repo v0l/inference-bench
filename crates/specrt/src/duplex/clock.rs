@@ -13,6 +13,7 @@ pub struct Out {
     pub late: bool,
     pub done: bool,
     pub error: Option<String>,
+    pub input: Option<u64>,
 }
 
 pub struct StartRequest {
@@ -71,9 +72,10 @@ pub enum Event {
 #[derive(Default)]
 struct Uplink {
     pending: Vec<f32>,
-    frames: VecDeque<Vec<f32>>,
+    frames: VecDeque<(u64, Vec<f32>)>,
     due: u64,
     skip: u64,
+    received: u64,
 }
 
 pub struct Clock {
@@ -117,7 +119,8 @@ pub fn run(engine: &mut dyn FrameEngine, clock: &Clock, events: Receiver<Event>,
                         u.pending.extend(pcm);
                         while u.pending.len() >= clock.samples {
                             let f: Vec<f32> = u.pending.drain(..clock.samples).collect();
-                            u.frames.push_back(f);
+                            u.frames.push_back((u.received, f));
+                            u.received += 1;
                             if u.frames.len() > clock.max_queue {
                                 u.frames.pop_front();
                                 stats.dropped_input += 1;
@@ -165,6 +168,7 @@ pub fn run(engine: &mut dyn FrameEngine, clock: &Clock, events: Receiver<Event>,
         let now_tick = tick;
         tick += 1;
         let mut batch = Vec::new();
+        let mut inputs: BTreeMap<SessionId, u64> = BTreeMap::new();
         for (&id, u) in ups.iter_mut() {
             if u.due > now_tick {
                 continue;
@@ -174,7 +178,13 @@ pub fn run(engine: &mut dyn FrameEngine, clock: &Clock, events: Receiver<Event>,
                 u.skip -= 1;
                 stats.dropped_input += 1;
             }
-            let frame = u.frames.pop_front().unwrap_or_else(|| vec![0.0; clock.samples]);
+            let frame = match u.frames.pop_front() {
+                Some((i, f)) => {
+                    inputs.insert(id, i);
+                    f
+                }
+                None => vec![0.0; clock.samples],
+            };
             batch.push((id, frame));
         }
         if batch.is_empty() {
@@ -186,13 +196,14 @@ pub fn run(engine: &mut dyn FrameEngine, clock: &Clock, events: Receiver<Event>,
             Err(e) => {
                 let why = format!("{e:#}");
                 tracing::error!(error = %why, sessions = batch.len(), "a duplex step failed, its sessions end");
-                batch.iter().map(|(id, _)| (*id, Out { audio: Vec::new(), token: None, text: String::new(), index: 0, late: false, done: true, error: Some(format!("the frame step failed: {why}")) })).collect()
+                batch.iter().map(|(id, _)| (*id, Out { audio: Vec::new(), token: None, text: String::new(), index: 0, late: false, done: true, error: Some(format!("the frame step failed: {why}")), input: None })).collect()
             }
         };
         stats.step_secs.push(began.elapsed().as_secs_f64());
         stats.steps += 1;
         let behind = Instant::now().saturating_duration_since(clock.tick(start, tick)).as_nanos() / clock.frame.as_nanos().max(1);
         for (id, mut o) in produced {
+            o.input = inputs.get(&id).copied();
             if behind > 0 {
                 o.late = true;
                 stats.late_frames += 1;
@@ -247,7 +258,7 @@ mod tests {
             std::thread::sleep(d);
             Ok(frames.iter().map(|(id, f)| {
                 self.seen.push((*id, f[0]));
-                (*id, Out { audio: f.clone(), token: None, text: String::new(), index: self.steps, late: false, done: false, error: None })
+                (*id, Out { audio: f.clone(), token: None, text: String::new(), index: self.steps, late: false, done: false, error: None, input: None })
             }).collect())
         }
     }
@@ -323,11 +334,11 @@ mod tests {
         }
         impl FrameEngine for Starts {
             fn step(&mut self, frames: &[(SessionId, Vec<f32>)]) -> anyhow::Result<Vec<(SessionId, Out)>> {
-                Ok(frames.iter().map(|(id, f)| (*id, Out { audio: f.clone(), token: Some(1), text: "a".into(), index: 1, late: false, done: false, error: None })).collect())
+                Ok(frames.iter().map(|(id, f)| (*id, Out { audio: f.clone(), token: Some(1), text: "a".into(), index: 1, late: false, done: false, error: None, input: None })).collect())
             }
             fn start(&mut self, _: StartRequest) -> anyhow::Result<(SessionId, Out)> {
                 self.next += 1;
-                Ok((self.next, Out { audio: vec![9.0; 4], token: Some(0), text: String::new(), index: 0, late: false, done: false, error: None }))
+                Ok((self.next, Out { audio: vec![9.0; 4], token: Some(0), text: String::new(), index: 0, late: false, done: false, error: None, input: None }))
             }
             fn control(&mut self, _: SessionId, c: Control) -> anyhow::Result<Reply> {
                 if let Control::Say(t) = c {
@@ -370,7 +381,7 @@ mod tests {
         struct Ends;
         impl FrameEngine for Ends {
             fn step(&mut self, frames: &[(SessionId, Vec<f32>)]) -> anyhow::Result<Vec<(SessionId, Out)>> {
-                Ok(frames.iter().map(|(id, _)| (*id, Out { audio: Vec::new(), token: None, text: String::new(), index: 0, late: false, done: true, error: None })).collect())
+                Ok(frames.iter().map(|(id, _)| (*id, Out { audio: Vec::new(), token: None, text: String::new(), index: 0, late: false, done: true, error: None, input: None })).collect())
             }
         }
         let (tx, rx) = channel();
