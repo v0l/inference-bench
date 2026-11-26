@@ -51,8 +51,8 @@ struct Need {
 }
 
 const WHISPER: &[Need] = &[
-    Need { piece: "log-mel front end: hann window 400, hop 160, power STFT, slaney mel bank 0 to 8 kHz, log10 clamp 1e-10, max - 8, (x + 4) / 4, 30 s pad", state: "new op", evidence: None, slice: "a" },
-    Need { piece: "conv stem: conv1d k3 p1 then k3 s2 p1 with exact GELU, centred padding", state: "new graph entry over kir::conv (same padding, not causal)", evidence: Some(("kir/src/cuda/conv.rs", "line_gelu")), slice: "a" },
+    Need { piece: "log-mel front end: hann window 400, hop 160, power STFT, slaney mel bank 0 to 8 kHz, log10 clamp 1e-10, max - 8, (x + 4) / 4, 30 s pad", state: "exists: kir::mel description, DFT and mel bank as constant line conv GEMMs, graphs/speech.toml", evidence: Some(("kir/src/mel.rs", "pub fn dft_table")), slice: "a" },
+    Need { piece: "conv stem: conv1d k3 p1 then k3 s2 p1 with exact GELU, centred padding", state: "exists: graphs/speech.toml nodes over kir::conv with a centred pad", evidence: Some(("kir/src/conv.rs", "pub fn padded(")), slice: "a" },
     Need { piece: "exact GELU", state: "exists", evidence: Some(("kir/src/expr.rs", "(\"gelu\", \"0.5 * x * (1.0 + erf(x * 0.7071067811865476))\")")), slice: "-" },
     Need { piece: "learned absolute positions added to the stem output and to token embeddings", state: "exists as an op", evidence: Some(("specrt/src/denoiser.rs", "\"table_add\" =>")), slice: "b" },
     Need { piece: "LayerNorm with bias", state: "exists as an op", evidence: Some(("specrt/src/denoiser.rs", "\"layer_norm\" =>")), slice: "b" },
@@ -115,7 +115,7 @@ fn the_engine_refuses_whisper_and_says_which_ops_are_missing() {
     for m in &missing {
         println!("  {m}");
     }
-    assert_eq!(missing.len(), 9, "{missing:#?}");
+    assert_eq!(missing.len(), 8, "{missing:#?}");
     for slice in ["a", "b", "c", "e", "f"] {
         assert!(WHISPER.iter().chain(TTS).any(|n| n.slice == slice), "slice {slice} has no gap");
     }
@@ -332,4 +332,164 @@ fn the_speech_fixture_stays_under_2_mb() {
     let total = size(&dir());
     println!("tests/fixtures/speech: {total} bytes");
     assert!(total < 2 * 1024 * 1024, "{total}");
+}
+
+fn max_abs(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len());
+    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+}
+
+fn max_rel(a: &[f32], b: &[f32]) -> f32 {
+    let scale = b.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-12);
+    max_abs(a, b) / scale
+}
+
+fn frames_major(mel: &[f32], bins: usize, frames: usize) -> Vec<f32> {
+    (0..frames * bins).map(|i| mel[(i % bins) * frames + i / bins]).collect()
+}
+
+fn speech_plan() -> specrt::speech::SpeechPlan {
+    specrt::speech::graph::plan_dir(&tiny()).unwrap()
+}
+
+#[test]
+fn the_speech_plan_reads_the_front_end_from_preprocessor_config() {
+    let p = speech_plan();
+    let m = &p.mel;
+    assert_eq!((m.samples, m.n_fft, m.hop, m.frames, m.bins, m.rate), (16000, 400, 160, 100, 80, 16000.0));
+    assert_eq!(m.window, kir::mel::Window::Hann { periodic: true });
+    assert_eq!((p.frames, p.width, p.positions), (50, 64, 50));
+    let mut pre = json(&tiny().join("preprocessor_config.json"));
+    pre["n_fft"] = 512.into();
+    pre["hop_length"] = 200.into();
+    let edited = specrt::speech::graph::log_mel(&pre).unwrap();
+    assert_eq!((edited.n_fft, edited.hop, edited.frames, edited.freqs()), (512, 200, 80, 257));
+    pre["feature_size"] = 128.into();
+    let err = specrt::speech::graph::plan(&json(&tiny().join("config.json")), &pre).unwrap_err();
+    assert!(format!("{err:#}").contains("reads 80 mel bins, the preprocessor makes 128"), "{err:#}");
+    let real = specrt::speech::graph::plan(&json(&dir().join("whisper-large-v3-turbo.config.json")), &serde_json::json!({"feature_extractor_type": "WhisperFeatureExtractor", "feature_size": 128, "hop_length": 160, "n_fft": 400, "n_samples": 480000, "sampling_rate": 16000})).unwrap();
+    assert_eq!((real.mel.frames, real.frames, real.width), (3000, 1500, 1280));
+}
+
+#[test]
+fn the_mel_bank_equals_transformers_filters() {
+    let p = speech_plan();
+    let (want, shape) = reference("mel.filters");
+    let bank = p.mel.mel_bank();
+    let (f, b) = (shape[0], shape[1]);
+    let got: Vec<f32> = (0..f * b).map(|i| bank[(i % b) * f + i / b]).collect();
+    let err = max_abs(&got, &want);
+    println!("mel.filters: max abs error {err:.2e}");
+    assert!(err < 1e-7, "{err}");
+}
+
+#[test]
+fn the_host_log_mel_and_stem_match_transformers() {
+    let host = specrt::speech::HostSpeech::open(&tiny()).unwrap();
+    let (bins, frames) = (host.plan.mel.bins, host.plan.mel.frames);
+    for (audio, mel) in [("audio.full", "mel.full"), ("audio.short", "mel.short")] {
+        let (pcm, _) = reference(audio);
+        let (want, _) = reference(mel);
+        let got = specrt::speech::host::log_mel(&host.plan, &pcm).unwrap();
+        let err = max_abs(&got, &frames_major(&want, bins, frames));
+        println!("host {mel}: max abs {err:.2e}");
+        assert!(err < 1e-4, "{mel}: {err}");
+    }
+    let (mel, _) = reference("mel.full");
+    let (want, _) = reference("encoder.stem");
+    let stem = host.stem(&frames_major(&mel, bins, frames)).unwrap();
+    let err = max_rel(&stem, &want);
+    println!("host encoder.stem: max rel {err:.2e}");
+    assert!(err < 1e-4, "{err}");
+}
+
+#[test]
+fn the_speech_ops_are_typed_and_the_gelu_fuses_into_the_conv() {
+    let p = speech_plan();
+    specrt::signature::validate_speech(&p).unwrap();
+    let t = kir::Target::sm_120();
+    let fused = specrt::speech::compile::fuse(&p, &t, true).unwrap();
+    let steps = specrt::speech::compile::steps(&p, &fused).unwrap();
+    print!("{}", specrt::speech::compile::report(&p, &fused, &steps));
+    assert_eq!((fused.launches_before, steps.len()), (11, 9));
+    let gelus: Vec<bool> = steps.iter().filter_map(|s| match s { specrt::speech::compile::Step::Gemm { gelu, .. } => Some(*gelu), _ => None }).collect();
+    assert_eq!(gelus, [false, false, true, true], "dft, bank, then both stem convs with GELU in the epilogue");
+    let ks = specrt::speech::compile::kernels(&steps, &t).unwrap();
+    assert!(ks.iter().filter(|k| k.shape.pad == Some(1)).count() == 2);
+    let unfused = specrt::speech::compile::fuse(&p, &t, false).unwrap();
+    let s = specrt::speech::compile::steps(&p, &unfused).unwrap();
+    assert!(specrt::speech::compile::kernels(&s, &t).is_err(), "an unfused GELU names its missing kernel");
+    let mut bad = p.clone();
+    if let specrt::speech::SpeechOp::Conv { t_in, .. } = &mut bad.ops[9] {
+        *t_in += 1;
+    }
+    let err = specrt::signature::validate_speech(&bad).unwrap_err();
+    assert!(format!("{err:#}").contains("reads stem"), "{err:#}");
+}
+
+#[test]
+fn the_padded_line_conv_is_its_own_kernel_and_refuses_a_wide_pad() {
+    let t = kir::Target::sm_120();
+    let causal = kir::conv::ConvShape::line(64, 64, 3, 2, 1);
+    let padded = kir::conv::ConvShape::padded(64, 64, 3, 2, 1);
+    assert_eq!((causal.out_len(100), padded.out_len(100), padded.context(), causal.context()), (50, 50, 0, 1));
+    let e = kir::conv::Epilogue { residual: false, stats: None, gelu: true };
+    let a = kir::conv::ConvKernel::new(&t, causal, kir::conv::Prologue::None, e).unwrap();
+    let b = kir::conv::ConvKernel::new(&t, padded, kir::conv::Prologue::None, e).unwrap();
+    assert_ne!(a.name(), b.name());
+    let src = kir::cuda::emit_line(&[a, b]).unwrap();
+    assert!(src.contains("true, -1>(x, st") && src.contains("true, 1>(x, st"), "causal convs keep PAD -1, the stem gets PAD 1");
+    assert!(kir::conv::ConvKernel::new(&t, kir::conv::ConvShape::padded(64, 64, 3, 1, 3), kir::conv::Prologue::None, e).is_err());
+}
+
+#[test]
+fn the_log_mel_emitter_bakes_the_spec_expressions() {
+    let p = speech_plan();
+    let src = kir::cuda::emit_mel(&p.mel).unwrap();
+    for name in p.mel.names() {
+        assert!(src.contains(&format!("void __launch_bounds__(256) {name}(")), "{name}");
+    }
+    assert!(src.contains("fmaxf(m, 1e-10f)") || src.contains("fmaxf(m, 0.0000000001f)"), "{}", src.as_str());
+    assert!(src.contains("constexpr int N_FFT = 400;") && src.contains("constexpr int HOP = 160;"));
+    let mut m = p.mel.clone();
+    m.log = kir::expr::Expr::parse("log(max(q, 1e-10))").unwrap();
+    let err = kir::cuda::emit_mel(&m).unwrap_err();
+    assert!(err.contains("names q"), "{err}");
+}
+
+#[test]
+#[ignore = "needs nvrtc, no GPU: compiles the tiny and real speech modules for sm_120"]
+fn every_speech_kernel_compiles_with_nvrtc() {
+    let host = specrt::speech::HostSpeech::open(&tiny()).unwrap();
+    let (m, _, _) = specrt::speech::cuda::module(&host, &kir::Target::sm_120()).unwrap();
+    let opts = cudarc::nvrtc::CompileOptions { arch: Some("compute_120"), options: vec!["--std=c++17".into()], ..Default::default() };
+    let ptx = cudarc::nvrtc::compile_ptx_with_opts(m.source.as_str(), opts).unwrap().to_src();
+    for name in &m.kernels {
+        assert!(ptx.contains(&format!(".entry {name}(")), "{name} missing from the PTX");
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn the_gpu_log_mel_and_stem_match_transformers() {
+    let host = specrt::speech::HostSpeech::open(&tiny()).unwrap();
+    let ctx = cudarc::driver::CudaContext::new(0).unwrap();
+    let cache = std::env::var_os("SPECRT_CACHE").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("specrt-speech-jit"));
+    let jit = specrt::jit::Jit::new(ctx.clone(), cache).unwrap();
+    let gpu = specrt::speech::cuda::CudaSpeech::load(&ctx.default_stream(), &jit, &host).unwrap();
+    let (bins, frames) = (host.plan.mel.bins, host.plan.mel.frames);
+    for (audio, mel) in [("audio.full", "mel.full"), ("audio.short", "mel.short")] {
+        let (pcm, _) = reference(audio);
+        let (want, _) = reference(mel);
+        let (got, stem) = gpu.run(&pcm).unwrap();
+        let err = max_abs(&got, &frames_major(&want, bins, frames));
+        println!("gpu {mel}: max abs {err:.2e}");
+        assert!(err < 1e-4, "{mel}: {err}");
+        if audio == "audio.full" {
+            let (want, _) = reference("encoder.stem");
+            let err = max_rel(&stem, &want);
+            println!("gpu encoder.stem: max rel {err:.2e}, {} launches", gpu.launches);
+            assert!(err < 1e-4, "{err}");
+        }
+    }
 }

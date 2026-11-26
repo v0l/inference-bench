@@ -724,6 +724,51 @@ pub struct Section<'p> {
     pub ops: &'p [Op],
 }
 
+pub fn speech_signature(plan: &crate::speech::SpeechPlan, op: &crate::speech::SpeechOp) -> Signature {
+    use crate::speech::SpeechOp as S;
+    let m = &plan.mel;
+    let (fr, freqs) = (m.frames, m.freqs());
+    let local = |n: &str, rows: usize, cols: usize| Tensor::new(Place::Local(n.into()), Rows::Fixed(rows), cols, Form::F32);
+    let weight = |n: String, rows: usize, cols: usize| Tensor::weight(n, rows, cols, Form::F32);
+    let sig = |class, reads, writes| Signature { class, reads, writes };
+    let first_conv = plan.ops.iter().position(|x| matches!(x, S::Conv { .. }));
+    match op {
+        S::Frames => sig(Class::Gather, vec![Tensor::new(Place::Input("pcm"), Rows::Fixed(1), m.samples, Form::F32)], vec![local("frames", fr, m.n_fft)]),
+        S::Dft => sig(Class::Gemm, vec![local("frames", fr, m.n_fft), weight("dft table".into(), 2 * freqs, m.n_fft)], vec![local("spectrum", fr, 2 * freqs)]),
+        S::Power => sig(Class::Elementwise, vec![local("spectrum", fr, 2 * freqs)], vec![local("power", fr, freqs)]),
+        S::Bank => sig(Class::Gemm, vec![local("power", fr, freqs), weight("mel bank".into(), m.bins, freqs)], vec![local("mel", fr, m.bins)]),
+        S::Log => sig(Class::Elementwise, vec![local("mel", fr, m.bins)], vec![local("mel", fr, m.bins)]),
+        S::Max => sig(Class::GridReduce, vec![local("mel", fr, m.bins)], vec![local("mel max", 1, 1)]),
+        S::Scale => sig(Class::Elementwise, vec![local("mel", fr, m.bins), local("mel max", 1, 1)], vec![local("mel", fr, m.bins)]),
+        S::Conv { weight: w, cin, cout, k, t_in, t_out, .. } => {
+            let input = if plan.ops.iter().position(|x| x == op) == first_conv { local("mel", *t_in, *cin) } else { local("stem", *t_in, *cin) };
+            sig(Class::Gemm, vec![input, weight(format!("{}.{w}.weight", plan.root), *cout, cin * k), weight(format!("{}.{w}.bias", plan.root), 1, *cout)], vec![local("stem", *t_out, *cout)])
+        }
+        S::Gelu { rows, width } => sig(Class::Elementwise, vec![local("stem", *rows, *width)], vec![local("stem", *rows, *width)]),
+    }
+}
+
+pub fn validate_speech(plan: &crate::speech::SpeechPlan) -> Result<()> {
+    let mut defined: BTreeMap<Place, Tensor> = BTreeMap::new();
+    for (i, op) in plan.ops.iter().enumerate() {
+        let s = speech_signature(plan, op);
+        for r in s.reads.iter().filter(|r| matches!(r.place, Place::Local(_))) {
+            let w = defined.get(&r.place).with_context(|| format!("speech node {i} ({}) reads {} before any node writes it", op.label(), r.describe()))?;
+            if (w.rows, w.cols) != (r.rows, r.cols) {
+                bail!("speech node {i} ({}) reads {}, the last write was {}", op.label(), r.describe(), w.describe());
+            }
+        }
+        for w in s.writes {
+            defined.insert(w.place.clone(), w);
+        }
+    }
+    let out = defined.get(&Place::Local("stem".into())).context("the speech plan never writes the stem")?;
+    if (out.rows, out.cols) != (Rows::Fixed(plan.positions), plan.width) {
+        bail!("the stem is {}, the encoder reads {} positions of {}", out.describe(), plan.positions, plan.width);
+    }
+    Ok(())
+}
+
 pub(crate) fn layers_using(spec: &Spec, layers: &[String], sparse: bool, tail: bool) -> Vec<usize> {
     (0..spec.layers.count)
         .filter(|&i| spec.shares_kv(i) == tail && layers.iter().any(|l| l == spec.block(i).name()) && spec.moe.as_ref().is_some_and(|m| m.is_sparse(i) && spec.has_mlp(i)) == sparse)
