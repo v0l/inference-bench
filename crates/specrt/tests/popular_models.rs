@@ -1,6 +1,7 @@
 use serde_json::Value;
 use specrt::chat::ChatTemplate;
-use specrt::spec::Spec;
+use specrt::anatomy::ModelAnatomy;
+use specrt::spec::{LayerQuant, Quant, QuantKeep, QuantPlan, QuantizeChoice, Spec};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -101,11 +102,20 @@ struct Verdict {
     why: String,
     gap: Option<Gap>,
     offload: Option<Offload>,
+    quantised: Vec<Requantised>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Requantised {
+    format: &'static str,
+    gb: f64,
+    class: Class,
+    offload: Offload,
 }
 
 impl Verdict {
     fn new(class: Class, why: impl Into<String>, gap: Option<Gap>) -> Self {
-        Verdict { class, why: why.into(), gap, offload: None }
+        Verdict { class, why: why.into(), gap, offload: None, quantised: Vec::new() }
     }
 }
 
@@ -468,7 +478,8 @@ fn sized(v: Verdict, row: &Row, m: &Machine, config: Option<&str>) -> Verdict {
             let need = offload_need(gb, m, spec.as_ref());
             let class = if need.short_gb > 0.0 { Class::NoFit } else { Class::Offload };
             let why = format!("{gb} GB of weights, {}; {}", need.text(), v.why);
-            Verdict { class, why, gap: v.gap, offload: Some(need) }
+            let quantised = requantised(row, m, config);
+            Verdict { class, why, gap: v.gap, offload: Some(need), quantised }
         }
         Class::Refused | Class::UnknownQuant => {
             let need = offload_need(gb, m, None);
@@ -477,6 +488,86 @@ fn sized(v: Verdict, row: &Row, m: &Machine, config: Option<&str>) -> Verdict {
         }
         _ => v,
     }
+}
+
+thread_local! {
+    static KEEP_OVERRIDE: std::cell::RefCell<Option<QuantKeep>> = const { std::cell::RefCell::new(None) };
+}
+
+const FORMATS: [(&str, Quant); 2] = [("nvfp4", Quant::Nvfp4G16), ("fp8", Quant::Fp8Channel)];
+
+fn planned_bytes(base: &Spec, format: Option<Quant>) -> u64 {
+    let mut spec = base.clone();
+    if let Some(keep) = KEEP_OVERRIDE.with(|k| k.borrow().clone()) {
+        spec.quant_keep = keep;
+    }
+    spec.runtime.quantize = QuantizeChoice::Off;
+    spec.quant_plan = QuantPlan::default();
+    if let Some(q) = format {
+        let n = spec.layers.count;
+        spec.quant_plan.layers = (0..n).map(|i| if spec.quant_keep.keeps_layer(i, n) { LayerQuant::BF16 } else { LayerQuant::new(q, true) }).collect();
+    }
+    ModelAnatomy::new(&spec, 0, None).total_bytes
+}
+
+fn requantised(row: &Row, m: &Machine, config: Option<&str>) -> Vec<Requantised> {
+    let Some(gb) = row.size() else { return Vec::new() };
+    if row.s("quant") != "none" || row.s("format") != "BF16" {
+        return Vec::new();
+    }
+    let Some(spec) = config.and_then(|c| serde_json::from_str::<Value>(c).ok()).and_then(|j| serving(&j).ok()) else { return Vec::new() };
+    if spec.quant != Quant::Bf16 || spec.mlp.quant.is_some() {
+        return Vec::new();
+    }
+    let plain = planned_bytes(&spec, None);
+    if plain == 0 {
+        return Vec::new();
+    }
+    FORMATS
+        .iter()
+        .filter(|(_, q)| *q != Quant::Fp8Channel || spec.moe.is_none())
+        .map(|(name, q)| {
+            let scaled = gb * planned_bytes(&spec, Some(*q)) as f64 / plain as f64;
+            let offload = offload_need(scaled, m, Some(&spec));
+            let class = if scaled <= card_room(m) {
+                Class::Loads
+            } else if offload.short_gb > 0.0 {
+                Class::NoFit
+            } else {
+                Class::Offload
+            };
+            Requantised { format: name, gb: scaled, class, offload }
+        })
+        .collect()
+}
+
+fn quantised_cell(v: &Verdict) -> String {
+    v.quantised.iter().map(|r| format!("{} {:.0} GB {}", r.format, r.gb, r.class.label())).collect::<Vec<_>>().join(", ")
+}
+
+fn quantised_section(rows: &[Row], verdicts: &[Verdict], skip: &BTreeSet<String>) -> String {
+    let mut out = String::new();
+    writeln!(out, "## Would load if quantised\n").unwrap();
+    writeln!(out, "Rows over one card whose bf16 weights the quantise at load path can shrink: the same placement planner reruns with the weights scaled by the quantised size of the whole model (nvfp4_g16 and fp8_channel sizes from `anatomy::quant_bytes`, the family keep list left in bf16). Only rows that change class are listed: to LOADS (one card), or from DOES-NOT-FIT to SUPPORTED-WITH-OFFLOAD. fp8_channel does not cover mixture-of-experts. Plain size arithmetic, nothing was quantised or loaded.\n").unwrap();
+    writeln!(out, "| model | bf16 GB | now | format | est. GB | after | cards | host GB | NVMe GB |").unwrap();
+    writeln!(out, "|---|---|---|---|---|---|---|---|---|").unwrap();
+    let mut listed = BTreeSet::new();
+    for (r, v) in rows.iter().zip(verdicts) {
+        if is_excluded(r, skip) || !listed.insert(r.repo()) {
+            continue;
+        }
+        for q in &v.quantised {
+            let moves = q.class == Class::Loads || (v.class == Class::NoFit && q.class == Class::Offload);
+            if !moves {
+                continue;
+            }
+            let o = &q.offload;
+            let cards = if q.class == Class::Loads { 1 } else { o.cards };
+            writeln!(out, "| {} | {} | {} | {} | {:.1} | {} | {} | {:.0} | {:.0} |", r.repo(), r.size().unwrap_or(0.0), v.class.label(), q.format, q.gb, q.class.label(), cards, o.host_gb, o.nvme_gb).unwrap();
+        }
+    }
+    out.push('\n');
+    out
 }
 
 fn classify_pipeline(row: &Row, m: &Machine, committed_only: bool) -> Option<Verdict> {
@@ -523,7 +614,7 @@ fn classify_pipeline(row: &Row, m: &Machine, committed_only: bool) -> Option<Ver
         return Some(Verdict::new(Class::Loads, what, None));
     }
     let need = offload_need(peak, m, None);
-    Some(Verdict { class: if need.short_gb > 0.0 { Class::NoFit } else { Class::Offload }, why: format!("{}; {what}", need.text()), gap: None, offload: Some(need) })
+    Some(Verdict { class: if need.short_gb > 0.0 { Class::NoFit } else { Class::Offload }, why: format!("{}; {what}", need.text()), gap: None, offload: Some(need), quantised: Vec::new() })
 }
 
 fn classify(row: &Row, m: &Machine, committed_only: bool) -> Option<Verdict> {
@@ -853,6 +944,7 @@ fn report() -> Report {
     writeln!(doc, "Fetched {fetched_on}. Generated by `crates/specrt/scripts/model_coverage.sh`; do not edit by hand.\n").unwrap();
     doc.push_str(&main_labs(&rows, &verdicts, &filed, &fold, &mach, &man, &skip));
     doc.push_str(&lab_gaps(&rows, &verdicts, &filed, &fold, &skip, &parked));
+    doc.push_str(&quantised_section(&rows, &verdicts, &skip));
     doc.push_str(&traffic_section(&rows, &verdicts, &skip));
     doc.push_str(&parked_section(&rows, &verdicts, &weight, &fold, &parked));
     writeln!(doc, "\"Popular\" means popular on Hugging Face on {fetched_on}: the most downloaded and the trending repos for the text-generation, image-text-to-text and any-to-any pipeline tags, as the hub API ranked them that day. Downloads are the hub's last-30-day counts. Nothing here was measured by loading weights: every class comes from the model's `config.json` (and the hub's file list for GGUF repos) run through specrt's own checks, `Spec::from_hf_config_serving`, `Vision::from_hf_config` and `Gguf::spec`, with the family specs embedded in this build.\n").unwrap();
@@ -937,8 +1029,8 @@ fn report() -> Report {
     writeln!(doc, "- Rows whose weights the hub sizes above one card: the planner's offload and multi-card paths decide those.\n").unwrap();
 
     writeln!(doc, "## Models\n").unwrap();
-    writeln!(doc, "| model | role | downloads | size GB | arch | quant | class | why | family | tiny fixture | chat template | issue |").unwrap();
-    writeln!(doc, "|---|---|---|---|---|---|---|---|---|---|---|---|").unwrap();
+    writeln!(doc, "| model | role | downloads | size GB | arch | quant | class | if quantised | why | family | tiny fixture | chat template | issue |").unwrap();
+    writeln!(doc, "|---|---|---|---|---|---|---|---|---|---|---|---|---|").unwrap();
     let mut order: Vec<usize> = (0..rows.len()).collect();
     order.sort_by(|&a, &b| rows[a].s("base").cmp(rows[b].s("base")).then((rows[a].s("role") != "base").cmp(&(rows[b].s("role") != "base"))).then(rows[a].repo().cmp(rows[b].repo())));
     let mut group_weight: BTreeMap<&str, u64> = BTreeMap::new();
@@ -963,7 +1055,7 @@ fn report() -> Report {
         let config_note = r.m["config_from"].as_str().map(|c| format!(" (config from {c})")).unwrap_or_default();
         writeln!(
             doc,
-            "| {}{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {}{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             r.repo(),
             cell(&config_note),
             r.s("role"),
@@ -972,6 +1064,7 @@ fn report() -> Report {
             mt,
             cell(r.s("quant")),
             v.class.label(),
+            cell(&quantised_cell(v)),
             cell(&short(&v.why, 220)),
             fam_cell,
             fixture,
@@ -1100,6 +1193,32 @@ fn the_offload_numbers_follow_the_machine_block() {
     assert!(refused.why.contains("then offload"));
     let loads = sized(Verdict::new(Class::Loads, "ok", None), &Row { m: &probe }, &mach, None);
     assert_eq!(loads.class, Class::NoFit);
+}
+
+#[test]
+fn regenerating_the_report_is_byte_identical() {
+    assert_eq!(report().doc, report().doc);
+}
+
+#[test]
+fn the_quantised_table_lists_rows_that_move_with_their_tiers() {
+    let doc = report().doc;
+    let body = section(&doc, "Would load if quantised");
+    let lines: Vec<&str> = body.lines().filter(|l| l.starts_with("| ") && !l.starts_with("| model")).collect();
+    assert!(!lines.is_empty(), "{body}");
+    assert!(lines.iter().any(|l| l.contains("| LOADS |")), "{body}");
+    for l in &lines {
+        assert!(l.contains("| nvfp4 |") || l.contains("| fp8 |"), "{l}");
+    }
+}
+
+#[test]
+fn a_planted_keep_list_change_changes_the_table() {
+    let before = report().doc;
+    KEEP_OVERRIDE.with(|k| *k.borrow_mut() = Some(QuantKeep { first_layers: 1000, last_layers: 1000, ..QuantKeep::default() }));
+    let after = report().doc;
+    KEEP_OVERRIDE.with(|k| *k.borrow_mut() = None);
+    assert_ne!(section(&before, "Would load if quantised"), section(&after, "Would load if quantised"));
 }
 
 #[test]
