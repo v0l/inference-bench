@@ -1144,6 +1144,11 @@ pub fn described_kernels(graph: &DenoiserGraph, spec: &DenoiserSpec, plan: &Plan
         for (k, v) in &extra {
             shape = shape.num(k, *v);
         }
+        if desc == "dit_map" {
+            let k = kir::desc::Description::parse(&map_description(d, graph, spec)?).map_err(anyhow::Error::msg)?.build(target, &shape).map_err(anyhow::Error::msg)?.renamed(&name);
+            out.insert(name, k);
+            continue;
+        }
         if desc == "dit_step" || desc == "dit_multistep" {
             let text = if desc == "dit_step" { step_description(d, graph)? } else { multistep_description(d, graph)? };
             let k = kir::desc::Description::parse(&text).map_err(anyhow::Error::msg)?.build(target, &shape).map_err(anyhow::Error::msg)?.renamed(&name);

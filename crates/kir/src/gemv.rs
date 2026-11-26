@@ -114,7 +114,7 @@ impl GemvKernel {
                 "extern \"C\" __global__ void {name}(const void* w, const float* s, const float* x, const float* nw, float* out) {{\n    gate_up_act_norm<{decoder}>(w, s, x, nw, out);\n}}\n\n"
             ),
             Gemv::Bf16Rows { n, k } => bf16_rows(name, *n, *k),
-            Gemv::Rows { n, k, epilogue } => planes_rows(name, *n, *k, &rows_epilogue(epilogue)?)?,
+            Gemv::Rows { k, epilogue, .. } => planes_rows(name, *k, &rows_epilogue(epilogue)?)?,
         })
     }
 }
@@ -131,14 +131,14 @@ pub fn emit_gemvs(kernels: &[GemvKernel]) -> Result<crate::KirSource, String> {
     Ok(crate::KirSource::emitted(out))
 }
 
-fn planes_rows(name: &str, n: usize, k: usize, epilogue: &crate::expr::Expr) -> Result<String, String> {
+fn planes_rows(name: &str, k: usize, epilogue: &crate::expr::Expr) -> Result<String, String> {
     let m = BA_ROWS_MAX_TOKENS;
     let t = BA_ROWS_THREADS;
     let warps = t / 32;
     let chunks = k / 8;
     let mut names = Vec::new();
     epilogue.names(&mut names);
-    let value = epilogue.subst(&|v| Some(crate::expr::Expr::Raw(format!("e_{v}")))).map_err(|e| e.to_string())?.lower(crate::expr::Dialect::Cuda, &[])?;
+    let value = epilogue.subst(&|v| Some(crate::expr::Expr::Raw(format!("e_{v}")))).map_err(|e| e.to_string())?.lower(crate::layout::Dialect::Cuda, &[])?;
     let mut loads = String::new();
     for v in &names {
         loads.push_str(&match v.as_str() {
