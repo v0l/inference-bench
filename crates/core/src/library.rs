@@ -160,6 +160,7 @@ impl LocalModel {
             ("specrt", Format::Spec) => self.path.display().to_string(),
             ("specrt" | "llama.cpp", Format::Gguf) => self.path.display().to_string(),
             ("specrt", _) if self.repo.is_empty() && specrt::media::is_pipeline(&self.path) => self.path.display().to_string(),
+            ("specrt", Format::Safetensors) if self.repo.is_empty() && is_duplex(self) => self.path.display().to_string(),
             ("specrt" | "vllm", _) if !self.repo.is_empty() => self.repo.clone(),
             _ => self.name.clone(),
         }
@@ -1084,6 +1085,7 @@ mod tests {
         assert!(!specrt_wgpu_support(&config).supported);
         let tiny = local_model_at(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures/haru/tiny")).unwrap();
         assert!(is_duplex(&tiny) && tiny.support_for("specrt").unwrap().supported);
+        assert_eq!(tiny.model_id("specrt"), tiny.path.display().to_string(), "a local duplex folder loads by its path");
     }
 
     #[test]

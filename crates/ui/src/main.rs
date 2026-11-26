@@ -389,3 +389,5 @@ mod tests;
 mod tests_images;
 #[cfg(test)]
 mod tests_video;
+#[cfg(test)]
+mod tests_duplex;

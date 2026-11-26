@@ -85,7 +85,8 @@ pub fn load_page(app: &mut App, ui: &mut egui::Ui) -> bool {
                     if !cards.is_empty() {
                         row(ui, "gpu", |ui| {
                             let mut picked = d.device.unwrap_or(cards[0].0);
-                            ui.allocate_ui(egui::vec2(220.0, KEY_H), |ui| {
+                            let wide = ui.available_width().clamp(120.0, 220.0);
+                            ui.allocate_ui(egui::vec2(wide, KEY_H), |ui| {
                                 choice(ui, "duplex-gpu", &mut picked, cards.iter().map(|(o, name, f)| (*o, format!("{name}, {} free", human_size(*f)))));
                             });
                             d.device = Some(picked);
