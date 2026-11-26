@@ -78,12 +78,12 @@ Printed by `cargo test -p inference-bench-specrt --test speech -- --nocapture th
 | Log-mel front end (STFT, mel bank, log10, global clamp, scale, 30 s pad) | landed (#1477): `kir::mel::LogMel` (window, the DFT table and slaney bank built from `preprocessor_config.json`), `graphs/speech.toml` `[[front]]`, the DFT and the bank as constant line conv GEMMs, `kir::cuda::emit_mel` for framing, power, log, the global max and the scale; host `speech::host`, CUDA `speech::cuda` | op | a |
 | Conv stem, k3 p1 and k3 s2 p1 with GELU | landed (#1477): `graphs/speech.toml` `[[stem]]` nodes over `kir::conv` with `ConvShape::padded` (causal convs keep `PAD -1`), GELU fused into the conv epilogue by the fusion engine | graph entry | a |
 | Exact GELU | `kir::expr` macro `gelu` | exists | |
-| Learned position tables added to rows | `DitOp::TableAdd` | exists as an op | b |
-| LayerNorm with bias | `DitOp::LayerNorm` (`dit_layernorm`) | exists as an op | b |
-| Linear with bias, k without | `DitOp::Linear { bias }` | exists as an op | b |
-| Bidirectional encoder attention | `DitOp::JointAttention` (vision flash) | exists as an op | b |
-| **Cross attention** | `DitOp::CrossAttention` and the `vis_flash_kv` kernel (`kir/src/cuda/vision/kernels.rs`), used by the Wan denoiser (`graphs/denoiser-cross.toml`): queries from one stream, keys and values from a packed second buffer, per sequence spans. **Not** an op of the decoder graph (`graphs/decoder.toml`, `plan::Op`), which has no notion of a second sequence | exists in the denoiser IR only; **new decoder graph op** `cross_attention` lowering to the same kernel family with a decode (one row per sequence) variant | b |
-| Cross K and V once per window, kept per sequence | nothing in the scheduler | **new session state** declared in the spec: `[speech] state = ["kv", "cross_kv"]`, `2 x layers x 1500 x d` per sequence (tiny.en 9.2 MB, turbo 31 MB in bf16), computed by the encoder step and read by every decode step | b |
+| Learned position tables added to rows | landed (#1478): `table_add` in the `[[encoder]]` graph, `position_add` in the decoder graph from `[embedding] positions` | op | b |
+| LayerNorm with bias | landed (#1478): `layer_norm` nodes in the encoder graph, `[norm] kind = "layer_norm"` (with `eps`) for the decoder | op | b |
+| Linear with bias, k without | landed (#1478): `unbiased = ["self_attn.k_proj"]` on an encoder linear, `[attention] k_bias = false` and `[mlp] bias = true` for the decoder | op | b |
+| Bidirectional encoder attention | landed (#1478): `graphs/speech.toml` `[[encoder]]`, a denoiser IR graph (`pack` with no norms, `attention`) | op | b |
+| **Cross attention** | landed (#1478): decoder graph ops `cross_attention` (prefill, `vis_flash_kv` family) and `cross_attention_rows` (decode, one row per sequence: `vis_flash_kv_rows`, emitted beside `vis_flash_kv` in the joint vision module) | op | b |
+| Cross K and V once per window, kept per sequence | landed (#1478): the decoder graph's `[[window]]` section runs `cross_kv` once per window; the family's `[cross]` names the per sequence `[[state]] cross_kv` (`2 x cross_rows x hidden` f32 per layer, tiny 51 KB) that every decode step reads | state | b |
 | Decoder self attention with a KV cache, no rope | paged KV and `nope_all` (Nemotron-H) | exists | b |
 | Tied head | `tie_word_embeddings` | exists | |
 | Suppress, begin suppress, forced prefix | duplex `RowPlan { edits, allow }` and `duplex_allow` kernels | **new sampler plan rows** reusing the duplex logit edit kernels, lists read from `generation_config.json` | c |
@@ -94,6 +94,14 @@ Printed by `cargo test -p inference-bench-specrt --test speech -- --nocapture th
 So two new ops (the mel front end, the decoder cross attention), one new state kind (cross KV), a new graph file and family for the encoder and decoder, and host decoding rules. Everything else is an op the denoiser IR already runs on CUDA (`denoiser_cuda.rs`) and on the host (`denoiser_host.rs`).
 
 Where it lives. The encoder is a whole window at once with no state, which is the denoiser IR's shape (`DenoiserGraph`, `[[block.node]]` lists of `linear`, `layer_norm`, `attention`, `table_add`, `map`). The decoder is a token loop with a KV cache and needs the scheduler. The plan: `graphs/speech.toml` with an `encoder` graph in the denoiser node vocabulary plus the two new nodes (`log_mel`, `conv`), and a `family-whisper.toml` whose decoder uses `graphs/decoder.toml` with a `layer_norm` norm kind, biases, learned positions and the new `cross_attention` node. No Rust names the architecture (`no_arch_names` stays green); `model_type = "whisper"` appears only in the TOML.
+
+What slice b built (#1478):
+
+- Encoder: `graphs/speech.toml` `[[encoder]]` (`kind = "encoder-graph"`, `classes = ["whisper"]`), run by the host denoiser (`speech::host::HostEncoder`, `HostDenoiser::run` with named inputs and output). `encoder.out` within 9.9e-7 relative.
+- Decoder: `specs/family-whisper.toml` maps the config onto the decoder names with `[remap]`, the checkpoint onto them with `[tensors]`, and declares `[norm] kind = "layer_norm"`, `[attention] k_bias = false`, `[mlp] bias = true` with the mapped GELU, `[embedding] positions`, `[rope] nope_all` and the tied head. `[[refuse]] part = "text"` keeps Whisper out of text chat; `Spec::from_hf_config_speech` loads it. The decoder graph block `cross_attention` (when `cross`) runs self attention, then `cross_attn_layernorm`, `cross_q`, cross attention and `cross_o`, then the dense MLP.
+- Cross state: `[cross] source, rows, state`; the `[[state]] cross_kv` is per sequence; `Plan::window` holds the ops run once per audio window (`cross_kv`), so no decode step recomputes cross K and V.
+- Host runner: `speech::decoder::HostDecoder` walks the lowered prefill and decode plans with per sequence self KV and `cross_kv`. Tiny fixture: `prefix.logits` 1.4e-6 and `greedy.logits` 1.5e-6 relative in f32 (bf16 weights 5.3e-3 and 9.5e-3), the 12 greedy tokens identical, two sequences batched bit identical to each alone.
+- CUDA: `vis_flash_kv_rows` (one block per head and sequence, keys and values read straight from each sequence's `cross_kv`), `speech::cuda::CudaCrossRows`; on GPU1 within 2.1e-7 of the host for two sequences, a batched sequence bit identical to it alone. The token runtime (`Runtime::load`) refuses a spec with `[cross]` by name; running the whole Whisper decoder on CUDA through the scheduler is slice c onwards.
 
 ### 2.5 Accuracy bar
 

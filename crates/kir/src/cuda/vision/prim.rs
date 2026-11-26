@@ -205,6 +205,19 @@ pub fn block_sum() -> String {
     ))
 }
 
+pub fn block_max() -> String {
+    format!("\n{}", forceinline(
+        "float",
+        "block_max",
+        "float v, float* red",
+        "    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));\n    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;\n    __syncthreads();\n    if (lane == 0) red[warp] = v;\n    __syncthreads();\n    float t = red[0];\n    for (int i = 1; i < blockDim.x / 32; i++) t = fmaxf(t, red[i]);\n    return t;\n",
+    ))
+}
+
+pub fn row_dot(acc: &str, a: &str, b: &str, n: &str) -> String {
+    format!("        float {acc} = 0.0f;\n        for (int d = 0; d < {n}; d++) {acc} += {a}[d] * {b}[d];\n")
+}
+
 pub fn fill(template: &str, slots: &[(&str, String)]) -> String {
     let mut out = template.to_string();
     for (k, v) in slots {
