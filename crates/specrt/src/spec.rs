@@ -224,6 +224,44 @@ impl QuantizeChoice {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct QuantKeep {
+    pub first_layers: usize,
+    pub last_layers: usize,
+    pub tensors: Vec<String>,
+    pub sensitive: Vec<String>,
+}
+
+impl Default for QuantKeep {
+    fn default() -> Self {
+        QuantKeep {
+            first_layers: 2,
+            last_layers: 2,
+            tensors: ["embed_tokens", "lm_head", "norm", "mlp.gate.weight", "router", "shared_expert_gate"].map(String::from).to_vec(),
+            sensitive: Vec::new(),
+        }
+    }
+}
+
+impl QuantKeep {
+    pub fn is_default(&self) -> bool {
+        *self == QuantKeep::default()
+    }
+
+    pub fn keeps_layer(&self, layer: usize, layers: usize) -> bool {
+        layer < self.first_layers || layer + self.last_layers >= layers
+    }
+
+    pub fn keeps_tensor(&self, name: &str) -> bool {
+        self.tensors.iter().chain(&self.sensitive).any(|t| name.contains(t.as_str()))
+    }
+
+    pub fn keeps(&self, layer: Option<usize>, layers: usize, name: &str) -> bool {
+        layer.is_none_or(|l| self.keeps_layer(l, layers)) || self.keeps_tensor(name)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Requant {
@@ -1323,6 +1361,8 @@ pub struct Spec {
     pub iq_quants: bool,
     #[serde(default, skip_serializing_if = "crate::quant_map::QuantMap::is_empty")]
     pub quant_map: crate::quant_map::QuantMap,
+    #[serde(default, skip_serializing_if = "QuantKeep::is_default")]
+    pub quant_keep: QuantKeep,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refused: Vec<Refusal>,
 }
@@ -2358,6 +2398,7 @@ impl Spec {
             plain_activations: !family.runtime.split_activations,
             iq_quants: false,
             quant_map,
+            quant_keep: family.quantization.keep.clone(),
             refused,
         };
         Ok(spec)
