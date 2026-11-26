@@ -1,7 +1,7 @@
 use crate::spec::Duplex;
 use anyhow::{Result, ensure};
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Prompt {
     pub tokens: Vec<u32>,
     pub model_latents: Vec<f32>,
@@ -142,6 +142,18 @@ mod tests {
         assert!(trim_reference(&d, &vec![0.0; rate]).is_empty());
         let long = vec![0.3f32; (d.reference_seconds as usize + 5) * rate];
         assert_eq!(trim_reference(&d, &long).len(), d.reference_seconds as usize * rate);
+    }
+
+    #[test]
+    fn card_fields_render_under_the_lead_with_headers_and_option_labels() {
+        let d = duplex();
+        let given: std::collections::BTreeMap<String, String> = [("name", "Haru"), ("backchannel", "mid"), ("situation", "A first chat.")].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let text = d.card.render(&given).unwrap();
+        assert_eq!(text, "You are the person described below, talking with the other person by voice.\n[Your Name]\nHaru\n[Your Backchannels]\nmoderate\n[Situation]\nA first chat.");
+        let bad: std::collections::BTreeMap<String, String> = [("mood".to_string(), "x".to_string())].into();
+        assert!(d.card.render(&bad).unwrap_err().to_string().contains("mood"));
+        let wrong: std::collections::BTreeMap<String, String> = [("gender".to_string(), "robot".to_string())].into();
+        assert!(d.card.render(&wrong).is_err());
     }
 
     #[test]

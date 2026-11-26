@@ -351,3 +351,46 @@ Say queue, `haru say <dir> --sentences tests/fixtures/haru/say_sentences.txt --c
 - The words that come out are the queued words, but the model wraps them in its own sounds ("Oh, God.", laughter, "Thank you." repeated in long silences).
 
 So constrained text alone does not keep supervisor speech intelligible: the fallback of section 10 holds (text to speech for supervisor replies, Haru in `relay` for turn taking and backchannels) until the say path gets a stronger control, for example `eop_bias` while the queue is not empty or a card that tells the model it relays an assistant.
+
+## 14. Audio API (#1431)
+
+The text routes keep refusing Haru (`[[refuse]] part = "text"`); the engine serves it as a duplex model instead. `Spec::from_hf_config_duplex` is the support check, so the library shows Haru as runnable ("full duplex speech, served on /v1/duplex"), the load dialog for it is its own page, and `/v1/models` lists it with `type: "duplex"` (`ModelKind::Duplex`, additive, no API bump).
+
+| Piece | Where |
+|---|---|
+| One clock thread per loaded model owns the engine; sessions start, take control messages, end or park through its event queue, and each session gets its own frame channel | `duplex::service::Service`, `duplex::clock::run` (`Event::Start`, `Control`, `Park`) |
+| Card as text or as fields; the field names, headers and option labels are data in `[duplex.card]` of `family-haru.toml` | `spec::CardTemplate::render` |
+| `GET /v1/duplex`, `POST /v1/duplex/voices`, `GET /v1/realtime`; auth, request id, access log line with frame counts, and metrics as for chat | `crates/server/src/duplex.rs` |
+| Gate: `duplex.sessions_per_gpu` (also the engine's slots) plus `duplex.queue_depth`, refused with an `error` event `code: "full"` | `[duplex]` in the server config |
+| A dropped socket ends the session and frees its slot; with `duplex.keep_idle_secs` it is snapshotted instead and `start` with `resume: <token from ready>` restores it | `Engine::park`, `resume` |
+| CLI client | `inference-bench duplex --wav in.wav --out out.wav [--card --voice --realtime --events]` (`core::duplex_client`) |
+| App | the load page picks the GPU with the most free memory, shows weights, per session memory and the fit; the Chat tab becomes Voice with the websocket address and the CLI line |
+
+Protocol on `/v1/duplex`: the client sends `{"type": "start", "model", "card", "voice", "speak_first", "guidance", "temperature", "mode", "seed"}`, then binary frames of PCM16 mono at 24 kHz, 3200 samples (6400 bytes) each. The server answers `ready` (session id, rate, frame size, resume token), then one binary frame per tick, a `frame` event naming the user frame it answers, `text` for frames with words, `late`, and `end` at `max_frames`. Control messages: `say` (answered with `queued` and the token count), `mode`, `interrupt` (answered with `said` and the unsaid token count), `stop`. The Realtime subset takes `session.update` (instructions become the card, fixed once audio starts) and `input_audio_buffer.append`, and sends `response.output_audio.delta` and `response.output_audio_transcript.delta`; `response.create`, `conversation.item.*` and the buffer commit events get an error that says why, and `/v1/capabilities` lists the same.
+
+### Tiny fixture through the websocket (GPU1)
+
+`crates/server/tests/duplex_gpu.rs` serves the tiny fixture with `NativeFactory` and replays the fixture session through the socket (`replay`, a test hook behind `duplex.allow_replay`, carries the fixture's prompt and recorded noise). Each of the 7 frames matches the engine fed the same PCM16 rounded user audio with max relative error 0.0, and the greedy tokens are the fixture's `[92, 397, 207, 212, 8, 435, 502]`. Against the fixture's float session the audio differs by 6.4e-2 relative, the free running backbone drift of section 13 from feeding PCM16 rounded user audio, not the transport. CPU tests with a scripted frame engine (`crates/server/tests/duplex.rs`) cover the frames both ways, text events, say, mode, interrupt, stop, the gate, auth, park and resume, `max_frames`, uploaded voices, the Realtime subset and the capabilities.
+
+### Real Haru-4B (bf16, GPU1)
+
+Served by `inference-bench serve` (`sessions_per_gpu = 4`, `max_ctx = 8192`), the recorded 19.8 s user clip of section 13 sent in real time by `inference-bench duplex` with the chat card and the 13.8 s voice: 149 frames in, 154 out, none late, and the reply WAV answers the user ("Hi, I'm Haru. I'm doing great. How about you? Oh, that sounds wonderful. Did you hike?"). The server held 15.7 GB on GPU1 (`nvidia-smi`, 4 slots of 8192 frames).
+
+Per frame latency is the time from sending user frame i to receiving the model frame that consumed it (the `frame` event names it). It is the step time plus the wait for the next 133 ms tick, so it depends on where in the tick the client's frames land and is fixed for a session:
+
+| Run | Frames | p50 ms | p95 ms |
+|---|---|---|---|
+| native, 6 sessions one after another | 916 | 60.6 | 157.9 |
+| native, sessions 3 to 6 of those | 611 | 59.2 | 63.3 |
+| native, through the app's server (below) | 152 | 151.2 | 155.4 |
+| Realtime subset (base64 JSON both ways) | 153 | 208.6 | 212.7 |
+
+The floor is the frame step (20 ms at one session, section 13); the rest is tick phase. A client that wants the floor sends each frame just before the server's tick, which the `frame` events let it find.
+
+### Through the app (headless sway, GPU1 lock held)
+
+Models, search `haru`, the Haru-4B card shows RUNS HERE, Load opens the speech load page with GPU 1 picked (95.5 GB free, 4 sessions, 8192 frames, 18 minute longest call), load model: the rail tab becomes Voice and the status line reads "Haru-4B loaded in 4.0 s, running on GPU 1 (15.3 GB)". `nvidia-smi --query-compute-apps` showed the app holding 15,700 MiB on GPU1 and 233 MiB on GPU0 (its startup device probe, as in section 7d of `specrt-diffusion.md`). Server tab, start server, then the CLI against the app's port gave a 154 frame reply WAV. The same walk at 392x844 fits without sideways scroll. Screenshots: `docs/shots/duplex/` (`load-1280x800.png`, `voice-1280x800.png`, `load-390x844.png`, `voice-390x844.png`).
+
+The load page in these screenshots estimated 12.0 GB against the measured 15.3 GB. The codec runs in f32, which the estimate now counts (1.37 GB more for the 687M codec parameters, `duplex::service::footprint`). That still leaves the estimate about 2 GB under the measured 15.3 GB: CUDA context, captured graphs and activations are not counted yet (#1468).
+
+Auth: `/v1/duplex`, `/v1/realtime` and `POST /v1/duplex/voices` sit behind the same API key check as chat, and each has a test that fails without the key. A voice reference, uploaded or sent in `start`, is refused past `duplex.max_voice_seconds` (default 60) because every session prefills it.

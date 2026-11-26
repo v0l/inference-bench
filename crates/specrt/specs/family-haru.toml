@@ -11,11 +11,44 @@ architectures = ["HaruForConditionalGeneration"]
 [[refuse]]
 when = "hidden_size > 0"
 part = "text"
-message = "Haru-4B is a full duplex speech model: it runs as duplex sessions (frames of audio in and out), not as text chat; the audio API that serves it is #1431"
+message = "Haru-4B is a full duplex speech model: it runs as duplex sessions over the /v1/duplex websocket (frames of audio in and out), not as text chat"
 
 [duplex]
 card_template = "<|im_start|>system\n{card}<|im_end|>\n"
 state = ["kv", "recurrent", "codec", "sampler", "frame"]
+
+[duplex.card]
+lead = "You are the person described below, talking with the other person by voice."
+
+[[duplex.card.fields]]
+name = "persona"
+header = "[Your Persona]"
+
+[[duplex.card.fields]]
+name = "name"
+header = "[Your Name]"
+
+[[duplex.card.fields]]
+name = "gender"
+header = "[Your Gender]"
+values = { female = "female", male = "male" }
+
+[[duplex.card.fields]]
+name = "backchannel"
+header = "[Your Backchannels]"
+values = { low = "sparse", mid = "moderate", high = "frequent" }
+
+[[duplex.card.fields]]
+name = "other_name"
+header = "[The Other Person's Name]"
+
+[[duplex.card.fields]]
+name = "relationship"
+header = "[Relationship]"
+
+[[duplex.card.fields]]
+name = "situation"
+header = "[Situation]"
 
 [duplex.params]
 frame_samples = { config = "frame_samples" }

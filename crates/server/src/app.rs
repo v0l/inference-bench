@@ -41,6 +41,7 @@ pub struct AppState {
     pub started: Instant,
     pub images: Arc<crate::images::Gate>,
     pub videos: crate::videos::Jobs,
+    pub duplex: crate::duplex::State,
 }
 
 impl AppState {
@@ -71,6 +72,7 @@ impl AppState {
             started: Instant::now(),
             images: Arc::new(crate::images::Gate::new(config.images.jobs_per_gpu, config.images.queue_depth)),
             videos: crate::videos::Jobs::default(),
+            duplex: crate::duplex::State::default(),
             config,
         }))
     }
@@ -86,6 +88,7 @@ impl AppState {
             engine: self.manager.engine_metrics(),
             image_queue: self.images.waiting(),
             image_running: self.images.running(),
+            duplex_sessions: self.duplex.open(),
         }
     }
 
@@ -116,7 +119,7 @@ impl AppState {
         Ok(Admission { state: self.clone(), running: false })
     }
 
-    fn write_access(&self, line: Value) {
+    pub(crate) fn write_access(&self, line: Value) {
         if let Some(f) = &self.access_log {
             let mut f = f.lock().unwrap();
             let _ = writeln!(f, "{line}");
@@ -178,6 +181,9 @@ fn api_routes() -> Vec<(ApiRoute, MethodRouter<Arc<AppState>>)> {
         (r("GET", "/slots", "llama.cpp style slot list"), get(crate::dialects::slots)),
         (r("POST", "/v1/embeddings", "Embeddings (not supported yet)"), post(embeddings)),
         (r("POST", "/v1/bench", "Run a timed generation"), post(bench)),
+        (r("GET", "/v1/duplex", "Full duplex speech websocket: a JSON start, then PCM16 mono frames both ways with text, said, late and error events"), get(crate::duplex::native)),
+        (r("POST", "/v1/duplex/voices", "Upload a voice reference (base64 PCM16 or WAV) for duplex sessions, returns its id"), post(crate::duplex::upload_voice)),
+        (r("GET", "/v1/realtime", "OpenAI Realtime subset over websocket for duplex models: session.update, input_audio_buffer.append, output audio and transcript deltas; turn events do not apply"), get(crate::duplex::realtime)),
         (r("POST", "/load", "Load the default model, or ?model=ID"), post(load_default)),
         (r("POST", "/unload", "Unload to free the GPU: 409 while busy, ?wait waits for requests to finish"), post(unload_default)),
         (r("GET", "/admin/models", "Model status and VRAM"), get(admin_models)),
@@ -233,7 +239,10 @@ fn new_request_id() -> String {
     format!("req-{}", &uuid::Uuid::new_v4().simple().to_string()[..16])
 }
 
-async fn request_scope(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next) -> Response {
+#[derive(Clone, Debug)]
+pub struct RequestId(pub String);
+
+async fn request_scope(State(state): State<Arc<AppState>>, mut req: Request<Body>, next: Next) -> Response {
     let incoming = req
         .headers()
         .get(REQUEST_ID_HEADER)
@@ -241,6 +250,7 @@ async fn request_scope(State(state): State<Arc<AppState>>, req: Request<Body>, n
         .filter(|v| !v.is_empty() && v.len() <= 64 && v.chars().all(|c| c.is_ascii_graphic()))
         .map(String::from);
     let request_id = incoming.unwrap_or_else(new_request_id);
+    req.extensions_mut().insert(RequestId(request_id.clone()));
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
     let span = tracing::info_span!(
@@ -296,6 +306,9 @@ fn endpoint_label(path: &str) -> &'static str {
         "/slots" => "slots",
         "/v1/embeddings" => "embeddings",
         "/v1/bench" => "bench",
+        "/v1/duplex" => "duplex",
+        "/v1/duplex/voices" => "duplex_voices",
+        "/v1/realtime" => "realtime",
         p if p.starts_with("/admin/") => "admin",
         _ => "other",
     }

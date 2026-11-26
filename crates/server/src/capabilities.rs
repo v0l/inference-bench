@@ -5,6 +5,8 @@ pub const COMPLETIONS: u8 = 2;
 pub const BENCH: u8 = 4;
 pub const IMAGES: u8 = 8;
 pub const VIDEOS: u8 = 16;
+pub const DUPLEX: u8 = 32;
+pub const VOICES: u8 = 64;
 const MEDIA: u8 = IMAGES | VIDEOS;
 const GENERATE: u8 = CHAT | COMPLETIONS;
 
@@ -40,16 +42,28 @@ const fn f(name: &'static str, on: u8, usage: Usage, ty: &'static str, note: &'s
 }
 
 pub const FIELDS: &[Field] = &[
-    f("model", CHAT | COMPLETIONS | BENCH | MEDIA, Usage::Read, "string", "a configured model id or served name; defaults to the only model"),
+    f("model", CHAT | COMPLETIONS | BENCH | MEDIA | DUPLEX, Usage::Read, "string", "a configured model id or served name; defaults to the only model"),
+    f("type", DUPLEX, Usage::Validated, "string", "start; then control messages say, mode, interrupt, stop. The server sends ready, text, said, late, queued, end and error events and binary PCM16 frames"),
+    f("card", DUPLEX, Usage::Read, "string or object", "the character card as text, or its fields from the model family (persona, name, gender, backchannel, other_name, relationship, situation for Haru)"),
+    f("voice", DUPLEX, Usage::Read, "string or object", "voice reference: base64 PCM16 mono at the model rate, {id} from /v1/duplex/voices, or {wav} base64"),
+    f("speak_first", DUPLEX, Usage::Read, "boolean", "the model opens the conversation"),
+    f("mode", DUPLEX, Usage::Validated, "string", "free (default) or relay: with an empty say queue relay only allows silence"),
+    f("resume", DUPLEX, Usage::Read, "string", "the resume token of a dropped session, when duplex.keep_idle_secs is set"),
+    f("replay", DUPLEX, Usage::Read, "object", "test hook behind duplex.allow_replay: a raw prompt and recorded noise"),
+    f("audio", VOICES, Usage::Read, "string", "base64 PCM16 mono or WAV"),
+    f("format", VOICES, Usage::Validated, "string", "pcm16 (default) or wav"),
+    f("sample_rate", VOICES, Usage::Read, "integer", "of pcm16 audio, default 24000"),
     f("size", MEDIA, Usage::Validated, "string", "WIDTHxHEIGHT, a multiple of the model's pixel step; refused with the nearest valid size; auto or absent takes the family default"),
     f("output_format", IMAGES, Usage::Validated, "string", "png only"),
     f("negative_prompt", MEDIA, Usage::Read, "string", "extension; used when guidance turns on classifier free guidance"),
     f("steps", MEDIA, Usage::Read, "integer", "extension, 1 to 200; defaults to the pipeline's steps"),
-    f("guidance", MEDIA, Usage::Read, "number", "extension, 0 to 30; defaults to the pipeline's guidance"),
+    f("guidance", MEDIA | DUPLEX, Usage::Read, "number", "extension, 0 to 30; defaults to the pipeline's guidance; on duplex the MeanFlow guidance"),
     f("sampler", MEDIA, Usage::Validated, "string", "extension; one of the family's samplers"),
     f("seconds", VIDEOS, Usage::Read, "string or number", "clip length; becomes the nearest frame count the video VAE takes at fps"),
     f("frames", VIDEOS, Usage::Read, "integer", "extension; 1 plus a multiple of the VAE's temporal step, wins over seconds"),
     f("fps", VIDEOS, Usage::Read, "integer", "extension, 1 to 120; the MP4 frame rate, defaults to the family's fps"),
+    f("sequential_cfg", VIDEOS, Usage::Read, "boolean", "extension; run the guidance passes one after the other to save memory"),
+    f("tiled_vae", VIDEOS, Usage::Read, "boolean", "extension; decode the video in tiles"),
     f("partial_images", IMAGES, Usage::Read, "integer", "with stream, a low resolution preview every k steps"),
     f("quality", IMAGES, Usage::Ignored, "string", "accepted and ignored"),
     f("style", IMAGES, Usage::Ignored, "string", "accepted and ignored"),
@@ -61,11 +75,11 @@ pub const FIELDS: &[Field] = &[
     f("repeat", BENCH, Usage::Read, "integer", "1 to 100"),
     f("max_tokens", CHAT | COMPLETIONS | BENCH, Usage::Read, "integer", "at least 1"),
     f("max_completion_tokens", GENERATE, Usage::Read, "integer", "wins over max_tokens"),
-    f("temperature", GENERATE, Usage::Read, "number", "defaults to 0"),
+    f("temperature", GENERATE | DUPLEX, Usage::Read, "number", "defaults to 0; on duplex 0 to 2, defaults to the family's text temperature"),
     f("top_p", GENERATE, Usage::Read, "number", ""),
     f("top_k", GENERATE, Usage::Read, "integer", "extension"),
     f("min_p", GENERATE, Usage::Read, "number", "extension"),
-    f("seed", GENERATE | MEDIA, Usage::Read, "integer", "on images the same seed gives the same image, image i of n uses seed + i; on videos the same seed gives the same clip"),
+    f("seed", GENERATE | MEDIA | DUPLEX, Usage::Read, "integer", "on images the same seed gives the same image, image i of n uses seed + i; on videos the same seed gives the same clip"),
     f("stop", GENERATE, Usage::Read, "string or array of strings", ""),
     f("stream", GENERATE | IMAGES, Usage::Read, "boolean", "on images: server sent events image_generation.progress, image_generation.partial_image, image_generation.completed"),
     f("stream_options", GENERATE, Usage::Read, "object", "include_usage"),
@@ -105,6 +119,8 @@ fn endpoint_of(method: &str, path: &str) -> u8 {
         ("POST", "/v1/bench") => BENCH,
         ("POST", "/v1/images/generations") => IMAGES,
         ("POST", "/v1/videos") => VIDEOS,
+        ("GET", "/v1/duplex") => DUPLEX,
+        ("POST", "/v1/duplex/voices") => VOICES,
         _ => 0,
     }
 }
@@ -129,6 +145,16 @@ pub fn routes_with_fields(routes: &[crate::landing::ApiRoute]) -> Value {
                 if on != 0 {
                     v["fields"] = fields_json(on);
                 }
+                if r.path == "/v1/realtime" {
+                    v["protocol"] = json!("websocket");
+                    v["client_events"] = json!(["session.update", "input_audio_buffer.append"]);
+                    v["server_events"] = json!(["session.created", "session.updated", "response.created", "response.output_audio.delta", "response.output_audio_transcript.delta", "error"]);
+                    v["unsupported"] = json!(crate::duplex::REALTIME_UNSUPPORTED);
+                }
+                if r.path == "/v1/duplex" {
+                    v["protocol"] = json!("websocket");
+                    v["frames"] = json!("binary PCM16 little endian mono at the model rate, one model frame per message both ways (3200 samples, 6400 bytes for Haru)");
+                }
                 v
             })
             .collect(),
@@ -141,7 +167,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     fn read_by_handlers() -> BTreeSet<String> {
-        let source = concat!(include_str!("app.rs"), include_str!("images.rs"), include_str!("videos.rs"));
+        let source = concat!(include_str!("app.rs"), include_str!("images.rs"), include_str!("videos.rs"), include_str!("duplex.rs"));
         let mut names = BTreeSet::new();
         let marker = "body[\"";
         for (at, _) in source.match_indices(marker) {
@@ -170,7 +196,7 @@ mod tests {
     fn field_names_are_unique_and_every_generate_endpoint_has_fields() {
         let names: BTreeSet<&str> = FIELDS.iter().map(|f| f.name).collect();
         assert_eq!(names.len(), FIELDS.len());
-        for on in [CHAT, COMPLETIONS, BENCH, IMAGES, VIDEOS] {
+        for on in [CHAT, COMPLETIONS, BENCH, IMAGES, VIDEOS, DUPLEX, VOICES] {
             assert!(!fields_json(on).as_array().unwrap().is_empty());
         }
     }

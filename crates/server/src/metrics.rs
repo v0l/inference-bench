@@ -46,6 +46,11 @@ struct Inner {
     image_step_secs: f64,
     image_seconds: f64,
     last_image_steps_per_sec: f64,
+    duplex_sessions: BTreeMap<String, u64>,
+    duplex_refused: BTreeMap<String, u64>,
+    duplex_frames_in: u64,
+    duplex_frames_out: u64,
+    duplex_late: u64,
 }
 
 #[derive(Default)]
@@ -62,6 +67,7 @@ pub struct Gauges {
     pub engine: String,
     pub image_queue: usize,
     pub image_running: usize,
+    pub duplex_sessions: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -130,6 +136,21 @@ impl Metrics {
         if step_secs > 0.0 {
             m.last_image_steps_per_sec = steps as f64 / step_secs;
         }
+    }
+
+    pub fn duplex_session(&self, model: &str) {
+        *self.inner.lock().unwrap().duplex_sessions.entry(model.to_string()).or_default() += 1;
+    }
+
+    pub fn duplex_refused(&self, reason: &str) {
+        *self.inner.lock().unwrap().duplex_refused.entry(reason.to_string()).or_default() += 1;
+    }
+
+    pub fn duplex_frames(&self, frames_in: u64, frames_out: u64, late: u64) {
+        let mut m = self.inner.lock().unwrap();
+        m.duplex_frames_in += frames_in;
+        m.duplex_frames_out += frames_out;
+        m.duplex_late += late;
     }
 
     pub fn model_loaded(&self, model: &str) {
@@ -228,6 +249,18 @@ impl Metrics {
         let _ = writeln!(o, "# HELP inference_image_steps_per_second Denoiser steps per second of the last job.\n# TYPE inference_image_steps_per_second gauge\ninference_image_steps_per_second {}", m.last_image_steps_per_sec);
         let _ = writeln!(o, "# HELP inference_image_queue_depth Image jobs waiting for a GPU.\n# TYPE inference_image_queue_depth gauge\ninference_image_queue_depth {}", g.image_queue);
         let _ = writeln!(o, "# TYPE inference_image_jobs_running gauge\ninference_image_jobs_running {}", g.image_running);
+        let _ = writeln!(o, "# HELP inference_duplex_sessions_total Duplex sessions started, by model.\n# TYPE inference_duplex_sessions_total counter");
+        for (model, n) in &m.duplex_sessions {
+            let _ = writeln!(o, "inference_duplex_sessions_total{{model=\"{model}\"}} {n}");
+        }
+        let _ = writeln!(o, "# TYPE inference_duplex_refused_total counter");
+        for (reason, n) in &m.duplex_refused {
+            let _ = writeln!(o, "inference_duplex_refused_total{{reason=\"{reason}\"}} {n}");
+        }
+        let _ = writeln!(o, "# TYPE inference_duplex_frames_in_total counter\ninference_duplex_frames_in_total {}", m.duplex_frames_in);
+        let _ = writeln!(o, "# TYPE inference_duplex_frames_out_total counter\ninference_duplex_frames_out_total {}", m.duplex_frames_out);
+        let _ = writeln!(o, "# HELP inference_duplex_late_frames_total Model frames that missed their slot.\n# TYPE inference_duplex_late_frames_total counter\ninference_duplex_late_frames_total {}", m.duplex_late);
+        let _ = writeln!(o, "# TYPE inference_duplex_sessions_open gauge\ninference_duplex_sessions_open {}", g.duplex_sessions);
         self.render_vllm(&mut o, &m, g);
         o
     }

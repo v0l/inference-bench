@@ -141,6 +141,11 @@ impl Model for specrt::Engine {
 }
 
 pub type Factory = Arc<dyn Fn(&str, Option<usize>) -> anyhow::Result<Box<dyn Model>> + Send + Sync>;
+pub type DuplexLoader = Arc<dyn Fn(&std::path::Path, specrt::duplex::service::ServiceOptions, usize) -> anyhow::Result<Arc<specrt::duplex::service::Service>> + Send + Sync>;
+
+pub fn specrt_duplex_loader() -> DuplexLoader {
+    Arc::new(|dir, opts, device| specrt::duplex::service::Service::load(dir, opts, device))
+}
 
 pub fn specrt_factory() -> Factory {
     specrt_factory_with(None)
@@ -182,6 +187,9 @@ pub struct Native {
     progress: Option<specrt::progress::Sink>,
     media: Option<specrt::media::MediaInfo>,
     device: Option<usize>,
+    duplex: Option<Arc<specrt::duplex::service::Service>>,
+    duplex_options: specrt::duplex::service::ServiceOptions,
+    duplex_loader: DuplexLoader,
 }
 
 impl Native {
@@ -194,7 +202,12 @@ impl Native {
     }
 
     pub fn with_factory(max_ctx: Option<usize>, factory: Factory) -> Self {
-        Self { max_ctx, factory, worker: None, vision: false, thinking: Default::default(), tools: Default::default(), progress: None, media: None, device: None }
+        Self { max_ctx, factory, worker: None, vision: false, thinking: Default::default(), tools: Default::default(), progress: None, media: None, device: None, duplex: None, duplex_options: Default::default(), duplex_loader: specrt_duplex_loader() }
+    }
+
+    pub fn with_duplex_loader(mut self, loader: DuplexLoader) -> Self {
+        self.duplex_loader = loader;
+        self
     }
 
     pub fn on_device(mut self, device: Option<usize>) -> Self {
@@ -231,6 +244,10 @@ impl Native {
             None => BackendError::failed("the native engine has stopped"),
         }
     }
+}
+
+fn not_duplex_text() -> BackendError {
+    BackendError::new(ErrorKind::InvalidRequest, "this is a duplex speech model: open a session on the /v1/duplex websocket, not a text route")
 }
 
 fn panic_text(payload: &(dyn Any + Send)) -> String {
@@ -335,7 +352,18 @@ impl Target for Native {
     }
 
     fn capabilities(&self) -> Capabilities {
+        if self.duplex.is_some() {
+            return Capabilities { streaming: true, kind: specrt::media::ModelKind::Duplex, ..Capabilities::default() };
+        }
         Capabilities { streaming: true, logits: true, memory: true, vision: self.vision, thinking: self.thinking, tools: self.tools, kind: self.media.as_ref().map(|m| m.kind).unwrap_or_default(), ..Capabilities::default() }
+    }
+
+    fn duplex(&self) -> Option<Arc<specrt::duplex::service::Service>> {
+        self.duplex.clone()
+    }
+
+    fn set_duplex(&mut self, options: specrt::duplex::service::ServiceOptions) {
+        self.duplex_options = options;
     }
 
     fn media_info(&self) -> Option<specrt::media::MediaInfo> {
@@ -372,6 +400,22 @@ impl Target for Native {
 
     fn load(&mut self, model: &str) -> Result<(), BackendError> {
         self.worker = None;
+        self.duplex = None;
+        if let Some(dir) = specrt::duplex::service::resolve_dir(model) {
+            let opts = self.duplex_options.clone();
+            let device = self.device.unwrap_or(0);
+            let progress = self.progress.clone();
+            let loader = self.duplex_loader.clone();
+            let loaded = catch_unwind(AssertUnwindSafe(|| specrt::progress::with_sink(progress, || loader(&dir, opts, device))));
+            return match loaded {
+                Ok(Ok(s)) => {
+                    self.duplex = Some(s);
+                    Ok(())
+                }
+                Ok(Err(e)) => Err(engine_error(&e)),
+                Err(p) => Err(BackendError::failed(format!("the duplex engine panicked while loading: {}", panic_text(p.as_ref())))),
+            };
+        }
         let (jobs, inbox) = channel();
         let (loaded_tx, loaded_rx) = channel();
         let panic = Arc::new(Mutex::new(None));
@@ -400,6 +444,9 @@ impl Target for Native {
     }
 
     fn generate(&mut self, request: &Request, on_text: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
+        if self.duplex.is_some() {
+            return Err(not_duplex_text());
+        }
         let (prompt, max_tokens) = (request.prompt.clone(), request.max_tokens);
         let g = self.call(move |m| {
             m.generate(&prompt, max_tokens, Sampling::GREEDY).map(generation).map_err(|e| engine_error(&e))
@@ -409,6 +456,9 @@ impl Target for Native {
     }
 
     fn chat(&mut self, request: &ChatRequest, on_text: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
+        if self.duplex.is_some() {
+            return Err(not_duplex_text());
+        }
         let messages = request.messages_json();
         let media = request.media.clone();
         let budget = request.media_budget();

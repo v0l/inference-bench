@@ -12,24 +12,70 @@ pub struct Out {
     pub index: u64,
     pub late: bool,
     pub done: bool,
+    pub error: Option<String>,
+    pub input: Option<u64>,
+}
+
+pub struct StartRequest {
+    pub options: super::StartOptions,
+    pub card_fields: std::collections::BTreeMap<String, String>,
+    pub prompt: Option<super::prompt::Prompt>,
+    pub resume: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Control {
+    Say(String),
+    Mode(super::Mode),
+    Interrupt,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Reply {
+    Done,
+    Queued(usize),
+    Said { said: String, unsaid: usize },
 }
 
 pub trait FrameEngine {
     fn step(&mut self, frames: &[(SessionId, Vec<f32>)]) -> anyhow::Result<Vec<(SessionId, Out)>>;
+
+    fn start(&mut self, _request: StartRequest) -> anyhow::Result<(SessionId, Out)> {
+        anyhow::bail!("this frame engine does not start sessions")
+    }
+
+    fn control(&mut self, _id: SessionId, _control: Control) -> anyhow::Result<Reply> {
+        anyhow::bail!("this frame engine takes no control messages")
+    }
+
+    fn end(&mut self, _id: SessionId) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn park(&mut self, id: SessionId) -> anyhow::Result<String> {
+        self.end(id)?;
+        anyhow::bail!("this frame engine keeps no snapshots")
+    }
 }
+
+type Started = anyhow::Result<(SessionId, Out)>;
 
 pub enum Event {
     Open(SessionId),
     Audio(SessionId, Vec<f32>),
     Close(SessionId),
+    Start(StartRequest, Sender<Out>, Sender<Started>),
+    Control(SessionId, Control, Sender<anyhow::Result<Reply>>),
+    Park(SessionId, Sender<anyhow::Result<String>>),
 }
 
 #[derive(Default)]
 struct Uplink {
     pending: Vec<f32>,
-    frames: VecDeque<Vec<f32>>,
+    frames: VecDeque<(u64, Vec<f32>)>,
     due: u64,
     skip: u64,
+    received: u64,
 }
 
 pub struct Clock {
@@ -54,6 +100,7 @@ pub struct Stats {
 pub fn run(engine: &mut dyn FrameEngine, clock: &Clock, events: Receiver<Event>, out: Sender<(SessionId, Out)>, until: Option<Instant>) -> anyhow::Result<Stats> {
     let start = Instant::now();
     let mut ups: BTreeMap<SessionId, Uplink> = BTreeMap::new();
+    let mut sinks: BTreeMap<SessionId, Sender<Out>> = BTreeMap::new();
     let mut stats = Stats { steps: 0, late_frames: 0, dropped_input: 0, step_secs: Vec::new() };
     let mut tick = 1u64;
     loop {
@@ -72,7 +119,8 @@ pub fn run(engine: &mut dyn FrameEngine, clock: &Clock, events: Receiver<Event>,
                         u.pending.extend(pcm);
                         while u.pending.len() >= clock.samples {
                             let f: Vec<f32> = u.pending.drain(..clock.samples).collect();
-                            u.frames.push_back(f);
+                            u.frames.push_back((u.received, f));
+                            u.received += 1;
                             if u.frames.len() > clock.max_queue {
                                 u.frames.pop_front();
                                 stats.dropped_input += 1;
@@ -82,6 +130,36 @@ pub fn run(engine: &mut dyn FrameEngine, clock: &Clock, events: Receiver<Event>,
                 }
                 Ok(Event::Close(id)) => {
                     ups.remove(&id);
+                    sinks.remove(&id);
+                    if let Err(e) = engine.end(id) {
+                        tracing::debug!(session = id, error = %e, "ending a duplex session");
+                    }
+                }
+                Ok(Event::Park(id, reply)) => {
+                    ups.remove(&id);
+                    sinks.remove(&id);
+                    let parked = engine.park(id);
+                    if parked.is_err() {
+                        let _ = engine.end(id);
+                    }
+                    let _ = reply.send(parked);
+                }
+                Ok(Event::Start(request, frames, reply)) => match engine.start(request) {
+                    Ok((id, first)) => {
+                        ups.insert(id, Uplink { due: tick + 1, ..Uplink::default() });
+                        sinks.insert(id, frames);
+                        if reply.send(Ok((id, first))).is_err() {
+                            ups.remove(&id);
+                            sinks.remove(&id);
+                            let _ = engine.end(id);
+                        }
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                },
+                Ok(Event::Control(id, control, reply)) => {
+                    let _ = reply.send(engine.control(id, control));
                 }
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => return Ok(stats),
@@ -90,6 +168,7 @@ pub fn run(engine: &mut dyn FrameEngine, clock: &Clock, events: Receiver<Event>,
         let now_tick = tick;
         tick += 1;
         let mut batch = Vec::new();
+        let mut inputs: BTreeMap<SessionId, u64> = BTreeMap::new();
         for (&id, u) in ups.iter_mut() {
             if u.due > now_tick {
                 continue;
@@ -99,27 +178,53 @@ pub fn run(engine: &mut dyn FrameEngine, clock: &Clock, events: Receiver<Event>,
                 u.skip -= 1;
                 stats.dropped_input += 1;
             }
-            let frame = u.frames.pop_front().unwrap_or_else(|| vec![0.0; clock.samples]);
+            let frame = match u.frames.pop_front() {
+                Some((i, f)) => {
+                    inputs.insert(id, i);
+                    f
+                }
+                None => vec![0.0; clock.samples],
+            };
             batch.push((id, frame));
         }
         if batch.is_empty() {
             continue;
         }
         let began = Instant::now();
-        let produced = engine.step(&batch)?;
+        let produced = match engine.step(&batch) {
+            Ok(p) => p,
+            Err(e) => {
+                let why = format!("{e:#}");
+                tracing::error!(error = %why, sessions = batch.len(), "a duplex step failed, its sessions end");
+                batch.iter().map(|(id, _)| (*id, Out { audio: Vec::new(), token: None, text: String::new(), index: 0, late: false, done: true, error: Some(format!("the frame step failed: {why}")), input: None })).collect()
+            }
+        };
         stats.step_secs.push(began.elapsed().as_secs_f64());
         stats.steps += 1;
         let behind = Instant::now().saturating_duration_since(clock.tick(start, tick)).as_nanos() / clock.frame.as_nanos().max(1);
         for (id, mut o) in produced {
+            o.input = inputs.get(&id).copied();
             if behind > 0 {
                 o.late = true;
                 stats.late_frames += 1;
             }
             if o.done {
                 ups.remove(&id);
+                let _ = engine.end(id);
             }
-            if out.send((id, o)).is_err() {
-                return Ok(stats);
+            match sinks.get(&id) {
+                Some(sink) => {
+                    if sink.send(o).is_err() {
+                        ups.remove(&id);
+                        sinks.remove(&id);
+                        let _ = engine.end(id);
+                    }
+                }
+                None => {
+                    if out.send((id, o)).is_err() {
+                        return Ok(stats);
+                    }
+                }
             }
         }
         if behind > 0 {
@@ -153,7 +258,7 @@ mod tests {
             std::thread::sleep(d);
             Ok(frames.iter().map(|(id, f)| {
                 self.seen.push((*id, f[0]));
-                (*id, Out { audio: f.clone(), token: None, text: String::new(), index: self.steps, late: false, done: false })
+                (*id, Out { audio: f.clone(), token: None, text: String::new(), index: self.steps, late: false, done: false, error: None, input: None })
             }).collect())
         }
     }
@@ -221,11 +326,62 @@ mod tests {
     }
 
     #[test]
+    fn a_started_session_gets_its_frames_on_its_own_sink_and_control_replies_come_back() {
+        struct Starts {
+            next: SessionId,
+            ended: Vec<SessionId>,
+            said: Vec<String>,
+        }
+        impl FrameEngine for Starts {
+            fn step(&mut self, frames: &[(SessionId, Vec<f32>)]) -> anyhow::Result<Vec<(SessionId, Out)>> {
+                Ok(frames.iter().map(|(id, f)| (*id, Out { audio: f.clone(), token: Some(1), text: "a".into(), index: 1, late: false, done: false, error: None, input: None })).collect())
+            }
+            fn start(&mut self, _: StartRequest) -> anyhow::Result<(SessionId, Out)> {
+                self.next += 1;
+                Ok((self.next, Out { audio: vec![9.0; 4], token: Some(0), text: String::new(), index: 0, late: false, done: false, error: None, input: None }))
+            }
+            fn control(&mut self, _: SessionId, c: Control) -> anyhow::Result<Reply> {
+                if let Control::Say(t) = c {
+                    self.said.push(t);
+                }
+                Ok(Reply::Queued(2))
+            }
+            fn end(&mut self, id: SessionId) -> anyhow::Result<()> {
+                self.ended.push(id);
+                Ok(())
+            }
+        }
+        let (tx, rx) = channel();
+        let (otx, orx) = channel();
+        let (ftx, frx) = channel();
+        let (stx, srx) = channel();
+        let (ctx, crx) = channel();
+        tx.send(Event::Start(StartRequest { options: Default::default(), card_fields: Default::default(), prompt: None, resume: None }, ftx, stx)).unwrap();
+        let driver = std::thread::spawn(move || {
+            let (id, first) = srx.recv().unwrap().unwrap();
+            assert_eq!(first.audio, vec![9.0; 4]);
+            tx.send(Event::Audio(id, vec![3.0; 4])).unwrap();
+            tx.send(Event::Control(id, Control::Say("hi".into()), ctx)).unwrap();
+            assert_eq!(crx.recv().unwrap().unwrap(), Reply::Queued(2));
+            let got = frx.recv_timeout(Duration::from_millis(200)).unwrap();
+            assert_eq!(got.audio, vec![3.0; 4]);
+            tx.send(Event::Close(id)).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            id
+        });
+        let mut e = Starts { next: 0, ended: Vec::new(), said: Vec::new() };
+        run(&mut e, &clock(), rx, otx, Some(Instant::now() + Duration::from_millis(150))).unwrap();
+        let id = driver.join().unwrap();
+        assert_eq!(orx.try_iter().count(), 0, "a started session's frames go to its own sink");
+        assert_eq!((e.said, e.ended), (vec!["hi".to_string()], vec![id]));
+    }
+
+    #[test]
     fn a_done_frame_closes_the_session() {
         struct Ends;
         impl FrameEngine for Ends {
             fn step(&mut self, frames: &[(SessionId, Vec<f32>)]) -> anyhow::Result<Vec<(SessionId, Out)>> {
-                Ok(frames.iter().map(|(id, _)| (*id, Out { audio: Vec::new(), token: None, text: String::new(), index: 0, late: false, done: true })).collect())
+                Ok(frames.iter().map(|(id, _)| (*id, Out { audio: Vec::new(), token: None, text: String::new(), index: 0, late: false, done: true, error: None, input: None })).collect())
             }
         }
         let (tx, rx) = channel();

@@ -6,6 +6,7 @@ mod breakdown;
 mod table;
 mod block;
 mod detail;
+mod duplex;
 mod engine;
 mod fmt;
 mod hardware;
@@ -79,6 +80,7 @@ pub struct App {
     pub specs: specs::SpecsUpdater,
     pub load: Option<load::LoadDialog>,
     pub image_load: Option<imagegen::ImageLoad>,
+    pub duplex_load: Option<duplex::DuplexLoad>,
     pub generate: imagegen::GenerateState,
     pub generate_video: videogen::VideoState,
     pub picker_query: String,
@@ -122,6 +124,7 @@ impl App {
             },
             load: None,
             image_load: None,
+            duplex_load: None,
             generate: imagegen::GenerateState::default(),
             generate_video: videogen::VideoState::default(),
             picker_query: String::new(),
@@ -179,9 +182,14 @@ impl App {
     }
 
     pub fn open_load_dialog(&mut self, model: &LocalModel) {
+        self.duplex_load = None;
         if let Some(info) = imagegen::is_image(model) {
             self.load = None;
             self.image_load = Some(imagegen::ImageLoad::open(self, model, info));
+        } else if duplex::is_duplex(model) {
+            self.load = None;
+            self.image_load = None;
+            self.duplex_load = Some(duplex::DuplexLoad::open(self, model));
         } else {
             self.image_load = None;
             self.load = Some(load::LoadDialog::open(self, model));
@@ -190,7 +198,11 @@ impl App {
     }
 
     pub fn generating(&self) -> bool {
-        self.loaded().is_some_and(|l| l.kind != specrt::media::ModelKind::Text)
+        self.loaded().is_some_and(|l| matches!(l.kind, specrt::media::ModelKind::Image | specrt::media::ModelKind::Video))
+    }
+
+    pub fn speaking(&self) -> bool {
+        self.loaded().is_some_and(|l| l.kind == specrt::media::ModelKind::Duplex)
     }
 
     pub fn load_model(&mut self, model: &LocalModel) {
@@ -377,3 +389,5 @@ mod tests;
 mod tests_images;
 #[cfg(test)]
 mod tests_video;
+#[cfg(test)]
+mod tests_duplex;

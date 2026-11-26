@@ -32,6 +32,10 @@ impl ModelSource for Handle {
     fn resume(&self, id: &str) -> Result<(), BackendError> {
         Handle::resume_model(self, Some(id))
     }
+
+    fn duplex(&self, id: &str) -> Option<std::sync::Arc<inference_bench_core::specrt_duplex::service::Service>> {
+        Handle::duplex_of(self, Some(id))
+    }
 }
 
 pub struct EngineBackend {

@@ -30,11 +30,12 @@ pub struct EngineOptions {
     pub max_frames: Option<usize>,
     pub window_frames: Option<usize>,
     pub kv_bytes: Option<usize>,
+    pub device: usize,
 }
 
 impl Default for EngineOptions {
     fn default() -> EngineOptions {
-        EngineOptions { slots: 1, max_ctx: 4096, graphs: true, temperature: None, top_k: None, max_frames: None, window_frames: None, kv_bytes: None }
+        EngineOptions { slots: 1, max_ctx: 4096, graphs: true, temperature: None, top_k: None, max_frames: None, window_frames: None, kv_bytes: None, device: 0 }
     }
 }
 
@@ -46,6 +47,7 @@ pub struct StartOptions {
     pub seed: u64,
     pub guidance: Option<f32>,
     pub greedy: bool,
+    pub temperature: Option<f32>,
     pub mode: Mode,
     pub noise: Option<RecordedNoise>,
 }
@@ -79,6 +81,8 @@ pub struct Live {
     pub seed: u64,
     pub greedy: bool,
     pub guidance: f32,
+    #[serde(default)]
+    pub temperature: Option<f32>,
     pub noise: Option<RecordedNoise>,
 }
 
@@ -175,7 +179,7 @@ impl Engine {
             None => opts.slots * pages,
         };
         let layout = Layout { max_ctx: opts.max_ctx, slots: opts.slots, kv_blocks, prefill_chunk: duplex.prefill_chunk.min(opts.max_ctx), kv_planes: 2, kv_headroom: 0, state_on_demand: false };
-        let rt = Runtime::load_layout(&spec, layout)?;
+        let rt = Runtime::load_stage(&spec, layout, crate::runtime::StageRange { device: opts.device, ..crate::runtime::StageRange::whole(&spec) })?;
         let st = rt.stepper()?;
         let stream = rt.stream().clone();
         let cache = spec.runtime.cache_dir.clone().unwrap_or_else(crate::jit::default_cache_dir);
@@ -306,6 +310,7 @@ impl Engine {
             text: TextState { mode: o.mode, ..TextState::new(if o.speak_first { self.duplex.sampling.forced_text } else { 0 }) },
             seed: o.seed,
             greedy: o.greedy,
+            temperature: o.temperature,
             guidance,
             noise: o.noise,
         };
@@ -469,7 +474,7 @@ impl Engine {
             return Sampling::GREEDY;
         }
         let s = &self.duplex.sampling;
-        Sampling { temperature: s.temperature, seed: (live.seed as u32) ^ (live.slot as u32).wrapping_mul(0x9e37_79b9), top_k: s.top_k, top_p: s.top_p, min_p: 0.0, logprobs: None }
+        Sampling { temperature: live.temperature.unwrap_or(s.temperature), seed: (live.seed as u32) ^ (live.slot as u32).wrapping_mul(0x9e37_79b9), top_k: s.top_k, top_p: s.top_p, min_p: 0.0, logprobs: None }
     }
 
     fn noise_inputs(&mut self, ids: &[SessionId], n: usize, with_user: bool) -> Result<()> {

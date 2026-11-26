@@ -4,6 +4,7 @@ pub mod capabilities;
 pub mod config;
 pub mod connect;
 pub mod dialects;
+pub mod duplex;
 pub mod engine_backend;
 pub mod error;
 pub mod gpu;

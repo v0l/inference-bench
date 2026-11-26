@@ -18,6 +18,7 @@ pub enum ModelKind {
     Text,
     Image,
     Video,
+    Duplex,
 }
 
 impl ModelKind {
@@ -26,6 +27,7 @@ impl ModelKind {
             ModelKind::Text => "text",
             ModelKind::Image => "image",
             ModelKind::Video => "video",
+            ModelKind::Duplex => "duplex",
         }
     }
 
@@ -34,6 +36,7 @@ impl ModelKind {
             "text" => Some(ModelKind::Text),
             "image" => Some(ModelKind::Image),
             "video" => Some(ModelKind::Video),
+            "duplex" => Some(ModelKind::Duplex),
             _ => None,
         }
     }

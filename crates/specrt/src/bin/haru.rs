@@ -4,50 +4,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 fn read_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
-    let b = std::fs::read(path).with_context(|| path.display().to_string())?;
-    ensure!(b.len() > 12 && &b[..4] == b"RIFF" && &b[8..12] == b"WAVE", "{} is not a WAV file", path.display());
-    let mut at = 12;
-    let (mut format, mut channels, mut rate, mut bits) = (0u16, 0u16, 0u32, 0u16);
-    while at + 8 <= b.len() {
-        let id = &b[at..at + 4];
-        let len = u32::from_le_bytes(b[at + 4..at + 8].try_into()?) as usize;
-        let body = &b[at + 8..(at + 8 + len).min(b.len())];
-        if id == b"fmt " {
-            format = u16::from_le_bytes(body[0..2].try_into()?);
-            channels = u16::from_le_bytes(body[2..4].try_into()?);
-            rate = u32::from_le_bytes(body[4..8].try_into()?);
-            bits = u16::from_le_bytes(body[14..16].try_into()?);
-        } else if id == b"data" {
-            let samples: Vec<f32> = match (format, bits) {
-                (1, 16) => body.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect(),
-                (3, 32) | (0xfffe, 32) => body.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
-                _ => bail!("{}: WAV format {format} with {bits} bits is not read; use PCM16 or float32", path.display()),
-            };
-            let ch = channels.max(1) as usize;
-            return Ok((samples.chunks(ch).map(|f| f.iter().sum::<f32>() / ch as f32).collect(), rate));
-        }
-        at += 8 + len + (len & 1);
-    }
-    bail!("{} has no data chunk", path.display())
+    specrt::duplex::wav::read_wav(&std::fs::read(path).with_context(|| path.display().to_string())?).with_context(|| path.display().to_string())
 }
 
 fn write_wav(path: &Path, samples: &[f32], rate: u32) -> Result<()> {
-    let data: Vec<u8> = samples.iter().flat_map(|v| ((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes()).collect();
-    let mut out = Vec::with_capacity(44 + data.len());
-    out.extend(b"RIFF");
-    out.extend(((36 + data.len()) as u32).to_le_bytes());
-    out.extend(b"WAVEfmt ");
-    out.extend(16u32.to_le_bytes());
-    out.extend(1u16.to_le_bytes());
-    out.extend(1u16.to_le_bytes());
-    out.extend(rate.to_le_bytes());
-    out.extend((rate * 2).to_le_bytes());
-    out.extend(2u16.to_le_bytes());
-    out.extend(16u16.to_le_bytes());
-    out.extend(b"data");
-    out.extend((data.len() as u32).to_le_bytes());
-    out.extend(data);
-    Ok(std::fs::write(path, out)?)
+    Ok(std::fs::write(path, specrt::duplex::wav::wav_bytes(samples, rate))?)
 }
 
 struct Args {

@@ -410,9 +410,9 @@ fn engine_spec() -> Spec {
 }
 
 #[test]
-fn the_haru_family_reads_the_lm_section_and_refuses_until_the_chain_runs() {
+fn the_haru_family_reads_the_lm_section_and_refuses_text_chat() {
     let err = format!("{:#}", Spec::from_hf_config(&real_config().to_string()).unwrap_err());
-    assert!(err.contains("duplex") && err.contains("#1431"), "{err}");
+    assert!(err.contains("duplex") && err.contains("/v1/duplex"), "{err}");
     let duplex = Spec::from_hf_config_duplex(&real_config().to_string()).unwrap();
     let d = duplex.duplex.as_ref().unwrap();
     assert_eq!((d.frame_samples, d.latent_dim, d.pad, d.eop, d.max_frames, d.window_frames), (3200, 64, 248076, 248071, 27000, 0));

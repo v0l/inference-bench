@@ -160,6 +160,7 @@ impl LocalModel {
             ("specrt", Format::Spec) => self.path.display().to_string(),
             ("specrt" | "llama.cpp", Format::Gguf) => self.path.display().to_string(),
             ("specrt", _) if self.repo.is_empty() && specrt::media::is_pipeline(&self.path) => self.path.display().to_string(),
+            ("specrt", Format::Safetensors) if self.repo.is_empty() && is_duplex(self) => self.path.display().to_string(),
             ("specrt" | "vllm", _) if !self.repo.is_empty() => self.repo.clone(),
             _ => self.name.clone(),
         }
@@ -236,14 +237,22 @@ fn is_text_generation(arch: &str) -> bool {
 }
 
 pub fn specrt_support(config: &Value) -> Support {
-    match specrt::spec::Spec::from_hf_config(&config.to_string()) {
+    let text = config.to_string();
+    match specrt::spec::Spec::from_hf_config(&text) {
         Ok(spec) => Support {
             backend: "specrt",
             supported: true,
             reason: format!("{} on CUDA", describe_spec(&spec)),
         },
-        Err(e) => Support::no("specrt", e.root_cause().to_string()),
+        Err(e) => match specrt::spec::Spec::from_hf_config_duplex(&text) {
+            Ok(spec) => Support::yes("specrt", &format!("full duplex speech, {} family, served on /v1/duplex on CUDA", spec.name)),
+            Err(_) => Support::no("specrt", e.root_cause().to_string()),
+        },
     }
+}
+
+pub fn is_duplex(model: &LocalModel) -> bool {
+    model.format == Format::Safetensors && std::fs::read_to_string(model.path.join("config.json")).is_ok_and(|t| specrt::duplex::service::is_duplex_config(&t))
 }
 
 pub fn specrt_wgpu_support(config: &Value) -> Support {
@@ -1030,7 +1039,7 @@ mod tests {
         let fixtures = engine_config_fixtures();
         assert!(fixtures.len() >= 12, "{} fixtures", fixtures.len());
         for (name, config) in &fixtures {
-            let engine = specrt::spec::Spec::from_hf_config(&config.to_string());
+            let engine = specrt::spec::Spec::from_hf_config(&config.to_string()).or_else(|_| specrt::spec::Spec::from_hf_config_duplex(&config.to_string()));
             let s = specrt_support(config);
             assert_eq!(s.supported, engine.is_ok(), "{name}: library says {:?}, engine says {:?}", s, engine.err());
             assert_eq!(s.supported, !engine_refuses.contains(&name.as_str()), "{name}: {}", s.reason);
@@ -1066,14 +1075,17 @@ mod tests {
     }
 
     #[test]
-    fn haru_is_refused_by_the_engine_with_the_missing_pieces_named() {
+    fn haru_is_supported_as_a_duplex_model_and_refused_on_wgpu() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures/haru/haru-4b.config.json");
         let config: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         let s = specrt_support(&config);
-        assert!(!s.supported, "{}", s.reason);
-        assert!(s.reason.contains("duplex") && s.reason.contains("#1431"), "{}", s.reason);
-        assert_eq!(s.reason, specrt::spec::Spec::from_hf_config(&config.to_string()).unwrap_err().root_cause().to_string());
+        assert!(s.supported && s.reason.contains("duplex"), "{}", s.reason);
+        assert!(specrt::spec::Spec::from_hf_config(&config.to_string()).is_err(), "text chat stays refused");
+        assert!(specrt::spec::Spec::from_hf_config_duplex(&config.to_string()).is_ok());
         assert!(!specrt_wgpu_support(&config).supported);
+        let tiny = local_model_at(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures/haru/tiny")).unwrap();
+        assert!(is_duplex(&tiny) && tiny.support_for("specrt").unwrap().supported);
+        assert_eq!(tiny.model_id("specrt"), tiny.path.display().to_string(), "a local duplex folder loads by its path");
     }
 
     #[test]
