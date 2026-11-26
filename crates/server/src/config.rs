@@ -174,6 +174,41 @@ pub struct ServerConfig {
     pub anthropic_thinking_on_request: bool,
     pub media: inference_bench_core::media::MediaLimits,
     pub images: ImagesSection,
+    #[serde(default)]
+    pub duplex: DuplexSection,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DuplexSection {
+    pub sessions_per_gpu: usize,
+    pub queue_depth: usize,
+    pub keep_idle_secs: u64,
+    pub max_ctx: usize,
+    pub max_input_frames: usize,
+    pub snapshot_dir: Option<PathBuf>,
+    pub max_voices: usize,
+    pub allow_replay: bool,
+}
+
+impl Default for DuplexSection {
+    fn default() -> Self {
+        Self { sessions_per_gpu: 4, queue_depth: 0, keep_idle_secs: 0, max_ctx: 8192, max_input_frames: 8, snapshot_dir: None, max_voices: 64, allow_replay: false }
+    }
+}
+
+impl DuplexSection {
+    pub fn service_options(&self) -> inference_bench_core::specrt_duplex::service::ServiceOptions {
+        let dir = self.snapshot_dir.clone().unwrap_or_else(|| std::env::temp_dir().join(format!("inference-bench-duplex-{}", std::process::id())));
+        inference_bench_core::specrt_duplex::service::ServiceOptions {
+            slots: self.sessions_per_gpu.max(1),
+            max_ctx: self.max_ctx,
+            max_queue: self.max_input_frames.max(1),
+            store_dir: (self.keep_idle_secs > 0).then_some(dir),
+            keep_idle_secs: self.keep_idle_secs,
+            graphs: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,6 +296,7 @@ impl Default for ServerConfig {
             anthropic_thinking_on_request: true,
             media: Default::default(),
             images: Default::default(),
+            duplex: Default::default(),
         }
     }
 }
@@ -358,6 +394,8 @@ impl ServerConfig {
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.media.max_image_bytes > 0 && self.media.max_video_bytes > 0, "media byte limits must be positive");
         anyhow::ensure!(self.max_concurrent >= 1, "max_concurrent must be at least 1");
+        anyhow::ensure!(self.duplex.sessions_per_gpu >= 1, "duplex.sessions_per_gpu must be at least 1");
+        anyhow::ensure!(self.duplex.max_ctx >= 64, "duplex.max_ctx must be at least 64");
         for (i, m) in self.models.iter().enumerate() {
             for name in &m.served_names {
                 let taken = self.models.iter().enumerate().any(|(j, o)| o.id == *name || (j != i && o.served_names.contains(name)));

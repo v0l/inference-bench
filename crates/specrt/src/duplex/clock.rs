@@ -12,11 +12,13 @@ pub struct Out {
     pub index: u64,
     pub late: bool,
     pub done: bool,
+    pub error: Option<String>,
 }
 
 pub struct StartRequest {
     pub options: super::StartOptions,
     pub card_fields: std::collections::BTreeMap<String, String>,
+    pub prompt: Option<super::prompt::Prompt>,
     pub resume: Option<String>,
 }
 
@@ -179,7 +181,14 @@ pub fn run(engine: &mut dyn FrameEngine, clock: &Clock, events: Receiver<Event>,
             continue;
         }
         let began = Instant::now();
-        let produced = engine.step(&batch)?;
+        let produced = match engine.step(&batch) {
+            Ok(p) => p,
+            Err(e) => {
+                let why = format!("{e:#}");
+                tracing::error!(error = %why, sessions = batch.len(), "a duplex step failed, its sessions end");
+                batch.iter().map(|(id, _)| (*id, Out { audio: Vec::new(), token: None, text: String::new(), index: 0, late: false, done: true, error: Some(format!("the frame step failed: {why}")) })).collect()
+            }
+        };
         stats.step_secs.push(began.elapsed().as_secs_f64());
         stats.steps += 1;
         let behind = Instant::now().saturating_duration_since(clock.tick(start, tick)).as_nanos() / clock.frame.as_nanos().max(1);
@@ -190,6 +199,7 @@ pub fn run(engine: &mut dyn FrameEngine, clock: &Clock, events: Receiver<Event>,
             }
             if o.done {
                 ups.remove(&id);
+                let _ = engine.end(id);
             }
             match sinks.get(&id) {
                 Some(sink) => {
@@ -237,7 +247,7 @@ mod tests {
             std::thread::sleep(d);
             Ok(frames.iter().map(|(id, f)| {
                 self.seen.push((*id, f[0]));
-                (*id, Out { audio: f.clone(), token: None, text: String::new(), index: self.steps, late: false, done: false })
+                (*id, Out { audio: f.clone(), token: None, text: String::new(), index: self.steps, late: false, done: false, error: None })
             }).collect())
         }
     }
@@ -313,11 +323,11 @@ mod tests {
         }
         impl FrameEngine for Starts {
             fn step(&mut self, frames: &[(SessionId, Vec<f32>)]) -> anyhow::Result<Vec<(SessionId, Out)>> {
-                Ok(frames.iter().map(|(id, f)| (*id, Out { audio: f.clone(), token: Some(1), text: "a".into(), index: 1, late: false, done: false })).collect())
+                Ok(frames.iter().map(|(id, f)| (*id, Out { audio: f.clone(), token: Some(1), text: "a".into(), index: 1, late: false, done: false, error: None })).collect())
             }
             fn start(&mut self, _: StartRequest) -> anyhow::Result<(SessionId, Out)> {
                 self.next += 1;
-                Ok((self.next, Out { audio: vec![9.0; 4], token: Some(0), text: String::new(), index: 0, late: false, done: false }))
+                Ok((self.next, Out { audio: vec![9.0; 4], token: Some(0), text: String::new(), index: 0, late: false, done: false, error: None }))
             }
             fn control(&mut self, _: SessionId, c: Control) -> anyhow::Result<Reply> {
                 if let Control::Say(t) = c {
@@ -335,7 +345,7 @@ mod tests {
         let (ftx, frx) = channel();
         let (stx, srx) = channel();
         let (ctx, crx) = channel();
-        tx.send(Event::Start(StartRequest { options: Default::default(), card_fields: Default::default(), resume: None }, ftx, stx)).unwrap();
+        tx.send(Event::Start(StartRequest { options: Default::default(), card_fields: Default::default(), prompt: None, resume: None }, ftx, stx)).unwrap();
         let driver = std::thread::spawn(move || {
             let (id, first) = srx.recv().unwrap().unwrap();
             assert_eq!(first.audio, vec![9.0; 4]);
@@ -360,7 +370,7 @@ mod tests {
         struct Ends;
         impl FrameEngine for Ends {
             fn step(&mut self, frames: &[(SessionId, Vec<f32>)]) -> anyhow::Result<Vec<(SessionId, Out)>> {
-                Ok(frames.iter().map(|(id, _)| (*id, Out { audio: Vec::new(), token: None, text: String::new(), index: 0, late: false, done: true })).collect())
+                Ok(frames.iter().map(|(id, _)| (*id, Out { audio: Vec::new(), token: None, text: String::new(), index: 0, late: false, done: true, error: None })).collect())
             }
         }
         let (tx, rx) = channel();

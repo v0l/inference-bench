@@ -22,7 +22,7 @@ cuda-probe = ["dep:cudarc"]
 inference-bench-core.workspace = true
 anyhow.workspace = true
 base64 = "0.22"
-axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "tokio", "query", "matched-path"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "tokio", "query", "matched-path", "ws"] }
 axum-server = { version = "0.7", optional = true, features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
 chrono.workspace = true
@@ -41,4 +41,5 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
+tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 tracing-subscriber.workspace = true

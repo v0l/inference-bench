@@ -69,20 +69,26 @@ pub struct Service {
 pub struct Session {
     pub id: SessionId,
     pub first: Out,
-    pub frames: Receiver<Out>,
+    frames: Mutex<Option<Receiver<Out>>>,
     events: Sender<Event>,
     closed: bool,
 }
 
 impl Session {
+    pub fn frames(&mut self) -> Option<Receiver<Out>> {
+        self.frames.lock().unwrap().take()
+    }
+
+    pub fn handle(&self) -> SessionHandle {
+        SessionHandle { id: self.id, events: self.events.clone() }
+    }
+
     pub fn audio(&self, pcm: Vec<f32>) -> Result<()> {
-        self.events.send(Event::Audio(self.id, pcm)).map_err(|_| anyhow!("the duplex engine has stopped"))
+        self.handle().audio(pcm)
     }
 
     pub fn control(&self, control: Control) -> Result<Reply> {
-        let (tx, rx) = channel();
-        self.events.send(Event::Control(self.id, control, tx)).map_err(|_| anyhow!("the duplex engine has stopped"))?;
-        rx.recv().map_err(|_| anyhow!("the duplex engine has stopped"))?
+        self.handle().control(control)
     }
 
     pub fn park(mut self) -> Result<String> {
@@ -103,6 +109,24 @@ impl Drop for Session {
         if !self.closed {
             let _ = self.events.send(Event::Close(self.id));
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct SessionHandle {
+    pub id: SessionId,
+    events: Sender<Event>,
+}
+
+impl SessionHandle {
+    pub fn audio(&self, pcm: Vec<f32>) -> Result<()> {
+        self.events.send(Event::Audio(self.id, pcm)).map_err(|_| anyhow!("the duplex engine has stopped"))
+    }
+
+    pub fn control(&self, control: Control) -> Result<Reply> {
+        let (tx, rx) = channel();
+        self.events.send(Event::Control(self.id, control, tx)).map_err(|_| anyhow!("the duplex engine has stopped"))?;
+        rx.recv().map_err(|_| anyhow!("the duplex engine has stopped"))?
     }
 }
 
@@ -169,7 +193,7 @@ impl Service {
         let (tx, rx) = channel();
         events.send(Event::Start(request, frames_tx, tx)).map_err(|_| anyhow!("the duplex engine has stopped"))?;
         let (id, first) = rx.recv().map_err(|_| anyhow!("the duplex engine has stopped"))??;
-        Ok(Session { id, first, frames, events, closed: false })
+        Ok(Session { id, first, frames: Mutex::new(Some(frames)), events, closed: false })
     }
 }
 
@@ -184,7 +208,7 @@ impl Drop for Service {
 }
 
 pub fn out_of(f: Frame) -> Out {
-    Out { audio: f.audio, token: Some(f.token), text: f.text, index: f.index, late: false, done: f.done }
+    Out { audio: f.audio, token: Some(f.token), text: f.text, index: f.index, late: false, done: f.done, error: None }
 }
 
 pub struct Hosted {
@@ -226,9 +250,13 @@ impl FrameEngine for Hosted {
             let id = self.engine.resume(store, &key, now())?;
             let _ = store.delete(&key);
             let index = self.engine.live(id)?.frame;
-            return Ok((id, Out { audio: Vec::new(), token: None, text: String::new(), index, late: false, done: false }));
+            return Ok((id, Out { audio: Vec::new(), token: None, text: String::new(), index, late: false, done: false, error: None }));
         }
         let mut options = request.options;
+        if let Some(p) = request.prompt {
+            let (id, first) = self.engine.start_prompt(&p, options)?;
+            return Ok((id, out_of(first)));
+        }
         if !request.card_fields.is_empty() {
             anyhow::ensure!(options.card.is_empty(), "give the card as text or as fields, not both");
             options.card = self.engine.duplex.card.render(&request.card_fields)?;

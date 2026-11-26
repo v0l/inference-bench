@@ -1,7 +1,7 @@
 use crate::spec::Duplex;
 use anyhow::{Result, ensure};
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Prompt {
     pub tokens: Vec<u32>,
     pub model_latents: Vec<f32>,
