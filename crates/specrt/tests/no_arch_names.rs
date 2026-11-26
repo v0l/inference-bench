@@ -50,7 +50,7 @@ const ALLOWED: &[Entry] = &[
     Entry { path: "specrt/src/solve.rs", lines: 1, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
     Entry { path: "specrt/src/structure.rs", lines: 7, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
     Entry { path: "specrt/src/tp.rs", lines: 15, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
-    Entry { path: "specrt/src/weights.rs", lines: 11, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
+    Entry { path: "specrt/src/weights.rs", lines: 12, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
     Entry { path: "ui/src/block.rs", lines: 11, kind: Kind::Permanent, note: "rope scaling label and tests over real model fixtures" },
     Entry { path: "ui/src/detail.rs", lines: 12, kind: Kind::Permanent, note: "UI tests over real model fixtures" },
     Entry { path: "ui/src/engine.rs", lines: 6, kind: Kind::Permanent, note: "UI tests over real model fixtures" },
