@@ -140,6 +140,23 @@ impl TextState {
         }
     }
 
+    pub fn replace_last(&mut self, token: u32, s: &DuplexSampling) {
+        if let (Some(d), Some(prev)) = (&s.dry, self.last)
+            && !d.exempt_ids.contains(&prev)
+            && self.history.last() == Some(&prev)
+        {
+            self.history.pop();
+        }
+        self.last = Some(token);
+        if let Some(d) = &s.dry
+            && !d.exempt_ids.contains(&token)
+        {
+            self.history.push(token);
+            let extra = self.history.len().saturating_sub(d.history_size());
+            self.history.drain(..extra);
+        }
+    }
+
     pub fn text(&mut self, token: u32, silent: &[u32], decode: &dyn Fn(&[u32]) -> String) -> String {
         if silent.contains(&token) {
             if self.in_gap {
@@ -239,6 +256,29 @@ mod tests {
         assert!(t.plan(&s, 508, 509).allow.is_empty(), "free mode samples freely once the queue is empty");
         t.mode = Mode::Relay;
         assert_eq!(t.plan(&s, 508, 509).allow, vec![508, 509]);
+    }
+
+    #[test]
+    fn a_fed_back_token_replaces_the_sampled_one_in_the_dry_history() {
+        let s = sampling();
+        let mut fed = TextState::new(0);
+        let mut own = TextState::new(0);
+        for tok in [1, 2, 3, 1] {
+            fed.accept(tok, &s);
+            own.accept(tok, &s);
+        }
+        fed.accept(7, &s);
+        fed.replace_last(2, &s);
+        own.accept(2, &s);
+        assert_eq!(fed.history, own.history);
+        assert_eq!(fed.last, Some(2));
+        assert_eq!(fed.plan(&s, 508, 509), own.plan(&s, 508, 509));
+        fed.replace_last(508, &s);
+        assert_eq!(fed.history, vec![1, 2, 3, 1], "an exempt fed token leaves no history entry");
+        let mut silent = TextState::new(0);
+        silent.accept(509, &s);
+        silent.replace_last(4, &s);
+        assert_eq!(silent.history, vec![4], "an exempt sampled token had no entry to drop");
     }
 
     #[test]

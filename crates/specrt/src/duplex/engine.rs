@@ -31,11 +31,12 @@ pub struct EngineOptions {
     pub window_frames: Option<usize>,
     pub kv_bytes: Option<usize>,
     pub device: usize,
+    pub trace_layers: Vec<usize>,
 }
 
 impl Default for EngineOptions {
     fn default() -> EngineOptions {
-        EngineOptions { slots: 1, max_ctx: 4096, graphs: true, temperature: None, top_k: None, max_frames: None, window_frames: None, kv_bytes: None, device: 0 }
+        EngineOptions { slots: 1, max_ctx: 4096, graphs: true, temperature: None, top_k: None, max_frames: None, window_frames: None, kv_bytes: None, device: 0, trace_layers: Vec::new() }
     }
 }
 
@@ -130,6 +131,7 @@ pub struct Engine {
     silence: Vec<f32>,
     opts: EngineOptions,
     edit_stride: usize,
+    trace: Option<CudaSlice<f32>>,
     pub capture_secs: Vec<(usize, f64)>,
 }
 
@@ -194,6 +196,7 @@ impl Engine {
         let dec_floats = codec.sessions(&codec.decoder, 1)?.floats_per_session();
         let pools = Pools { enc: stream.alloc_zeros(opts.slots * enc_floats)?, dec: stream.alloc_zeros(opts.slots * dec_floats)?, enc_floats, dec_floats };
         let edit_stride = 8 + duplex.sampling.forced_bans.len() + duplex.sampling.dry.as_ref().map_or(0, |d| d.history_size());
+        let trace = if opts.trace_layers.is_empty() { None } else { Some(stream.alloc_zeros::<f32>((opts.trace_layers.len() + 1) * row_capacity(opts.slots) * spec.dims.hidden)?) };
         let mut e = Engine {
             free: (0..opts.slots).rev().collect(),
             spec,
@@ -212,6 +215,7 @@ impl Engine {
             silence: Vec::new(),
             opts,
             edit_stride,
+            trace,
             capture_secs: Vec::new(),
         };
         e.silence = e.encode_whole(&vec![0.0; e.duplex.silence_frames * e.duplex.frame_samples])?.split_off((e.duplex.silence_frames - 1) * e.duplex.latent_dim);
@@ -220,6 +224,10 @@ impl Engine {
 
     pub fn silence_latent(&self) -> &[f32] {
         &self.silence
+    }
+
+    pub fn encode_clip(&self, audio: &[f32]) -> Result<Vec<f32>> {
+        self.encode_whole(audio)
     }
 
     pub fn host_codec(&self) -> &HostCodec {
@@ -240,13 +248,14 @@ impl Engine {
 
     fn encode_whole(&self, audio: &[f32]) -> Result<Vec<f32>> {
         let f = self.duplex.frame_samples;
-        let padded_len = audio.len().div_ceil(f) * f;
-        let mut a = audio.to_vec();
-        a.resize(padded_len, 0.0);
+        let whole = audio.len() / f * f;
         let mut s = self.codec.sessions(&self.codec.encoder, 1)?;
         let mut out = Vec::new();
-        for chunk in a.chunks(self.duplex.silence_frames * f) {
+        for chunk in audio[..whole].chunks(self.duplex.silence_frames * f) {
             out.extend(self.codec.run(&self.codec.encoder, chunk, &mut s)?);
+        }
+        if whole < audio.len() {
+            out.extend(self.codec.run(&self.codec.encoder, &audio[whole..], &mut s)?);
         }
         Ok(out)
     }
@@ -715,7 +724,10 @@ impl Engine {
             let dst = self.rt.input_buffer(name)?.device_ptr(&stream).0;
             unsafe { cudarc::driver::result::memcpy_dtod_async(dst, src, len * 4, stream.cu_stream()) }?;
         }
-        self.rt.forward_rows(&self.st, n)?;
+        match &self.trace {
+            Some(t) => self.rt.forward_rows_traced(&self.st, n, &self.opts.trace_layers, t)?,
+            None => self.rt.forward_rows(&self.st, n)?,
+        }
         {
             let join = self.rt.module_kernel("duplex_join")?.clone();
             let (hi, lo) = self.rt.normed_planes();
@@ -765,10 +777,29 @@ impl Engine {
 
     pub fn set_feedback(&mut self, id: SessionId, token: u32, latent: &[f32]) -> Result<()> {
         ensure!(latent.len() == self.duplex.latent_dim, "a latent of {} values", latent.len());
+        let s = self.duplex.sampling.clone();
         let l = self.live_mut(id)?;
         l.token = token;
         l.latent = latent.to_vec();
+        l.text.replace_last(token, &s);
         Ok(())
+    }
+
+    pub fn layer_trace(&self, rows: usize) -> Result<Vec<f32>> {
+        let t = self.trace.as_ref().context("the engine was loaded without trace_layers")?;
+        let per = rows * self.spec.dims.hidden;
+        Ok(self.stream.clone_dtoh(&t.slice(..(self.opts.trace_layers.len() + 1) * per))?)
+    }
+
+    pub fn row_logits(&self, row: usize) -> Result<Vec<f32>> {
+        let v = self.spec.dims.vocab;
+        Ok(self.stream.clone_dtoh(&self.st.row_logits().slice(row * v..(row + 1) * v))?)
+    }
+
+    pub fn user_latent_rows(&mut self, rows: usize) -> Result<Vec<f32>> {
+        let n = rows * self.duplex.latent_dim;
+        let stream = self.stream.clone();
+        Ok(stream.clone_dtoh(&self.rt.input_buffer("user_latent")?.slice(..n))?)
     }
 
     pub fn say(&mut self, id: SessionId, text: &str) -> Result<usize> {
