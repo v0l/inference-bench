@@ -217,6 +217,20 @@ fn play_steps_frames_at_the_clips_fps_and_stops_on_the_last() {
 }
 
 #[test]
+fn the_finished_clip_is_scrolled_into_view_on_a_phone_without_touching_anything() {
+    let mut h = video_app("vid-phone-scroll", egui::vec2(390.0, 844.0), 2);
+    load_through_the_page(&mut h);
+    start_generation(&mut h, "a red fox");
+    finish_generation(&mut h);
+    h.run();
+    h.run();
+    for label in ["play", "save as mp4"] {
+        let r = h.get_by_label(label).rect();
+        assert!(r.top() >= 0.0 && r.bottom() <= 844.0, "{label} at {r:?} is off screen");
+    }
+}
+
+#[test]
 fn the_video_page_stacks_on_a_phone_with_a_sideways_strip_and_nothing_clipped() {
     let mut h = video_app("vid-phone", egui::vec2(390.0, 844.0), 2);
     load_through_the_page(&mut h);

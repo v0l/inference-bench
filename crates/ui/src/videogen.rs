@@ -123,6 +123,7 @@ pub struct VideoState {
     pub running: Option<Running>,
     pub rows: Vec<VideoRow>,
     pub shown: Option<usize>,
+    pub reveal: bool,
     pub play: Playback,
     pub error: Option<String>,
     pub for_model: String,
@@ -146,6 +147,7 @@ impl Default for VideoState {
             running: None,
             rows: Vec::new(),
             shown: None,
+            reveal: false,
             play: Playback { frame: 0, playing: false, acc: 0.0, at: None },
             error: None,
             for_model: String::new(),
@@ -385,6 +387,7 @@ impl VideoState {
         }
         if has_clip {
             self.shown = Some(self.rows.len() - 1);
+            self.reveal = true;
             self.play = Playback { frame: 0, playing: false, acc: 0.0, at: None };
         }
         let n = self.rows.len();
@@ -525,6 +528,8 @@ fn player(app: &mut App, ui: &mut egui::Ui) {
         }
         clip.main_frame = Some(frame);
     }
+    let top = ui.cursor().min;
+    let reveal = std::mem::take(&mut g.reveal);
     let aspect = clip.height as f32 / clip.width.max(1) as f32;
     let w = ui.available_width().min(960.0).min(380.0 / aspect.max(0.01));
     let h = w * aspect;
@@ -534,6 +539,9 @@ fn player(app: &mut App, ui: &mut egui::Ui) {
     Line::new().legend("frame").set(format!("{} of {count}", frame + 1)).gap(8.0).value(format!("{}x{} at {} fps", clip.width, clip.height, clip.fps)).size(10.5).elided(ui);
     let mut save = false;
     let mut toggle = false;
+    if reveal {
+        ui.scroll_to_rect(egui::Rect::from_min_size(top, egui::vec2(10.0, 4.0)), Some(egui::Align::TOP));
+    }
     ui.horizontal_wrapped(|ui| {
         if ui.add(Key::new(if g.play.playing { "pause" } else { "play" }).solid(READOUT).min_width(90.0).id_salt("vid-play")).clicked() {
             toggle = true;
