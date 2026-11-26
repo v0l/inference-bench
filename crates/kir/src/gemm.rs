@@ -827,7 +827,8 @@ pub fn select(t: &Target, policy: &Policy, r: &Request) -> Result<Choice, GemmEr
             Choice { quant: Some("gg_dequant_bf16"), ..plain(name, GemmPath::Ggb, tile, Some(k)) }
         }
         w => {
-            let name = format!("{}_mma{suffix}", r.linear);
+            let stem = if w == WeightFormat::Fp8 && policy.fp8_weights.is_none() && !head { "f8w" } else { "mma" };
+            let name = format!("{}_{stem}{suffix}", r.linear);
             let tile = tuning.mma_tile(variant, w, r.shape.n);
             let k = KernelInstance::gemm(t, &name, r.shape, w, tile, r.split, false)?;
             plain(name, GemmPath::Mma, tile, Some(k))

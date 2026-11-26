@@ -588,16 +588,21 @@ impl Checkpoint {
         self.quantized.read()
     }
 
-    fn served<'s>(&self, spec: &Spec, raw: Raw<'s>, quant: Quant, what: &str) -> Result<Matrix<'s>> {
+    fn served<'s>(&self, spec: &Spec, raw: Raw<'s>, quant: Quant, what: &str, search: bool) -> Result<Matrix<'s>> {
         let Raw::Bf16 { w, cols } = &raw else { return raw.into_matrix(quant, what) };
-        if spec.runtime.quantize.format() != Some(quant) {
+        if !spec.quantized_at_load() || !matches!(quant, Quant::Nvfp4G16 | Quant::Fp8Channel) {
             return raw.into_matrix(quant, what);
         }
         let started = std::time::Instant::now();
-        let m = match quant {
-            Quant::Nvfp4G16 => Matrix::Fp4(crate::quantize::nvfp4_search(w, *cols)),
-            _ => {
+        let m = match (quant, search) {
+            (Quant::Nvfp4G16, true) => Matrix::Fp4(crate::quantize::nvfp4_search(w, *cols)),
+            (Quant::Nvfp4G16, false) => Matrix::Fp4(quantize_nvfp4(w, *cols)),
+            (_, true) => {
                 let (values, scales) = crate::quantize::fp8_channel_search(w, *cols);
+                Matrix::Fp8 { values: Cow::Owned(values), scales }
+            }
+            (_, false) => {
+                let (values, scales) = quantize_fp8_channel(w, *cols);
                 Matrix::Fp8 { values: Cow::Owned(values), scales }
             }
         };
@@ -1352,7 +1357,7 @@ impl Checkpoint {
         }
         Ok(Attn {
             extra,
-            qkv: self.served(spec, Raw::concat(parts)?, qkv_quant, &format!("{attn}.qkv"))?,
+            qkv: self.served(spec, Raw::concat(parts)?, qkv_quant, &format!("{attn}.qkv"), spec.quant_search(layer))?,
             qkv_bias,
             o_bias: if a.o_bias { Some(self.f32(&format!("{attn}.o_proj.bias"), h)?) } else { None },
             q_norm,
@@ -1361,7 +1366,7 @@ impl Checkpoint {
                 let (full, cols) = (spec.o_dim(), spec.o_cols_in(block));
                 let raw = w(a.o_tensor.as_deref().unwrap_or("o_proj"), h, cols)?;
                 let raw = if cols < full { pad_cols(raw, full) } else { raw };
-                self.served(spec, raw, o_quant, &format!("{attn}.{}", a.o_tensor.as_deref().unwrap_or("o_proj")))?
+                self.served(spec, raw, o_quant, &format!("{attn}.{}", a.o_tensor.as_deref().unwrap_or("o_proj")), spec.quant_search(layer))?
             },
         })
     }
@@ -1394,13 +1399,13 @@ impl Checkpoint {
             (in_proj, ba)
         };
         Ok(Gdn {
-            in_proj: self.served(spec, in_proj, spec.linear_quant("lin_in", layer), &format!("{p}.in_proj"))?,
+            in_proj: self.served(spec, in_proj, spec.linear_quant("lin_in", layer), &format!("{p}.in_proj"), spec.quant_search(layer))?,
             ba: Matrix::Bf16(Cow::Owned(ba)),
             conv: self.floats(&format!("{p}.conv1d.weight"), &[conv_dim, 1, la.conv_kernel])?,
             neg_a: self.neg_a(&format!("{p}.A_log"), heads)?,
             dt_bias: self.f32(&format!("{p}.dt_bias"), heads)?,
             norm: self.f32(&format!("{p}.norm.weight"), la.value_head_dim)?,
-            out: self.served(spec, w("out_proj", h, value_dim)?, spec.linear_quant("lin_out", layer), &format!("{p}.out_proj"))?,
+            out: self.served(spec, w("out_proj", h, value_dim)?, spec.linear_quant("lin_out", layer), &format!("{p}.out_proj"), spec.quant_search(layer))?,
         })
     }
 
@@ -1421,8 +1426,8 @@ impl Checkpoint {
             }
         }
         Ok(Described {
-            in_proj: self.served(spec, Raw::concat(parts)?, spec.quant, &format!("{module}.in_proj"))?,
-            out: self.served(spec, self.raw(&format!("{module}.{}.weight", m.out_tensor), h, spec.mix_out_cols())?, spec.quant, &format!("{module}.out_proj"))?,
+            in_proj: self.served(spec, Raw::concat(parts)?, spec.quant, &format!("{module}.in_proj"), true)?,
+            out: self.served(spec, self.raw(&format!("{module}.{}.weight", m.out_tensor), h, spec.mix_out_cols())?, spec.quant, &format!("{module}.out_proj"), true)?,
             extra,
         })
     }
@@ -1452,7 +1457,7 @@ impl Checkpoint {
         let mlp = spec.mlp_quant(i);
         let served = spec.served_mlp_quant(i);
         let sparse = spec.moe.as_ref().is_some_and(|m| m.is_sparse(i)) && spec.has_mlp(i);
-        let moe = if sparse { Some(self.moe_layer(spec, &p, spec.expert_quant(i))?) } else { None };
+        let moe = if sparse { Some(self.moe_layer_searched(spec, &p, spec.expert_quant(i), spec.quant_search(i))?) } else { None };
         let none = || (Matrix::Bf16(Cow::Owned(vec![0; 8])), Matrix::Bf16(Cow::Owned(vec![0; 8])));
         let dense_beside = sparse && spec.parallel_moe();
         let (gate_up, down) = if (sparse && !dense_beside) || !spec.has_mlp(i) {
@@ -1460,7 +1465,7 @@ impl Checkpoint {
         } else if spec.mlp.mapped.is_some() {
             let up = self.raw(&format!("{p}.mlp.up_proj.weight"), inter, h)?;
             let down = self.raw(&format!("{p}.mlp.down_proj.weight"), h, inter)?;
-            (self.served(spec, up, mlp, &format!("{p}.mlp.up_proj"))?, self.served(spec, down, mlp, &format!("{p}.mlp.down_proj"))?)
+            (self.served(spec, up, mlp, &format!("{p}.mlp.up_proj"), spec.quant_search(i))?, self.served(spec, down, mlp, &format!("{p}.mlp.down_proj"), spec.quant_search(i))?)
         } else if mlp == Quant::Nvfp4G16 {
             let gate = self.fp4(&format!("{p}.mlp.gate_proj"), inter, h)?;
             let up = self.fp4(&format!("{p}.mlp.up_proj"), inter, h)?;
@@ -1474,8 +1479,8 @@ impl Checkpoint {
             };
             let down = self.raw(&format!("{p}.mlp.down_proj.weight"), h, inter)?;
             (
-                self.served(spec, Raw::interleave(gate, up)?, served, &format!("{p}.mlp.gate_up"))?,
-                self.served(spec, down, served, &format!("{p}.mlp.down_proj"))?,
+                self.served(spec, Raw::interleave(gate, up)?, served, &format!("{p}.mlp.gate_up"), spec.quant_search(i))?,
+                self.served(spec, down, served, &format!("{p}.mlp.down_proj"), spec.quant_search(i))?,
             )
         };
         let ln1 = if spec.norm.pre { self.norm(spec, &format!("{p}.input_layernorm.weight"), h)? } else { vec![0.0; 1] };
@@ -1707,6 +1712,10 @@ impl Checkpoint {
     }
 
     fn moe_layer(&self, spec: &Spec, p: &str, quant: Quant) -> Result<MoeWeights> {
+        self.moe_layer_searched(spec, p, quant, true)
+    }
+
+    fn moe_layer_searched(&self, spec: &Spec, p: &str, quant: Quant, search: bool) -> Result<MoeWeights> {
         if let Some(g) = &self.gguf {
             let global: usize = p.rsplit('.').next().and_then(|n| n.parse().ok()).context("GGUF layer index")?;
             return self.gguf_moe_layer(g, spec, global);
@@ -1746,7 +1755,7 @@ impl Checkpoint {
                 let mut inv_global = Vec::with_capacity(total);
                 let mut input_global = f32::MAX;
                 for i in 0..total {
-                    let f = self.fp4_or_requant(spec, &module(i, which), rows, cols)?;
+                    let f = self.fp4_or_requant(spec, &module(i, which), rows, cols, search)?;
                     packed.extend_from_slice(&f.packed);
                     scales.extend_from_slice(&f.scales);
                     inv_global.push(1.0 / f.global);
@@ -1974,12 +1983,12 @@ impl Checkpoint {
         Ok(None)
     }
 
-    fn fp4_or_requant(&self, spec: &Spec, module: &str, rows: usize, cols: usize) -> Result<crate::nvfp4::Fp4<'_>> {
+    fn fp4_or_requant(&self, spec: &Spec, module: &str, rows: usize, cols: usize, search: bool) -> Result<crate::nvfp4::Fp4<'_>> {
         if self.is_fp4(module) {
             return self.fp4(module, rows, cols);
         }
         match self.raw(&format!("{module}.weight"), rows, cols)?.dequantized() {
-            raw @ Raw::Bf16 { .. } if spec.runtime.quantize.format() == Some(Quant::Nvfp4G16) => match self.served(spec, raw, Quant::Nvfp4G16, module)? {
+            raw @ Raw::Bf16 { .. } if spec.quantized_at_load() => match self.served(spec, raw, Quant::Nvfp4G16, module, search)? {
                 Matrix::Fp4(f) => Ok(f),
                 _ => bail!("{module} did not quantise to nvfp4"),
             },

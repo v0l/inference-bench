@@ -236,6 +236,9 @@ fn store_name(linear: &str) -> Option<&'static str> {
 
 pub fn gemv_into(spec: &Spec, linear: &str, weight: WeightKind, normed: bool, store: bool) -> Option<GemvLaunch> {
     let s = linear_shape(spec, linear);
+    if weight == WeightKind::Fp8 && !spec.quant.is_fp8() && !linear.ends_with("head") {
+        return None;
+    }
     if normed && s.epi == Epilogue::Map {
         return None;
     }
@@ -258,7 +261,7 @@ pub fn select_act(spec: &Spec, target: &kir::Target, linear: &str, tokens: usize
 
 pub fn batch_part_len(spec: &Spec, target: &kir::Target, fp4: bool) -> usize {
     let linears: Vec<&str> = if fp4 {
-        FP4_LINEARS.iter().copied().chain(spec.requanted_linears()).collect()
+        FP4_LINEARS.iter().copied().chain(spec.served_linears(Quant::Nvfp4G16)).collect()
     } else {
         kg::BATCH_LINEARS.iter().copied().filter(|l| spec.linear_attention.is_some() || !l.starts_with("lin_")).collect()
     };
@@ -480,13 +483,21 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
             }
         }
     }
-    for linear in spec.requanted_linears() {
+    for linear in spec.served_linears(Quant::Nvfp4G16) {
         let shape = linear_shape(spec, linear);
         set.tiles(t, &format!("{linear}_f4w"), shape, WeightFormat::Fp4, true, false, &tuning)?;
         for tokens in BATCH_VARIANTS {
             set.push(KernelInstance::batch(t, &format!("{linear}_f4b{tokens}"), shape, WeightFormat::Fp4, tokens))?;
         }
         set.push(KernelInstance::batch_reduce(t, &format!("{linear}_f4b_reduce"), shape, WeightFormat::Fp4))?;
+    }
+    for linear in spec.served_fp8_linears() {
+        let shape = linear_shape(spec, linear);
+        set.tiles(t, &format!("{linear}_f8w"), shape, WeightFormat::Fp8, split(spec, linear, WeightFormat::Fp8), false, &tuning)?;
+        for tokens in BATCH_VARIANTS {
+            set.push(KernelInstance::batch(t, &format!("{linear}_f8b{tokens}"), shape, WeightFormat::Fp8, tokens))?;
+        }
+        set.push(KernelInstance::batch_reduce(t, &format!("{linear}_f8b_reduce"), shape, WeightFormat::Fp8))?;
     }
     if spec.lm_head_quant() == Quant::Nvfp4G16 {
         let shape = linear_shape(spec, "lm_head");

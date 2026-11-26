@@ -22,4 +22,13 @@ fn main() {
     table.push_str("]\n");
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("embedded_specs.rs");
     std::fs::write(out, table).unwrap();
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=SPECRT_ENGINE_COMMIT={commit}");
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
 }

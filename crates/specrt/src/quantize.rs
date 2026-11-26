@@ -9,6 +9,7 @@ pub const FP8_CHANNEL_MEAN_KL_BOUND: f64 = 0.02;
 pub const NVFP4_G16_MEAN_KL_BOUND: f64 = 0.155;
 pub const FP8_CHANNEL_TOP1_FLOOR: f64 = 0.92;
 pub const NVFP4_G16_TOP1_FLOOR: f64 = 0.72;
+pub const MAX_KL_WEIGHT: f64 = 0.01;
 
 fn nvfp4_group_error(group: &[u16], code: u8, global: f32) -> f64 {
     let s = e4m3_to_f32(code) / global;
@@ -165,18 +166,40 @@ fn argmax(row: &[f32]) -> usize {
 }
 
 pub fn logit_stats(reference: &[&[f32]], quantised: &[&[f32]], vocab: usize) -> LogitStats {
-    let (mut positions, mut sum, mut max, mut same) = (0usize, 0f64, 0f64, 0usize);
-    for (a, b) in reference.iter().zip(quantised) {
-        assert_eq!(a.len(), b.len());
-        for (p, q) in a.chunks_exact(vocab).zip(b.chunks_exact(vocab)) {
-            let (lp, lq) = (log_softmax(p), log_softmax(q));
-            let kl = lp.iter().zip(&lq).map(|(x, y)| x.exp() * (x - y)).sum::<f64>().max(0.0);
-            sum += kl;
-            max = max.max(kl);
-            same += (argmax(p) == argmax(q)) as usize;
-            positions += 1;
-        }
+    let rows: Vec<(&[f32], &[f32])> = reference
+        .iter()
+        .zip(quantised)
+        .flat_map(|(a, b)| {
+            assert_eq!(a.len(), b.len());
+            a.chunks_exact(vocab).zip(b.chunks_exact(vocab))
+        })
+        .collect();
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(rows.len().max(1));
+    let per = rows.len().div_ceil(threads).max(1);
+    let each: Vec<(f64, bool)> = std::thread::scope(|s| {
+        let parts: Vec<_> = rows
+            .chunks(per)
+            .map(|chunk| {
+                s.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|(p, q)| {
+                            let (lp, lq) = (log_softmax(p), log_softmax(q));
+                            (lp.iter().zip(&lq).map(|(x, y)| x.exp() * (x - y)).sum::<f64>().max(0.0), argmax(p) == argmax(q))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        parts.into_iter().flat_map(|h| h.join().expect("kl thread")).collect()
+    });
+    let (mut sum, mut max, mut same) = (0f64, 0f64, 0usize);
+    for &(kl, top) in &each {
+        sum += kl;
+        max = max.max(kl);
+        same += top as usize;
     }
+    let positions = each.len();
     let n = positions.max(1) as f64;
     LogitStats { positions, mean_kl: sum / n, max_kl: max, top1: same as f64 / n }
 }

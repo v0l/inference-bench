@@ -1372,14 +1372,14 @@ impl Runtime {
         };
         let target = crate::codegen::cuda_target(&ctx)?;
         let sms = target.sm_count;
-        let f4b_part = if spec.mlp.quant == Some(crate::spec::Quant::Nvfp4G16) || spec.serves_fp4_mlp() || !spec.requanted_linears().is_empty() || spec.draft_head_quant() == Some(crate::spec::Quant::Nvfp4G16) {
+        let f4b_part = if spec.mlp.quant == Some(crate::spec::Quant::Nvfp4G16) || spec.serves_fp4_mlp() || !spec.served_linears(crate::spec::Quant::Nvfp4G16).is_empty() || spec.draft_head_quant() == Some(crate::spec::Quant::Nvfp4G16) {
             stream.alloc_zeros(crate::gemm::batch_part_len(spec, &target, true))?
         } else {
             stream.alloc_zeros(1)?
         };
         let f8b_part = if spec.quant == crate::spec::Quant::Gguf {
             stream.alloc_zeros(crate::gemm::ggml_part_len(spec, &target))?
-        } else if spec.quant.is_fp8() {
+        } else if spec.quant.is_fp8() || !spec.served_fp8_linears().is_empty() {
             stream.alloc_zeros(crate::gemm::batch_part_len(spec, &target, false))?
         } else {
             stream.alloc_zeros(1)?
@@ -1633,6 +1633,31 @@ impl Runtime {
 
     pub fn spec(&self) -> &Spec {
         &self.spec
+    }
+
+    pub fn layer_bytes(&self) -> Vec<u64> {
+        self.layers.iter().map(DeviceLayer::bytes).collect()
+    }
+
+    pub fn requantize_layer(&mut self, layer: usize, quant: crate::spec::LayerQuant) -> Result<u64> {
+        ensure!(layer < self.layers.len(), "layer {layer} is outside the {} loaded layers", self.layers.len());
+        ensure!(self.streamer.is_none() && self.expert_cache.is_none() && self.comm.is_none(), "requantising a layer needs every layer resident on one device");
+        ensure!(!self.spec.quant_plan.layers.is_empty(), "requantising a layer needs a runtime loaded with a per layer quant plan");
+        let mut spec = self.spec.clone();
+        spec.quant_plan.layers[layer] = quant;
+        ensure!(quant.format == crate::spec::Quant::Bf16 || spec.quant_plan.kernels.contains(&quant.format), "the runtime has no {:?} kernels; load it with that format in quant_plan.kernels", quant.format);
+        let ck = Checkpoint::for_repo(&spec.repo)?.renamed(&spec.tensors);
+        let store = moe::experts::ExpertStore::new(self.ctx.clone(), 0, None);
+        let global = self.layers[layer].global;
+        self.stream.synchronize()?;
+        let fresh = upload_layer(&self.stream, &ck, &spec, &store, layer, global)?;
+        self.stream.synchronize()?;
+        let bytes = fresh.bytes();
+        self.weight_bytes = self.weight_bytes - self.layers[layer].bytes() + bytes;
+        self.layers[layer] = fresh;
+        self.plans = exec::Plans::compile(&spec, self.use_mma, &self.target, &crate::compile::Options::planes(self.max_ctx), self.role)?;
+        self.spec = spec;
+        Ok(bytes)
     }
 
     pub fn offload_stats(&self) -> Option<crate::offload::OffloadStats> {
