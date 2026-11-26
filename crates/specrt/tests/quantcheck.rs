@@ -1,5 +1,5 @@
 use specrt::quantcheck::{Budget, LayerOption, Measured, Probe, Recipe, choose, estimated_kl, layer_options, recipe_from, total_bytes};
-use specrt::spec::{LayerQuant, Quant, Spec};
+use specrt::spec::{LayerQuant, Quant, QuantizeChoice, Spec};
 use std::path::Path;
 
 fn kl(mean: f64, max: f64) -> Measured {
@@ -87,4 +87,96 @@ fn a_recipe_is_a_few_kb_of_toml_and_round_trips_into_a_quant_plan() {
     std::fs::write(&path, bumped).unwrap();
     assert!(Recipe::load(&path).is_err());
     std::fs::remove_file(&path).ok();
+}
+
+fn tiny_spec() -> Spec {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-qwen3.5");
+    let mut spec = Spec::from_hf_config(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    spec.name = "tiny-qwen3.5".into();
+    spec.repo = dir.display().to_string();
+    spec
+}
+
+fn tiny_recipe(spec: &Spec) -> Recipe {
+    let probes: Vec<Probe> = (0..spec.layers.count).flat_map(|l| [probe(l, Quant::Nvfp4G16, l != 1, 30, 0.01, 0.1), probe(l, Quant::Fp8Channel, true, 55, 0.001, 0.01)]).collect();
+    let options = layer_options(&probes, &vec![100; spec.layers.count]);
+    let budget = Budget { kl: 0.025, bytes: None };
+    recipe_from(spec, &options, &choose(&options, 7, budget), 7, budget, 99)
+}
+
+fn recipe_spec(spec: &Spec, recipe: &Recipe, name: &str) -> (Spec, std::path::PathBuf) {
+    let path = std::env::temp_dir().join(format!("quantcheck-{}-{name}.quantrecipe.toml", std::process::id()));
+    recipe.save(&path).unwrap();
+    let mut s = spec.clone();
+    s.runtime.quantize = QuantizeChoice::Recipe;
+    s.runtime.quantize_recipe = Some(path.clone());
+    (s, path)
+}
+
+#[test]
+fn quantize_recipe_loads_the_per_layer_plan_from_the_file() {
+    let spec = tiny_spec();
+    let recipe = tiny_recipe(&spec);
+    let (mut s, path) = recipe_spec(&spec, &recipe, "ok");
+    let warnings = s.resolve_recipe().unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(s.quant_plan, recipe.plan());
+    assert_eq!(s.runtime.quantize, QuantizeChoice::Off);
+    let (mut applied, applied_path) = recipe_spec(&spec, &recipe, "apply");
+    applied.apply_quantize().unwrap();
+    std::fs::remove_file(&applied_path).ok();
+    assert_eq!(applied.quant_plan, recipe.plan());
+    assert_eq!(applied.served_mlp_quant(0), recipe.layers[0].format);
+    let dir = std::env::temp_dir().join(format!("quantcheck-spec-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(&path, dir.join("tiny.quantrecipe.toml")).unwrap();
+    let mut file = spec.clone();
+    file.runtime.quantize = QuantizeChoice::Recipe;
+    file.runtime.quantize_recipe = Some("tiny.quantrecipe.toml".into());
+    std::fs::write(dir.join("tiny.toml"), file.to_toml().unwrap()).unwrap();
+    let loaded = Spec::load(&dir.join("tiny.toml")).unwrap();
+    assert_eq!(loaded.runtime.quantize_recipe.as_deref(), Some(dir.join("tiny.quantrecipe.toml").as_path()), "a relative recipe path is read beside the spec");
+    let mut loaded = loaded;
+    loaded.resolve_recipe().unwrap();
+    assert_eq!(loaded.quant_plan, recipe.plan());
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_recipe_for_another_model_layer_count_or_format_version_is_refused() {
+    let spec = tiny_spec();
+    let good = tiny_recipe(&spec);
+    let refused = |recipe: Recipe, name: &str| {
+        let (mut s, path) = recipe_spec(&spec, &recipe, name);
+        let err = format!("{:#}", s.resolve_recipe().unwrap_err());
+        std::fs::remove_file(&path).ok();
+        assert!(err.contains("does not fit this model"), "{err}");
+        err
+    };
+    let err = refused(Recipe { model: "Qwen/Qwen3-0.6B".into(), ..good.clone() }, "model");
+    assert!(err.contains("Qwen/Qwen3-0.6B") && err.contains("tiny-qwen3.5"), "{err}");
+    let mut short = good.clone();
+    short.layers.pop();
+    assert!(refused(short, "layers").contains(&format!("has {} layers", spec.layers.count - 1)));
+    let err = refused(Recipe { format_version: 99, ..good.clone() }, "format");
+    assert!(err.contains("format version 99") && err.contains("run quantcheck again"), "{err}");
+    let mut none = spec.clone();
+    none.runtime.quantize = QuantizeChoice::Recipe;
+    assert!(format!("{:#}", none.resolve_recipe().unwrap_err()).contains("quantize_recipe"));
+    let mut missing = none.clone();
+    missing.runtime.quantize_recipe = Some("/nonexistent/x.quantrecipe.toml".into());
+    assert!(format!("{:#}", missing.resolve_recipe().unwrap_err()).contains("/nonexistent/x.quantrecipe.toml"));
+}
+
+#[test]
+fn a_recipe_from_another_engine_or_prompt_set_loads_with_a_warning() {
+    let spec = tiny_spec();
+    let recipe = Recipe { engine: "0123456789ab".into(), prompt_set: "feedfacecafebeef".into(), ..tiny_recipe(&spec) };
+    let (mut s, path) = recipe_spec(&spec, &recipe, "warn");
+    let warnings = s.resolve_recipe().unwrap();
+    std::fs::remove_file(&path).ok();
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert!(warnings[0].contains("0123456789ab") && warnings[1].contains("feedfacecafebeef"), "{warnings:?}");
+    assert_eq!(s.quant_plan, recipe.plan());
 }

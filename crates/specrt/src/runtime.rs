@@ -1184,7 +1184,8 @@ impl Runtime {
     }
 
     fn load_inner(spec: &Spec, layout: Layout, range: StageRange, tp: Option<(usize, usize, &crate::allreduce::Fabric)>) -> Result<Self> {
-        let resolved = crate::engine::apply_rope_extension(spec)?;
+        let mut resolved = crate::engine::apply_rope_extension(spec)?;
+        resolved.resolve_recipe()?;
         range.check(&resolved)?;
         let role = StageRole::of(&resolved, range);
         let full = if role.whole() { resolved.clone() } else { resolved.stage(range.start, range.end) };

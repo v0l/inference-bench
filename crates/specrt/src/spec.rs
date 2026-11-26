@@ -196,6 +196,10 @@ pub struct RuntimeOptions {
     pub requant: Requant,
     #[serde(skip_serializing_if = "QuantizeChoice::is_off")]
     pub quantize: QuantizeChoice,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantize_recipe: Option<PathBuf>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub quantize_cache: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,6 +212,7 @@ pub enum QuantizeChoice {
     Nvfp4G16,
     #[serde(rename = "fp8_channel")]
     Fp8Channel,
+    Recipe,
 }
 
 impl QuantizeChoice {
@@ -217,7 +222,7 @@ impl QuantizeChoice {
 
     pub fn format(self) -> Option<Quant> {
         match self {
-            QuantizeChoice::Off => None,
+            QuantizeChoice::Off | QuantizeChoice::Recipe => None,
             QuantizeChoice::Auto | QuantizeChoice::Nvfp4G16 => Some(Quant::Nvfp4G16),
             QuantizeChoice::Fp8Channel => Some(Quant::Fp8Channel),
         }
@@ -459,7 +464,7 @@ impl PrefixCacheOptions {
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, pdl: false, fuse: true, store_epilogue: false, pdl_hoist: false, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp8_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), split_activations: None, gemm_fp32: false, chunked_scan: true, kv_dtype: KvDtype::F16, kv_f16_layers: None, rope_extension: None, cache_dir: None, cache_max_bytes: None, compile_jobs: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default(), offload: crate::offload::OffloadSettings::default(), requant: Requant::default(), quantize: QuantizeChoice::Off }
+        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, pdl: false, fuse: true, store_epilogue: false, pdl_hoist: false, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp8_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), split_activations: None, gemm_fp32: false, chunked_scan: true, kv_dtype: KvDtype::F16, kv_f16_layers: None, rope_extension: None, cache_dir: None, cache_max_bytes: None, compile_jobs: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default(), offload: crate::offload::OffloadSettings::default(), requant: Requant::default(), quantize: QuantizeChoice::Off, quantize_recipe: None, quantize_cache: false }
     }
 }
 
@@ -2036,6 +2041,11 @@ impl Spec {
         if spec.runtime.offload.hotlist.is_none() && beside.exists() {
             spec.runtime.offload.hotlist = Some(beside.display().to_string());
         }
+        if let (Some(recipe), Some(dir)) = (spec.runtime.quantize_recipe.as_mut(), path.parent())
+            && recipe.is_relative()
+        {
+            *recipe = dir.join(&*recipe);
+        }
         Ok(spec)
     }
 
@@ -2786,7 +2796,23 @@ impl Spec {
         !self.runtime.quantize.is_off() || !self.quant_plan.is_empty()
     }
 
+    pub fn resolve_recipe(&mut self) -> Result<Vec<String>> {
+        if self.runtime.quantize != QuantizeChoice::Recipe {
+            return Ok(Vec::new());
+        }
+        let path = self.runtime.quantize_recipe.clone().context("[runtime] quantize = \"recipe\" needs [runtime] quantize_recipe, the path of a quantcheck recipe")?;
+        let recipe = crate::quantcheck::Recipe::load(&path)?;
+        let warnings = recipe.check(self).with_context(|| format!("{} does not fit this model", path.display()))?;
+        for w in &warnings {
+            tracing::warn!(recipe = %path.display(), "{w}");
+        }
+        self.quant_plan = recipe.plan();
+        self.runtime.quantize = QuantizeChoice::Off;
+        Ok(warnings)
+    }
+
     pub fn apply_quantize(&mut self) -> Result<()> {
+        self.resolve_recipe()?;
         if self.quantized_at_load() {
             ensure!(!self.runtime.gemm_fp32, "[runtime] quantize needs the tensor core path ([runtime] gemm_fp32 = false)");
         }

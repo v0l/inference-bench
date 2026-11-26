@@ -145,6 +145,26 @@ impl Recipe {
         std::fs::write(path, self.to_toml()?).with_context(|| path.display().to_string())
     }
 
+    pub fn check(&self, spec: &Spec) -> Result<Vec<String>> {
+        ensure!(model_name(&self.model) == model_name(&spec.repo), "the recipe is for {}, not {}", self.model, spec.repo);
+        ensure!(
+            self.format_version == crate::quantize::FORMAT_VERSION,
+            "the recipe was written for quantised format version {}, this engine has version {}; run quantcheck again",
+            self.format_version,
+            crate::quantize::FORMAT_VERSION
+        );
+        ensure!(self.layers.len() == spec.layers.count, "the recipe has {} layers, {} has {}", self.layers.len(), spec.repo, spec.layers.count);
+        ensure!(self.layers.iter().enumerate().all(|(i, l)| l.index == i), "the recipe layers are not numbered 0 to {}", self.layers.len().saturating_sub(1));
+        let mut warnings = Vec::new();
+        if self.engine != ENGINE_COMMIT {
+            warnings.push(format!("the recipe was measured by engine {}, this is {}; its KL figures may be stale", self.engine, ENGINE_COMMIT));
+        }
+        if self.prompt_set != prompt_set_hash() {
+            warnings.push(format!("the recipe was measured on prompt set {}, the engine ships {}; its KL figures may not compare", self.prompt_set, prompt_set_hash()));
+        }
+        Ok(warnings)
+    }
+
     pub fn counts(&self) -> Vec<(Quant, usize)> {
         let mut out: Vec<(Quant, usize)> = Vec::new();
         for l in &self.layers {
@@ -155,6 +175,10 @@ impl Recipe {
         }
         out
     }
+}
+
+pub fn model_name(repo: &str) -> String {
+    repo.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or(repo).to_lowercase()
 }
 
 pub fn recipe_from(spec: &Spec, options: &[Vec<LayerOption>], at: &[usize], fixed: u64, budget: Budget, positions: usize) -> Recipe {
