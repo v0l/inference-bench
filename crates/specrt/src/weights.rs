@@ -1737,7 +1737,7 @@ impl Checkpoint {
                 let (gate, up) = self.block_gate_up(format, &format!("{p}.mlp.experts.gate_up_proj"), e, inter, h, m.gate_up_interleaved)?;
                 (gate, up, self.block_stack(format, &format!("{p}.mlp.experts.down_proj"), e, h, inter)?)
             }
-            None if m.experts_transposed => {
+            None if m.experts_transposed && self.has(&format!("{p}.mlp.experts.gate_up_proj")) => {
                 ensure!(quant == Quant::Bf16, "transposed fused experts are bf16 only");
                 ensure!(shared_slots <= 1, "transposed fused experts take at most one shared expert");
                 let fused = self.bf16(&format!("{p}.mlp.experts.gate_up_proj"), &[e, h, 2 * inter])?;
