@@ -1153,7 +1153,7 @@ impl Serving {
             "thinking": format!("{:?}", self.thinking()),
             "tool_format": format!("{:?}", self.tool_format()),
             "n_ctx": self.max_model_len(),
-            "generation": {"top_k": d.top_k, "top_p": d.top_p, "min_p": d.min_p, "max_new_tokens": d.max_new_tokens},
+            "generation": {"temperature": d.temperature, "top_k": d.top_k, "top_p": d.top_p, "min_p": d.min_p, "max_new_tokens": d.max_new_tokens},
             "vision": self.accepts_media(),
         })
     }

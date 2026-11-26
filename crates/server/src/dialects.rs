@@ -836,6 +836,7 @@ pub(crate) async fn props(State(state): State<Arc<AppState>>, Query(query): Quer
             "n_ctx": n_ctx,
             "n_predict": state.config.default_max_tokens.map(|n| n as i64).unwrap_or(-1),
             "params": {
+                "temperature": state.config.temperature.map(Value::from).unwrap_or_else(|| defaults["temperature"].clone()),
                 "top_k": state.config.top_k.map(Value::from).unwrap_or_else(|| defaults["top_k"].clone()),
                 "top_p": state.config.top_p.map(Value::from).unwrap_or_else(|| defaults["top_p"].clone()),
                 "min_p": state.config.min_p.map(Value::from).unwrap_or_else(|| defaults["min_p"].clone()),

@@ -55,6 +55,7 @@ idle_unload_secs = 900
 max_loaded_models = 1                # N concurrent models
 vram_budget_bytes = 20000000000      # evict idle models to stay inside
 # default_max_tokens = 4096   # unset: until the context is full
+# temperature = 0.7           # unset: the model's generation_config.json, else greedy
 # top_k = 20
 # top_p = 0.95
 # min_p = 0.0
@@ -202,6 +203,8 @@ Pass the same `--max-ctx` and `--slots` the server runs with (`--max-model-len`,
 `logprobs: true` with `top_logprobs` up to 20 (chat) or `logprobs: N` (completions) return per-token log probabilities, streamed or not, computed on the host from the sampled row's logits. `n` up to 16 runs that many sequences on the batched engine; usage sums their completion tokens. Both need the batched engine (`max_num_seqs` above 1, or more than one parallel request in the app) and return 400 saying so otherwise. A `developer` message is templated as `system`, and a chat template error from client input is a 400.
 
 A field the server does not handle returns 400 naming it: `response_format` other than `text` (structured output is #591), non-zero `frequency_penalty` or `presence_penalty`, named or `required` `tool_choice`, and any unknown top-level key. `user`, `parallel_tool_calls`, `store` and `metadata` are accepted and ignored.
+
+A request without `temperature` samples at the server config's `temperature`, else at the model's `generation_config.json` (`do_sample: false` is greedy), else greedy. A request without `seed` draws a new one, so the same body can give a different reply; `seed` makes it repeatable, and with `n` choice i uses `seed + i`. Before #1469 an unset temperature was greedy and an unset seed was 0, so an agent whose tool kept failing got the identical prompt and sent the identical call every turn (`docs/fixtures/chat-tab-thinking-off-loop.json`, the inference-bench Chat tab on the 27B with thinking off).
 
 ## Tool loop parity with vLLM (Qwen3.8-27B)
 

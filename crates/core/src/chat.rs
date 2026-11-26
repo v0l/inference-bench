@@ -44,6 +44,8 @@ pub const UNTIL_FULL: usize = specrt::engine::UNTIL_FULL;
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Sampling {
     pub temperature: f32,
+    #[serde(default = "explicit")]
+    pub explicit_temperature: bool,
     #[serde(default)]
     pub top_p: Option<f32>,
     #[serde(default)]
@@ -56,13 +58,30 @@ pub struct Sampling {
 
 impl Default for Sampling {
     fn default() -> Self {
-        Self { temperature: 0.7, top_p: None, top_k: None, min_p: None, seed: None, max_tokens: UNTIL_FULL }
+        Self { temperature: 0.7, explicit_temperature: true, top_p: None, top_k: None, min_p: None, seed: None, max_tokens: UNTIL_FULL }
+    }
+}
+
+fn explicit() -> bool {
+    true
+}
+
+fn fresh_seed() -> u32 {
+    let mut b = [0u8; 4];
+    match getrandom::fill(&mut b) {
+        Ok(()) => u32::from_le_bytes(b),
+        Err(_) => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos()),
     }
 }
 
 impl Sampling {
     pub fn resolve(&self, defaults: specrt::engine::SamplingDefaults) -> specrt::runtime::Sampling {
-        specrt::runtime::Sampling::new(self.temperature.max(0.0), self.seed.unwrap_or(0) as u32).truncated(
+        let temperature = match self.explicit_temperature {
+            true => self.temperature,
+            false => defaults.temperature.unwrap_or(self.temperature),
+        };
+        let seed = self.seed.map_or_else(fresh_seed, |s| s as u32);
+        specrt::runtime::Sampling::new(temperature.max(0.0), seed).truncated(
             self.top_k.or(defaults.top_k).unwrap_or(0),
             self.top_p.or(defaults.top_p).unwrap_or(1.0),
             self.min_p.or(defaults.min_p).unwrap_or(0.0),
@@ -177,8 +196,10 @@ impl ChatRequest {
 
     pub fn from_openai(body: &Value) -> Option<Self> {
         let defaults = Sampling::default();
+        let temperature = body["temperature"].as_f64().map(|v| v as f32);
         let sampling = Sampling {
-            temperature: body["temperature"].as_f64().map(|v| v as f32).unwrap_or(defaults.temperature),
+            temperature: temperature.unwrap_or(defaults.temperature),
+            explicit_temperature: temperature.is_some(),
             top_p: body["top_p"].as_f64().map(|v| v as f32).or(defaults.top_p),
             top_k: body["top_k"].as_u64().map(|v| v as u32).or(defaults.top_k),
             min_p: body["min_p"].as_f64().map(|v| v as f32).or(defaults.min_p),
@@ -264,6 +285,40 @@ mod tests {
         assert!(!r.use_template);
         assert_eq!(r.flatten(), "once upon");
         assert!(ChatRequest::from_openai(&json!({})).is_none());
+    }
+
+    fn model_defaults() -> specrt::engine::SamplingDefaults {
+        specrt::engine::SamplingDefaults { temperature: Some(1.0), top_k: Some(20), top_p: Some(0.95), ..Default::default() }
+    }
+
+    #[test]
+    fn an_unseeded_request_draws_a_new_seed_each_time() {
+        let s = Sampling { seed: None, ..Sampling::default() };
+        let seeds: std::collections::HashSet<u32> = (0..8).map(|_| s.resolve(model_defaults()).seed).collect();
+        assert!(seeds.len() > 1, "every unseeded request sampled with seed {seeds:?}");
+        let fixed = Sampling { seed: Some(9), ..Sampling::default() };
+        assert_eq!(fixed.resolve(model_defaults()).seed, 9);
+    }
+
+    #[test]
+    fn an_unset_temperature_samples_at_the_models_own() {
+        let unset = Sampling { temperature: 0.0, explicit_temperature: false, ..Sampling::default() };
+        assert_eq!(unset.resolve(model_defaults()).temperature, 1.0);
+        assert_eq!(unset.resolve(Default::default()).temperature, 0.0);
+        let greedy = Sampling { temperature: 0.0, ..Sampling::default() };
+        assert_eq!(greedy.resolve(model_defaults()).temperature, 0.0);
+    }
+
+    #[test]
+    fn a_saved_sampling_without_the_flag_keeps_its_temperature() {
+        let s: Sampling = serde_json::from_value(json!({"temperature": 0.2, "seed": null, "max_tokens": 5})).unwrap();
+        assert_eq!(s.resolve(model_defaults()).temperature, 0.2);
+    }
+
+    #[test]
+    fn an_openai_body_without_temperature_leaves_it_to_the_model() {
+        let r = ChatRequest::from_openai(&json!({"messages": [{"role": "user", "content": "hi"}]})).unwrap();
+        assert_eq!(r.sampling.resolve(model_defaults()).temperature, 1.0);
     }
 
     #[test]

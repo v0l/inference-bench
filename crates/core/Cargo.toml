@@ -16,6 +16,7 @@ ureq.workspace = true
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png"] }
 sha2 = "0.10"
+getrandom = "0.3"
 clap.workspace = true
 specrt = { package = "inference-bench-specrt", path = "../specrt" }
 tracing.workspace = true

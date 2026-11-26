@@ -35,6 +35,51 @@ fn a_served_name_from_server_toml_resolves_to_its_model_and_is_not_listed() {
     assert!(inference_bench_server::ServerConfig::parse("[[models]]\nid='m'\nserved_names=['n']\n[[models]]\nid='n'").is_err());
 }
 
+fn chat_tab_loop_body() -> Value {
+    let fixture: Value = serde_json::from_str(include_str!("../../../docs/fixtures/chat-tab-thinking-off-loop.json")).unwrap();
+    let mut body = json!({"model": "m", "max_tokens": 2, "stream": false});
+    for key in ["chat_template_kwargs", "tools", "messages"] {
+        body[key] = fixture[key].clone();
+    }
+    body
+}
+
+fn model_defaults() -> inference_bench_core::specrt_engine::SamplingDefaults {
+    inference_bench_core::specrt_engine::SamplingDefaults { temperature: Some(1.0), top_k: Some(20), top_p: Some(0.95), ..Default::default() }
+}
+
+#[test]
+fn the_chat_tab_loop_request_samples_at_the_model_temperature_with_a_fresh_seed() {
+    let rig = start(config("[[models]]\nid='m'"), Shape::default());
+    for _ in 0..4 {
+        let (status, body, _) = rig.post("/v1/chat/completions", None, chat_tab_loop_body());
+        assert_eq!(status, 200, "{body}");
+    }
+    let requests = rig.stats.requests.lock().unwrap();
+    let resolved: Vec<_> = requests.iter().map(|r| r.sampling.resolve(model_defaults())).collect();
+    assert!(resolved.iter().all(|s| s.temperature == 1.0), "{resolved:?}");
+    let seeds: std::collections::HashSet<u32> = resolved.iter().map(|s| s.seed).collect();
+    assert!(seeds.len() > 1, "the same body sampled with seed {seeds:?} every time");
+    drop(requests);
+    rig.stop();
+}
+
+#[test]
+fn an_explicit_temperature_or_the_server_config_overrides_the_model() {
+    let rig = start(config("[[models]]\nid='m'"), Shape::default());
+    let mut greedy = chat_tab_loop_body();
+    greedy["temperature"] = json!(0);
+    rig.post("/v1/chat/completions", None, greedy);
+    let first = rig.stats.requests.lock().unwrap().last().unwrap().sampling.resolve(model_defaults());
+    assert_eq!(first.temperature, 0.0);
+    rig.stop();
+    let rig = start(config("temperature = 0.6\n[[models]]\nid='m'"), Shape::default());
+    rig.post("/v1/chat/completions", None, chat_tab_loop_body());
+    let set = rig.stats.requests.lock().unwrap().last().unwrap().sampling.resolve(model_defaults());
+    assert_eq!(set.temperature, 0.6);
+    rig.stop();
+}
+
 #[test]
 fn a_developer_message_reaches_the_template_as_system() {
     let rig = start(config("[[models]]\nid='m'"), Shape::default());

@@ -105,6 +105,7 @@ const END_OF_TURN: [&str; 6] =
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SamplingDefaults {
+    pub temperature: Option<f32>,
     pub top_k: Option<u32>,
     pub top_p: Option<f32>,
     pub min_p: Option<f32>,
@@ -116,6 +117,10 @@ impl SamplingDefaults {
     pub fn from_generation_config(text: Option<&str>) -> Self {
         let Some(v) = text.and_then(|t| serde_json::from_str::<Value>(t).ok()) else { return Self::default() };
         SamplingDefaults {
+            temperature: match v["do_sample"].as_bool() {
+                Some(false) => Some(0.0),
+                _ => v["temperature"].as_f64().map(|n| n as f32),
+            },
             top_k: v["top_k"].as_u64().map(|n| n as u32),
             top_p: v["top_p"].as_f64().map(|n| n as f32),
             min_p: v["min_p"].as_f64().map(|n| n as f32),
@@ -673,8 +678,15 @@ mod tests {
     #[test]
     fn sampling_defaults_come_from_generation_config() {
         let d = SamplingDefaults::from_generation_config(Some(r#"{"top_k": 20, "top_p": 0.95, "temperature": 1.0}"#));
-        assert_eq!(d, SamplingDefaults { top_k: Some(20), top_p: Some(0.95), ..Default::default() });
+        assert_eq!(d, SamplingDefaults { top_k: Some(20), top_p: Some(0.95), temperature: Some(1.0), ..Default::default() });
         assert_eq!(SamplingDefaults::from_generation_config(None), SamplingDefaults::default());
+    }
+
+    #[test]
+    fn a_generation_config_without_sampling_is_greedy() {
+        let d = SamplingDefaults::from_generation_config(Some(r#"{"do_sample": false, "temperature": 0.6}"#));
+        assert_eq!(d.temperature, Some(0.0));
+        assert_eq!(SamplingDefaults::from_generation_config(Some("{}")).temperature, None);
     }
 
     #[test]
