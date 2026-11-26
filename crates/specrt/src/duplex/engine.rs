@@ -752,9 +752,17 @@ impl Engine {
         self.rt.set_block_table(live.slot, &blocks)?;
         let l = self.live_mut(id)?;
         l.kept -= page;
-        let delta = (l.prompt_len as i64 + l.frame as i64) - l.kept as i64;
+        let delta = (l.prompt_len as i64 + l.frame as i64 - 1) - l.kept as i64;
         let slot = l.slot;
         self.rt.set_position_offset(slot, delta as i32)?;
+        Ok(())
+    }
+
+    pub fn set_feedback(&mut self, id: SessionId, token: u32, latent: &[f32]) -> Result<()> {
+        ensure!(latent.len() == self.duplex.latent_dim, "a latent of {} values", latent.len());
+        let l = self.live_mut(id)?;
+        l.token = token;
+        l.latent = latent.to_vec();
         Ok(())
     }
 

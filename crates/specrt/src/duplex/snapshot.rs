@@ -71,7 +71,7 @@ impl Engine {
             self.rt.load_kv_blocks(&blocks[..used], &s.sections[1], &s.sections[2])?;
             self.rt.restore_state(slot, &state)?;
             self.set_slot_codec(slot, &all[..enc_len], &all[enc_len..])?;
-            let delta = (live.prompt_len as i64 + live.frame as i64 - 1) - (live.kept as i64 - 1);
+            let delta = (live.prompt_len as i64 + live.frame as i64 - 1) - live.kept as i64;
             self.rt.set_position_offset(slot, delta as i32)?;
             Ok(())
         })();
