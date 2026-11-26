@@ -23,19 +23,31 @@ pub struct ConvShape {
     pub line: bool,
     pub stride: usize,
     pub phases: usize,
+    pub pad: Option<usize>,
 }
 
 impl ConvShape {
     pub fn grid(cin: usize, cout: usize, k: usize, kt: usize, upsample: bool, interleave: bool) -> ConvShape {
-        ConvShape { cin, cout, k, kt, upsample, interleave, line: false, stride: 1, phases: 1 }
+        ConvShape { cin, cout, k, kt, upsample, interleave, line: false, stride: 1, phases: 1, pad: None }
     }
 
     pub fn line(cin: usize, cout: usize, taps: usize, stride: usize, phases: usize) -> ConvShape {
-        ConvShape { cin, cout, k: 1, kt: taps, upsample: false, interleave: false, line: true, stride, phases }
+        ConvShape { cin, cout, k: 1, kt: taps, upsample: false, interleave: false, line: true, stride, phases, pad: None }
+    }
+
+    pub fn padded(cin: usize, cout: usize, taps: usize, stride: usize, pad: usize) -> ConvShape {
+        ConvShape { pad: Some(pad), ..ConvShape::line(cin, cout, taps, stride, 1) }
     }
 
     pub fn context(&self) -> usize {
-        self.kt - self.stride
+        if self.pad.is_some() { 0 } else { self.kt - self.stride }
+    }
+
+    pub fn out_len(&self, t: usize) -> usize {
+        match self.pad {
+            Some(p) => (t + 2 * p).saturating_sub(self.kt) / self.stride + usize::from(t + 2 * p >= self.kt),
+            None => t.div_ceil(self.stride),
+        }
     }
 
     pub fn taps(&self) -> usize {
@@ -160,8 +172,13 @@ impl ConvKernel {
         if s.line && (s.k != 1 || s.upsample || s.interleave || s.stride == 0 || s.stride > s.kt || s.phases == 0 || !s.cout.is_multiple_of(s.phases) || self.prologue != Prologue::None || self.epilogue.stats.is_some()) {
             return bad(format!("a causal line conv over {} taps with stride {} and {} phases needs a 1x1 spatial kernel, whole phases and no group norm", s.kt, s.stride, s.phases));
         }
-        if !s.line && (s.stride != 1 || s.phases != 1 || self.epilogue.gelu) {
-            return bad("stride, phases and gelu are line conv options".into());
+        if !s.line && (s.stride != 1 || s.phases != 1 || self.epilogue.gelu || s.pad.is_some()) {
+            return bad("stride, phases, padding and gelu are line conv options".into());
+        }
+        if let Some(p) = s.pad
+            && (s.phases != 1 || p >= s.kt)
+        {
+            return bad(format!("a padded line conv over {} taps pads fewer than its taps on each side and has one phase, not pad {p} and {} phases", s.kt, s.phases));
         }
         if self.family == Family::Rows && !s.line {
             return bad("the rows family is a line conv".into());
@@ -191,7 +208,7 @@ impl ConvKernel {
     fn describe_shape(&self) -> String {
         let s = &self.shape;
         format!(
-            "{}x{}x{} {}->{}{}{}{}",
+            "{}x{}x{} {}->{}{}{}{}{}",
             s.kt,
             s.k,
             s.k,
@@ -199,7 +216,8 @@ impl ConvKernel {
             s.cout,
             if s.upsample { " up" } else { "" },
             if s.interleave { " interleave" } else { "" },
-            if s.line { format!(" line stride {} phases {}", s.stride, s.phases) } else { String::new() }
+            if s.line { format!(" line stride {} phases {}", s.stride, s.phases) } else { String::new() },
+            s.pad.map_or(String::new(), |p| format!(" pad {p}"))
         )
     }
 

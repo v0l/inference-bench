@@ -336,13 +336,14 @@ fn wrapper(k: &ConvKernel) -> String {
 
 const LINE: &str = r#"__device__ __forceinline__ float line_gelu(float v) { return 0.5f * v * (1.0f + erff(v * 0.70710678118654752f)); }
 
-template <int KT, int STRIDE, int CIN>
+template <int KT, int STRIDE, int CIN, int PAD>
 __device__ __forceinline__ float line_input(const float* __restrict__ x, const float* __restrict__ st, int T, int b, int o, int tap, int c) {
     if (c >= CIN) return 0.0f;
-    constexpr int CTX = KT - STRIDE;
+    constexpr int CTX = PAD >= 0 ? PAD : KT - STRIDE;
     int p = o * STRIDE + tap - CTX;
     if (p >= T) return 0.0f;
     if (p >= 0) return x[((size_t)b * T + p) * CIN + c];
+    if (PAD >= 0) return 0.0f;
     return st[((size_t)b * (CTX > 0 ? CTX : 1) + (CTX + p)) * CIN + c];
 }
 
@@ -356,7 +357,7 @@ __device__ __forceinline__ void line_store(float v, const float* __restrict__ sc
     else y[at] = v;
 }
 
-template <int BM, int BN, int BK, int TM, int TN, int STAGES, int KT, int STRIDE, int CIN, int COUT, int PHASES, bool RES, bool GELU>
+template <int BM, int BN, int BK, int TM, int TN, int STAGES, int KT, int STRIDE, int CIN, int COUT, int PHASES, bool RES, bool GELU, int PAD>
 __device__ __forceinline__ void line_conv_tile(const float* __restrict__ x, const float* __restrict__ st, const float* __restrict__ w, const float* __restrict__ bias,
                                                const float* __restrict__ scale, float* __restrict__ y, int B, int T, int TO) {
     extern __shared__ __align__(16) unsigned char line_smem[];
@@ -375,7 +376,7 @@ __device__ __forceinline__ void line_conv_tile(const float* __restrict__ x, cons
         for (int e = tid; e < BM * BK; e += blockDim.x) {
             int p = e / BK, kk = e % BK;
             int m = m0 + p;
-            A[kk * BM + p] = m < rows ? line_input<KT, STRIDE, CIN>(x, st, T, m / TO, m % TO, tap, c0 + kk) : 0.0f;
+            A[kk * BM + p] = m < rows ? line_input<KT, STRIDE, CIN, PAD>(x, st, T, m / TO, m % TO, tap, c0 + kk) : 0.0f;
         }
         for (int e = tid; e < BN * BK; e += blockDim.x) {
             int j = e / BK, kk = e % BK;
@@ -426,7 +427,7 @@ __device__ __forceinline__ void line_conv_tile(const float* __restrict__ x, cons
     }
 }
 
-template <int KT, int STRIDE, int CIN, int COUT, int PHASES, bool RES, bool GELU>
+template <int KT, int STRIDE, int CIN, int COUT, int PHASES, bool RES, bool GELU, int PAD>
 __device__ __forceinline__ void line_conv_direct(const float* __restrict__ x, const float* __restrict__ st, const float* __restrict__ w, const float* __restrict__ bias,
                                                  const float* __restrict__ scale, float* __restrict__ y, int B, int T, int TO) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -437,12 +438,12 @@ __device__ __forceinline__ void line_conv_direct(const float* __restrict__ x, co
     float acc = bias[n];
     for (int tap = 0; tap < KT; tap++) {
         const float* wr = w + ((size_t)n * KT + tap) * CIN;
-        for (int c = 0; c < CIN; c++) acc = fmaf(line_input<KT, STRIDE, CIN>(x, st, T, b, o, tap, c), wr[c], acc);
+        for (int c = 0; c < CIN; c++) acc = fmaf(line_input<KT, STRIDE, CIN, PAD>(x, st, T, b, o, tap, c), wr[c], acc);
     }
     line_store<COUT, PHASES, RES, GELU>(acc, scale, y, TO, b, o, n);
 }
 
-template <int KT, int STRIDE, int CIN, int COUT, int PHASES, int CHUNK, bool RES, bool GELU>
+template <int KT, int STRIDE, int CIN, int COUT, int PHASES, int CHUNK, bool RES, bool GELU, int PAD>
 __device__ __forceinline__ void line_conv_rows(const float* __restrict__ x, const float* __restrict__ st, const float* __restrict__ w, const float* __restrict__ bias,
                                                const float* __restrict__ scale, float* __restrict__ y, int B, int T, int TO) {
     __shared__ float part[CHUNK][32];
@@ -461,7 +462,7 @@ __device__ __forceinline__ void line_conv_rows(const float* __restrict__ x, cons
 #pragma unroll
             for (int j = 0; j < CHUNK; j++) {
                 int m = r0 + j;
-                if (m < rows) acc[j] = fmaf(line_input<KT, STRIDE, CIN>(x, st, T, m / TO, m % TO, tap, c), wv, acc[j]);
+                if (m < rows) acc[j] = fmaf(line_input<KT, STRIDE, CIN, PAD>(x, st, T, m / TO, m % TO, tap, c), wv, acc[j]);
             }
         }
 #pragma unroll
@@ -532,13 +533,14 @@ const LINE_PASS: &str = "x, st, w, bias, scale, y, B, T, TO";
 fn line_wrapper(k: &ConvKernel) -> String {
     let s = &k.shape;
     let (res, gelu) = (flag(k.epilogue.residual), flag(k.epilogue.gelu));
+    let pad = s.pad.map_or(-1, |p| p as i64);
     let call = match k.family {
         Family::Tile => {
             let t = &k.tile;
-            format!("line_conv_tile<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {res}, {gelu}>", t.bm, t.bn, t.bk, t.tm, t.tn, t.stages, s.kt, s.stride, s.cin, s.cout, s.phases)
+            format!("line_conv_tile<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {res}, {gelu}, {pad}>", t.bm, t.bn, t.bk, t.tm, t.tn, t.stages, s.kt, s.stride, s.cin, s.cout, s.phases)
         }
-        Family::Direct => format!("line_conv_direct<{}, {}, {}, {}, {}, {res}, {gelu}>", s.kt, s.stride, s.cin, s.cout, s.phases),
-        Family::Rows => format!("line_conv_rows<{}, {}, {}, {}, {}, {}, {res}, {gelu}>", s.kt, s.stride, s.cin, s.cout, s.phases, crate::conv::ROWS_CHUNK),
+        Family::Direct => format!("line_conv_direct<{}, {}, {}, {}, {}, {res}, {gelu}, {pad}>", s.kt, s.stride, s.cin, s.cout, s.phases),
+        Family::Rows => format!("line_conv_rows<{}, {}, {}, {}, {}, {}, {res}, {gelu}, {pad}>", s.kt, s.stride, s.cin, s.cout, s.phases, crate::conv::ROWS_CHUNK),
     };
     format!("extern \"C\" __global__ void __launch_bounds__({THREADS}) {}({LINE_ARGS}) {{\n    {call}({LINE_PASS});\n}}\n\n", k.name())
 }
