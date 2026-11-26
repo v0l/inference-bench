@@ -292,7 +292,7 @@ enum Cmd {
         context: Option<usize>,
         #[arg(long, default_value = "decode", help = "prefill, decode or verify")]
         phase: String,
-        #[arg(long, help = "With --plan: count a non decoder graph instead; denoiser reads --spec as a diffusers pipeline folder or a transformer config.json, vae as a diffusers pipeline or vae folder, codec as a model config.json with a codec section (--tokens is the session count)")]
+        #[arg(long, help = "With --plan: count a non decoder graph instead; denoiser reads --spec as a diffusers pipeline folder or a transformer config.json, vae as a diffusers pipeline or vae folder, codec as a model config.json with a codec section, head as a model config.json with a [head] family section (--tokens is the session count)")]
         graph: Option<String>,
         #[arg(long, default_value = "1024x1024", help = "With --graph denoiser or vae: image size in pixels, WIDTHxHEIGHT")]
         size: String,
@@ -517,6 +517,18 @@ fn denoiser_command(path: &Path, size: &str, text: usize, frames: usize, fusion:
             }
         }
     }
+    Ok(())
+}
+
+fn head_kernels_command(path: &Path, target: Option<&str>, sessions: usize) -> Result<()> {
+    let file = if path.is_dir() { path.join("config.json") } else { path.to_path_buf() };
+    let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).with_context(|| file.display().to_string())?)?;
+    let head = specrt::flow_head::FlowHead::from_config(&config, None)?;
+    let target = match target {
+        Some(name) => kir::Target::named(name).with_context(|| format!("target {name:?} is not sm_120, sm_80, wgpu or wgpu-nosubgroups"))?,
+        None => specrt::codegen::default_target(),
+    };
+    print!("{}", head.report(sessions.max(1), &target)?.render());
     Ok(())
 }
 
@@ -838,7 +850,8 @@ fn main() -> Result<()> {
                     "denoiser" => return denoiser_command(Path::new(spec), size, *text, *frames, *fusion),
                     "vae" => return vae_kernels_command(Path::new(spec), target.as_deref(), size, *frames, *fusion, *compiled),
                     "codec" => return codec_kernels_command(Path::new(spec), target.as_deref(), *frames, *tokens),
-                    other => bail!("--graph {other:?} is not denoiser, vae or codec"),
+                    "head" => return head_kernels_command(Path::new(spec), target.as_deref(), *tokens),
+                    other => bail!("--graph {other:?} is not denoiser, vae, codec or head"),
                 }
             }
             kernels_command(&data, spec, target.as_deref(), plan.then_some((phase.as_str(), *tokens, *context)), *fusion, *compiled)?
