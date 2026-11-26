@@ -26,6 +26,8 @@ pub mod generate;
 pub mod engine;
 pub mod executor;
 pub mod family;
+pub mod flow_head;
+pub mod flow_head_cuda;
 pub mod gguf;
 pub mod gguf_iq;
 pub mod hardware;

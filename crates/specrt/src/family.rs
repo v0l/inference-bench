@@ -72,7 +72,10 @@ impl ParamSource {
             ParamSource::Number(v) => Ok(*v),
             ParamSource::Expr { .. } | ParamSource::Int { .. } => read_params(&[(name.to_string(), self.clone())].into_iter().collect(), config).map(|m| m[name]),
             ParamSource::Config { config: key, default, alt } => std::iter::once(key).chain(alt.as_ref())
-                .find_map(|key| key.split('.').try_fold(config, |v, k| v.get(k)).and_then(|v| v.as_f64().or_else(|| v.as_bool().map(f64::from))))
+                .find_map(|key| key.split('.').try_fold(config, |v, k| match k.parse::<usize>() {
+                    Ok(i) if v.is_array() => v.get(i),
+                    _ => v.get(k),
+                }).and_then(|v| v.as_f64().or_else(|| v.as_bool().map(f64::from))))
                 .or(*default)
                 .with_context(|| format!("attention param {name} reads config.json key {key}, which is missing")),
         }
@@ -797,6 +800,24 @@ impl FamilyGguf {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyHead {
+    pub graph: String,
+    pub root: String,
+    pub params: std::collections::BTreeMap<String, ParamSource>,
+}
+
+impl FamilyHead {
+    pub fn is_set(&self) -> bool {
+        !self.graph.is_empty()
+    }
+
+    pub fn read(&self, config: &serde_json::Value) -> Result<std::collections::BTreeMap<String, f64>> {
+        read_params(&self.params, config).with_context(|| format!("[head] of graph {}", self.graph))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Family {
@@ -863,6 +884,8 @@ pub struct Family {
     #[serde(default)]
     pub inputs: FamilyInputs,
     #[serde(default)]
+    pub head: FamilyHead,
+    #[serde(default)]
     pub tensors: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub refuse: Vec<FamilyRefuse>,
@@ -891,7 +914,7 @@ impl Family {
         for s in &self.inputs.streams {
             push(&s.width, &mut out);
         }
-        for (_, key) in self.attention.params.iter().chain(self.mixer.params.iter()).chain(self.inputs.params.iter()).chain(self.gated_residual.params.iter()).chain(self.per_layer.params.iter()).chain(self.prelude.params.iter()) {
+        for (_, key) in self.attention.params.iter().chain(self.mixer.params.iter()).chain(self.inputs.params.iter()).chain(self.gated_residual.params.iter()).chain(self.per_layer.params.iter()).chain(self.prelude.params.iter()).chain(self.head.params.iter()) {
             match key {
                 ParamSource::Config { config, alt, .. } => {
                     push(config, &mut out);

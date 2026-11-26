@@ -1786,7 +1786,7 @@ impl Checkpoint {
                 let (gate, up) = self.block_gate_up(format, &format!("{p}.mlp.experts.gate_up_proj"), e, inter, h, m.gate_up_interleaved)?;
                 (gate, up, self.block_stack(format, &format!("{p}.mlp.experts.down_proj"), e, h, inter)?)
             }
-            None if m.experts_transposed => {
+            None if m.experts_transposed && self.has(&format!("{p}.mlp.experts.gate_up_proj")) => {
                 ensure!(quant == Quant::Bf16, "transposed fused experts are bf16 only");
                 ensure!(shared_slots <= 1, "transposed fused experts take at most one shared expert");
                 let fused = self.bf16(&format!("{p}.mlp.experts.gate_up_proj"), &[e, h, 2 * inter])?;
@@ -2571,6 +2571,62 @@ mod block_expert_tests {
         checkpoint(&dir, 2, 32, 160);
         let ck = Checkpoint::open(&dir).unwrap();
         assert!(ck.block_stack(&MXFP4, "model.layers.0.mlp.experts.gate_up_proj", 2, 32, 160).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod per_expert_transposed_tests {
+    use super::*;
+    use safetensors::tensor::TensorView;
+
+    fn tiny_spec(h: usize, inter: usize, e: usize) -> Spec {
+        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/llama4-scout.config.json")).unwrap();
+        let mut config: serde_json::Value = serde_json::from_str(&text).unwrap();
+        config.as_object_mut().unwrap().remove("vision_config");
+        let t = &mut config["text_config"];
+        t["hidden_size"] = h.into();
+        t["intermediate_size"] = inter.into();
+        t["intermediate_size_mlp"] = (2 * inter).into();
+        t["num_local_experts"] = e.into();
+        t["num_hidden_layers"] = 1.into();
+        t["no_rope_layers"] = serde_json::json!([1]);
+        t["num_attention_heads"] = 2.into();
+        t["num_key_value_heads"] = 1.into();
+        t["head_dim"] = 64.into();
+        Spec::from_hf_config_serving_in(crate::family::Registry::embedded(), &config.to_string()).unwrap()
+    }
+
+    #[test]
+    fn nvfp4_experts_stored_one_by_one_load_in_the_transposed_layout() {
+        let (h, inter, e) = (128usize, 64usize, 2usize);
+        let dir = std::env::temp_dir().join(format!("per-expert-nvfp4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut owned: Vec<(String, Dtype, Vec<usize>, Vec<u8>)> = Vec::new();
+        let mut module = |name: String, rows: usize, cols: usize, fill: u8| {
+            owned.push((format!("{name}.weight_packed"), Dtype::U8, vec![rows, cols / 2], vec![fill; rows * cols / 2]));
+            owned.push((format!("{name}.weight_scale"), Dtype::F8_E4M3, vec![rows, cols / 16], vec![0x38; rows * cols / 16]));
+            owned.push((format!("{name}.weight_global_scale"), Dtype::F32, vec![1], 1.0f32.to_le_bytes().to_vec()));
+            owned.push((format!("{name}.input_global_scale"), Dtype::F32, vec![1], 1.0f32.to_le_bytes().to_vec()));
+        };
+        let p = "model.layers.0.mlp";
+        for x in 0..e {
+            module(format!("{p}.experts.{x}.gate_proj"), inter, h, 0x22);
+            module(format!("{p}.experts.{x}.up_proj"), inter, h, 0x22);
+            module(format!("{p}.experts.{x}.down_proj"), h, inter, 0x22);
+        }
+        module(format!("{p}.shared_expert.gate_proj"), inter, h, 0x22);
+        module(format!("{p}.shared_expert.up_proj"), inter, h, 0x22);
+        module(format!("{p}.shared_expert.down_proj"), h, inter, 0x22);
+        owned.push((format!("{p}.router.weight"), Dtype::BF16, vec![e, h], vec![0u8; e * h * 2]));
+        let views: Vec<(String, TensorView)> = owned.iter().map(|(n, d, s, b)| (n.clone(), TensorView::new(*d, s.clone(), b).unwrap())).collect();
+        safetensors::serialize_to_file(views, None, &dir.join("model.safetensors")).unwrap();
+        let ck = Checkpoint::open(&dir).unwrap();
+        let spec = tiny_spec(h, inter, e);
+        let w = ck.moe_layer(&spec, "model.layers.0", Quant::Nvfp4G16).unwrap();
+        let Stacked::Fp4 { packed, inv_global, .. } = &w.gate else { panic!("an fp4 stack") };
+        assert_eq!(packed.len(), (e + 1) * inter * h / 2);
+        assert_eq!(inv_global.len(), e + 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

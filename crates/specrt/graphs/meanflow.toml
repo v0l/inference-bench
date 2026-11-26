@@ -1,0 +1,443 @@
+name = "meanflow"
+kind = "flow-head-graph"
+frame = ["hidden", "noise"]
+constants = ["latent_scale", "latent_bias"]
+
+[scalars]
+t = "step / num_steps"
+dt = "interval_embed"
+h_step = "1 / num_steps"
+omega = "1 - 1 / guidance"
+
+[symbols]
+mod3 = "3 * hidden"
+mod2 = "2 * hidden"
+gate_up = "2 * mlp"
+
+[[input]]
+name = "hidden"
+rows = "seqs"
+cols = "hidden"
+
+[[input]]
+name = "noise"
+rows = "seqs"
+cols = "latent_dim"
+
+[[input]]
+name = "t"
+rows = "seqs"
+cols = "1"
+
+[[input]]
+name = "dt"
+rows = "seqs"
+cols = "1"
+
+[[input]]
+name = "h_step"
+rows = "seqs"
+cols = "1"
+
+[[input]]
+name = "omega"
+rows = "seqs"
+cols = "1"
+
+[[output]]
+name = "latent"
+rows = "seqs"
+cols = "latent_dim"
+
+[[buffer]]
+name = "hidden_planes"
+rows = "seqs"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "cond"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "t_freq"
+rows = "seqs"
+cols = "freq"
+planes = true
+
+[[buffer]]
+name = "t_mid"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "t_act"
+rows = "seqs"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "t_emb"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "dt_freq"
+rows = "seqs"
+cols = "freq"
+planes = true
+
+[[buffer]]
+name = "dt_mid"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "dt_act"
+rows = "seqs"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "dt_emb"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "h_freq"
+rows = "seqs"
+cols = "freq"
+planes = true
+
+[[buffer]]
+name = "h_mid"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "h_act"
+rows = "seqs"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "h_emb"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "omega_freq"
+rows = "seqs"
+cols = "freq"
+planes = true
+
+[[buffer]]
+name = "omega_mid"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "omega_act"
+rows = "seqs"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "omega_emb"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "emb"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "c"
+rows = "seqs"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "z"
+rows = "seqs"
+cols = "latent_dim"
+
+[[buffer]]
+name = "z_planes"
+rows = "seqs"
+cols = "latent_dim"
+planes = true
+
+[[buffer]]
+name = "x"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "xn"
+rows = "seqs"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "mod"
+rows = "seqs"
+cols = "mod3"
+
+[[buffer]]
+name = "gate_up"
+rows = "seqs"
+cols = "gate_up"
+
+[[buffer]]
+name = "act"
+rows = "seqs"
+cols = "mlp"
+planes = true
+
+[[buffer]]
+name = "branch"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "mod_out"
+rows = "seqs"
+cols = "mod2"
+
+[[buffer]]
+name = "u"
+rows = "seqs"
+cols = "latent_dim"
+
+[[head]]
+op = "timestep"
+in = "t"
+out = "t_freq"
+
+[[head]]
+op = "linear"
+weight = "t_embed.fc1"
+in = "t_freq"
+out = "t_mid"
+rows = "seqs"
+
+[[head]]
+op = "silu_split"
+in = "t_mid"
+out = "t_act"
+rows = "seqs"
+
+[[head]]
+op = "linear"
+weight = "t_embed.fc2"
+in = "t_act"
+out = "t_emb"
+rows = "seqs"
+
+[[head]]
+op = "timestep"
+in = "dt"
+out = "dt_freq"
+
+[[head]]
+op = "linear"
+weight = "dt_embed.fc1"
+in = "dt_freq"
+out = "dt_mid"
+rows = "seqs"
+
+[[head]]
+op = "silu_split"
+in = "dt_mid"
+out = "dt_act"
+rows = "seqs"
+
+[[head]]
+op = "linear"
+weight = "dt_embed.fc2"
+in = "dt_act"
+out = "dt_emb"
+rows = "seqs"
+
+[[head]]
+op = "timestep"
+in = "h_step"
+out = "h_freq"
+
+[[head]]
+op = "linear"
+weight = "h_embed.fc1"
+in = "h_freq"
+out = "h_mid"
+rows = "seqs"
+
+[[head]]
+op = "silu_split"
+in = "h_mid"
+out = "h_act"
+rows = "seqs"
+
+[[head]]
+op = "linear"
+weight = "h_embed.fc2"
+in = "h_act"
+out = "h_emb"
+rows = "seqs"
+
+[[head]]
+op = "timestep"
+in = "omega"
+out = "omega_freq"
+
+[[head]]
+op = "linear"
+weight = "omega_embed.fc1"
+in = "omega_freq"
+out = "omega_mid"
+rows = "seqs"
+
+[[head]]
+op = "silu_split"
+in = "omega_mid"
+out = "omega_act"
+rows = "seqs"
+
+[[head]]
+op = "linear"
+weight = "omega_embed.fc2"
+in = "omega_act"
+out = "omega_emb"
+rows = "seqs"
+
+[[head]]
+op = "map"
+out = "emb"
+rows = "seqs"
+expr = "t_emb + dt_emb + h_emb + omega_emb"
+
+[[head]]
+op = "split"
+in = "hidden"
+out = "hidden_planes"
+rows = "seqs"
+
+[[head]]
+op = "linear"
+weight = "cond_proj"
+in = "hidden_planes"
+out = "cond"
+rows = "seqs"
+
+[[head]]
+op = "map"
+out = "c"
+rows = "seqs"
+expr = "silu(cond + emb)"
+
+[[start]]
+op = "copy"
+in = "noise"
+out = "z"
+rows = "seqs"
+
+[[head]]
+op = "split"
+in = "z"
+out = "z_planes"
+rows = "seqs"
+
+[[head]]
+op = "linear"
+weight = "latent_proj"
+in = "z_planes"
+out = "x"
+rows = "seqs"
+
+[[block]]
+name = "layers"
+prefix = "layers"
+count = "layers"
+
+[[block.node]]
+op = "linear"
+weight = "ada"
+in = "c"
+out = "mod"
+rows = "seqs"
+
+[[block.node]]
+op = "modulate"
+norm = "rms"
+weight = "norm"
+in = "x"
+out = "xn"
+rows = "seqs"
+set = "mod"
+shift = 0
+scale = 1
+
+[[block.node]]
+op = "linear"
+weight = "ffn.gate_proj+ffn.up_proj"
+in = "xn"
+out = "gate_up"
+rows = "seqs"
+
+[[block.node]]
+op = "glu"
+in = "gate_up"
+out = "act"
+rows = "seqs"
+
+[[block.node]]
+op = "linear"
+weight = "ffn.down_proj"
+in = "act"
+out = "branch"
+rows = "seqs"
+
+[[block.node]]
+op = "gated_add"
+in = "branch"
+rows = "seqs"
+set = "mod"
+gate = 2
+
+[[tail]]
+op = "linear"
+weight = "final.ada"
+in = "c"
+out = "mod_out"
+rows = "seqs"
+
+[[tail]]
+op = "modulate"
+norm = "rms"
+in = "x"
+out = "xn"
+rows = "seqs"
+set = "mod_out"
+shift = 0
+scale = 1
+
+[[tail]]
+op = "linear"
+weight = "final.proj"
+in = "xn"
+out = "u"
+rows = "seqs"
+
+[[tail]]
+op = "map"
+out = "z"
+rows = "seqs"
+expr = "z + h_step * u"
+
+[[finish]]
+op = "map"
+out = "latent"
+rows = "seqs"
+expr = "z / latent_scale - latent_bias"

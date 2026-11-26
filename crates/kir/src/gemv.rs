@@ -30,6 +30,19 @@ pub enum Gemv {
     GateUpAct { decoder: String },
     Tiled { decoder: String, n: usize, k: usize, bias: bool, residual: bool },
     Bf16Rows { n: usize, k: usize },
+    Rows { n: usize, k: usize, epilogue: String },
+}
+
+pub const ROWS_NAMES: [&str; 4] = ["acc", "old", "g", "r"];
+
+pub fn rows_epilogue(text: &str) -> Result<crate::expr::Expr, String> {
+    let e = crate::expr::Expr::parse(text)?;
+    let mut names = Vec::new();
+    e.names(&mut names);
+    if let Some(n) = names.iter().find(|n| !ROWS_NAMES.contains(&n.as_str())) {
+        return Err(format!("a rows gemv epilogue reads {}, not {n:?}", ROWS_NAMES.join(", ")));
+    }
+    Ok(e)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +71,10 @@ impl GemvKernel {
             Gemv::Norm { decoder, n, .. } => !decoder.is_empty() && *n > 0,
             Gemv::GateUpAct { decoder } => !decoder.is_empty(),
             Gemv::Bf16Rows { n, k } => *n > 0 && k.is_multiple_of(8),
+            Gemv::Rows { n, k, epilogue } => {
+                rows_epilogue(epilogue).map_err(|e| format!("{}: {e}", self.name))?;
+                *n > 0 && *k > 0 && k.is_multiple_of(8)
+            }
         };
         if !ok {
             return Err(format!("{}: bad gemv shape {:?}", self.name, self.op));
@@ -67,7 +84,7 @@ impl GemvKernel {
 
     pub fn threads(&self) -> u32 {
         match self.op {
-            Gemv::Bf16Rows { .. } => BA_ROWS_THREADS,
+            Gemv::Bf16Rows { .. } | Gemv::Rows { .. } => BA_ROWS_THREADS,
             _ => GEMV_THREADS,
         }
     }
@@ -97,6 +114,7 @@ impl GemvKernel {
                 "extern \"C\" __global__ void {name}(const void* w, const float* s, const float* x, const float* nw, float* out) {{\n    gate_up_act_norm<{decoder}>(w, s, x, nw, out);\n}}\n\n"
             ),
             Gemv::Bf16Rows { n, k } => bf16_rows(name, *n, *k),
+            Gemv::Rows { k, epilogue, .. } => planes_rows(name, *k, &rows_epilogue(epilogue)?)?,
         })
     }
 }
@@ -111,6 +129,83 @@ pub fn emit_gemvs(kernels: &[GemvKernel]) -> Result<crate::KirSource, String> {
         out.push_str(&k.emit()?);
     }
     Ok(crate::KirSource::emitted(out))
+}
+
+fn planes_rows(name: &str, k: usize, epilogue: &crate::expr::Expr) -> Result<String, String> {
+    let m = BA_ROWS_MAX_TOKENS;
+    let t = BA_ROWS_THREADS;
+    let warps = t / 32;
+    let chunks = k / 8;
+    let mut names = Vec::new();
+    epilogue.names(&mut names);
+    let value = epilogue.subst(&|v| Some(crate::expr::Expr::Raw(format!("e_{v}")))).map_err(|e| e.to_string())?.lower(crate::layout::Dialect::Cuda, &[])?;
+    let mut loads = String::new();
+    for v in &names {
+        loads.push_str(&match v.as_str() {
+            "acc" => "        float e_acc = v;\n".to_string(),
+            "old" => "        float e_old = *o;\n".to_string(),
+            "g" => "        float e_g = aux[m * (size_t)aux_stride + row];\n".to_string(),
+            _ => "        float e_r = aux[m * (size_t)aux_stride];\n".to_string(),
+        });
+    }
+    Ok(format!(
+        "extern \"C\" __global__ void {name}(const unsigned short* w, const unsigned short* xh, const unsigned short* xl, float* out,
+                                       const float* aux, int tokens, int out_stride, int aux_stride) {{
+    __shared__ float part[{warps}][{m}];
+    int row = blockIdx.x;
+    int m0 = blockIdx.y * {m};
+    int chunk = min(tokens - m0, {m});
+    int tid = threadIdx.x;
+    float acc[{m}];
+#pragma unroll
+    for (int m = 0; m < {m}; m++) acc[m] = 0.0f;
+    const uint4* wr = (const uint4*)(w + (size_t)row * {k});
+    for (int i = tid; i < {chunks}; i += {t}) {{
+        uint4 q = wr[i];
+        float wf[8];
+        unsigned words[4] = {{q.x, q.y, q.z, q.w}};
+#pragma unroll
+        for (int j = 0; j < 4; j++) {{
+            wf[2 * j] = __uint_as_float(words[j] << 16);
+            wf[2 * j + 1] = __uint_as_float(words[j] & 0xffff0000u);
+        }}
+#pragma unroll
+        for (int m = 0; m < {m}; m++) {{
+            if (m < chunk) {{
+                uint4 h = ((const uint4*)(xh + (size_t)(m0 + m) * {k}))[i];
+                uint4 l = ((const uint4*)(xl + (size_t)(m0 + m) * {k}))[i];
+                unsigned hw[4] = {{h.x, h.y, h.z, h.w}};
+                unsigned lw[4] = {{l.x, l.y, l.z, l.w}};
+                float a = acc[m];
+#pragma unroll
+                for (int j = 0; j < 4; j++) {{
+                    a += wf[2 * j] * (__uint_as_float(hw[j] << 16) + __uint_as_float(lw[j] << 16));
+                    a += wf[2 * j + 1] * (__uint_as_float(hw[j] & 0xffff0000u) + __uint_as_float(lw[j] & 0xffff0000u));
+                }}
+                acc[m] = a;
+            }}
+        }}
+    }}
+#pragma unroll
+    for (int m = 0; m < {m}; m++) {{
+        float v = acc[m];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
+        if ((tid & 31) == 0) part[tid >> 5][m] = v;
+    }}
+    __syncthreads();
+    if (tid < chunk) {{
+        float v = 0.0f;
+#pragma unroll
+        for (int wp = 0; wp < {warps}; wp++) v += part[wp][tid];
+        size_t m = m0 + tid;
+        float* o = out + m * (size_t)out_stride + row;
+{loads}        *o = {value};
+    }}
+}}
+
+"
+    ))
 }
 
 fn bf16_rows(name: &str, n: usize, k: usize) -> String {

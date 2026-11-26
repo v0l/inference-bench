@@ -248,7 +248,7 @@ impl Heavy {
             }
             Gemv::Norm { decoder, n, bias } => gemv(decoder, *n, hidden)?.slotted(true, epilogue(Epilogue::Store, *bias, *n))?,
             Gemv::GateUpAct { decoder } => gemv(decoder, 2 * inter, hidden)?.slotted(true, epilogue_into(Epilogue::Act, false, 2 * inter, OUT))?,
-            Gemv::Tiled { .. } | Gemv::Bf16Rows { .. } => return Ok(None),
+            Gemv::Tiled { .. } | Gemv::Bf16Rows { .. } | Gemv::Rows { .. } => return Ok(None),
         };
         Ok(Some(h))
     }
