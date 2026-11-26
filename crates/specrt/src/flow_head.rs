@@ -129,7 +129,35 @@ impl FlowHead {
     }
 
     pub fn levels(&self) -> Result<Vec<Level>> {
-        Ok(vec![Level::Step; self.plan.head.len()])
+        let signer = self.signer();
+        let mut level: BTreeMap<Place, Level> = BTreeMap::new();
+        for n in &self.graph.frame {
+            level.insert(Place::Input(intern_name(n)), Level::Frame);
+        }
+        for n in self.step_scalars() {
+            level.insert(Place::Input(intern_name(n)), Level::Step);
+        }
+        for op in &self.start {
+            for w in signer.sign(dit(op)?)?.writes {
+                level.insert(w.place, Level::Frame);
+            }
+        }
+        for op in self.plan.blocks.iter().flat_map(|b| &b.ops).chain(&self.plan.tail) {
+            for w in signer.sign(dit(op)?)?.writes {
+                level.insert(w.place, Level::Step);
+            }
+        }
+        let mut out = Vec::with_capacity(self.plan.head.len());
+        for op in &self.plan.head {
+            let sig = signer.sign(dit(op)?)?;
+            let l = sig.reads.iter().chain(&sig.writes).filter_map(|t| level.get(&t.place).copied()).max().unwrap_or(Level::Session);
+            for w in &sig.writes {
+                let e = level.entry(w.place.clone()).or_insert(l);
+                *e = (*e).max(l);
+            }
+            out.push(l);
+        }
+        Ok(out)
     }
 
     pub fn ops_at(&self, level: Level) -> Result<Vec<usize>> {
