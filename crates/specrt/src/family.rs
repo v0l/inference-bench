@@ -366,6 +366,34 @@ impl Default for FamilyNorm {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct FamilySpeech {
+    pub decode: Option<SpeechDecode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeechDecode {
+    pub time_precision: f64,
+    pub top_k: usize,
+    pub condition_below: f64,
+    pub temperatures: Vec<f64>,
+    #[serde(default)]
+    pub compression_ratio_threshold: Option<f64>,
+    #[serde(default)]
+    pub logprob_threshold: Option<f64>,
+    #[serde(default)]
+    pub no_speech_threshold: Option<f64>,
+    pub suppress: String,
+    pub begin_suppress: String,
+    pub languages: String,
+    pub tasks: String,
+    pub forced: String,
+    pub multilingual: String,
+    pub params: std::collections::BTreeMap<String, ParamSource>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct FamilyCross {
     pub source: Option<String>,
     pub rows: Option<String>,
@@ -1006,6 +1034,8 @@ pub struct Family {
     pub remap: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub cross: FamilyCross,
+    #[serde(default)]
+    pub speech: FamilySpeech,
 }
 
 impl Family {

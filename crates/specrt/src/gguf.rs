@@ -636,6 +636,7 @@ impl Gguf {
             inputs: None,
             duplex: None,
             cross: None,
+            speech_decode: None,
             tensors: Default::default(),
             mtp: (family.mtp && nextn > 0).then(|| crate::spec::Mtp { head_quant: Some(Quant::Bf16), ..crate::spec::Mtp::new(nextn) }),
             vision: None,

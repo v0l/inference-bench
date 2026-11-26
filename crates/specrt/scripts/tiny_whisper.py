@@ -9,6 +9,8 @@ import torch
 from safetensors.torch import save_file
 from transformers import WhisperConfig, WhisperFeatureExtractor, WhisperForConditionalGeneration
 from transformers.generation import GenerationConfig
+from transformers.generation.logits_process import WhisperNoSpeechDetection
+from transformers.models.whisper.generation_whisper import _get_attr_from_logit_processors
 
 ROOT = Path(__file__).parent.parent
 FIXTURE = ROOT / "tests/fixtures/speech"
@@ -18,6 +20,10 @@ SEED = 0
 RATE = 16000
 WINDOW_SECONDS = 1
 STEPS = 12
+LONG_SECONDS = 1.5
+THRESHOLDS = dict(logprob_threshold=-1.0, no_speech_threshold=0.6, compression_ratio_threshold=2.4)
+FALLBACK = (0.0, 0.4, 0.8)
+MIXED = dict(logprob_threshold=-2.45, no_speech_threshold=0.0003, compression_ratio_threshold=1.9)
 
 TEXT = 512
 EOT = TEXT
@@ -92,6 +98,70 @@ def audio():
     full = (voiced + 0.01 * rng.standard_normal(t.shape)).astype(np.float32)
     short = full[: int(0.6 * RATE)].copy()
     return full, short
+
+
+def long_audio():
+    rng = np.random.default_rng(SEED + 1)
+    t = np.arange(int(LONG_SECONDS * RATE)) / RATE
+    chirp = 0.3 * np.sin(2 * math.pi * (300 + 400 * t) * t)
+    gate = np.sin(2 * math.pi * 1.3 * t) > -0.3
+    return (chirp * gate + 0.01 * rng.standard_normal(t.shape)).astype(np.float32)
+
+
+def recorder(model):
+    windows = []
+    need = model._need_fallback
+    with_fallback = model.generate_with_fallback
+
+    def generate_with_fallback(segment_input, decoder_input_ids, cur_bsz, seek, *args, **kwargs):
+        windows.append({"seek": int(seek[0]), "decoder_input": [int(t) for t in decoder_input_ids[0]], "attempts": []})
+        return with_fallback(segment_input, decoder_input_ids, cur_bsz, seek, *args, **kwargs)
+
+    def need_fallback(seq, outs, i, processors, gc, vocab, temperature):
+        fallback, skip = need(seq, outs, i, processors, gc, vocab, temperature)
+        temperature = temperature or 0.0
+        nsp = None
+        if gc.no_speech_threshold is not None:
+            nsp = float(_get_attr_from_logit_processors(processors, WhisperNoSpeechDetection, "no_speech_prob")[i])
+        windows[-1]["attempts"].append({
+            "temperature": float(temperature),
+            "tokens": [int(t) for t in seq],
+            "compression_ratio": float(model._retrieve_compression_ratio(seq, vocab)),
+            "avg_logprob": float(model._retrieve_avg_logprobs(outs[i]["scores"], seq, temperature)),
+            "no_speech_prob": nsp,
+            "needs_fallback": bool(fallback),
+            "should_skip": bool(skip),
+            "scores": torch.stack(outs[i]["scores"]).numpy().copy(),
+        })
+        return fallback, skip
+
+    model._need_fallback = need_fallback
+    model.generate_with_fallback = generate_with_fallback
+    return windows
+
+
+def transcribe(model, mel, **kw):
+    windows = recorder(model)
+    torch.manual_seed(SEED)
+    with torch.no_grad():
+        out = model.generate(mel, return_timestamps=True, return_segments=True, output_scores=True, return_dict_in_generate=True, **kw)
+    del model._need_fallback, model.generate_with_fallback
+    segments = [{"start": round(float(s["start"]), 6), "end": round(float(s["end"]), 6), "tokens": [int(t) for t in s["tokens"]]} for s in out["segments"][0]]
+    return {"sequence": [int(t) for t in out["sequences"][0]], "segments": segments, "windows": windows}
+
+
+def strip_scores(run, refs=None, name=None):
+    for wi, w in enumerate(run["windows"]):
+        for ai, a in enumerate(w["attempts"]):
+            scores = a.pop("scores")
+            if refs is None or a["temperature"] == 0.0:
+                continue
+            rows, cols = np.nonzero(np.isfinite(scores))
+            key = f"{name}.w{wi}.a{ai}"
+            save_ref(refs, f"{key}.ids", np.stack([rows, cols], axis=1).astype(np.float32))
+            save_ref(refs, f"{key}.scores", scores[rows, cols])
+            a["scores"] = key
+    return run
 
 
 def save_ref(store, name, array):
@@ -179,6 +249,19 @@ def reference():
     with torch.no_grad():
         hf = model.generate(mel, language="en", task="transcribe", return_timestamps=False, max_new_tokens=STEPS)
     hf_tokens = [int(t) for t in hf[0]]
+    timestamps = transcribe(model, mel)
+    long = long_audio()
+    save_ref(refs, "audio.long", long)
+    mel_long = fe(long, sampling_rate=RATE, return_tensors="pt", padding="longest", truncation=False).input_features
+    save_ref(refs, "mel.long", mel_long[0])
+    runs = {
+        "timestamps": strip_scores(timestamps),
+        "long": strip_scores(transcribe(model, mel_long, language="en", task="transcribe", condition_on_prev_tokens=True, temperature=0.0, **THRESHOLDS)),
+        "fallback": strip_scores(transcribe(model, mel_long, language="en", task="transcribe", condition_on_prev_tokens=True, temperature=FALLBACK, **MIXED), refs, "fallback"),
+    }
+    options = {"timestamps": {}, "long": {"temperatures": [0.0], "condition_on_prev_tokens": True, "language": "en", **THRESHOLDS}, "fallback": {"temperatures": list(FALLBACK), "condition_on_prev_tokens": True, "language": "en", **MIXED}}
+    for k, v in options.items():
+        runs[k]["options"] = v
     meta = {
         "seed": SEED,
         "transformers": __import__("transformers").__version__,
@@ -188,6 +271,7 @@ def reference():
         "greedy": tokens,
         "generate": hf_tokens,
         "detected_language": detected,
+        "runs": runs,
         "files": {},
     }
     out = TINY / "reference"

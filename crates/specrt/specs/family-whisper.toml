@@ -61,6 +61,33 @@ source = "model.encoder"
 rows = "max_source_positions"
 state = "cross_kv"
 
+[speech.decode]
+time_precision = 0.02
+top_k = 50
+condition_below = 0.5
+temperatures = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+compression_ratio_threshold = 2.4
+logprob_threshold = -1.0
+no_speech_threshold = 0.6
+suppress = "suppress_tokens"
+begin_suppress = "begin_suppress_tokens"
+languages = "lang_to_id"
+tasks = "task_to_id"
+forced = "forced_decoder_ids"
+multilingual = "is_multilingual"
+
+[speech.decode.params]
+sot = { config = "decoder_start_token_id" }
+eot = { config = "eos_token_id" }
+no_timestamps = { config = "no_timestamps_token_id" }
+timestamp_begin = { expr = "no_timestamps_token_id + 1" }
+no_speech = { expr = "no_timestamps_token_id - 1" }
+prev = { config = "prev_sot_token_id", default = -1 }
+max_target = { config = "max_target_positions" }
+prev_cutoff = { expr = "floor(max_target_positions / 2) - 1" }
+max_length = { config = "max_length", alt = "max_target_positions" }
+max_initial_timestamp = { config = "max_initial_timestamp_index", default = -1 }
+
 [[state]]
 name = "k"
 per = "token"
