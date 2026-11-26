@@ -105,6 +105,9 @@ pub fn unsupported(spec: &Spec) -> Option<String> {
     if spec.act_quant != ActQuant::None || spec.mlp.act_quant != ActQuant::None {
         return Some("activation quantisation is not yet on wgpu".into());
     }
+    if spec.quantized_at_load() {
+        return Some("quantising at load is not yet on wgpu".into());
+    }
     let mut quants = vec![spec.quant, spec.lm_head_quant()];
     quants.extend((0..spec.layers.count).map(|i| spec.mlp_quant(i)));
     for q in quants {

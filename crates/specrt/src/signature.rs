@@ -560,7 +560,7 @@ impl<'a> Signer<'a> {
         let rows = Tensor::new(Place::Local("moe rows".into()), Rows::Tokens, h, Form::F32);
         let routes = Tensor::new(Place::Local("moe routes".into()), Rows::Pairs(m.pairs()), 2, Form::I32);
         let outs = Tensor::new(Place::Local("moe outputs".into()), Rows::Pairs(m.pairs()), h, Form::F32);
-        let q = self.spec.mlp_quant(layer);
+        let q = self.spec.expert_quant(layer);
         match op {
             Op::MoeRoute => Signature {
                 class: Class::Gemm,

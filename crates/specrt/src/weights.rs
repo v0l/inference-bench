@@ -231,7 +231,36 @@ pub struct Checkpoint {
     staged: Option<crate::loader::Batch>,
     cut: Option<std::sync::Arc<crate::tp::RankCut>>,
     owned: std::sync::Arc<std::sync::Mutex<Vec<Box<[u8]>>>>,
+    quantized: std::sync::Arc<QuantStats>,
     pub files: Vec<PathBuf>,
+}
+
+#[derive(Default)]
+pub struct QuantStats {
+    nanos: std::sync::atomic::AtomicU64,
+    bytes: std::sync::atomic::AtomicU64,
+    tensors: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Quantized {
+    pub secs: f64,
+    pub bf16_bytes: u64,
+    pub tensors: u64,
+}
+
+impl QuantStats {
+    fn record(&self, started: std::time::Instant, bf16_bytes: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.nanos.fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+        self.bytes.fetch_add(bf16_bytes as u64, Relaxed);
+        self.tensors.fetch_add(1, Relaxed);
+    }
+
+    fn read(&self) -> Quantized {
+        use std::sync::atomic::Ordering::Relaxed;
+        Quantized { secs: self.nanos.load(Relaxed) as f64 / 1e9, bf16_bytes: self.bytes.load(Relaxed), tensors: self.tensors.load(Relaxed) }
+    }
 }
 
 pub struct View<'a> {
@@ -297,7 +326,7 @@ fn shard_files(dir: &Path) -> Result<Vec<PathBuf>> {
 impl Checkpoint {
     pub fn open(dir: &Path) -> Result<Self> {
         if dir.extension().is_some_and(|e| e == "gguf") {
-            return Ok(Checkpoint { gguf: Some(std::sync::Arc::new(Gguf::open(dir)?)), shards: Default::default(), names: Default::default(), joined: Default::default(), staged: None, cut: None, owned: Default::default(), files: vec![dir.to_path_buf()] });
+            return Ok(Checkpoint { gguf: Some(std::sync::Arc::new(Gguf::open(dir)?)), shards: Default::default(), names: Default::default(), joined: Default::default(), staged: None, cut: None, owned: Default::default(), quantized: Default::default(), files: vec![dir.to_path_buf()] });
         }
         let files = shard_files(dir)?;
         let mut shards = Vec::with_capacity(files.len());
@@ -315,7 +344,7 @@ impl Checkpoint {
             shards.push(Shard { map, data_start: 8 + header, meta });
         }
         let joined = std::sync::Arc::new(join_row_shards(&names));
-        Ok(Checkpoint { gguf: None, shards: std::sync::Arc::new(shards), names: std::sync::Arc::new(names), joined, staged: None, cut: None, owned: Default::default(), files })
+        Ok(Checkpoint { gguf: None, shards: std::sync::Arc::new(shards), names: std::sync::Arc::new(names), joined, staged: None, cut: None, owned: Default::default(), quantized: Default::default(), files })
     }
 
     pub fn for_rank(&self, cut: crate::tp::RankCut) -> Result<Checkpoint> {
@@ -552,7 +581,28 @@ impl Checkpoint {
     }
 
     pub fn with_staged(&self, batch: Option<crate::loader::Batch>) -> Checkpoint {
-        Checkpoint { gguf: self.gguf.clone(), shards: self.shards.clone(), names: self.names.clone(), joined: self.joined.clone(), staged: batch, cut: self.cut.clone(), owned: Default::default(), files: self.files.clone() }
+        Checkpoint { gguf: self.gguf.clone(), shards: self.shards.clone(), names: self.names.clone(), joined: self.joined.clone(), staged: batch, cut: self.cut.clone(), owned: Default::default(), quantized: self.quantized.clone(), files: self.files.clone() }
+    }
+
+    pub fn quantized(&self) -> Quantized {
+        self.quantized.read()
+    }
+
+    fn served<'s>(&self, spec: &Spec, raw: Raw<'s>, quant: Quant, what: &str) -> Result<Matrix<'s>> {
+        let Raw::Bf16 { w, cols } = &raw else { return raw.into_matrix(quant, what) };
+        if spec.runtime.quantize.format() != Some(quant) {
+            return raw.into_matrix(quant, what);
+        }
+        let started = std::time::Instant::now();
+        let m = match quant {
+            Quant::Nvfp4G16 => Matrix::Fp4(crate::quantize::nvfp4_search(w, *cols)),
+            _ => {
+                let (values, scales) = crate::quantize::fp8_channel_search(w, *cols);
+                Matrix::Fp8 { values: Cow::Owned(values), scales }
+            }
+        };
+        self.quantized.record(started, w.len() * 2);
+        Ok(m)
     }
 
     pub fn release(&self) {
@@ -1195,14 +1245,13 @@ impl Checkpoint {
         Ok(self.f32(name, len)?.into_iter().map(|w| w + offset).collect())
     }
 
-    fn attention(&self, spec: &Spec, attn: &str, block: Block, shared: bool) -> Result<Attn<'_>> {
-        self.attention_as(spec, attn, false, block, shared)
+    fn attention(&self, spec: &Spec, attn: &str, block: Block, shared: bool, layer: usize) -> Result<Attn<'_>> {
+        self.attention_as(spec, attn, false, block, shared, layer)
     }
 
-    fn attention_as(&self, spec: &Spec, attn: &str, bf16: bool, block: Block, shared: bool) -> Result<Attn<'_>> {
+    fn attention_as(&self, spec: &Spec, attn: &str, bf16: bool, block: Block, shared: bool, layer: usize) -> Result<Attn<'_>> {
         let a = &spec.attention;
-        let quant = if bf16 { Quant::Bf16 } else { spec.quant };
-        let (qkv_quant, o_quant) = if bf16 { (Quant::Bf16, Quant::Bf16) } else { (spec.requanted("qkv", quant), spec.requanted("o", quant)) };
+        let (qkv_quant, o_quant) = if bf16 { (Quant::Bf16, Quant::Bf16) } else { (spec.linear_quant("qkv", layer), spec.linear_quant("o", layer)) };
         let (h, q, kv) = (spec.dims.hidden, spec.q_dim(), spec.kv_dim());
         let w = |p: &str, rows: usize, cols: usize| {
             self.raw(&format!("{attn}.{p}.weight"), rows, cols).map(|r| if bf16 { r.dequantized() } else { r })
@@ -1303,7 +1352,7 @@ impl Checkpoint {
         }
         Ok(Attn {
             extra,
-            qkv: Raw::concat(parts)?.into_matrix(qkv_quant, &format!("{attn}.qkv"))?,
+            qkv: self.served(spec, Raw::concat(parts)?, qkv_quant, &format!("{attn}.qkv"))?,
             qkv_bias,
             o_bias: if a.o_bias { Some(self.f32(&format!("{attn}.o_proj.bias"), h)?) } else { None },
             q_norm,
@@ -1312,7 +1361,7 @@ impl Checkpoint {
                 let (full, cols) = (spec.o_dim(), spec.o_cols_in(block));
                 let raw = w(a.o_tensor.as_deref().unwrap_or("o_proj"), h, cols)?;
                 let raw = if cols < full { pad_cols(raw, full) } else { raw };
-                raw.into_matrix(o_quant, &format!("{attn}.{}", a.o_tensor.as_deref().unwrap_or("o_proj")))?
+                self.served(spec, raw, o_quant, &format!("{attn}.{}", a.o_tensor.as_deref().unwrap_or("o_proj")))?
             },
         })
     }
@@ -1323,7 +1372,7 @@ impl Checkpoint {
         Ok(if negated { stored } else { stored.into_iter().map(|a| -a.exp()).collect() })
     }
 
-    fn gated_delta_net(&self, spec: &Spec, p: &str) -> Result<Gdn<'_>> {
+    fn gated_delta_net(&self, spec: &Spec, p: &str, layer: usize) -> Result<Gdn<'_>> {
         let la = spec.linear_attention.as_ref().context("no [linear_attention]")?;
         let h = spec.dims.hidden;
         let (conv_dim, value_dim, heads) = (la.conv_dim(), la.value_dim(), la.value_heads);
@@ -1345,13 +1394,13 @@ impl Checkpoint {
             (in_proj, ba)
         };
         Ok(Gdn {
-            in_proj: in_proj.into_matrix(spec.requanted("lin_in", spec.quant), &format!("{p}.in_proj"))?,
+            in_proj: self.served(spec, in_proj, spec.linear_quant("lin_in", layer), &format!("{p}.in_proj"))?,
             ba: Matrix::Bf16(Cow::Owned(ba)),
             conv: self.floats(&format!("{p}.conv1d.weight"), &[conv_dim, 1, la.conv_kernel])?,
             neg_a: self.neg_a(&format!("{p}.A_log"), heads)?,
             dt_bias: self.f32(&format!("{p}.dt_bias"), heads)?,
             norm: self.f32(&format!("{p}.norm.weight"), la.value_head_dim)?,
-            out: w("out_proj", h, value_dim)?.into_matrix(spec.requanted("lin_out", spec.quant), &format!("{p}.out_proj"))?,
+            out: self.served(spec, w("out_proj", h, value_dim)?, spec.linear_quant("lin_out", layer), &format!("{p}.out_proj"))?,
         })
     }
 
@@ -1372,8 +1421,8 @@ impl Checkpoint {
             }
         }
         Ok(Described {
-            in_proj: Raw::concat(parts)?.into_matrix(spec.quant, &format!("{module}.in_proj"))?,
-            out: self.raw(&format!("{module}.{}.weight", m.out_tensor), h, spec.mix_out_cols())?.into_matrix(spec.quant, &format!("{module}.out_proj"))?,
+            in_proj: self.served(spec, Raw::concat(parts)?, spec.quant, &format!("{module}.in_proj"))?,
+            out: self.served(spec, self.raw(&format!("{module}.{}.weight", m.out_tensor), h, spec.mix_out_cols())?, spec.quant, &format!("{module}.out_proj"))?,
             extra,
         })
     }
@@ -1384,7 +1433,7 @@ impl Checkpoint {
 
     pub fn layer_attention(&self, spec: &Spec, i: usize) -> Result<Attn<'_>> {
         ensure!(spec.block(i).is_attention(), "layer {i} is not an attention layer");
-        self.attention(spec, &format!("{}.layers.{i}.self_attn", self.root()), spec.block(i), spec.shares_kv(i))
+        self.attention(spec, &format!("{}.layers.{i}.self_attn", self.root()), spec.block(i), spec.shares_kv(i), i)
     }
 
     pub fn layer_at(&self, spec: &Spec, i: usize, global: usize) -> Result<Layer<'_>> {
@@ -1396,14 +1445,14 @@ impl Checkpoint {
         } else if spec.block(i).is_linear() && spec.mixer.is_some() {
             Mixer::Described(self.described_mixer(spec, &p)?)
         } else if spec.block(i).is_linear() {
-            Mixer::Linear(self.gated_delta_net(spec, &format!("{p}.linear_attn"))?)
+            Mixer::Linear(self.gated_delta_net(spec, &format!("{p}.linear_attn"), i)?)
         } else {
-            Mixer::Attention(self.attention(spec, &format!("{p}.self_attn"), spec.block(i), spec.shares_kv(i))?)
+            Mixer::Attention(self.attention(spec, &format!("{p}.self_attn"), spec.block(i), spec.shares_kv(i), i)?)
         };
         let mlp = spec.mlp_quant(i);
         let served = spec.served_mlp_quant(i);
         let sparse = spec.moe.as_ref().is_some_and(|m| m.is_sparse(i)) && spec.has_mlp(i);
-        let moe = if sparse { Some(self.moe_layer(spec, &p, mlp)?) } else { None };
+        let moe = if sparse { Some(self.moe_layer(spec, &p, spec.expert_quant(i))?) } else { None };
         let none = || (Matrix::Bf16(Cow::Owned(vec![0; 8])), Matrix::Bf16(Cow::Owned(vec![0; 8])));
         let dense_beside = sparse && spec.parallel_moe();
         let (gate_up, down) = if (sparse && !dense_beside) || !spec.has_mlp(i) {
@@ -1411,7 +1460,7 @@ impl Checkpoint {
         } else if spec.mlp.mapped.is_some() {
             let up = self.raw(&format!("{p}.mlp.up_proj.weight"), inter, h)?;
             let down = self.raw(&format!("{p}.mlp.down_proj.weight"), h, inter)?;
-            (up.into_matrix(mlp, &format!("{p}.mlp.up_proj"))?, down.into_matrix(mlp, &format!("{p}.mlp.down_proj"))?)
+            (self.served(spec, up, mlp, &format!("{p}.mlp.up_proj"))?, self.served(spec, down, mlp, &format!("{p}.mlp.down_proj"))?)
         } else if mlp == Quant::Nvfp4G16 {
             let gate = self.fp4(&format!("{p}.mlp.gate_proj"), inter, h)?;
             let up = self.fp4(&format!("{p}.mlp.up_proj"), inter, h)?;
@@ -1425,8 +1474,8 @@ impl Checkpoint {
             };
             let down = self.raw(&format!("{p}.mlp.down_proj.weight"), h, inter)?;
             (
-                Raw::interleave(gate, up)?.into_matrix(served, &format!("{p}.mlp.gate_up"))?,
-                down.into_matrix(served, &format!("{p}.mlp.down_proj"))?,
+                self.served(spec, Raw::interleave(gate, up)?, served, &format!("{p}.mlp.gate_up"))?,
+                self.served(spec, down, served, &format!("{p}.mlp.down_proj"))?,
             )
         };
         let ln1 = if spec.norm.pre { self.norm(spec, &format!("{p}.input_layernorm.weight"), h)? } else { vec![0.0; 1] };
@@ -1697,7 +1746,7 @@ impl Checkpoint {
                 let mut inv_global = Vec::with_capacity(total);
                 let mut input_global = f32::MAX;
                 for i in 0..total {
-                    let f = self.fp4_or_requant(&module(i, which), rows, cols)?;
+                    let f = self.fp4_or_requant(spec, &module(i, which), rows, cols)?;
                     packed.extend_from_slice(&f.packed);
                     scales.extend_from_slice(&f.scales);
                     inv_global.push(1.0 / f.global);
@@ -1925,11 +1974,15 @@ impl Checkpoint {
         Ok(None)
     }
 
-    fn fp4_or_requant(&self, module: &str, rows: usize, cols: usize) -> Result<crate::nvfp4::Fp4<'_>> {
+    fn fp4_or_requant(&self, spec: &Spec, module: &str, rows: usize, cols: usize) -> Result<crate::nvfp4::Fp4<'_>> {
         if self.is_fp4(module) {
             return self.fp4(module, rows, cols);
         }
         match self.raw(&format!("{module}.weight"), rows, cols)?.dequantized() {
+            raw @ Raw::Bf16 { .. } if spec.runtime.quantize.format() == Some(Quant::Nvfp4G16) => match self.served(spec, raw, Quant::Nvfp4G16, module)? {
+                Matrix::Fp4(f) => Ok(f),
+                _ => bail!("{module} did not quantise to nvfp4"),
+            },
             Raw::Bf16 { w, cols } => Ok(quantize_nvfp4(&w, cols)),
             _ => bail!("{module} did not decode to bf16"),
         }
@@ -1985,7 +2038,7 @@ impl Checkpoint {
         ensure!(self.has(&lay.fc), "the checkpoint has no {}", lay.fc);
         let bf16 = |r: Raw<'a>, what: &str| -> Result<Matrix<'a>> { r.dequantized().into_matrix(Quant::Bf16, what) };
         let p = lay.layer.as_str();
-        let attn = self.attention_as(spec, &format!("{p}.self_attn"), true, Block::Full, false)?;
+        let attn = self.attention_as(spec, &format!("{p}.self_attn"), true, Block::Full, false, 0)?;
         let sparse = spec.moe.is_some();
         let (gate_up, down, moe) = if sparse {
             let dummy = || Matrix::Bf16(Cow::Owned(vec![0; 8]));
@@ -2284,7 +2337,7 @@ mod tests {
         let m = spec.moe.as_ref().unwrap();
         assert_eq!((m.experts, m.top_k(), m.expert_intermediate, m.shared_intermediate, m.shared_gate), (e, 2, inter, inter, true));
         spec.check_moe_runnable().unwrap();
-        let ck = Checkpoint { gguf: Some(std::sync::Arc::new(g)), shards: Default::default(), names: Default::default(), joined: Default::default(), staged: None, cut: None, owned: Default::default(), files: Vec::new() };
+        let ck = Checkpoint { gguf: Some(std::sync::Arc::new(g)), shards: Default::default(), names: Default::default(), joined: Default::default(), staged: None, cut: None, owned: Default::default(), quantized: Default::default(), files: Vec::new() };
         let w = ck.moe_layer(&spec, "model.layers.0", Quant::Bf16).unwrap();
         let Stacked::Bf16(gate) = &w.gate else { panic!("bf16 stack") };
         assert_eq!(gate.len(), (e + 1) * inter * h);

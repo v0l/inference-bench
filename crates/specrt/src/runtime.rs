@@ -103,6 +103,7 @@ struct Weights {
     direct: bool,
     gated: GatedWeights,
     ple: PleWeights,
+    read_bytes: u64,
 }
 
 type GatedWeights = std::collections::BTreeMap<String, CudaSlice<f32>>;
@@ -337,6 +338,7 @@ fn load_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, ck: &Checkpoin
     let store = &moe::experts::ExpertStore::new(ctx.clone(), spec.runtime.offload.host_budget, spec.runtime.offload.nvme_path.as_deref());
     let feed = Mutex::new(Feed::new(ck, groups, opts, ctx, budget.clone())?);
     let direct = feed.lock().unwrap().direct();
+    let read_bytes = feed.lock().unwrap().total();
     let reader = feed.lock().unwrap().reader();
     let next = Mutex::new(0usize);
     let failed = AtomicBool::new(false);
@@ -433,7 +435,7 @@ fn load_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, ck: &Checkpoin
         None => (stream.alloc_zeros(1)?, DeviceMatrix::Bf16(stream.alloc_zeros(1)?)),
     };
     let layers = layers.into_iter().enumerate().map(|(i, l)| l.with_context(|| format!("layer {} was not loaded", range.start + i))).collect::<Result<Vec<_>>>()?;
-    Ok(Weights { layers, embed, norm, lm_head, mtp, direct, gated, ple })
+    Ok(Weights { layers, embed, norm, lm_head, mtp, direct, gated, ple, read_bytes })
 }
 
 enum DeviceMatrix {
@@ -1014,6 +1016,8 @@ pub struct Runtime {
     pub device_bytes: u64,
     pub weight_bytes: u64,
     pub weight_secs: f64,
+    pub quantized: crate::weights::Quantized,
+    pub bytes_read: u64,
     pub load_secs: f64,
     pub peak_host_rss_bytes: u64,
     ctx: Arc<CudaContext>,
@@ -1192,6 +1196,7 @@ impl Runtime {
             None => full.clone(),
         };
         let mut staged = staged;
+        staged.apply_quantize()?;
         if staged.runtime.offload.enabled() {
             staged.runtime.graphs = false;
         }
@@ -1257,10 +1262,11 @@ impl Runtime {
         };
         checkpoint.check_quant_layout(&checkpoint.quant_map()?.renamed(&spec.tensors))?;
         let weights_started = Instant::now();
-        let Weights { mut layers, embed, norm, lm_head, mtp: mtp_weights, direct: weights_direct, gated: mut gated_head, ple: ple_head } =
+        let Weights { mut layers, embed, norm, lm_head, mtp: mtp_weights, direct: weights_direct, gated: mut gated_head, ple: ple_head, read_bytes } =
             load_weights(&ctx, &stream, &checkpoint, spec, range, role)?;
         let res_head = gated_head.remove(RES_HEAD);
         let weight_secs = weights_started.elapsed().as_secs_f64();
+        let quantized = checkpoint.quantized();
         let weight_bytes = layers.iter().map(DeviceLayer::bytes).sum::<u64>()
             + (embed.num_bytes() + norm.num_bytes()) as u64
             + lm_head.bytes()
@@ -1498,6 +1504,8 @@ impl Runtime {
             device_bytes: 0,
             weight_bytes,
             weight_secs,
+            quantized,
+            bytes_read: read_bytes,
             load_secs: 0.0,
             peak_host_rss_bytes: 0,
             ctx: ctx.clone(),
@@ -1581,6 +1589,11 @@ impl Runtime {
             vram_after_bytes = free_after,
             device_bytes = rt.device_bytes,
             load_secs = rt.load_secs,
+            quantize = ?rt.spec.runtime.quantize,
+            quantize_secs = rt.quantized.secs,
+            quantize_tensors = rt.quantized.tensors,
+            quantize_bf16_bytes = rt.quantized.bf16_bytes,
+            bytes_read = rt.bytes_read,
             "runtime loaded"
         );
         Ok(rt)

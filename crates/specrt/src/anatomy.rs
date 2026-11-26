@@ -252,8 +252,13 @@ fn layer(spec: &Spec, index: usize) -> LayerInfo {
         LayerKind::DeltaNet => delta_counts(spec),
         LayerKind::Mlp => Counts { quantised: 0, plain: 0 },
     };
-    let mixer_quant = spec.quant;
-    let mlp_quant = spec.mlp_quant(index);
+    let quantized = spec.quantized_at_load();
+    let mixer_quant = if quantized && kind != LayerKind::DeltaNet { spec.linear_quant("qkv", index) } else if quantized { spec.linear_quant("lin_in", index) } else { spec.quant };
+    let mlp_quant = match spec.moe.as_ref() {
+        _ if !quantized => spec.mlp_quant(index),
+        Some(m) if m.is_sparse(index) => spec.expert_quant(index),
+        _ => spec.served_mlp_quant(index),
+    };
     let parts = if spec.has_mlp(index) { mlp_parts(spec, index, false) } else { MlpParts { dense: 0, routed: 0, shared: 0, router: 0, active_routed: 0 } };
     let mlp = parts.total();
     let norm_params = if spec.layers.split { 1 } else { 2 } * spec.dims.hidden as u64;

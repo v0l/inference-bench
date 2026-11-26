@@ -161,6 +161,8 @@ $PY crates/specrt/scripts/reference.py tiny-mtp crates/specrt/tests/fixtures/tin
 | `fp4_gemv.rs` | NVFP4 GEMV against a CUDA reference | not ignored, but it opens the GPU, so it needs one in tier 1 | 0 | none | small, 10 s |
 | `quant_search.rs` | load time scale search (#1417) for nvfp4_g16 and fp8_channel, bit for bit against `scripts/quant_search_reference.py` | CPU | 0 | none | none, 0.1 s |
 | `quant_search_gpu.rs` | the kir scale search kernels (`kir::weight_quant::ScaleSearch`) bit for bit against the CPU search on the numpy case, mixed and zero rows and the tiny fixture head | 2, 3 ign, run with `-- --ignored` under `~/.agents/bin/gpu-run 1 --min-free 2000 --` | 3 | none | small, 1 s |
+| `quantize_load.rs` | `[runtime] quantize` at load (#1417): each linear and expert stack goes through the scale search bit for bit, the keep list and sensitive tensors stay bf16, fp8_channel row scales, off leaves the spec and every matrix as it was, stages count the keep list in whole model layers | CPU | 0 | none | none, 0.1 s |
+| `quantize_gpu.rs` | the tiny dense and MoE fixtures loaded with `quantize` nvfp4_g16 and fp8_channel: fewer device bytes, mean logits KL under 0.05 (nvfp4) and 0.01 (fp8) against bf16, batch decode agrees with single | 2, 3 ign, `-- --ignored --test-threads=1` under `gpu-run 1 --min-free 2000` | 3 | none | 1 GB, 5 s |
 | `prefix.rs` | prefix cache, snapshots, block tables | CPU, 2 ign | 2 | none | none, 0.4 s |
 | `yarn.rs` | YaRN rope against `yarn_reference.json` | CPU, 1 ign | 1 | none | 2 GB |
 | `gguf.rs` | GGUF parse, spec from GGUF | CPU, 3 ign | 3 | GGUF files in `~/.cache/specrt-gguf` | 2 GB |

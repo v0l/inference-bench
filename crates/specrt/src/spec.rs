@@ -260,7 +260,20 @@ impl QuantKeep {
     pub fn keeps(&self, layer: Option<usize>, layers: usize, name: &str) -> bool {
         layer.is_none_or(|l| self.keeps_layer(l, layers)) || self.keeps_tensor(name)
     }
+
+    pub fn staged(&self, start: usize, end: usize, layers: usize) -> QuantKeep {
+        QuantKeep { first_layers: self.first_layers.saturating_sub(start), last_layers: self.last_layers.saturating_sub(layers - end), ..self.clone() }
+    }
 }
+
+pub const QUANTIZED_LINEARS: [(&str, &[&str]); 6] = [
+    ("qkv", &["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"]),
+    ("o", &["self_attn.o_proj"]),
+    ("lin_in", &["linear_attn.in_proj"]),
+    ("lin_out", &["linear_attn.out_proj"]),
+    ("gate_up", &["mlp.gate_proj", "mlp.up_proj"]),
+    ("down", &["mlp.down_proj"]),
+];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -2677,16 +2690,61 @@ impl Spec {
         }
     }
 
+    fn quantize_keeps(&self, linear: &str, layer: usize) -> bool {
+        let tensors = QUANTIZED_LINEARS.iter().find(|(l, _)| *l == linear).map_or(&[][..], |(_, t)| *t);
+        tensors.is_empty() || self.quant_keep.keeps_layer(layer, self.layers.count) || tensors.iter().any(|t| self.quant_keep.keeps_tensor(&format!("layers.{layer}.{t}.weight")))
+    }
+
+    fn quantizes_to_fp4(&self, linear: &str, layer: usize) -> bool {
+        if self.runtime.quantize.format() != Some(Quant::Nvfp4G16) {
+            return false;
+        }
+        let shape = crate::gemm::linear_shape(self, linear);
+        shape.k.is_multiple_of(128) && shape.n.is_multiple_of(16) && !self.quantize_keeps(linear, layer)
+    }
+
+    pub fn linear_quant(&self, linear: &str, layer: usize) -> Quant {
+        match self.requanted(linear, self.quant) {
+            Quant::Bf16 if self.quantizes_to_fp4(linear, layer) => Quant::Nvfp4G16,
+            q => q,
+        }
+    }
+
+    pub fn expert_quant(&self, layer: usize) -> Quant {
+        let fits = self.moe.as_ref().is_some_and(|m| m.expert_intermediate.is_multiple_of(128) && m.expert_block.is_none() && !m.quantized_experts) && self.dims.hidden.is_multiple_of(256) && self.mlp.mapped.is_none();
+        match self.mlp_quant(layer) {
+            Quant::Bf16 if fits && self.runtime.quantize.format() == Some(Quant::Nvfp4G16) && !self.quantize_keeps("gate_up", layer) => Quant::Nvfp4G16,
+            q => q,
+        }
+    }
+
+    pub fn quantized_at_load(&self) -> bool {
+        !self.runtime.quantize.is_off()
+    }
+
+    pub fn apply_quantize(&mut self) -> Result<()> {
+        if self.quantized_at_load() {
+            ensure!(!self.runtime.gemm_fp32, "[runtime] quantize needs the tensor core path ([runtime] gemm_fp32 = false)");
+        }
+        if self.runtime.quantize.format() == Some(Quant::Fp8Channel) && self.quant == Quant::Bf16 {
+            ensure!(self.moe.is_none(), "[runtime] quantize = \"fp8_channel\" does not cover mixture-of-experts yet; use nvfp4_g16");
+            self.quant = Quant::Fp8Channel;
+            self.validate().context("[runtime] quantize = \"fp8_channel\"")?;
+        }
+        Ok(())
+    }
+
     pub fn served_mlp_quant(&self, layer: usize) -> Quant {
-        self.requanted("mlp_tail", self.mlp_quant(layer))
+        let dense = self.has_mlp(layer) && !self.moe.as_ref().is_some_and(|m| m.is_sparse(layer)) && self.mlp.mapped.is_none() && !self.mlp.wide_shared_tail;
+        match self.requanted("mlp_tail", self.mlp_quant(layer)) {
+            Quant::Bf16 if dense && self.dense_fp4_fits() && self.quantizes_to_fp4("gate_up", layer) && self.quantizes_to_fp4("down", layer) => Quant::Nvfp4G16,
+            q => q,
+        }
     }
 
     pub fn requanted_linears(&self) -> Vec<&'static str> {
-        let mut out: Vec<&'static str> = ["qkv", "o"].into_iter().filter(|l| self.requanted(l, self.quant) != self.quant).collect();
-        if self.linear_attention.is_some() {
-            out.extend(["lin_in", "lin_out"].into_iter().filter(|l| self.requanted(l, self.quant) != self.quant));
-        }
-        out
+        let classes: &[&'static str] = if self.linear_attention.is_some() { &["qkv", "o", "lin_in", "lin_out"] } else { &["qkv", "o"] };
+        classes.iter().copied().filter(|l| (0..self.layers.count).any(|i| self.linear_quant(l, i) != self.quant)).collect()
     }
 
     pub fn serves_fp4_mlp(&self) -> bool {
@@ -2700,6 +2758,9 @@ impl Spec {
         s.layers.count = end - start;
         s.mlp.quant_until = self.mlp.quant_until.map(|u| u.saturating_sub(start));
         s.quant_map = self.quant_map.stage(start, end);
+        if self.quantized_at_load() {
+            s.quant_keep = self.quant_keep.staged(start, end, self.layers.count);
+        }
         s.rope.nope_layers = (start..end).filter(|&l| self.nope(l)).map(|l| l - start).collect();
         if let (Some(m), Some(whole)) = (s.moe.as_mut(), self.moe.as_ref()) {
             m.dense_layers = (start..end).filter(|&l| !whole.is_sparse(l)).map(|l| l - start).collect();
