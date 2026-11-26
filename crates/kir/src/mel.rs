@@ -4,7 +4,7 @@ use crate::fnv;
 use std::f64::consts::PI;
 
 pub const THREADS: u32 = 256;
-pub const KERNELS: &[&str] = &["mel_frames", "mel_power", "mel_log", "mel_max", "mel_log_max", "mel_scale", "mel_act"];
+pub const STAGES: &[&str] = &["mel_frames", "mel_power", "mel_log", "mel_max", "mel_scale"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Window {
@@ -166,6 +166,18 @@ impl LogMel {
             _ => i,
         };
         Some(j as usize)
+    }
+
+    pub fn name(&self, stage: &str) -> String {
+        format!("{stage}_{}", &self.hash()[..12])
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        STAGES.iter().map(|s| self.name(s)).collect()
+    }
+
+    pub fn grid(&self, elems: usize) -> u32 {
+        elems.div_ceil(THREADS as usize).max(1) as u32
     }
 
     pub fn describe(&self) -> String {

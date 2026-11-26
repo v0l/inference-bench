@@ -12,6 +12,7 @@ mod bandwidth;
 mod weight_quant;
 mod dequant;
 mod duplex;
+mod mel;
 pub(crate) mod topk;
 
 pub use bandwidth::emit_bandwidth;
@@ -26,6 +27,7 @@ pub use ggml::emit_ggml;
 pub use vision::{emit_vision, emit_vision_step};
 pub use conv::{emit_line, emit_vae};
 pub use duplex::emit_duplex;
+pub use mel::emit_mel;
 pub use ops::emit_ops;
 pub use moe::emit_moe;
 pub use gemm::{fp4_act_source, emit_gemm, emit_gemms, gemm_library, needs_arch_features};

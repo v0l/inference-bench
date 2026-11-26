@@ -1,0 +1,32 @@
+name = "speech"
+kind = "graph"
+
+[[front]]
+extractor = "WhisperFeatureExtractor"
+op = "log_mel"
+samples = "n_samples"
+n_fft = "n_fft"
+hop = "hop_length"
+bins = "feature_size"
+rate = "sampling_rate"
+frames = "n_samples / hop_length"
+window = "hann_periodic"
+mel_scale = "slaney"
+norm = "slaney"
+fmin = "0"
+fmax = "8000"
+pad = "reflect"
+log = "log(max(m, 0.0000000001)) * 0.43429448190325176"
+floor = "max(v, top - 8.0)"
+out = "(v + 4.0) / 4.0"
+
+[[stem]]
+name = "conv-stem"
+model_types = ["whisper"]
+root = "model.encoder"
+features = "num_mel_bins"
+positions = "max_source_positions"
+node = [
+  { op = "conv", weight = "conv1", cin = "num_mel_bins", cout = "d_model", k = "3", pad = "1", act = "gelu" },
+  { op = "conv", weight = "conv2", cin = "d_model", cout = "d_model", k = "3", stride = "2", pad = "1", act = "gelu" },
+]
