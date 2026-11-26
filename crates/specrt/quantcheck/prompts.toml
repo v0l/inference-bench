@@ -1,0 +1,24 @@
+[[prompt]]
+name = "short"
+text = "The capital of France is Paris, and the capital of Japan is"
+
+[[prompt]]
+name = "code"
+text = '''
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+def main():
+    for i in range(10):
+        print(i, fibonacci(i))
+'''
+
+[[prompt]]
+name = "science"
+text = "Water boils at one hundred degrees Celsius at sea level, but at the top of a high mountain the air pressure is lower, so it boils at a lower temperature. This is why cooking pasta takes longer in the mountains. The same idea explains pressure cookers: by raising the pressure inside the pot, they raise the boiling point of water, and food cooks faster. A cup of tea made at altitude can taste flat for the same reason, because the water never gets as hot as it would at the coast."
+
+[[prompt]]
+name = "story"
+text = "Once upon a time, in a small village between two rivers, there lived a baker who woke every morning before the sun. She lit the oven with dry oak, kneaded the dough by hand and sang old songs while the bread rose. The villagers said her loaves were the best in the valley, and travellers came from far towns to buy them. One winter the rivers froze, the roads closed and no flour came to the village for weeks. The baker opened her stores and shared what she had, a little each day, until the thaw. When spring came, every family in the village brought her a sack of grain from their own fields, and she baked for a whole week without selling a single loaf. Years later, when she was too old to lift the trays, the children she had fed took turns at the oven, and the bakery never closed. People still tell the story when the rivers freeze, and someone always brings bread."

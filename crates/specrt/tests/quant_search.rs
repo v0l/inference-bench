@@ -52,3 +52,24 @@ fn the_search_never_does_worse_than_round_to_nearest_from_the_absmax() {
     let (e_search, e_plain) = (squared_error_fp8_channel(&w, cols, &sv, &ss), squared_error_fp8_channel(&w, cols, &pv, &ps));
     assert!(e_search <= e_plain, "fp8 search {e_search} against plain {e_plain}");
 }
+
+#[test]
+fn the_quantcheck_prompt_set_parses_and_its_hash_is_stable() {
+    let set = specrt::quantize::prompt_set();
+    assert_eq!(set.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["short", "code", "science", "story"]);
+    let lens: Vec<usize> = set.iter().map(|p| p.text.len()).collect();
+    assert!(lens[0] * 10 < lens[3], "{lens:?}");
+    assert_eq!(specrt::quantize::prompt_set_hash().len(), 16);
+}
+
+#[test]
+fn logit_stats_counts_kl_and_top1_per_position() {
+    let a = [0.0f32, 1.0, 2.0, 3.0, 0.0, 0.0];
+    let same = specrt::quantize::logit_stats(&[&a], &[&a], 3);
+    assert_eq!((same.positions, same.mean_kl, same.max_kl, same.top1), (2, 0.0, 0.0, 1.0));
+    let b = [0.0f32, 1.0, 2.0, 0.0, 0.0, 3.0];
+    let s = specrt::quantize::logit_stats(&[&a], &[&b], 3);
+    assert_eq!(s.positions, 2);
+    assert_eq!(s.top1, 0.5);
+    assert!(s.max_kl > 1.0 && (s.mean_kl - s.max_kl / 2.0).abs() < 1e-12, "{s:?}");
+}

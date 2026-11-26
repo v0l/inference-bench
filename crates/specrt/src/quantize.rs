@@ -5,6 +5,10 @@ use std::borrow::Cow;
 pub const NVFP4_SCALE_STEPS: [i32; 5] = [-1, -2, -3, -4, 1];
 pub const FP8_SCALE_FACTORS: [f32; 5] = [1.0, 0.96875, 0.9375, 0.90625, 0.875];
 pub const FORMAT_VERSION: u32 = 1;
+pub const FP8_CHANNEL_MEAN_KL_BOUND: f64 = 0.02;
+pub const NVFP4_G16_MEAN_KL_BOUND: f64 = 0.155;
+pub const FP8_CHANNEL_TOP1_FLOOR: f64 = 0.92;
+pub const NVFP4_G16_TOP1_FLOOR: f64 = 0.72;
 
 fn nvfp4_group_error(group: &[u16], code: u8, global: f32) -> f64 {
     let s = e4m3_to_f32(code) / global;
@@ -118,6 +122,63 @@ pub fn squared_error_fp8_channel(w: &[u16], cols: usize, values: &[u8], scales: 
             (bf16_to_f32(v) as f64 - (e4m3_to_f32(q) * s) as f64).powi(2)
         })
         .sum()
+}
+
+pub const PROMPTS: &str = include_str!("../quantcheck/prompts.toml");
+
+#[derive(serde::Deserialize)]
+struct PromptFile {
+    prompt: Vec<Prompt>,
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+pub struct Prompt {
+    pub name: String,
+    pub text: String,
+}
+
+pub fn prompt_set() -> Vec<Prompt> {
+    toml::from_str::<PromptFile>(PROMPTS).expect("quantcheck prompts").prompt
+}
+
+pub fn prompt_set_hash() -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(PROMPTS.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LogitStats {
+    pub positions: usize,
+    pub mean_kl: f64,
+    pub max_kl: f64,
+    pub top1: f64,
+}
+
+fn log_softmax(row: &[f32]) -> Vec<f64> {
+    let max = row.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v)) as f64;
+    let lse = max + row.iter().map(|&v| (v as f64 - max).exp()).sum::<f64>().ln();
+    row.iter().map(|&v| v as f64 - lse).collect()
+}
+
+fn argmax(row: &[f32]) -> usize {
+    (0..row.len()).fold(0, |best, i| if row[i] > row[best] { i } else { best })
+}
+
+pub fn logit_stats(reference: &[&[f32]], quantised: &[&[f32]], vocab: usize) -> LogitStats {
+    let (mut positions, mut sum, mut max, mut same) = (0usize, 0f64, 0f64, 0usize);
+    for (a, b) in reference.iter().zip(quantised) {
+        assert_eq!(a.len(), b.len());
+        for (p, q) in a.chunks_exact(vocab).zip(b.chunks_exact(vocab)) {
+            let (lp, lq) = (log_softmax(p), log_softmax(q));
+            let kl = lp.iter().zip(&lq).map(|(x, y)| x.exp() * (x - y)).sum::<f64>().max(0.0);
+            sum += kl;
+            max = max.max(kl);
+            same += (argmax(p) == argmax(q)) as usize;
+            positions += 1;
+        }
+    }
+    let n = positions.max(1) as f64;
+    LogitStats { positions, mean_kl: sum / n, max_kl: max, top1: same as f64 / n }
 }
 
 pub struct DeviceFp8 {
