@@ -120,6 +120,61 @@ pub fn squared_error_fp8_channel(w: &[u16], cols: usize, values: &[u8], scales: 
         .sum()
 }
 
+pub struct DeviceFp8 {
+    pub values: cudarc::driver::CudaSlice<u8>,
+    pub row_scales: cudarc::driver::CudaSlice<f32>,
+}
+
+fn search_kernels(stream: &std::sync::Arc<cudarc::driver::CudaStream>, cache_dir: &std::path::Path) -> anyhow::Result<(kir::weight_quant::ScaleSearch, crate::jit::Loaded)> {
+    let ctx = stream.context();
+    let target = crate::codegen::cuda_target(ctx)?;
+    let search = kir::weight_quant::ScaleSearch::new(&target, &NVFP4_SCALE_STEPS, &FP8_SCALE_FACTORS).map_err(anyhow::Error::msg)?;
+    let module = crate::codegen::Module {
+        source: kir::cuda::emit_scale_search(&search).map_err(anyhow::Error::msg)?,
+        kernels: kir::weight_quant::SEARCH_KERNELS.to_vec(),
+        smem: std::collections::BTreeMap::new(),
+        arch_features: false,
+        kir_hash: search.hash(),
+    };
+    Ok((search, crate::jit::Jit::new(ctx.clone(), cache_dir.to_path_buf())?.load(&module)?))
+}
+
+fn launch(l: kir::weight_quant::Launch) -> cudarc::driver::LaunchConfig {
+    cudarc::driver::LaunchConfig { grid_dim: (l.grid, 1, 1), block_dim: (l.threads, 1, 1), shared_mem_bytes: 0 }
+}
+
+pub fn nvfp4_search_on_device(stream: &std::sync::Arc<cudarc::driver::CudaStream>, cache_dir: &std::path::Path, w: &[u16], cols: usize) -> anyhow::Result<crate::nvfp4::DeviceFp4> {
+    use cudarc::driver::PushKernelArg;
+    anyhow::ensure!(cols.is_multiple_of(GROUP) && w.len().is_multiple_of(cols), "nvfp4 rows must be a multiple of {GROUP} wide");
+    let (search, loaded) = search_kernels(stream, cache_dir)?;
+    let amax_kernel = loaded.function(kir::weight_quant::AMAX)?;
+    let search_kernel = loaded.function(kir::weight_quant::NVFP4_SEARCH)?;
+    let dev_w = stream.clone_htod(w)?;
+    let mut amax = stream.alloc_zeros::<u32>(1)?;
+    let groups = w.len() / GROUP;
+    let mut packed = stream.alloc_zeros::<u8>(w.len() / 2)?;
+    let mut scales = stream.alloc_zeros::<u8>(crate::nvfp4::SCALE_HEADER + groups)?;
+    let n = w.len() as u64;
+    unsafe { stream.launch_builder(&amax_kernel).arg(&dev_w).arg(&n).arg(&mut amax).launch(launch(search.quant.amax_launch())) }?;
+    let g = groups as u64;
+    unsafe { stream.launch_builder(&search_kernel).arg(&dev_w).arg(&g).arg(&amax).arg(&mut packed).arg(&mut scales).launch(launch(search.group_launch(groups))) }?;
+    Ok(crate::nvfp4::DeviceFp4 { packed, scales })
+}
+
+pub fn fp8_channel_search_on_device(stream: &std::sync::Arc<cudarc::driver::CudaStream>, cache_dir: &std::path::Path, w: &[u16], cols: usize) -> anyhow::Result<DeviceFp8> {
+    use cudarc::driver::PushKernelArg;
+    anyhow::ensure!(cols > 0 && w.len().is_multiple_of(cols), "fp8 channel search needs whole rows");
+    let (search, loaded) = search_kernels(stream, cache_dir)?;
+    let kernel = loaded.function(kir::weight_quant::FP8_CHANNEL_SEARCH)?;
+    let rows = w.len() / cols;
+    let dev_w = stream.clone_htod(w)?;
+    let mut values = stream.alloc_zeros::<u8>(w.len())?;
+    let mut row_scales = stream.alloc_zeros::<f32>(rows.max(1))?;
+    let (r, c) = (rows as u64, cols as u64);
+    unsafe { stream.launch_builder(&kernel).arg(&dev_w).arg(&r).arg(&c).arg(&mut values).arg(&mut row_scales).launch(launch(search.row_launch(rows))) }?;
+    Ok(DeviceFp8 { values, row_scales })
+}
+
 fn rows_in_parallel<A: Send, B: Send>(w: &[u16], cols: usize, a: &mut [A], a_cols: usize, b: &mut [B], b_cols: usize, f: impl Fn(&[u16], &mut [A], &mut [B]) + Sync) {
     let rows = w.len() / cols;
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());

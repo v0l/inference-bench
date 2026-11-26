@@ -1,5 +1,5 @@
 use kir::Target;
-use kir::weight_quant::WeightQuant;
+use kir::weight_quant::{ScaleSearch, WeightQuant};
 use std::path::PathBuf;
 
 fn golden(name: &str, actual: &str) {
@@ -32,6 +32,28 @@ fn bandwidth_probe_spells_the_old_script_token_for_token() {
     assert_eq!(tokens(&src), tokens(&old));
     assert_eq!(b.grid(), 188 * 8);
     assert!(kir::bandwidth::Bandwidth::probe(&Target::wgpu_baseline()).is_err());
+}
+
+#[test]
+fn scale_search_kernels_take_their_candidates_from_data() {
+    let t = Target::sm_120();
+    let k = ScaleSearch::new(&t, &[-1, -2, -3, -4, 1], &[1.0, 0.96875, 0.9375, 0.90625, 0.875]).unwrap();
+    let src = kir::cuda::emit_scale_search(&k).unwrap();
+    for name in kir::weight_quant::SEARCH_KERNELS {
+        assert!(src.contains(&format!("void {name}(")), "{name} missing");
+    }
+    assert!(src.contains("const int steps[5] = {-1, -2, -3, -4, 1};"));
+    assert!(src.contains(&format!("__uint_as_float({:#x}u)", 0.96875f32.to_bits())));
+    golden("search_sm120.cu", &src);
+    let fewer = ScaleSearch::new(&t, &[-1], &[1.0]).unwrap();
+    assert_ne!(k.hash(), fewer.hash());
+    assert!(kir::cuda::emit_scale_search(&fewer).unwrap().contains("const int steps[1] = {-1};"));
+    assert_eq!((k.row_launch(130).grid, k.row_launch(130).threads), (3, 64));
+    assert_eq!(k.group_launch(129).grid, 2);
+    assert!(ScaleSearch::new(&t, &[], &[1.0]).is_err());
+    assert!(ScaleSearch::new(&t, &[0], &[1.0]).is_err());
+    assert!(ScaleSearch::new(&t, &[-1], &[]).is_err());
+    assert!(ScaleSearch::new(&Target::wgpu_baseline(), &[-1], &[1.0]).is_err());
 }
 
 #[test]

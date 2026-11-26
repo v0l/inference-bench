@@ -1,5 +1,5 @@
 use super::gemm::prim::device;
-use crate::weight_quant::{AMAX, GROUP, QUANTIZE, SCALE_HEADER, WeightQuant};
+use crate::weight_quant::{AMAX, FP8_CHANNEL_SEARCH, GROUP, NVFP4_SEARCH, QUANTIZE, SCALE_HEADER, ScaleSearch, WeightQuant};
 
 fn types() -> &'static str {
     "typedef unsigned short u16;\ntypedef unsigned char u8;\ntypedef unsigned int u32;\ntypedef unsigned long long u64;\n\n"
@@ -110,6 +110,125 @@ fn quantize_kernel(k: &WeightQuant) -> String {
         fp4 = k.fp4_max,
         e4m3 = k.e4m3_max,
     )
+}
+
+fn search_error(name: &str, args: &str, setup: &str, quant: &str) -> String {
+    device(
+        "double",
+        name,
+        args,
+        &format!(
+            "{setup}    double err = 0.0;
+    for (u64 i = 0; i < n; i++) {{
+        float w = bf16_f32(src[i]);
+{quant}        double d = (double)w - (double)__fmul_rn(q, s);
+        err = __dadd_rn(err, __dmul_rn(d, d));
+    }}
+    return err;
+"
+        ),
+    )
+}
+
+fn nvfp4_search_kernel(k: &ScaleSearch) -> String {
+    let steps = k.nvfp4_steps.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ");
+    let error = search_error(
+        "nvfp4_group_error",
+        "const u16* src, u64 n, u32 code, float global",
+        "    float s = e4m3_f32((u8)code) / global;\n",
+        "        float q = s > 0.0f ? e2m1_value(f32_e2m1(w / s)) : 0.0f;\n",
+    );
+    format!(
+        "__device__ __forceinline__ float e2m1_value(u32 n) {{
+    const float table[8] = {{0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f}};
+    float v = table[n & 7u];
+    return (n & 8u) ? -v : v;
+}}
+
+{error}extern \"C\" __global__ void {NVFP4_SEARCH}(const u16* w, u64 groups, const u32* amax_bits, u8* packed, u8* scales) {{
+    const int steps[{count}] = {{{steps}}};
+    float global = global_scale(amax_bits);
+    u64 g = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g == 0) {{
+        float* header = (float*)scales;
+        header[0] = 1.0f / global;
+    }}
+    if (g >= groups) return;
+    const u16* src = w + g * {GROUP};
+    float amax = 0.0f;
+    for (int i = 0; i < {GROUP}; i++) amax = fmaxf(amax, fabsf(bf16_f32(src[i])));
+    u32 best = f32_e4m3(fminf(amax / {fp4}.0f * global, {e4m3}.0f));
+    if (amax != 0.0f) {{
+        double best_err = nvfp4_group_error(src, {GROUP}, best, global);
+        u32 base = best;
+        for (int j = 0; j < {count}; j++) {{
+            int c = (int)base + steps[j];
+            if (c < 1 || c > 0x7e) continue;
+            double e = nvfp4_group_error(src, {GROUP}, (u32)c, global);
+            if (e < best_err) {{
+                best = (u32)c;
+                best_err = e;
+            }}
+        }}
+    }}
+    scales[{SCALE_HEADER} + g] = (u8)best;
+    float s = e4m3_f32((u8)best) / global;
+    u64 out = 0;
+    for (int i = 0; i < {GROUP}; i++) {{
+        u32 q = s > 0.0f ? f32_e2m1(bf16_f32(src[i]) / s) : 0u;
+        out |= (u64)q << (4 * i);
+    }}
+    ((u64*)packed)[g] = out;
+}}
+
+",
+        count = k.nvfp4_steps.len(),
+        fp4 = k.quant.fp4_max,
+        e4m3 = k.quant.e4m3_max,
+    )
+}
+
+fn fp8_channel_search_kernel(k: &ScaleSearch) -> String {
+    let factors = k.fp8_factors.iter().map(|f| format!("__uint_as_float({:#x}u)", f.to_bits())).collect::<Vec<_>>().join(", ");
+    let error = search_error("fp8_row_error", "const u16* src, u64 n, float s", "", "        float q = e4m3_f32(f32_e4m3(w / s));\n");
+    format!(
+        "{error}extern \"C\" __global__ void {FP8_CHANNEL_SEARCH}(const u16* w, u64 rows, u64 cols, u8* values, float* row_scales) {{
+    const float factors[{count}] = {{{factors}}};
+    u64 r = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const u16* src = w + r * cols;
+    float amax = 0.0f;
+    for (u64 i = 0; i < cols; i++) amax = fmaxf(amax, fabsf(bf16_f32(src[i])));
+    float best = 1.0f;
+    if (amax != 0.0f) {{
+        double best_err = 0.0;
+        for (int j = 0; j < {count}; j++) {{
+            float s = amax / {e4m3}.0f * factors[j];
+            double e = fp8_row_error(src, cols, s);
+            if (j == 0 || e < best_err) {{
+                best = s;
+                best_err = e;
+            }}
+        }}
+    }}
+    row_scales[r] = best;
+    u8* out = values + r * cols;
+    for (u64 i = 0; i < cols; i++) out[i] = f32_e4m3(bf16_f32(src[i]) / best);
+}}
+",
+        count = k.fp8_factors.len(),
+        e4m3 = k.quant.e4m3_max,
+    )
+}
+
+pub fn emit_scale_search(k: &ScaleSearch) -> Result<crate::KirSource, String> {
+    k.validate()?;
+    let q = &k.quant;
+    let mut out = String::from(types());
+    for part in [bf16_f32(), f32_e4m3(q.e4m3_max), e4m3_f32(), f32_e2m1(), global_scale(q), amax_kernel(q), nvfp4_search_kernel(k), fp8_channel_search_kernel(k)] {
+        out.push_str(&part);
+    }
+    Ok(crate::KirSource::emitted(out))
 }
 
 pub fn emit_weight_quant(k: &WeightQuant) -> Result<crate::KirSource, String> {

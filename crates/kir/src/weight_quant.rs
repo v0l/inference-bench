@@ -5,6 +5,56 @@ pub const SCALE_HEADER: u32 = 16;
 pub const AMAX: &str = "nvfp4_amax";
 pub const QUANTIZE: &str = "nvfp4_quantize";
 pub const KERNELS: [&str; 2] = [AMAX, QUANTIZE];
+pub const NVFP4_SEARCH: &str = "nvfp4_search";
+pub const FP8_CHANNEL_SEARCH: &str = "fp8_channel_search";
+pub const SEARCH_KERNELS: [&str; 3] = [AMAX, NVFP4_SEARCH, FP8_CHANNEL_SEARCH];
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScaleSearch {
+    pub quant: WeightQuant,
+    pub nvfp4_steps: &'static [i32],
+    pub fp8_factors: &'static [f32],
+    pub row_threads: u32,
+}
+
+impl ScaleSearch {
+    pub fn new(t: &Target, nvfp4_steps: &'static [i32], fp8_factors: &'static [f32]) -> Result<ScaleSearch, String> {
+        let k = ScaleSearch { quant: WeightQuant::nvfp4(t)?, nvfp4_steps, fp8_factors, row_threads: 64 };
+        k.validate()?;
+        Ok(k)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        self.quant.validate()?;
+        let t = &self.quant.target;
+        if self.row_threads == 0 || self.row_threads > t.max_threads || self.row_threads % t.warp_size != 0 {
+            return Err(format!("scale search: {} row threads does not fit the target", self.row_threads));
+        }
+        if self.fp8_factors.is_empty() || self.fp8_factors.iter().any(|f| !f.is_finite() || *f <= 0.0) {
+            return Err(format!("scale search: fp8 factors {:?} must be positive", self.fp8_factors));
+        }
+        if self.nvfp4_steps.is_empty() || self.nvfp4_steps.iter().any(|s| *s == 0 || s.abs() > 0x7e) {
+            return Err(format!("scale search: nvfp4 steps {:?} must be non zero code offsets", self.nvfp4_steps));
+        }
+        Ok(())
+    }
+
+    pub fn group_launch(&self, groups: usize) -> Launch {
+        self.quant.quant_launch(groups)
+    }
+
+    pub fn row_launch(&self, rows: usize) -> Launch {
+        Launch { grid: rows.div_ceil(self.row_threads as usize).max(1) as u32, threads: self.row_threads }
+    }
+
+    pub fn describe(&self) -> String {
+        format!("{}\nscale search nvfp4_steps={:?} fp8_factors={:?} row_threads={}", self.quant.describe(), self.nvfp4_steps, self.fp8_factors, self.row_threads)
+    }
+
+    pub fn hash(&self) -> String {
+        fnv(self.describe().bytes())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WeightQuant {
