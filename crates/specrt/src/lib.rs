@@ -52,6 +52,7 @@ pub mod pairing;
 pub mod csf;
 pub mod quant_map;
 pub mod quantize;
+pub mod quant_cache;
 pub mod quantcheck;
 pub mod fusion;
 pub mod pipeline;

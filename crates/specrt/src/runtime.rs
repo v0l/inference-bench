@@ -76,7 +76,7 @@ fn weight_plan(ck: &Checkpoint, spec: &Spec, range: StageRange, role: StageRole)
 }
 
 fn layer_names(ck: &Checkpoint, prefix: &str) -> Vec<String> {
-    ck.names_under(prefix).into_iter().filter(|n| !ck.is_part(n)).collect()
+    ck.names_under(prefix).into_iter().filter(|n| !ck.is_part(n) && !ck.quant_store().is_some_and(|s| s.covers(n))).collect()
 }
 
 #[derive(Clone, Copy)]
@@ -371,6 +371,9 @@ fn load_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, ck: &Checkpoin
                         let outcome = claimed.and_then(|(g, batch)| {
                             let view = ck.with_staged(batch);
                             let up = upload_group(ws, &view, spec, store, range, role, work[g])?;
+                            if let Some(w) = view.quant_writer() {
+                                w.flush(&format!("group-{g:05}"));
+                            }
                             if !view.has_staged() {
                                 view.release_names(&names[g]);
                             }
@@ -1017,6 +1020,7 @@ pub struct Runtime {
     pub weight_bytes: u64,
     pub weight_secs: f64,
     pub quantized: crate::weights::Quantized,
+    pub quant_cache: Option<crate::quant_cache::Usage>,
     pub bytes_read: u64,
     pub load_secs: f64,
     pub peak_host_rss_bytes: u64,
@@ -1261,6 +1265,8 @@ impl Runtime {
             Some((n, rank, _)) => Checkpoint::for_repo(&spec.repo)?.renamed(&spec.tensors).for_rank(crate::tp::RankCut::new(&full, crate::graph::Graph::decoder(), n, rank)?)?,
             None => Checkpoint::for_repo(&spec.repo)?.renamed(&spec.tensors),
         };
+        let attached = crate::quant_cache::attach(spec, &checkpoint.files, checkpoint.is_safetensors(), role.whole() && tp.is_none())?;
+        let checkpoint = checkpoint.with_quant_cache(attached);
         checkpoint.check_quant_layout(&checkpoint.quant_map()?.renamed(&spec.tensors))?;
         let weights_started = Instant::now();
         let Weights { mut layers, embed, norm, lm_head, mtp: mtp_weights, direct: weights_direct, gated: mut gated_head, ple: ple_head, read_bytes } =
@@ -1268,6 +1274,14 @@ impl Runtime {
         let res_head = gated_head.remove(RES_HEAD);
         let weight_secs = weights_started.elapsed().as_secs_f64();
         let quantized = checkpoint.quantized();
+        let quant_cache = match (checkpoint.quant_store(), checkpoint.quant_writer()) {
+            (Some(s), _) => Some(crate::quant_cache::Usage { dir: s.dir.clone(), bytes: s.manifest.bytes, hit: true }),
+            (None, Some(w)) => w.finish().unwrap_or_else(|e| {
+                tracing::warn!(repo = %spec.repo, "{e:#}; the next start converts again");
+                None
+            }),
+            (None, None) => None,
+        };
         let weight_bytes = layers.iter().map(DeviceLayer::bytes).sum::<u64>()
             + (embed.num_bytes() + norm.num_bytes()) as u64
             + lm_head.bytes()
@@ -1506,6 +1520,7 @@ impl Runtime {
             weight_bytes,
             weight_secs,
             quantized,
+            quant_cache,
             bytes_read: read_bytes,
             load_secs: 0.0,
             peak_host_rss_bytes: 0,
@@ -1594,6 +1609,7 @@ impl Runtime {
             quantize_secs = rt.quantized.secs,
             quantize_tensors = rt.quantized.tensors,
             quantize_bf16_bytes = rt.quantized.bf16_bytes,
+            quantize_cache = ?rt.quant_cache.as_ref().map(|c| (c.dir.display().to_string(), c.bytes, if c.hit { "read" } else { "written" })),
             bytes_read = rt.bytes_read,
             "runtime loaded"
         );

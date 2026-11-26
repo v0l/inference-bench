@@ -214,6 +214,7 @@ pub fn prompt_tokens(spec: &Spec) -> Result<Vec<Vec<u32>>> {
 pub fn probe_spec(spec: &Spec, formats: &[Quant]) -> Result<Spec> {
     let mut s = spec.clone();
     s.runtime.quantize = QuantizeChoice::Off;
+    s.runtime.quantize_cache = false;
     s.quant_plan = QuantPlan { layers: vec![LayerQuant::BF16; s.layers.count], kernels: formats.to_vec() };
     s.apply_quantize()?;
     Ok(s)
