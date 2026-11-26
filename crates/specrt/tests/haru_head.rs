@@ -106,15 +106,17 @@ fn the_four_scalar_embeddings_are_hoisted_to_once_per_session() {
 #[test]
 fn the_rows_gemv_fuses_the_gated_residual_into_the_down_projection() {
     let head = FlowHead::from_config(&config("haru-4b.config.json"), None).unwrap();
-    let fused = head.gated_epilogues(8, &kir::Target::sm_120()).unwrap();
     let ops = &head.plan.blocks[0].ops;
     let down = ops.iter().position(|o| matches!(o, Op::Dit(DitOp::Linear { weight, .. }) if weight.ends_with("down_proj"))).unwrap();
-    for f in head.block_fusion(8, &kir::Target::sm_120()).unwrap() {
-        for g in &f.groups {
-            eprintln!("{}: [{}]", f.name, g.units.join(" + "));
+    for sessions in [1, 8] {
+        let fused = head.gated_epilogues(sessions, &kir::Target::sm_120()).unwrap();
+        for f in head.block_fusion(sessions, &kir::Target::sm_120()).unwrap() {
+            for g in &f.groups {
+                eprintln!("{sessions} sessions {}: [{}]", f.name, g.units.join(" + "));
+            }
         }
+        assert_eq!(fused, vec![std::collections::BTreeSet::from([down])], "{sessions} sessions: the gated add joins the down projection epilogue");
     }
-    assert_eq!(fused, vec![std::collections::BTreeSet::from([down])], "the gated add joins the down projection epilogue");
 }
 
 #[test]

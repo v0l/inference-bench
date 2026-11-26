@@ -227,7 +227,6 @@ impl FlowHead {
                 let linear = g.ops.iter().copied().find(|&o| matches!(b.ops[o], Op::Dit(DitOp::Linear { .. })));
                 let gated = g.ops.iter().copied().find(|&o| matches!(b.ops[o], Op::Dit(DitOp::GatedAdd { .. })));
                 if let (Some(l), Some(a)) = (linear, gated)
-                    && g.ops.len() == 2
                     && a == l + 1
                 {
                     fused.insert(l);
