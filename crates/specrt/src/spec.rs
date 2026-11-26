@@ -606,6 +606,8 @@ impl LinearAttention {
 #[serde(rename_all = "lowercase")]
 pub enum NormKind {
     Rmsnorm,
+    #[serde(rename = "layer_norm")]
+    LayerNorm,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1009,6 +1011,8 @@ pub struct Dims {
     pub logit_softcap: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logit_scale: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions: Option<String>,
     #[serde(skip)]
     pub head_rows: Option<std::ops::Range<usize>>,
 }
@@ -1266,6 +1270,8 @@ pub struct Attention {
     pub kv_heads: usize,
     pub head_dim: usize,
     pub qkv_bias: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub k_bias: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub o_bias: bool,
     pub qk_norm: bool,
@@ -1404,6 +1410,8 @@ pub struct Mlp {
     pub wide_shared_tail: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub stored_gate_up: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bias: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1452,6 +1460,8 @@ pub struct Spec {
     pub inputs: Option<Inputs>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duplex: Option<Duplex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross: Option<Cross>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtp: Option<Mtp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1555,6 +1565,14 @@ impl CardTemplate {
         }
         Ok(lines.join("\n"))
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cross {
+    pub source: String,
+    pub rows: usize,
+    pub state: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1794,7 +1812,7 @@ struct HfConfig {
     num_key_value_heads: Option<usize>,
     head_dim: Option<usize>,
     vocab_size: usize,
-    rms_norm_eps: f64,
+    rms_norm_eps: Option<f64>,
     rope_theta: Option<f64>,
     hidden_act: Option<String>,
     tie_word_embeddings: Option<bool>,
@@ -2336,6 +2354,7 @@ impl Spec {
             family.attention.qk_norm.read(&value),
             family.attention.output_gate.read(&value),
         );
+        let k_bias = family.attention.k_bias.read(&value);
         family.normalise(&mut value);
         let mut refused = Vec::new();
         if strict {
@@ -2588,12 +2607,13 @@ impl Spec {
                     .or(multiplier(&family.multipliers.embedding)),
                 logit_softcap: hf.final_logit_softcapping,
                 logit_scale: multiplier(&family.multipliers.logits_divisor).filter(|d| *d > 0.0).map(|d| 1.0 / d),
+                positions: family.embedding.positions.clone(),
                 head_rows: None,
             },
             layers: Layers { count: hf.num_hidden_layers, window: hf.sliding_window.filter(|_| pattern.iter().any(|b| b.windowed())), pattern, split: family.blocks.split, shared_tail: family.blocks.shared_tail_key.as_deref().and_then(|k| value.get(k)?.as_u64()).unwrap_or(0) as usize },
             norm: Norm {
-                kind: NormKind::Rmsnorm,
-                eps: hf.rms_norm_eps,
+                kind: family.norm.kind.unwrap_or(NormKind::Rmsnorm),
+                eps: hf.rms_norm_eps.or(family.norm.eps).context("config.json has no rms_norm_eps")?,
                 unit_offset: family.norm.unit_offset.unwrap_or(hybrid && !family.norm.no_offset_keys.iter().any(|k| k.split('.').try_fold(&value, |v, p| v.get(p)).is_some())),
                 sandwich: family.norm.sandwich,
                 pre: family.norm.pre,
@@ -2606,6 +2626,7 @@ impl Spec {
                 kv_heads: hf.num_key_value_heads.unwrap_or(hf.num_attention_heads),
                 head_dim,
                 qkv_bias,
+                k_bias,
                 o_bias,
                 qk_norm,
                 qk_norm_unit: qk_norm && family.attention.qk_norm_unit,
@@ -2644,6 +2665,7 @@ impl Spec {
                 },
                 wide_shared_tail: family.mlp.shared_tail_wide_key.as_deref().and_then(|k| value.get(k)?.as_bool()).unwrap_or(false),
                 stored_gate_up: family.mlp.stored_gate_up,
+                bias: family.mlp.bias,
             },
             moe,
             mtp: (family.mtp && (hybrid || family.mtp_layout.is_some()) && hf.mtp_num_hidden_layers > 0 && !refused.iter().any(|r| r.part == "mtp"))
@@ -2657,6 +2679,7 @@ impl Spec {
             block_residual: family.block_residual.read(&value),
             inputs: family.inputs.read(&outer)?,
             duplex: family.duplex.read(&outer)?,
+            cross: family.cross.read(&value)?,
             tensors: family.tensors.clone(),
             vision: if strict { crate::vision::Vision::from_hf_config(json)? } else { None },
             state: if family.state.is_empty() { crate::state::stock() } else { family.state.clone() },

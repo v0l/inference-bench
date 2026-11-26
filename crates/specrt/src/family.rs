@@ -136,6 +136,7 @@ pub struct FamilyAttention {
     pub scratch: std::collections::BTreeMap<String, String>,
     pub int_scratch: std::collections::BTreeMap<String, String>,
     pub qkv_bias: Flag,
+    pub k_bias: Flag,
     pub o_bias: Flag,
     pub qk_norm: Flag,
     pub output_gate: Flag,
@@ -331,6 +332,7 @@ impl Default for FamilyAttention {
             scratch: Default::default(),
             int_scratch: Default::default(),
             qkv_bias: Flag::Config { config: "attention_bias".into(), default: false },
+            k_bias: Flag::Fixed(true),
             o_bias: Flag::Fixed(false),
             qk_norm: Flag::Fixed(false),
             output_gate: Flag::Config { config: "attn_output_gate".into(), default: false },
@@ -352,11 +354,30 @@ pub struct FamilyNorm {
     pub pre: bool,
     pub no_offset_keys: Vec<String>,
     pub layer_scale: Option<String>,
+    pub kind: Option<crate::spec::NormKind>,
+    pub eps: Option<f64>,
 }
 
 impl Default for FamilyNorm {
     fn default() -> Self {
-        FamilyNorm { unit_offset: None, sandwich: false, pre: true, no_offset_keys: Vec::new(), layer_scale: None }
+        FamilyNorm { unit_offset: None, sandwich: false, pre: true, no_offset_keys: Vec::new(), layer_scale: None, kind: None, eps: None }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyCross {
+    pub source: Option<String>,
+    pub rows: Option<String>,
+    pub state: Option<String>,
+}
+
+impl FamilyCross {
+    pub fn read(&self, config: &serde_json::Value) -> Result<Option<crate::spec::Cross>> {
+        let Some(source) = &self.source else { return Ok(None) };
+        let key = self.rows.as_deref().context("[cross] needs rows, the config key of the encoder row count")?;
+        let rows = dotted(config, key).and_then(|v| v.as_u64()).with_context(|| format!("[cross] rows reads {key}, which the config does not give"))? as usize;
+        Ok(Some(crate::spec::Cross { source: source.clone(), rows, state: self.state.clone().context("[cross] needs state, the per sequence [[state]] that keeps the cross keys and values")? }))
     }
 }
 
@@ -429,6 +450,7 @@ pub struct FamilyMlp {
     pub mapped: Option<FamilyGated>,
     pub dense_intermediate_key: Option<String>,
     pub shared_tail_wide_key: Option<String>,
+    pub bias: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -526,6 +548,7 @@ impl Default for FamilyRuntime {
 pub struct FamilyEmbedding {
     pub scale: Option<String>,
     pub tie: Option<bool>,
+    pub positions: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -979,6 +1002,10 @@ pub struct Family {
     pub refuse: Vec<FamilyRefuse>,
     #[serde(default)]
     pub pipeline: FamilyPipeline,
+    #[serde(default)]
+    pub remap: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub cross: FamilyCross,
 }
 
 impl Family {
@@ -1113,6 +1140,13 @@ impl Family {
     }
 
     pub fn normalise(&self, config: &mut serde_json::Value) {
+        for (canonical, source) in &self.remap {
+            if let Some(v) = dotted(config, source).cloned()
+                && let Some(map) = config.as_object_mut()
+            {
+                insert_dotted(map, canonical, v);
+            }
+        }
         for (canonical, alternatives) in &self.fields {
             if dotted(config, canonical).is_some() {
                 continue;

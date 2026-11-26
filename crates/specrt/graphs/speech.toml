@@ -30,3 +30,139 @@ node = [
   { op = "conv", weight = "conv1", cin = "num_mel_bins", cout = "d_model", k = "3", pad = "1", act = "gelu" },
   { op = "conv", weight = "conv2", cin = "d_model", cout = "d_model", k = "3", stride = "2", pad = "1", act = "gelu" },
 ]
+
+[[encoder]]
+name = "speech-encoder"
+kind = "encoder-graph"
+classes = ["whisper"]
+
+[encoder.fields]
+heads = ["model.encoder_attention_heads"]
+d_model = ["model.d_model"]
+ffn = ["model.encoder_ffn_dim"]
+layers = ["model.encoder_layers"]
+positions = ["model.max_source_positions"]
+
+[encoder.symbols]
+hidden = "d_model"
+head_dim = "d_model / heads"
+qkv = "3 * d_model"
+norm_eps = "0.00001"
+
+[[encoder.input]]
+name = "stem"
+rows = "image"
+cols = "hidden"
+
+[[encoder.output]]
+name = "states"
+rows = "image"
+cols = "hidden"
+
+[[encoder.buffer]]
+name = "x"
+rows = "image"
+cols = "hidden"
+
+[[encoder.buffer]]
+name = "xn"
+rows = "image"
+cols = "hidden"
+planes = true
+
+[[encoder.buffer]]
+name = "qkv"
+rows = "image"
+cols = "qkv"
+
+[[encoder.buffer]]
+name = "attn"
+rows = "image"
+cols = "hidden"
+planes = true
+
+[[encoder.buffer]]
+name = "act"
+rows = "image"
+cols = "ffn"
+planes = true
+
+[[encoder.head]]
+op = "table_add"
+table = "model.encoder.embed_positions.weight"
+in = "stem"
+out = "x"
+
+[[encoder.block]]
+name = "encoder"
+prefix = "model.encoder.layers"
+count = "layers"
+
+[[encoder.block.node]]
+op = "layer_norm"
+weight = "self_attn_layer_norm"
+in = "x"
+out = "xn"
+rows = "image"
+
+[[encoder.block.node]]
+op = "linear"
+weight = "self_attn.q_proj+self_attn.k_proj+self_attn.v_proj"
+bias = true
+unbiased = ["self_attn.k_proj"]
+in = "xn"
+out = "qkv"
+rows = "image"
+
+[[encoder.block.node]]
+op = "pack"
+in = "qkv"
+out = "planes"
+rows = "image"
+norms = ["", "", ""]
+
+[[encoder.block.node]]
+op = "attention"
+out = "attn"
+rows = "image"
+
+[[encoder.block.node]]
+op = "linear"
+weight = "self_attn.out_proj"
+bias = true
+add = true
+in = "attn"
+out = "x"
+rows = "image"
+
+[[encoder.block.node]]
+op = "layer_norm"
+weight = "final_layer_norm"
+in = "x"
+out = "xn"
+rows = "image"
+
+[[encoder.block.node]]
+op = "linear"
+weight = "fc1"
+bias = true
+act = "gelu"
+in = "xn"
+out = "act"
+rows = "image"
+
+[[encoder.block.node]]
+op = "linear"
+weight = "fc2"
+bias = true
+add = true
+in = "act"
+out = "x"
+rows = "image"
+
+[[encoder.tail]]
+op = "layer_norm"
+weight = "model.encoder.layer_norm"
+in = "x"
+out = "states"
+rows = "image"
