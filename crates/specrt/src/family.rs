@@ -689,6 +689,7 @@ pub struct FamilyQuant {
     pub per_tensor: bool,
     pub group_error: String,
     pub flat_error: String,
+    pub keep: crate::spec::QuantKeep,
 }
 
 fn json_at<'a>(v: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {

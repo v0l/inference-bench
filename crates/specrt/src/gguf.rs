@@ -639,6 +639,7 @@ impl Gguf {
             plain_activations: false,
             iq_quants: self.tensors.values().any(|t| matches!(t.kind, GgmlType::Iq(_))),
             quant_map: Default::default(),
+            quant_keep: Default::default(),
             state: crate::state::stock(),
             runtime: RuntimeOptions {
                 unsplit: Vec::new(),
