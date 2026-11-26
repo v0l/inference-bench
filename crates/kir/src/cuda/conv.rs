@@ -321,7 +321,7 @@ fn wrapper(k: &ConvKernel) -> String {
                 t.bm, t.bn, t.bk, t.ph, t.pw, t.tm, t.tn, t.stages, s.k, s.kt, s.cin, s.cout, flag(s.upsample), flag(s.interleave), flag(silu), flag(k.epilogue.residual)
             )
         }
-        Family::Direct => format!("vae_conv_direct<{}, {}, {}, {}, {}, {}, {gin}, {}, {gout}, {}, CLAMP>", s.k, s.kt, s.cin, s.cout, flag(s.upsample), flag(s.interleave), flag(silu), flag(k.epilogue.residual)),
+        Family::Direct | Family::Rows => format!("vae_conv_direct<{}, {}, {}, {}, {}, {}, {gin}, {}, {gout}, {}, CLAMP>", s.k, s.kt, s.cin, s.cout, flag(s.upsample), flag(s.interleave), flag(silu), flag(k.epilogue.residual)),
     };
     let mut out = String::new();
     for (suffix, clamp) in [("", "false"), ("_clamp", "true")] {
@@ -442,6 +442,47 @@ __device__ __forceinline__ void line_conv_direct(const float* __restrict__ x, co
     line_store<COUT, PHASES, RES, GELU>(acc, scale, y, TO, b, o, n);
 }
 
+template <int KT, int STRIDE, int CIN, int COUT, int PHASES, int CHUNK, bool RES, bool GELU>
+__device__ __forceinline__ void line_conv_rows(const float* __restrict__ x, const float* __restrict__ st, const float* __restrict__ w, const float* __restrict__ bias,
+                                               const float* __restrict__ scale, float* __restrict__ y, int B, int T, int TO) {
+    __shared__ float part[CHUNK][32];
+    constexpr int RED = KT * CIN;
+    int n = blockIdx.x;
+    int rows = B * TO;
+    const float* wr = w + (size_t)n * RED;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    for (int r0 = 0; r0 < rows; r0 += CHUNK) {
+        float acc[CHUNK];
+#pragma unroll
+        for (int j = 0; j < CHUNK; j++) acc[j] = 0.0f;
+        for (int e = threadIdx.x; e < RED; e += blockDim.x) {
+            int tap = e / CIN, c = e % CIN;
+            float wv = wr[e];
+#pragma unroll
+            for (int j = 0; j < CHUNK; j++) {
+                int m = r0 + j;
+                if (m < rows) acc[j] = fmaf(line_input<KT, STRIDE, CIN>(x, st, T, m / TO, m % TO, tap, c), wv, acc[j]);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < CHUNK; j++) {
+            float v = acc[j];
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
+            if (lane == 0) part[j][warp] = v;
+        }
+        __syncthreads();
+        if (threadIdx.x < CHUNK) {
+            int m = r0 + threadIdx.x;
+            if (m < rows) {
+                float v = bias[n];
+                for (int i = 0; i < (int)(blockDim.x >> 5); i++) v += part[threadIdx.x][i];
+                line_store<COUT, PHASES, RES, GELU>(v, scale, y, TO, m / TO, m % TO, n);
+            }
+        }
+        __syncthreads();
+    }
+}
+
 extern "C" __global__ void line_rms(const float* x, float* y, const float* gamma, int P, int C, float eps) {
     int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     size_t p = (size_t)blockIdx.x * (blockDim.x / 32) + warp;
@@ -497,6 +538,7 @@ fn line_wrapper(k: &ConvKernel) -> String {
             format!("line_conv_tile<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {res}, {gelu}>", t.bm, t.bn, t.bk, t.tm, t.tn, t.stages, s.kt, s.stride, s.cin, s.cout, s.phases)
         }
         Family::Direct => format!("line_conv_direct<{}, {}, {}, {}, {}, {res}, {gelu}>", s.kt, s.stride, s.cin, s.cout, s.phases),
+        Family::Rows => format!("line_conv_rows<{}, {}, {}, {}, {}, {}, {res}, {gelu}>", s.kt, s.stride, s.cin, s.cout, s.phases, crate::conv::ROWS_CHUNK),
     };
     format!("extern \"C\" __global__ void __launch_bounds__({THREADS}) {}({LINE_ARGS}) {{\n    {call}({LINE_PASS});\n}}\n\n", k.name())
 }
@@ -510,7 +552,7 @@ pub fn emit_line(kernels: &[ConvKernel]) -> Result<crate::KirSource, ConvError> 
         if !k.shape.line {
             return Err(ConvError(format!("{} is not a line conv", k.name())));
         }
-        if THREAD_ROWS * k.tile.tm != k.tile.bm || THREAD_COLS * k.tile.tn != k.tile.bn {
+        if k.family == Family::Tile && (THREAD_ROWS * k.tile.tm != k.tile.bm || THREAD_COLS * k.tile.tn != k.tile.bn) {
             return Err(ConvError(format!("{}: the tile {:?} does not map onto {THREADS} threads", k.name(), k.tile)));
         }
         if !seen.contains(&k.name()) {

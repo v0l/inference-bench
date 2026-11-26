@@ -33,11 +33,46 @@ pub struct GpuStack {
 pub struct Sessions {
     pub batch: usize,
     state: BTreeMap<usize, [CudaSlice<f32>; 2]>,
+    flip: bool,
 }
 
 impl Sessions {
     pub fn floats_per_session(&self) -> usize {
         self.state.values().map(|s| s[0].len()).sum::<usize>() / self.batch
+    }
+
+    pub fn fixed(mut self) -> Sessions {
+        self.flip = false;
+        self
+    }
+
+    pub fn segments(&self, stream: &Arc<CudaStream>) -> Vec<(u64, u64, usize)> {
+        self.state.values().map(|p| (p[0].device_ptr(stream).0, p[1].device_ptr(stream).0, p[0].len() / self.batch)).collect()
+    }
+}
+
+pub struct FrameBufs {
+    plan: LaunchPlan,
+    bufs: Vec<CudaSlice<f32>>,
+    ptrs: Vec<u64>,
+    pub batch: usize,
+}
+
+impl FrameBufs {
+    pub fn input(&mut self) -> &mut CudaSlice<f32> {
+        &mut self.bufs[self.plan.input]
+    }
+
+    pub fn input_ptr(&self) -> u64 {
+        self.ptrs[self.plan.input]
+    }
+
+    pub fn output(&self) -> &CudaSlice<f32> {
+        &self.bufs[self.plan.output]
+    }
+
+    pub fn output_floats(&self) -> usize {
+        self.batch * self.plan.t_out * self.plan.out_channels
     }
 }
 
@@ -72,6 +107,11 @@ fn rows(n: usize) -> LaunchConfig {
 
 impl CudaCodec {
     pub fn load(ctx: &Arc<CudaContext>, jit: &Jit, host: &HostCodec, shapes: &[(usize, usize)]) -> Result<CudaCodec> {
+        Self::load_on(&ctx.default_stream(), jit, host, shapes)
+    }
+
+    pub fn load_on(stream: &Arc<CudaStream>, jit: &Jit, host: &HostCodec, shapes: &[(usize, usize)]) -> Result<CudaCodec> {
+        let ctx = stream.context();
         let target = crate::codegen::cuda_target(ctx)?;
         let mut all = Vec::new();
         for &(steps, batch) in shapes {
@@ -90,7 +130,7 @@ impl CudaCodec {
             use cudarc::driver::sys::CUfunction_attribute as A;
             fns[&k.name()].set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, k.smem_bytes() as i32)?;
         }
-        let stream = ctx.default_stream();
+        let stream = stream.clone();
         let encoder = upload(&stream, &host.encoder)?;
         let decoder = upload(&stream, &host.decoder)?;
         let kernels = all.into_iter().map(|k| (k.name(), k)).collect();
@@ -110,7 +150,19 @@ impl CudaCodec {
                 state.insert(i, [self.stream.alloc_zeros(n)?, self.stream.alloc_zeros(n)?]);
             }
         }
-        Ok(Sessions { batch, state })
+        Ok(Sessions { batch, state, flip: true })
+    }
+
+    pub fn frame_buffers(&self, which: &GpuStack, steps: usize, batch: usize) -> Result<FrameBufs> {
+        let p = plan(&which.stack, steps, batch)?;
+        let bufs: Vec<CudaSlice<f32>> = p.buffer_floats.iter().map(|n| self.stream.alloc_zeros((*n).max(1))).collect::<Result<_, _>>()?;
+        let ptrs: Vec<u64> = bufs.iter().map(|v| v.device_ptr(&self.stream).0).collect();
+        Ok(FrameBufs { plan: p, bufs, ptrs, batch })
+    }
+
+    pub fn launch_frame(&self, which: &GpuStack, f: &FrameBufs, sessions: &mut Sessions) -> Result<()> {
+        ensure!(sessions.batch == f.batch, "frame buffers for {} sessions, state for {}", f.batch, sessions.batch);
+        self.launch_all(which, &f.plan, &f.ptrs, sessions)
     }
 
     pub fn run(&self, which: &GpuStack, input: &[f32], sessions: &mut Sessions) -> Result<Vec<f32>> {
@@ -135,8 +187,8 @@ impl CudaCodec {
             let (x, y) = (ptrs[l.input], ptrs[l.output]);
             let (t, to) = (l.t_in as i32, l.t_out as i32);
             match &l.kind {
-                Kind::Conv { shape, gelu, residual } => {
-                    let k = &self.kernels[&super::compile::conv_kernel(&self.target, *shape, *gelu, *residual)?.name()];
+                Kind::Conv { shape, gelu, residual, rows } => {
+                    let k = &self.kernels[&super::compile::conv_kernel(&self.target, *shape, *gelu, *residual, *rows)?.name()];
                     let dev = &which.weights[&l.op];
                     let st = match l.layer.and_then(|i| sessions.state.get(&i)) {
                         Some(pair) => dptr(&pair[0]),
@@ -177,7 +229,12 @@ impl CudaCodec {
                     let mut lb = s.launch_builder(&self.fns["line_shift"]);
                     lb.arg(&x).arg(&old).arg(&new).arg(&b).arg(&t).arg(&tp).arg(&c).arg(&ctx);
                     unsafe { lb.launch(rows(sessions.batch * context * channels)) }?;
-                    pair.swap(0, 1);
+                    if sessions.flip {
+                        pair.swap(0, 1);
+                    } else {
+                        let [old, new] = pair;
+                        s.memcpy_dtod(&*new, old)?;
+                    }
                 }
             }
         }

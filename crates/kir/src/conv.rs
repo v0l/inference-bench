@@ -51,6 +51,19 @@ impl ConvShape {
 pub enum Family {
     Tile,
     Direct,
+    Rows,
+}
+
+pub const ROWS_CHUNK: usize = 8;
+pub const ROWS_MAX: usize = 64;
+pub const ROWS_FEW_MAX: usize = 512;
+pub const ROWS_FEW_BLOCKS: usize = 48;
+pub const ROWS_MIN_REDUCTION: usize = 256;
+
+pub fn rows_fit(s: &ConvShape, rows: usize) -> bool {
+    let bn = s.cout.div_ceil(N_STEP).max(1).saturating_mul(N_STEP).min(N_MAX);
+    let tile_blocks = rows.div_ceil(PATCH_H * PATCH_W) * s.cout.div_ceil(bn);
+    s.line && s.cin * s.kt >= ROWS_MIN_REDUCTION && (rows <= ROWS_MAX || (rows <= ROWS_FEW_MAX && tile_blocks < ROWS_FEW_BLOCKS))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -126,6 +139,12 @@ impl ConvKernel {
         Ok(k)
     }
 
+    pub fn rows(t: &Target, shape: ConvShape, epilogue: Epilogue) -> Result<ConvKernel, ConvError> {
+        let k = ConvKernel { target: *t, shape, family: Family::Rows, tile: tile(t, &shape), prologue: Prologue::None, epilogue };
+        k.validate()?;
+        Ok(k)
+    }
+
     pub fn validate(&self) -> Result<(), ConvError> {
         let bad = |s: String| Err(ConvError(format!("conv {}: {s}", self.describe_shape())));
         let s = &self.shape;
@@ -143,6 +162,9 @@ impl ConvKernel {
         }
         if !s.line && (s.stride != 1 || s.phases != 1 || self.epilogue.gelu) {
             return bad("stride, phases and gelu are line conv options".into());
+        }
+        if self.family == Family::Rows && !s.line {
+            return bad("the rows family is a line conv".into());
         }
         if let Prologue::GroupApply { groups, .. } = self.prologue
             && (groups == 0 || groups > MAX_GROUPS || !s.cin.is_multiple_of(groups) || s.kt > 1)
@@ -192,7 +214,7 @@ impl ConvKernel {
         let stats = 16 * self.epilogue.stats.unwrap_or(0) + 8 * self.groups_in();
         let tiles = match self.family {
             Family::Tile => self.tile.stage_bytes() * self.tile.stages,
-            Family::Direct => 0,
+            Family::Direct | Family::Rows => 0,
         };
         (tiles + stats) as u32
     }
@@ -201,6 +223,7 @@ impl ConvKernel {
         match self.family {
             Family::Tile => crate::heavy::BASE_REGS + (self.tile.tm * self.tile.tn + self.tile.tm + self.tile.tn) as u32,
             Family::Direct => crate::heavy::BASE_REGS + 8,
+            Family::Rows => crate::heavy::BASE_REGS + ROWS_CHUNK as u32,
         }
     }
 
@@ -212,13 +235,14 @@ impl ConvKernel {
         match self.family {
             Family::Tile => (rows.div_ceil(self.tile.bm) as u32, self.shape.cout.div_ceil(self.tile.bn) as u32, 1),
             Family::Direct => ((rows * self.shape.cout).div_ceil(THREADS as usize).max(1) as u32, 1, 1),
+            Family::Rows => (self.shape.cout as u32, 1, 1),
         }
     }
 
     pub fn grid(&self, frames: usize, h: usize, w: usize) -> (u32, u32, u32) {
         match self.family {
             Family::Tile => (w.div_ceil(self.tile.pw) as u32, h.div_ceil(self.tile.ph) as u32, (frames * self.shape.cout.div_ceil(self.tile.bn)) as u32),
-            Family::Direct => ((frames * h * w * self.shape.cout).div_ceil(THREADS as usize) as u32, 1, 1),
+            Family::Direct | Family::Rows => ((frames * h * w * self.shape.cout).div_ceil(THREADS as usize) as u32, 1, 1),
         }
     }
 
