@@ -76,6 +76,60 @@ fn a_quantcheck_recipe_beats_blanket_nvfp4_on_top1_at_a_similar_size_on_qwen3_0_
 
 #[test]
 #[ignore = "needs a CUDA GPU and Qwen/Qwen3-0.6B"]
+fn quantize_cache_load_time_on_qwen3_0_6b() {
+    use specrt::spec::{LayerQuant, Quant, QuantPlan};
+    let base = spec(QuantizeChoice::Off);
+    let n = base.layers.count;
+    let mut planned = base.clone();
+    planned.quant_plan = QuantPlan { layers: (0..n).map(|l| if l % 3 == 0 { LayerQuant::new(Quant::Fp8Channel, true) } else { LayerQuant::new(Quant::Nvfp4G16, l % 2 == 0) }).collect(), kernels: Vec::new() };
+    let files = specrt::weights::Checkpoint::for_repo(&base.repo).unwrap().files;
+    let mut cached = planned.clone();
+    cached.runtime.quantize_cache = true;
+    let dir = specrt::quant_cache::dir_for(&cached, &files).unwrap();
+    assert!(!dir.starts_with(files[0].parent().unwrap()), "the cache is not beside the original files");
+    std::fs::remove_dir_all(&dir).ok();
+    let drop_page_cache = |paths: &[std::path::PathBuf]| {
+        for p in paths {
+            let f = std::fs::File::open(p).unwrap();
+            use std::os::fd::AsRawFd;
+            unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        }
+    };
+    let cache_files = |d: &std::path::Path| -> Vec<std::path::PathBuf> { std::fs::read_dir(d).map(|r| r.flatten().map(|e| e.path()).collect()).unwrap_or_default() };
+    let prompt: Vec<u32> = (0..128u32).map(|i| 1000 + (i * 37) % 30000).collect();
+    let run = |s: &specrt::spec::Spec, cold: bool| {
+        if cold {
+            drop_page_cache(&files);
+            drop_page_cache(&cache_files(&dir));
+        }
+        let mut rt = Runtime::load(s, 512).unwrap();
+        let logits = rt.prompt_logits(&prompt).unwrap();
+        (logits, rt.load_secs, rt.weight_secs, rt.bytes_read, rt.quantized.secs, rt.quant_cache.clone())
+    };
+    let (want, ..) = run(&planned, false);
+    let mut lines = Vec::new();
+    for cold in [true, false] {
+        let temp = if cold { "cold" } else { "warm" };
+        std::fs::remove_dir_all(&dir).ok();
+        let (a, secs, wsecs, read, qsecs, _) = run(&planned, cold);
+        lines.push(format!("{temp} no cache: load {secs:.2}s (weights {wsecs:.2}s, conversion {qsecs:.2}s), source read {read} bytes"));
+        let (b, secs, wsecs, read, qsecs, written) = run(&cached, cold);
+        let written = written.unwrap();
+        lines.push(format!("{temp} cache write: load {secs:.2}s (weights {wsecs:.2}s, conversion {qsecs:.2}s), source read {read} bytes, wrote {} bytes", written.bytes));
+        let (c, secs, wsecs, read, qsecs, hit) = run(&cached, cold);
+        let hit = hit.unwrap();
+        assert!(hit.hit && qsecs == 0.0);
+        lines.push(format!("{temp} cache read: load {secs:.2}s (weights {wsecs:.2}s), source read {read} bytes, cache {} bytes", hit.bytes));
+        assert!(a == want && b == want && c == want, "the cache changes no logits");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    for l in lines {
+        eprintln!("{l}");
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and Qwen/Qwen3-0.6B"]
 fn quantised_prefill_and_decode_speed_on_qwen3_0_6b() {
     use specrt::quantcheck::{Budget, Options, run};
     use specrt::spec::{Quant, QuantPlan};

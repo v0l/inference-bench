@@ -86,7 +86,7 @@ Choosing:
 - The per layer KLs do not add up exactly, so the chosen recipe is checked by one whole model run against bf16. If that is over the budget the target is scaled down and greedy runs again (up to 4 rounds). On Qwen3-0.6B the sum was slightly pessimistic every time (estimated 0.0977, measured 0.0912 at budget 0.1), so one round was enough.
 - The keep list's edge layers (first and last two) are not forced to bf16 under a recipe: quantcheck measures them like any other layer. The named and sensitive tensors (embeddings, head, norms, routers, `sensitive`) still stay bf16.
 
-The recipe, `<model>.quantrecipe.toml`, is about 4 KB for 28 layers: recipe version, model, engine commit, `FORMAT_VERSION`, prompt set hash, positions, budgets, total and bf16 bytes, the estimated and checked KL, and per layer the format, search or plain, its own mean and max KL and its bytes. `Recipe::plan()` turns it into a `quant_plan`, the spec field the loader reads per layer (step 3 adds `quantize = "recipe"` with the path). A model of `n` layers with `f` formats costs `2fn` probes; each probe is one layer re-read and one pass over 353 positions.
+The recipe, `<model>.quantrecipe.toml`, is about 4 KB for 28 layers: recipe version, model, engine commit, `FORMAT_VERSION`, prompt set hash, positions, budgets, total and bf16 bytes, the estimated and checked KL, and per layer the format, search or plain, its own mean and max KL and its bytes. `Recipe::plan()` turns it into a `quant_plan`, the spec field the loader reads per layer. A model of `n` layers with `f` formats costs `2fn` probes; each probe is one layer re-read and one pass over 353 positions.
 
 For a model that does not fit one card, quantcheck still needs every layer resident: run it on a stage, or wait for the streaming variant; `requantize_layer` refuses offloaded or tensor parallel runtimes.
 
@@ -120,4 +120,41 @@ All inside 3%: a 0.6B model is launch bound, so the win here is memory only. The
 
 ## Trade off
 
-Quantising on the fly reads the full bf16 model from disk on every start, against a stored NVFP4 copy that reads a quarter of that. It saves disk and costs load time. The planned `quantize_cache` option (step 3) stores the result next to the model for the second start.
+Quantising on the fly reads the full bf16 model from disk on every start, against a stored NVFP4 copy that reads a quarter of that. It saves disk and costs load time. `quantize_cache` stores the result next to the model for the second start.
+
+## Loading a recipe
+
+```toml
+[runtime]
+quantize = "recipe"
+quantize_recipe = "Qwen3-0.6B.quantrecipe.toml"
+```
+
+The same two keys are server and app options (`runtime.quantize`, `runtime.quantize_recipe`). A relative path in a spec file is read beside the spec. At load (`Spec::resolve_recipe`, called from `Runtime::load_inner` and `apply_quantize`) the recipe becomes the spec's `quant_plan` and the loader quantises each layer as it streams in, so nothing quantised is stored and only the few KB recipe is kept. The recipe is checked against the model first:
+
+- refused: a different model (`model`, compared by its last path part, case insensitive), a different `format_version` ("run quantcheck again"), a different layer count, or layers not numbered 0 to n-1. The error names the recipe file and both values.
+- warned and loaded: a different engine commit or prompt set hash; the KL figures in the file may then be stale or not comparable, but the plan is still valid.
+
+On Qwen3-0.6B a load from the KL 0.1 recipe file gives mean KL 0.0912 and top-1 85.6%, exactly the check quantcheck recorded, and 929,694,976 weight bytes, exactly its count (`a_quantcheck_recipe_beats_blanket_nvfp4_*`, which now loads through the file). The tiny fixture test does the same on the tiny model (`quantcheck_gpu.rs`), and `quantcheck.rs` covers the refusals and warnings on CPU.
+
+## The quantised weight cache
+
+`[runtime] quantize_cache = true` (off by default) writes what the load converted and reads it back on the next start, so the conversion and most of the bf16 read are skipped.
+
+- Where: for a model in the HF cache, `<hub>/models--<org>--<name>/specrt-quant/<key>/`, next to `snapshots/` and `blobs/`, never inside a snapshot and never beside the user's own files. A checkpoint outside the hub caches under `<cache_dir>/quant/<model>/<key>/` (`[runtime] cache_dir`, default the user cache folder).
+- Key: sha256 of the cache version, `FORMAT_VERSION`, the scale search candidates, the spec with serving options cleared (so the plan, keep list, quant and tensor names count but KV, graphs and batch do not) and each source file's blob hash (from the hub symlink) or its size and mtime. A new recipe, a new spec or new weights is a new folder.
+- What: one safetensors file per load group with each quantised matrix (nvfp4 packed, scales and the two globals; fp8 values and row scales), and `quant.toml` with the key, model, bytes and the source tensors it covers. A hit drops those tensors from the read plan; norms, embeddings, the head and kept bf16 layers are still read from the checkpoint. It is written to a `.partial` folder and renamed when the load finishes, so a crash leaves nothing a later start would read. A failed write is a warning and the start goes on.
+- Not covered yet: pipeline stages and tensor parallel ranks convert at load as before.
+- Reported: `runtime loaded` logs `quantize_cache = (dir, bytes, read|written)`, and `Runtime::quant_cache` carries it.
+
+Qwen3-0.6B, a plan of 10 fp8_channel and 18 nvfp4_g16 layers, GPU1 (`quantize_cache_load_time_on_qwen3_0_6b`; cold means the page cache of the source and cache files was dropped with `posix_fadvise` first):
+
+| start | load | weights | conversion (thread seconds) | source bytes read | cache on disk |
+|---|---|---|---|---|---|
+| cold, no cache | 1.28 s | 0.89 s | 3.13 s | 1.19 GB | none |
+| cold, first start writes the cache | 1.27 s | 0.88 s | 2.98 s | 1.19 GB | 0.32 GB written |
+| cold, cache read | 0.46 s | 0.09 s | 0 | 0.31 GB | 0.32 GB |
+| warm, no cache | 1.29 s | 0.91 s | 3.15 s | 1.19 GB | none |
+| warm, cache read | 0.47 s | 0.10 s | 0 | 0.31 GB | 0.32 GB |
+
+The cache costs 0.32 GB of disk here (about a quarter of the 1.19 GB checkpoint) and cuts the load by 0.8 s; writing it costs nothing measurable. The 0.31 GB still read is the bf16 embedding and norms. Logits from a cached start equal a converting start bit for bit (`quantize_cache.rs`: CPU on the tiny dense and MoE fixtures, matrix by matrix, plus the GPU test on logits).
