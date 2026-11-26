@@ -68,6 +68,57 @@ impl CudaCrossRows {
     }
 }
 
+pub struct CudaRowPlans {
+    stream: Arc<CudaStream>,
+    edit: CudaFunction,
+    allow: CudaFunction,
+    vocab: usize,
+}
+
+impl CudaRowPlans {
+    pub fn load(stream: &Arc<CudaStream>, jit: &Jit, spec: &crate::spec::Spec) -> Result<CudaRowPlans> {
+        let shape = kir::duplex::DuplexShape { hidden: spec.dims.hidden, vocab: spec.dims.vocab, latent: 1 };
+        let source = kir::cuda::emit_duplex(&shape).map_err(anyhow::Error::msg)?;
+        let loaded = jit.load(&Module { source, kernels: kir::duplex::KERNELS.to_vec(), smem: BTreeMap::new(), arch_features: false, kir_hash: kir::fnv_hash(&shape.hash()) })?;
+        Ok(CudaRowPlans { stream: stream.clone(), edit: loaded.function("duplex_edit_logits")?, allow: loaded.function("duplex_allow")?, vocab: spec.dims.vocab })
+    }
+
+    pub fn run(&self, logits: &[f32], plans: &[crate::duplex::sampling::RowPlan]) -> Result<Vec<f32>> {
+        let s = &self.stream;
+        let rows = plans.len();
+        ensure!(logits.len() == rows * self.vocab, "{} logits for {rows} rows of {}", logits.len(), self.vocab);
+        let es = plans.iter().map(|p| p.edits.len()).max().unwrap_or(0).max(1);
+        let al = plans.iter().map(|p| p.allow.len()).max().unwrap_or(0).max(1);
+        let mut tok = vec![0i32; rows * es];
+        let mut add = vec![0f32; rows * es];
+        let mut allow = vec![0i32; rows * al];
+        for (r, p) in plans.iter().enumerate() {
+            for (i, (t, a)) in p.edits.iter().enumerate() {
+                tok[r * es + i] = *t as i32;
+                add[r * es + i] = *a;
+            }
+            for (i, t) in p.allow.iter().enumerate() {
+                allow[r * al + i] = *t as i32;
+            }
+        }
+        let ecount: Vec<i32> = plans.iter().map(|p| p.edits.len() as i32).collect();
+        let acount: Vec<i32> = plans.iter().map(|p| p.allow.len() as i32).collect();
+        let l = s.clone_htod(logits)?;
+        let (td, ad, ed, ald, acd) = (s.clone_htod(&tok)?, s.clone_htod(&add)?, s.clone_htod(&ecount)?, s.clone_htod(&allow)?, s.clone_htod(&acount)?);
+        let lp = l.device_ptr(s).0;
+        let (tp, ap, ep, alp, acp) = (td.device_ptr(s).0, ad.device_ptr(s).0, ed.device_ptr(s).0, ald.device_ptr(s).0, acd.device_ptr(s).0);
+        let (es, al) = (es as i32, al as i32);
+        let mut b = s.launch_builder(&self.edit);
+        b.arg(&lp).arg(&tp).arg(&ap).arg(&ep).arg(&es);
+        unsafe { b.launch(LaunchConfig { grid_dim: (rows as u32, 1, 1), block_dim: (64, 1, 1), shared_mem_bytes: 0 }) }?;
+        let mut b = s.launch_builder(&self.allow);
+        b.arg(&lp).arg(&alp).arg(&acp).arg(&al);
+        let y = (self.vocab as u32).div_ceil(256).min(64);
+        unsafe { b.launch(LaunchConfig { grid_dim: (rows as u32, y, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
+        Ok(s.clone_dtoh(&l)?)
+    }
+}
+
 struct Gemm {
     w: CudaSlice<f32>,
     b: CudaSlice<f32>,

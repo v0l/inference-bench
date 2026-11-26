@@ -616,6 +616,10 @@ fn splitmix(seed: u64, i: u64) -> f64 {
     (z >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
 }
 
+pub fn uniform(seed: u64, i: u64) -> f64 {
+    splitmix(seed, i)
+}
+
 pub fn noise(seed: u64, n: usize) -> Vec<f32> {
     let pairs = n.div_ceil(2);
     let mut out = Vec::with_capacity(2 * pairs);

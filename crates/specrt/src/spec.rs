@@ -1463,6 +1463,8 @@ pub struct Spec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cross: Option<Cross>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech_decode: Option<crate::family::SpeechDecode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtp: Option<Mtp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<crate::vision::Vision>,
@@ -2686,6 +2688,7 @@ impl Spec {
             inputs: family.inputs.read(&outer)?,
             duplex: family.duplex.read(&outer)?,
             cross: family.cross.read(&value)?,
+            speech_decode: family.speech.decode.clone(),
             tensors: family.tensors.clone(),
             vision: if strict { crate::vision::Vision::from_hf_config(json)? } else { None },
             state: if family.state.is_empty() { crate::state::stock() } else { family.state.clone() },

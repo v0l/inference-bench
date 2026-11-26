@@ -62,10 +62,10 @@ const WHISPER: &[Need] = &[
     Need { piece: "cross attention K and V computed once per window and kept per sequence", state: "exists: the [[window]] cross_kv op and the per sequence cross_kv [[state]] named by [cross]", evidence: Some(("specrt/graphs/decoder.toml", "[[window]]\nop = \"cross_kv\"")), slice: "b" },
     Need { piece: "decoder causal self attention with a paged KV cache, no rope", state: "exists (paged KV, nope_all)", evidence: Some(("specrt/src/family.rs", "pub nope_all: bool")), slice: "b" },
     Need { piece: "tied output head", state: "exists", evidence: Some(("specrt/src/spec.rs", "\"tie_word_embeddings\"")), slice: "-" },
-    Need { piece: "suppress and begin suppress lists, forced prefix", state: "new sampler plan rows (allow and ban lists exist for duplex)", evidence: Some(("specrt/src/duplex/sampling.rs", "pub allow: Vec<u32>")), slice: "c" },
-    Need { piece: "language detection over the language token logits at step 0", state: "new decoding rule", evidence: None, slice: "c" },
-    Need { piece: "timestamp rules, no speech probability, temperature fallback, compression ratio, avg logprob", state: "new decoding rules (host)", evidence: None, slice: "c" },
-    Need { piece: "long audio: 30 s windows with seek by the last timestamp, previous text as prompt", state: "new host loop", evidence: None, slice: "c" },
+    Need { piece: "suppress and begin suppress lists, forced prefix", state: "exists: speech::decode::Rules rows as duplex RowPlan edits and allow lists, read from generation_config.json", evidence: Some(("specrt/src/speech/decode.rs", "pub fn row(&self, generated: &[u32], timestamps: bool) -> RowPlan")), slice: "c" },
+    Need { piece: "language detection over the language token logits at step 0", state: "exists: Rules::detect, one step on SOT through the language allow row", evidence: Some(("specrt/src/speech/decode.rs", "pub fn detect(&self, sot_logits: &[f32]) -> u32")), slice: "c" },
+    Need { piece: "timestamp rules, no speech probability, temperature fallback, compression ratio, avg logprob", state: "exists: Rules::row, timestamp_rule, no_speech_prob, compression_ratio (zlib), avg_logprob, decide; thresholds in [speech.decode]", evidence: Some(("specrt/src/speech/decode.rs", "pub fn decide(")), slice: "c" },
+    Need { piece: "long audio: 30 s windows with seek by the last timestamp, previous text as prompt", state: "exists: speech::transcribe::HostTranscriber::transcribe_mel", evidence: Some(("specrt/src/speech/transcribe.rs", "pub fn transcribe_mel(")), slice: "c" },
 ];
 
 const TTS: &[Need] = &[
@@ -116,7 +116,7 @@ fn the_engine_refuses_whisper_as_text_chat_and_says_which_ops_are_missing() {
     for m in &missing {
         println!("  {m}");
     }
-    assert_eq!(missing.len(), 7, "{missing:#?}");
+    assert_eq!(missing.len(), 4, "{missing:#?}");
     for slice in ["a", "b", "c", "e", "f"] {
         assert!(WHISPER.iter().chain(TTS).any(|n| n.slice == slice), "slice {slice} has no gap");
     }
@@ -616,6 +616,254 @@ fn the_gpu_cross_attention_rows_match_the_host_on_two_sequences() {
         let alone = gpu.run(&q[qd..], &[&b.cross_kv[layer]]).unwrap();
         assert_eq!(&got[qd..], &alone[..], "layer {layer}: sequence b batched differs from alone");
     }
+}
+
+fn rules() -> specrt::speech::decode::Rules {
+    let spec = specrt::spec::Spec::from_hf_config_speech(&std::fs::read_to_string(tiny().join("config.json")).unwrap()).unwrap();
+    specrt::speech::decode::Rules::open(&tiny(), spec.speech_decode.as_ref().unwrap()).unwrap()
+}
+
+fn run_options(run: &Value) -> specrt::speech::decode::Options {
+    let o = &run["options"];
+    let f = |k: &str| o[k].as_f64();
+    specrt::speech::decode::Options {
+        language: o["language"].as_str().map(str::to_string),
+        task: Some("transcribe".into()).filter(|_| o["language"].is_string()),
+        timestamps: true,
+        temperatures: o["temperatures"].as_array().map_or(vec![0.0], |a| a.iter().map(|t| t.as_f64().unwrap()).collect()),
+        compression_ratio_threshold: f("compression_ratio_threshold"),
+        logprob_threshold: f("logprob_threshold"),
+        no_speech_threshold: f("no_speech_threshold"),
+        condition_on_prev: o["condition_on_prev_tokens"].as_bool().unwrap_or(false),
+        max_new_tokens: None,
+        seed: 0,
+    }
+}
+
+fn transcriber() -> specrt::speech::transcribe::HostTranscriber {
+    specrt::speech::transcribe::HostTranscriber::open(&tiny(), false).unwrap()
+}
+
+fn frames_major_mel(name: &str) -> Vec<f32> {
+    let (mel, shape) = reference(name);
+    frames_major(&mel, shape[0], shape[1])
+}
+
+fn check_run(name: &str, got: &specrt::speech::transcribe::Transcript, run: &Value) {
+    let windows = run["windows"].as_array().unwrap();
+    assert_eq!(got.windows.len(), windows.len(), "{name}: windows");
+    for (w, (g, want)) in got.windows.iter().zip(windows).enumerate() {
+        assert_eq!(g.seek as u64, want["seek"].as_u64().unwrap(), "{name} window {w}: seek");
+        assert_eq!(g.decoder_input, ids(&want["decoder_input"]), "{name} window {w}: prompt with the previous text");
+        let attempts = want["attempts"].as_array().unwrap();
+        assert_eq!(g.attempts.len(), attempts.len(), "{name} window {w}: fallback attempts");
+        for (a, (ga, wa)) in g.attempts.iter().zip(attempts).enumerate() {
+            assert_eq!(ga.temperature, wa["temperature"].as_f64().unwrap(), "{name} {w}.{a}");
+            assert_eq!(ga.tokens, ids(&wa["tokens"]), "{name} {w}.{a}: tokens");
+            let d = &ga.decision;
+            assert!((d.compression_ratio - wa["compression_ratio"].as_f64().unwrap()).abs() < 1e-9, "{name} {w}.{a}: compression ratio {}", d.compression_ratio);
+            assert!((d.avg_logprob - wa["avg_logprob"].as_f64().unwrap()).abs() < 2e-3, "{name} {w}.{a}: avg logprob {} against {}", d.avg_logprob, wa["avg_logprob"]);
+            if let Some(p) = wa["no_speech_prob"].as_f64() {
+                assert!((d.no_speech_prob.unwrap() - p).abs() < 1e-3 * p.max(1e-4), "{name} {w}.{a}: no speech {:?} against {p}", d.no_speech_prob);
+            }
+            assert_eq!((d.needs_fallback, d.should_skip), (wa["needs_fallback"].as_bool().unwrap(), wa["should_skip"].as_bool().unwrap()), "{name} {w}.{a}: fallback decision");
+        }
+    }
+    let segs: Vec<(f64, f64, Vec<u32>)> = got.segments.iter().map(|s| (s.start, s.end, s.tokens.clone())).collect();
+    let want: Vec<(f64, f64, Vec<u32>)> = run["segments"].as_array().unwrap().iter().map(|s| (s["start"].as_f64().unwrap(), s["end"].as_f64().unwrap(), ids(&s["tokens"]))).collect();
+    assert_eq!(segs.len(), want.len(), "{name}: segments {segs:?}");
+    for (g, w) in segs.iter().zip(&want) {
+        assert!((g.0 - w.0).abs() < 1e-6 && (g.1 - w.1).abs() < 1e-6 && g.2 == w.2, "{name}: segment {g:?} against {w:?}");
+    }
+    assert_eq!(got.sequence, ids(&run["sequence"]), "{name}: generate sequence");
+}
+
+#[test]
+fn the_decoding_rules_come_from_generation_config_and_the_family() {
+    let r = rules();
+    assert_eq!((r.sot, r.eot, r.no_timestamps, r.timestamp_begin, r.no_speech, r.prev), (513, 512, 523, 524, 522, Some(521)));
+    assert_eq!((r.prev_cutoff, r.max_length, r.max_initial_timestamp), (31, 64, Some(50)));
+    assert_eq!(r.forced, vec![(1, None), (2, Some(519))]);
+    let meta = json(&tiny().join("reference.json"));
+    let greedy = specrt::speech::decode::Options { language: Some("en".into()), task: Some("transcribe".into()), ..specrt::speech::decode::Options::greedy() };
+    assert_eq!(r.init_tokens(&greedy, None).unwrap(), ids(&meta["prefix"]), "the forced prefix of generate(language=en, task=transcribe)");
+    let auto = specrt::speech::decode::Options::greedy();
+    assert!(r.needs_detection(&auto), "forced_decoder_ids [1, null] asks for language detection");
+    assert_eq!(r.init_tokens(&auto, Some(515)).unwrap(), vec![513, 515, 519, 523]);
+    let ts = specrt::speech::decode::Options { timestamps: true, ..auto };
+    assert_eq!(r.init_tokens(&ts, Some(515)).unwrap(), vec![513, 515, 519], "timestamps drop no_timestamps");
+    for (name, prefix) in [("whisper-tiny.en", vec![50257u32]), ("whisper-base", vec![50258, 50259, 50359]), ("whisper-large-v3-turbo", vec![50258, 50259, 50360])] {
+        let c = json(&dir().join(format!("{name}.config.json")));
+        let g = json(&dir().join(format!("{name}.generation_config.json")));
+        let spec = specrt::spec::Spec::from_hf_config_speech(&c.to_string()).unwrap();
+        let real = specrt::speech::decode::Rules::from_configs(&c, &g, spec.speech_decode.as_ref().unwrap()).unwrap();
+        let o = specrt::speech::decode::Options { timestamps: true, language: real.multilingual.then(|| "en".to_string()), ..specrt::speech::decode::Options::greedy() };
+        assert_eq!(real.init_tokens(&o, None).unwrap(), prefix, "{name}");
+        assert_eq!(real.timestamp_begin, real.no_timestamps + 1, "{name}");
+        assert_eq!(real.prev_cutoff, 223, "{name}");
+    }
+    let plan = r.row(&[], false);
+    assert!(plan.allow.is_empty());
+    let banned: BTreeSet<u32> = plan.edits.iter().map(|e| e.0).collect();
+    assert!(banned.contains(&512) && banned.contains(&220) && banned.contains(&1), "begin suppress and suppress on the first step");
+    assert!(!r.row(&[100], false).edits.iter().any(|e| e.0 == 512), "EOT is allowed after the first step");
+}
+
+#[test]
+fn the_compression_ratio_is_zlib_of_the_token_bytes_as_transformers_computes_it() {
+    let r = rules();
+    let meta = json(&tiny().join("reference.json"));
+    let mut n = 0;
+    for run in meta["runs"].as_object().unwrap().values() {
+        for w in run["windows"].as_array().unwrap() {
+            for a in w["attempts"].as_array().unwrap() {
+                let got = r.compression_ratio(&ids(&a["tokens"])).unwrap();
+                assert_eq!(got, a["compression_ratio"].as_f64().unwrap(), "{:?}", ids(&a["tokens"]));
+                n += 1;
+            }
+        }
+    }
+    assert_eq!(n, 7, "attempts");
+}
+
+#[test]
+fn the_fallback_decisions_match_transformers_on_the_recorded_logits() {
+    let r = rules();
+    let meta = json(&tiny().join("reference.json"));
+    let run = &meta["runs"]["fallback"];
+    let o = run_options(run);
+    let mut kinds = BTreeSet::new();
+    for w in run["windows"].as_array().unwrap() {
+        for a in w["attempts"].as_array().unwrap() {
+            let Some(key) = a["scores"].as_str() else { continue };
+            let (pos, _) = reference(&format!("{key}.ids"));
+            let (vals, _) = reference(&format!("{key}.scores"));
+            let tokens = ids(&a["tokens"]);
+            let mut rows = vec![vec![f32::NEG_INFINITY; r.vocab]; tokens.len()];
+            for (p, v) in pos.chunks(2).zip(&vals) {
+                rows[p[0] as usize][p[1] as usize] = *v;
+            }
+            let t = a["temperature"].as_f64().unwrap();
+            let d = r.decide(&o, &tokens, &rows, t, a["no_speech_prob"].as_f64()).unwrap();
+            assert!((d.avg_logprob - a["avg_logprob"].as_f64().unwrap()).abs() < 1e-5, "{key}: {} against {}", d.avg_logprob, a["avg_logprob"]);
+            assert_eq!((d.needs_fallback, d.should_skip), (a["needs_fallback"].as_bool().unwrap(), a["should_skip"].as_bool().unwrap()), "{key}");
+        }
+    }
+    for w in run["windows"].as_array().unwrap() {
+        for a in w["attempts"].as_array().unwrap() {
+            let ratio = r.compression_ratio(&ids(&a["tokens"])).unwrap();
+            let low = a["avg_logprob"].as_f64().unwrap() < o.logprob_threshold.unwrap();
+            let quiet = a["no_speech_prob"].as_f64().unwrap() > o.no_speech_threshold.unwrap();
+            let want = (a["needs_fallback"].as_bool().unwrap(), a["should_skip"].as_bool().unwrap());
+            assert_eq!(want, (!(low && quiet) && (ratio > o.compression_ratio_threshold.unwrap() || low), low && quiet), "the transformers rule on the recorded figures");
+            kinds.insert(want);
+        }
+    }
+    assert_eq!(kinds.len(), 3, "the fixture covers a fallback, a kept attempt and a skipped window: {kinds:?}");
+}
+
+#[test]
+fn greedy_through_the_transcriber_equals_generate_and_detects_the_language() {
+    let t = transcriber();
+    let meta = json(&tiny().join("reference.json"));
+    let mel = frames_major_mel("mel.full");
+    let states = t.encode(&mel, 0, t.window_frames()).unwrap();
+    let (lang, logits) = t.detect(&states).unwrap();
+    assert_eq!(u64::from(lang), meta["detected_language"].as_u64().unwrap());
+    let (want, _) = reference("language.logits");
+    assert!(max_rel(&logits, &want) < 1e-3);
+    let o = specrt::speech::decode::Options { language: Some("en".into()), task: Some("transcribe".into()), max_new_tokens: Some(12), ..specrt::speech::decode::Options::greedy() };
+    let got = t.transcribe_mel(&mel, &o, &mut |_, _, _, _, _| None).unwrap();
+    assert_eq!(got.windows[0].decoder_input, ids(&meta["prefix"]));
+    let generated = ids(&meta["generate"]);
+    assert_eq!(got.windows[0].attempts[0].tokens, generated, "generate(language=en, max_new_tokens=12)");
+    let (pcm, _) = reference("audio.full");
+    assert_eq!(t.transcribe(&pcm, &o).unwrap().sequence, got.sequence, "from the audio through the host front end");
+}
+
+#[test]
+fn timestamp_decoding_equals_transformers_generate() {
+    let t = transcriber();
+    let meta = json(&tiny().join("reference.json"));
+    let run = &meta["runs"]["timestamps"];
+    let o = specrt::speech::decode::Options { timestamps: true, ..specrt::speech::decode::Options::greedy() };
+    let got = t.transcribe_mel(&frames_major_mel("mel.full"), &o, &mut |_, _, _, _, _| None).unwrap();
+    assert_eq!(got.language.map(u64::from), meta["detected_language"].as_u64());
+    check_run("timestamps", &got, run);
+    assert!(got.sequence.iter().filter(|x| **x >= 524).count() >= 4, "timestamp pairs");
+}
+
+#[test]
+fn a_two_window_clip_seeks_by_the_last_timestamp_and_conditions_on_the_previous_text() {
+    let t = transcriber();
+    let meta = json(&tiny().join("reference.json"));
+    let mel = frames_major_mel("mel.long");
+    assert!(mel.len() / 80 > t.window_frames(), "the clip is longer than one window");
+    let run = &meta["runs"]["long"];
+    let got = t.transcribe_mel(&mel, &run_options(run), &mut |_, _, _, _, _| None).unwrap();
+    check_run("long", &got, run);
+    assert_eq!(got.windows[1].decoder_input[0], 521, "the second window starts with <|startofprev|>");
+    let (pcm, _) = reference("audio.long");
+    let host = specrt::speech::transcribe::log_mel_clip(&t.speech.plan, &pcm).unwrap();
+    assert!(max_abs(&host, &mel) < 1e-4, "the long front end matches transformers");
+}
+
+#[test]
+fn temperature_fallback_redoes_a_window_and_skips_silence_as_transformers_does() {
+    let t = transcriber();
+    let meta = json(&tiny().join("reference.json"));
+    let run = &meta["runs"]["fallback"];
+    let windows = run["windows"].as_array().unwrap().clone();
+    let mut forced = |w: usize, a: usize, step: usize, row: &[f32], temperature: f64| -> Option<u32> {
+        if temperature == 0.0 {
+            return None;
+        }
+        let tok = ids(&windows[w]["attempts"][a]["tokens"])[step];
+        assert!(row[tok as usize].is_finite(), "window {w} attempt {a} step {step}: the sampled token {tok} is masked by our rules");
+        Some(tok)
+    };
+    let got = t.transcribe_mel(&frames_major_mel("mel.long"), &run_options(run), &mut forced).unwrap();
+    check_run("fallback", &got, run);
+}
+
+#[test]
+fn sampling_at_a_temperature_keeps_to_the_top_k_of_the_warped_row() {
+    let r = rules();
+    let mut row: Vec<f32> = (0..r.vocab).map(|i| (i % 97) as f32 * 0.1).collect();
+    r.warp(&mut row, 0.5);
+    assert_eq!(row.iter().filter(|v| v.is_finite()).count(), 54, "the top 50 and every tie of the 50th, as TopKLogitsWarper keeps them");
+    for draw in 0..64 {
+        let t = r.pick(&row, 0.5, 7, draw);
+        assert!(row[t as usize].is_finite());
+    }
+    assert_eq!(r.pick(&row, 0.5, 7, 3), r.pick(&row, 0.5, 7, 3), "seeded");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn the_row_plans_on_the_gpu_duplex_kernels_equal_the_host_rules() {
+    let r = rules();
+    let spec = specrt::spec::Spec::from_hf_config_speech(&std::fs::read_to_string(tiny().join("config.json")).unwrap()).unwrap();
+    let ctx = cudarc::driver::CudaContext::new(0).unwrap();
+    let cache = std::env::var_os("SPECRT_CACHE").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("specrt-speech-jit"));
+    let jit = specrt::jit::Jit::new(ctx.clone(), cache).unwrap();
+    let gpu = specrt::speech::cuda::CudaRowPlans::load(&ctx.default_stream(), &jit, &spec).unwrap();
+    let meta = json(&tiny().join("reference.json"));
+    let seq = ids(&meta["runs"]["timestamps"]["windows"][0]["attempts"][0]["tokens"]);
+    let (greedy, _) = reference("greedy.logits");
+    let base = &greedy[..r.vocab];
+    let histories: Vec<(Vec<u32>, bool)> = vec![(vec![], false), (vec![501], false), (vec![], true), (seq[..1].to_vec(), true), (seq[..2].to_vec(), true), (seq[..15].to_vec(), true), (seq[..16].to_vec(), true)];
+    let mut plans: Vec<specrt::duplex::sampling::RowPlan> = histories.iter().map(|(h, ts)| r.row(h, *ts)).collect();
+    plans.push(r.language_row());
+    plans.push(specrt::speech::decode::Rules::forced_row(519));
+    let logits: Vec<f32> = plans.iter().flat_map(|_| base.iter().copied()).collect();
+    let got = gpu.run(&logits, &plans).unwrap();
+    for (i, p) in plans.iter().enumerate() {
+        let mut want = base.to_vec();
+        specrt::speech::decode::apply(&mut want, p);
+        assert_eq!(&got[i * r.vocab..(i + 1) * r.vocab], &want[..], "row {i}");
+    }
+    println!("gpu row plans: {} rows bit identical to the host rules", plans.len());
 }
 
 #[test]

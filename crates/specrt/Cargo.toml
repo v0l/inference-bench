@@ -20,6 +20,7 @@ anyhow.workspace = true
 getrandom = "0.3"
 ureq.workspace = true
 zip = { version = "2", default-features = false, features = ["deflate"] }
+flate2 = { version = "1.1", default-features = false, features = ["zlib"] }
 inference-bench-kir = { path = "../kir" }
 cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13000"] }
 dirs.workspace = true
