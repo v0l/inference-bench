@@ -713,7 +713,27 @@ impl<'a> Signer<'a> {
                 let w = spec.moe.as_ref().map_or(h, |m| m.width(h));
                 sig(Class::RowReduce, vec![Tensor::buf(Buf::Latent, Rows::Tokens, w), Tensor::weight("latent norm", 1, w, Form::F32)], vec![Tensor::buf(Buf::LatentPlanes, Rows::Tokens, w)])
             }
+            Op::PositionAdd => {
+                let table = spec.dims.positions.clone().context("position_add needs [embedding] positions")?;
+                sig(Class::Gather, vec![Tensor::new(Place::Input("positions"), Rows::Tokens, 1, Form::I32), Tensor::new(Place::Weight(table), Rows::Tokens, h, Form::F32), self.x()], vec![self.x()])
+            }
+            Op::CrossKv => {
+                let c = spec.cross.as_ref().context("cross_kv needs a [cross] section")?;
+                let s = self.linear(Weight::CrossKv, crate::plan::QuantSource::Attn, Buf::Xn, Buf::Qkv, layer);
+                let source = Tensor::new(Place::Input("encoder states"), Rows::Fixed(c.rows), h, Form::F32);
+                sig(Class::Gemm, std::iter::once(source).chain(s.reads.into_iter().skip(1)).collect(), vec![self.cross_state(c)?])
+            }
+            Op::CrossAttention { .. } => {
+                let c = spec.cross.as_ref().context("cross attention needs a [cross] section")?;
+                sig(Class::Attention, vec![Tensor::buf(Buf::Qkv, Rows::Tokens, spec.q_dim()), self.cross_state(c)?], vec![Tensor::buf(Buf::AttnPlanes, Rows::Tokens, spec.q_dim())])
+            }
         })
+    }
+
+    fn cross_state(&self, c: &crate::spec::Cross) -> Result<Tensor> {
+        let s = crate::state::named(self.spec, &c.state).with_context(|| format!("[cross] state {:?} is not a declared [[state]]", c.state))?;
+        anyhow::ensure!(s.per == crate::state::Per::Sequence, "[cross] state {:?} must be per sequence", c.state);
+        Ok(Tensor::new(Place::State(c.state.clone()), Rows::Seqs, s.elements(self.spec)?, Form::F32))
     }
 }
 

@@ -410,7 +410,7 @@ impl DenoiserGraph {
         for b in &self.block {
             blocks.push(PlanBlock { layers: vec![b.name.clone()], sparse: false, tail: false, ops: lower(&b.node, &format!("{}.{{i}}", b.prefix))? });
         }
-        Ok(Plan { phase: Phase::Forward, tensor_core: true, head: lower(&self.head, "")?, blocks, per_layer: Vec::new(), tail: lower(&self.tail, "")?, mtp: Vec::new(), mtp_head: Vec::new() })
+        Ok(Plan { phase: Phase::Forward, tensor_core: true, head: lower(&self.head, "")?, blocks, per_layer: Vec::new(), tail: lower(&self.tail, "")?, mtp: Vec::new(), mtp_head: Vec::new(), window: Vec::new() })
     }
 
     pub fn sampling_plan(&self, rule: &kir::expr::Expr, guided: bool) -> Result<Plan> {

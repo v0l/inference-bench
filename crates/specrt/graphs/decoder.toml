@@ -6,6 +6,14 @@ op = "embed"
 out = "x"
 
 [[head]]
+op = "position_add"
+when = "positions"
+
+[[window]]
+op = "cross_kv"
+when = "cross"
+
+[[head]]
 op = "input_nodes"
 when = "inputs+tensor_core"
 
@@ -1097,6 +1105,98 @@ op = "moe_combine"
 [[block.node]]
 op = "gated_post"
 weight = "1"
+
+[[block]]
+name = "cross_attention"
+when = "cross+tensor_core"
+layers = ["dense"]
+mlp = "dense"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+out = "xn_planes"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "qkv"
+shard = "column"
+quant = "attn"
+out = "qkv"
+in = "xn_planes"
+
+[[block.node]]
+op = "kv_rope"
+phase = "prefill"
+
+[[block.node]]
+op = "flash"
+phase = "prefill"
+
+[[block.node]]
+op = "decode_attention"
+phase = "rows"
+
+[[block.node]]
+op = "linear"
+weight = "o"
+shard = "row"
+quant = "attn"
+out = "x"
+in = "attn_planes"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "cross_attn_layernorm.weight"
+out = "xn_planes"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "cross_q"
+shard = "column"
+quant = "attn"
+out = "qkv"
+in = "xn_planes"
+
+[[block.node]]
+op = "cross_attention"
+phase = "prefill"
+
+[[block.node]]
+op = "cross_attention_rows"
+phase = "rows"
+
+[[block.node]]
+op = "linear"
+weight = "cross_o"
+shard = "row"
+quant = "attn"
+out = "x"
+in = "attn_planes"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "post_attention_layernorm.weight"
+out = "xn_planes"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "gate_up"
+shard = "column"
+quant = "mlp"
+out = "act_planes"
+in = "xn_planes"
+
+[[block.node]]
+op = "linear"
+weight = "down"
+shard = "row"
+quant = "mlp"
+out = "x"
+in = "act_planes"
 
 [[block]]
 name = "attention"

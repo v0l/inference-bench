@@ -130,9 +130,9 @@ pub fn linear_shape(spec: &Spec, linear: &str) -> GemmShape {
     let (n, k, epi, bias) = match linear {
         "qkv" => (spec.qkv_rows(), d.hidden, Epilogue::Store, spec.attention.qkv_bias),
         "o" => (d.hidden, spec.o_dim(), Epilogue::Residual, spec.attention.o_bias),
-        "gate_up" => (spec.gate_up_rows(), d.hidden, gate_up_epilogue(spec), false),
+        "gate_up" => (spec.gate_up_rows(), d.hidden, gate_up_epilogue(spec), spec.mlp.bias),
         "gate_up_wide" => (spec.gate_up_rows_wide(), d.hidden, gate_up_epilogue(spec), false),
-        "down" => (d.hidden, d.intermediate, Epilogue::Residual, false),
+        "down" => (d.hidden, d.intermediate, Epilogue::Residual, spec.mlp.bias),
         "down_wide" => (d.hidden, 2 * d.intermediate, Epilogue::Residual, false),
         "lin_in" => (la.map_or(0, |l| l.in_proj_rows()), d.hidden, Epilogue::Store, false),
         "lin_ba" => (la.map_or(0, |l| l.ba_rows()), d.hidden, Epilogue::Store, false),
@@ -150,6 +150,9 @@ pub fn linear_shape(spec: &Spec, linear: &str) -> GemmShape {
         "latent_up" => (d.hidden, spec.moe.as_ref().map_or(0, |m| m.width(d.hidden)), Epilogue::Residual, false),
         "shared_gate_up" => (2 * spec.moe.as_ref().map_or(0, |m| m.shared_intermediate), d.hidden, Epilogue::Act, false),
         "shared_down" => (d.hidden, spec.moe.as_ref().map_or(0, |m| m.shared_intermediate), Epilogue::Residual, false),
+        "cross_q" => (spec.q_dim(), d.hidden, Epilogue::Store, spec.attention.qkv_bias),
+        "cross_kv" => (2 * spec.q_dim(), d.hidden, Epilogue::Store, spec.attention.qkv_bias),
+        "cross_o" => (d.hidden, spec.q_dim(), Epilogue::Residual, spec.attention.o_bias),
         _ => (spec.head_rows().len(), d.hidden, Epilogue::Store, false),
     };
     GemmShape::new(n, k, epi, bias).with_act(act(spec))

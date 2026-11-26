@@ -221,6 +221,9 @@ pub enum Weight {
     LatentUp,
     SharedGateUp,
     SharedDown,
+    CrossQ,
+    CrossKv,
+    CrossO,
 }
 
 impl Weight {
@@ -249,6 +252,9 @@ impl Weight {
             Weight::LatentUp => "latent_up",
             Weight::SharedGateUp => "shared_gate_up",
             Weight::SharedDown => "shared_down",
+            Weight::CrossQ => "cross_q",
+            Weight::CrossKv => "cross_kv",
+            Weight::CrossO => "cross_o",
         }
     }
 
@@ -268,6 +274,9 @@ impl Weight {
             Weight::LatentDown => spec.expert_width(),
             Weight::LatentUp | Weight::SharedDown => spec.dims.hidden,
             Weight::SharedGateUp => 2 * spec.shared_expert_rows(),
+            Weight::CrossQ => spec.q_dim(),
+            Weight::CrossKv => 2 * spec.q_dim(),
+            Weight::CrossO => spec.dims.hidden,
         }
     }
 
@@ -279,7 +288,7 @@ impl Weight {
                 let names: &[&str] = if spec.attention.fused_qkv { &["self_attn.qkv_proj"] } else { &["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"] };
                 let mut t: Vec<String> = names.iter().map(|m| w(m)).collect();
                 if spec.attention.qkv_bias {
-                    t.extend(["self_attn.q_proj.bias", "self_attn.k_proj.bias", "self_attn.v_proj.bias"].map(String::from));
+                    t.extend(["self_attn.q_proj.bias", "self_attn.k_proj.bias", "self_attn.v_proj.bias"].iter().filter(|b| spec.attention.k_bias || !b.contains(".k_proj")).map(|b| b.to_string()));
                 }
                 t.extend(spec.attention.projection.iter().map(|p| format!("self_attn.{}.weight", p.tensor)));
                 t
@@ -291,10 +300,10 @@ impl Weight {
                 }
                 t
             }
-            Weight::GateUp | Weight::GateUpWide if spec.mlp.mapped.is_some() => vec![w("mlp.up_proj")],
+            Weight::GateUp | Weight::GateUpWide if spec.mlp.mapped.is_some() => [w("mlp.up_proj")].into_iter().chain(spec.mlp.bias.then(|| "mlp.up_proj.bias".to_string())).collect(),
             Weight::GateUp | Weight::GateUpWide if spec.mlp.fused_gate_up => vec![w("mlp.gate_up_proj")],
             Weight::GateUp | Weight::GateUpWide => vec![w("mlp.gate_proj"), w("mlp.up_proj")],
-            Weight::Down | Weight::DownWide => vec![w("mlp.down_proj")],
+            Weight::Down | Weight::DownWide => [w("mlp.down_proj")].into_iter().chain(spec.mlp.bias.then(|| "mlp.down_proj.bias".to_string())).collect(),
             Weight::LinIn if spec.linear_attention.as_ref().is_some_and(|l| l.fused_interleaved) => vec![w("linear_attn.in_proj_qkvz")],
             Weight::LinBa if spec.linear_attention.as_ref().is_some_and(|l| l.fused_interleaved) => vec![w("linear_attn.in_proj_ba")],
             Weight::LinIn => vec![w("linear_attn.in_proj_qkv"), w("linear_attn.in_proj_z")],
@@ -309,7 +318,28 @@ impl Weight {
             Weight::LatentUp => spec.latent_tensors(true),
             Weight::SharedGateUp => spec.shared_tensors(false),
             Weight::SharedDown => spec.shared_tensors(true),
+            Weight::CrossQ => cross_tensors(spec, &["q_proj"]),
+            Weight::CrossKv => cross_tensors(spec, &["k_proj", "v_proj"]),
+            Weight::CrossO => cross_tensors(spec, &["o_proj"]),
         }
+    }
+}
+
+fn cross_tensors(spec: &Spec, parts: &[&str]) -> Vec<String> {
+    let a = &spec.attention;
+    let biased = |p: &str| match p {
+        "o_proj" => a.o_bias,
+        "k_proj" => a.qkv_bias && a.k_bias,
+        _ => a.qkv_bias,
+    };
+    let mut t: Vec<String> = parts.iter().map(|p| format!("cross_attn.{p}.weight")).collect();
+    t.extend(parts.iter().filter(|p| biased(p)).map(|p| format!("cross_attn.{p}.bias")));
+    t
+}
+
+impl Weight {
+    pub fn is_cross(self) -> bool {
+        matches!(self, Weight::CrossQ | Weight::CrossKv | Weight::CrossO)
     }
 }
 
@@ -351,6 +381,7 @@ pub enum NormKind {
     PostMlp,
     PostDense,
     PostExperts,
+    Cross,
     Final,
 }
 
@@ -363,6 +394,7 @@ impl NormKind {
             NormKind::PostMlp => "post_feedforward_layernorm.weight",
             NormKind::PostDense => "post_feedforward_layernorm_1.weight",
             NormKind::PostExperts => "post_feedforward_layernorm_2.weight",
+            NormKind::Cross => "cross_attn_layernorm.weight",
             NormKind::Final => "norm.weight",
         }
     }
@@ -418,6 +450,9 @@ pub enum Op {
     Dit(DitOp),
     BlockRes { stage: ResStage },
     LatentNorm,
+    PositionAdd,
+    CrossKv,
+    CrossAttention { decode: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -468,6 +503,7 @@ impl Op {
                 NormKind::PostMlp => "post mlp norm".into(),
                 NormKind::PostDense => "post dense mlp norm".into(),
                 NormKind::PostExperts => "post experts norm".into(),
+                NormKind::Cross => "cross attention norm".into(),
                 NormKind::Final => "final norm".into(),
             },
             Op::NormAdd { which, .. } => format!("{which:?} norm and add"),
@@ -513,6 +549,10 @@ impl Op {
             Op::Dit(d) => d.label(),
             Op::BlockRes { stage } => format!("block residual {}", stage.name()),
             Op::LatentNorm => "latent expert norm".into(),
+            Op::PositionAdd => "learned positions".into(),
+            Op::CrossKv => "cross keys and values".into(),
+            Op::CrossAttention { decode: true } => "cross attention rows".into(),
+            Op::CrossAttention { .. } => "cross attention".into(),
         }
     }
 
@@ -561,13 +601,24 @@ impl Op {
             Op::BlockRes { stage: ResStage::Done } => "prefix added to x".into(),
             Op::BlockRes { .. } => "x, prefix and block stack to x".into(),
             Op::LatentNorm => "latent to latent planes".into(),
+            Op::PositionAdd => "position rows added to x".into(),
+            Op::CrossKv => "encoder states to the cross_kv state".into(),
+            Op::CrossAttention { .. } => "qkv and the cross_kv state to attn planes".into(),
         }
     }
 
     pub fn tensors(&self, spec: &Spec) -> Vec<String> {
         match self {
             Op::Embed => vec!["embed_tokens.weight".into()],
-            Op::Norm { which, .. } | Op::NormAdd { which, .. } => vec![which.tensor().into()],
+            Op::PositionAdd => spec.dims.positions.iter().cloned().collect(),
+            Op::CrossKv => Weight::CrossKv.tensors(spec),
+            Op::Norm { which, .. } | Op::NormAdd { which, .. } => {
+                let mut t = vec![which.tensor().to_string()];
+                if spec.norm.kind == crate::spec::NormKind::LayerNorm {
+                    t.push(which.tensor().replace(".weight", ".bias"));
+                }
+                t
+            }
             Op::Linear { weight, .. } => weight.tensors(spec),
             Op::Gemv { norm, weight, .. } => norm.iter().map(|n| n.tensor().to_string()).chain(weight.tensors(spec)).collect(),
             Op::GemvStore { weight, .. } => weight.tensors(spec),
@@ -752,6 +803,10 @@ impl Op {
             Op::BlockRes { stage: ResStage::Done } => names(&["block_res_out"]),
             Op::BlockRes { stage: ResStage::Tail } => names(&["block_res_mix"]),
             Op::LatentNorm => names(&["latent_norm"]),
+            Op::PositionAdd => names(&["add_rows"]),
+            Op::CrossKv => Op::Linear { weight: Weight::CrossKv, quant: QuantSource::Attn, input: Buf::Xn, output: Buf::Qkv }.kernels(spec, layer, tokens, target),
+            Op::CrossAttention { decode: true } => names(&["vis_flash_kv_rows"]),
+            Op::CrossAttention { .. } => names(&["vis_flash_kv"]),
         }
     }
 }
@@ -774,6 +829,7 @@ pub struct Plan {
     pub tail: Vec<Op>,
     pub mtp: Vec<Op>,
     pub mtp_head: Vec<Op>,
+    pub window: Vec<Op>,
 }
 
 impl Plan {

@@ -2244,6 +2244,12 @@ impl Spec {
         Ok(spec)
     }
 
+    pub fn from_hf_config_speech(json: &str) -> Result<Self> {
+        let spec = Self::duplex_in(&crate::family::active(), json)?;
+        ensure!(spec.cross.is_some(), "the {} family declares no [cross] section, so it reads no encoder states", spec.name);
+        Ok(spec)
+    }
+
     fn duplex_in(registry: &crate::family::Registry, json: &str) -> Result<Self> {
         let spec = Self::hf_config(registry, json, true)?;
         spec.validate()?;

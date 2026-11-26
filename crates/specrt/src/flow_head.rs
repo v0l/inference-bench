@@ -79,7 +79,7 @@ impl FlowHead {
         for b in &graph.block {
             blocks.push(PlanBlock { layers: vec![b.name.clone()], sparse: false, tail: false, ops: lower(&b.node, &format!("{root}.{}.{{i}}", b.prefix))? });
         }
-        let plan = Plan { phase: Phase::Decode, tensor_core: false, head: lower(&graph.head, root)?, blocks, per_layer: Vec::new(), tail: lower(&graph.tail, root)?, mtp: Vec::new(), mtp_head: Vec::new() };
+        let plan = Plan { phase: Phase::Decode, tensor_core: false, head: lower(&graph.head, root)?, blocks, per_layer: Vec::new(), tail: lower(&graph.tail, root)?, mtp: Vec::new(), mtp_head: Vec::new(), window: Vec::new() };
         let steps = spec.size("num_steps")?;
         ensure!(steps >= 1, "num_steps is {steps}");
         let head = FlowHead { graph, spec, root: root.to_string(), start: lower(&graph.start, root)?, plan, finish: lower(&graph.finish, root)?, steps };

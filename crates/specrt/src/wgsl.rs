@@ -55,6 +55,7 @@ pub fn kernels_for(op: &Op, spec: &Spec, tokens: usize) -> Result<Vec<&'static s
         Op::HyperExpand | Op::HyperPre { .. } | Op::HyperPost | Op::HyperMean => anyhow::bail!("hyper-connections are not yet on wgpu"),
         Op::Dit(_) => anyhow::bail!("the denoiser is not yet on wgpu"),
         Op::BlockRes { .. } | Op::LatentNorm => anyhow::bail!("block residuals and latent experts are not yet on wgpu"),
+        Op::PositionAdd | Op::CrossKv | Op::CrossAttention { .. } => anyhow::bail!("learned positions and cross attention are not yet on wgpu"),
     })
 }
 

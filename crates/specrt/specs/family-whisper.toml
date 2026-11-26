@@ -6,6 +6,11 @@ extends = "base"
 model_types = ["whisper"]
 architectures = ["WhisperForConditionalGeneration"]
 
+[[refuse]]
+when = "d_model > 0"
+part = "text"
+message = "Whisper is a speech to text model: its decoder reads encoder states of audio through cross attention, so it transcribes audio and does not serve text chat"
+
 [remap]
 hidden_size = "d_model"
 intermediate_size = "decoder_ffn_dim"

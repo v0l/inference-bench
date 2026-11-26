@@ -90,6 +90,7 @@ fn symbol(spec: &Spec, name: &str) -> Option<usize> {
         "value_head_dim" => la?.value_head_dim,
         "hc_streams" => spec.gated_residual().map(|g| g.streams).or(spec.hyper.as_ref().map(|h| h.streams))?,
         "hc_width" => spec.gated_residual()?.width(spec.dims.hidden),
+        "cross_rows" => spec.cross.as_ref()?.rows,
         other => match other.parse::<usize>() {
             Ok(n) => n,
             Err(_) => {

@@ -77,6 +77,8 @@ pub struct Graph {
     pub mtp: Vec<Node>,
     #[serde(default)]
     pub mtp_head: Vec<Node>,
+    #[serde(default)]
+    pub window: Vec<Node>,
 }
 
 pub const DECODER: &str = include_str!("../graphs/decoder.toml");
@@ -135,6 +137,8 @@ fn weight(name: &str) -> Result<Weight> {
         "latent_up" => Weight::LatentUp,
         "shared_gate_up" => Weight::SharedGateUp,
         "shared_down" => Weight::SharedDown,
+        "cross_q" => Weight::CrossQ,
+        "cross_o" => Weight::CrossO,
         other => bail!("unknown weight {other}"),
     })
 }
@@ -158,6 +162,7 @@ fn norm(name: &str) -> Result<NormKind> {
         "post_feedforward_layernorm.weight" => NormKind::PostMlp,
         "post_feedforward_layernorm_1.weight" => NormKind::PostDense,
         "post_feedforward_layernorm_2.weight" => NormKind::PostExperts,
+        "cross_attn_layernorm.weight" => NormKind::Cross,
         "norm.weight" => NormKind::Final,
         other => bail!("unknown norm weight {other}"),
     })
@@ -243,6 +248,10 @@ impl Node {
                 },
             },
             "latent_norm" => Op::LatentNorm,
+            "position_add" => Op::PositionAdd,
+            "cross_kv" => Op::CrossKv,
+            "cross_attention" => Op::CrossAttention { decode: false },
+            "cross_attention_rows" => Op::CrossAttention { decode: true },
             "flash" => Op::Flash,
             "decode_attention" => Op::DecodeAttention,
             other => bail!("unknown op {other}"),
@@ -263,7 +272,7 @@ fn holds(when: Option<&str>, tensor_core: bool, spec: &Spec, tail: bool) -> bool
             "nopre" => !spec.norm.pre,
             "qk_norm_full" => spec.attention.qk_norm_full,
             "branch" => spec.uses_branch() && !spec.layers.split && spec.hyper.is_none() && spec.gated_residual().is_none(),
-            "plain" => !spec.uses_branch() && !spec.layers.split && spec.hyper.is_none() && spec.gated_residual().is_none() && spec.block_residual.is_none(),
+            "plain" => !spec.uses_branch() && !spec.layers.split && spec.hyper.is_none() && spec.gated_residual().is_none() && spec.block_residual.is_none() && spec.cross.is_none(),
             "blockres" => spec.block_residual.is_some(),
             "latent" => spec.moe.as_ref().is_some_and(|m| m.latent.is_some()),
             "flatmoe" => spec.moe.as_ref().is_some_and(|m| m.latent.is_none()),
@@ -290,6 +299,9 @@ fn holds(when: Option<&str>, tensor_core: bool, spec: &Spec, tail: bool) -> bool
             "gdn" => spec.mixer.is_none(),
             "stock" => spec.attention.node.is_empty(),
             "dense" => spec.moe.is_none(),
+            "cross" => spec.cross.is_some(),
+            "positions" => spec.dims.positions.is_some(),
+            "rms" => spec.norm.kind == crate::spec::NormKind::Rmsnorm,
             _ => false,
         })
     })
@@ -483,7 +495,7 @@ impl Graph {
             Some(p) => p.nodes("layer").map(|(i, _)| Op::PerLayer { node: i as u8, stage: crate::plan::PLE_LAYER }).collect(),
             None => Vec::new(),
         };
-        Ok(Plan { phase, tensor_core, head: lower(&self.head, phase, tensor_core, spec, None, false)?, blocks, per_layer, tail: lower(&self.tail, phase, tensor_core, spec, None, false)?, mtp: lower(&self.mtp, phase, tensor_core, spec, None, false)?, mtp_head: lower(&self.mtp_head, phase, tensor_core, spec, None, false)? })
+        Ok(Plan { phase, tensor_core, head: lower(&self.head, phase, tensor_core, spec, None, false)?, blocks, per_layer, tail: lower(&self.tail, phase, tensor_core, spec, None, false)?, mtp: lower(&self.mtp, phase, tensor_core, spec, None, false)?, mtp_head: lower(&self.mtp_head, phase, tensor_core, spec, None, false)?, window: lower(&self.window, phase, tensor_core, spec, None, false)? })
     }
 }
 

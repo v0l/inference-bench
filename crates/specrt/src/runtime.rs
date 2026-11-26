@@ -1188,6 +1188,7 @@ impl Runtime {
     }
 
     fn load_inner(spec: &Spec, layout: Layout, range: StageRange, tp: Option<(usize, usize, &crate::allreduce::Fabric)>) -> Result<Self> {
+        ensure!(spec.cross.is_none(), "{} reads encoder states through cross attention, which runs in the speech decoder runner, not the token runtime", spec.name);
         let mut resolved = crate::engine::apply_rope_extension(spec)?;
         resolved.resolve_recipe()?;
         range.check(&resolved)?;

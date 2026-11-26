@@ -150,6 +150,7 @@ impl Runtime {
             Op::Dit(_) => anyhow::bail!("{} runs in the denoiser, not the token runtime", op.label()),
             Op::BlockRes { stage } => self.block_res_op(stage, layer, run),
             Op::LatentNorm => self.latent_norm_op(layer, run),
+            Op::PositionAdd | Op::CrossKv | Op::CrossAttention { .. } => bail!("{} runs in the speech decoder runner, not the token runtime", op.label()),
         }
     }
 
@@ -527,6 +528,7 @@ impl Runtime {
             NormKind::PostMlp => l().ln_post_mlp.as_ref().expect("a sandwich layer has a post mlp norm"),
             NormKind::PostDense => l().moe_norms().0,
             NormKind::PostExperts => l().moe_norms().1,
+            NormKind::Cross => unreachable!("cross attention norms run in the speech decoder runner"),
             NormKind::Final => &self.norm,
         }
     }
@@ -805,6 +807,7 @@ impl Runtime {
             Weight::LatentUp => (&self.latent_of(layer).up, None),
             Weight::SharedGateUp => (&self.latent_of(layer).shared_gate_up, None),
             Weight::SharedDown => (&self.latent_of(layer).shared_down, None),
+            Weight::CrossQ | Weight::CrossKv | Weight::CrossO => unreachable!("cross attention weights run in the speech decoder runner"),
         }
     }
 

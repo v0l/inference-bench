@@ -54,12 +54,12 @@ const WHISPER: &[Need] = &[
     Need { piece: "log-mel front end: hann window 400, hop 160, power STFT, slaney mel bank 0 to 8 kHz, log10 clamp 1e-10, max - 8, (x + 4) / 4, 30 s pad", state: "exists: kir::mel description, DFT and mel bank as constant line conv GEMMs, graphs/speech.toml", evidence: Some(("kir/src/mel.rs", "pub fn dft_table")), slice: "a" },
     Need { piece: "conv stem: conv1d k3 p1 then k3 s2 p1 with exact GELU, centred padding", state: "exists: graphs/speech.toml nodes over kir::conv with a centred pad", evidence: Some(("kir/src/conv.rs", "pub fn padded(")), slice: "a" },
     Need { piece: "exact GELU", state: "exists", evidence: Some(("kir/src/expr.rs", "(\"gelu\", \"0.5 * x * (1.0 + erf(x * 0.7071067811865476))\")")), slice: "-" },
-    Need { piece: "learned absolute positions added to the stem output and to token embeddings", state: "exists as an op", evidence: Some(("specrt/src/denoiser.rs", "\"table_add\" =>")), slice: "b" },
-    Need { piece: "LayerNorm with bias", state: "exists as an op", evidence: Some(("specrt/src/denoiser.rs", "\"layer_norm\" =>")), slice: "b" },
-    Need { piece: "linear with bias, k_proj without bias", state: "exists as an op", evidence: Some(("specrt/src/denoiser.rs", "DitOp::Linear { weight, input: from()?, output: into()?, rows: self.rows()?, add: self.add, bias: self.bias, act }")), slice: "b" },
-    Need { piece: "bidirectional encoder self attention", state: "exists as an op", evidence: Some(("specrt/src/denoiser.rs", "\"attention\" => DitOp::JointAttention")), slice: "b" },
-    Need { piece: "cross attention from decoder rows to encoder states", state: "exists as a denoiser op only (vis_flash_kv); no decoder graph op", evidence: Some(("specrt/src/denoiser.rs", "\"cross_attention\" => DitOp::CrossAttention")), slice: "b" },
-    Need { piece: "cross attention K and V computed once per window and kept per sequence", state: "new decoder graph op and session state", evidence: None, slice: "b" },
+    Need { piece: "learned absolute positions added to the stem output and to token embeddings", state: "exists: table_add in the encoder graph, position_add in the decoder graph from [embedding] positions", evidence: Some(("specrt/src/graph.rs", "\"position_add\" => Op::PositionAdd")), slice: "b" },
+    Need { piece: "LayerNorm with bias", state: "exists: layer_norm in the encoder graph, [norm] kind = layer_norm for the decoder", evidence: Some(("specrt/src/spec.rs", "#[serde(rename = \"layer_norm\")]")), slice: "b" },
+    Need { piece: "linear with bias, k_proj without bias", state: "exists: unbiased parts on an encoder linear, [attention] k_bias = false for the decoder", evidence: Some(("specrt/src/denoiser.rs", "pub fn biased_parts")), slice: "b" },
+    Need { piece: "bidirectional encoder self attention", state: "exists: graphs/speech.toml [[encoder]] over the denoiser IR", evidence: Some(("specrt/graphs/speech.toml", "kind = \"encoder-graph\"")), slice: "b" },
+    Need { piece: "cross attention from decoder rows to encoder states", state: "exists: decoder graph op cross_attention (prefill) and cross_attention_rows (one row per sequence)", evidence: Some(("specrt/src/graph.rs", "\"cross_attention_rows\" => Op::CrossAttention { decode: true }")), slice: "b" },
+    Need { piece: "cross attention K and V computed once per window and kept per sequence", state: "exists: the [[window]] cross_kv op and the per sequence cross_kv [[state]] named by [cross]", evidence: Some(("specrt/graphs/decoder.toml", "[[window]]\nop = \"cross_kv\"")), slice: "b" },
     Need { piece: "decoder causal self attention with a paged KV cache, no rope", state: "exists (paged KV, nope_all)", evidence: Some(("specrt/src/family.rs", "pub nope_all: bool")), slice: "b" },
     Need { piece: "tied output head", state: "exists", evidence: Some(("specrt/src/spec.rs", "\"tie_word_embeddings\"")), slice: "-" },
     Need { piece: "suppress and begin suppress lists, forced prefix", state: "new sampler plan rows (allow and ban lists exist for duplex)", evidence: Some(("specrt/src/duplex/sampling.rs", "pub allow: Vec<u32>")), slice: "c" },
@@ -94,13 +94,14 @@ fn render(title: &str, needs: &[Need]) -> String {
 }
 
 #[test]
-fn the_engine_refuses_whisper_and_says_which_ops_are_missing() {
+fn the_engine_refuses_whisper_as_text_chat_and_says_which_ops_are_missing() {
     for name in ["tiny-whisper/config.json", "whisper-tiny.en.config.json", "whisper-base.config.json", "whisper-large-v3-turbo.config.json"] {
         let text = std::fs::read_to_string(dir().join(name)).unwrap();
         let err = specrt::spec::Spec::from_hf_config(&text).unwrap_err();
-        assert!(format!("{err:#}").contains("model_type whisper is not supported"), "{name}: {err:#}");
+        assert!(format!("{err:#}").contains("Whisper is a speech to text model"), "{name}: {err:#}");
         assert!(specrt::spec::Spec::from_hf_config_duplex(&text).is_err(), "{name}");
-        assert!(specrt::spec::Spec::describe_hf_config(&text).is_err(), "{name}");
+        let speech = specrt::spec::Spec::from_hf_config_speech(&text).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+        assert!(speech.cross.is_some(), "{name}");
     }
     let mut missing = Vec::new();
     for n in WHISPER.iter().chain(TTS) {
@@ -115,7 +116,7 @@ fn the_engine_refuses_whisper_and_says_which_ops_are_missing() {
     for m in &missing {
         println!("  {m}");
     }
-    assert_eq!(missing.len(), 8, "{missing:#?}");
+    assert_eq!(missing.len(), 7, "{missing:#?}");
     for slice in ["a", "b", "c", "e", "f"] {
         assert!(WHISPER.iter().chain(TTS).any(|n| n.slice == slice), "slice {slice} has no gap");
     }
@@ -381,6 +382,105 @@ fn the_mel_bank_equals_transformers_filters() {
     let err = max_abs(&got, &want);
     println!("mel.filters: max abs error {err:.2e}");
     assert!(err < 1e-7, "{err}");
+}
+
+fn encoder_states() -> Vec<f32> {
+    let host = specrt::speech::HostSpeech::open(&tiny()).unwrap();
+    let enc = specrt::speech::host::HostEncoder::new(&json(&tiny().join("config.json"))).unwrap();
+    let ck = specrt::weights::Checkpoint::open(&tiny()).unwrap();
+    let (pcm, _) = reference("audio.full");
+    let (_, stem) = host.run(&pcm).unwrap();
+    enc.encode(&ck, &stem).unwrap()
+}
+
+fn greedy_tokens(dec: &specrt::speech::decoder::HostDecoder, states: &[f32]) -> (Vec<f32>, Vec<f32>, Vec<u32>) {
+    let meta = json(&tiny().join("reference.json"));
+    let generation = json(&tiny().join("generation_config.json"));
+    let suppress: BTreeSet<u32> = ids(&generation["suppress_tokens"]).into_iter().collect();
+    let begin: BTreeSet<u32> = ids(&generation["begin_suppress_tokens"]).into_iter().collect();
+    let vocab = dec.spec.dims.vocab;
+    let prefix = ids(&meta["prefix"]);
+    let mut seq = dec.new_sequence();
+    dec.window(&mut seq, states).unwrap();
+    let prompt = dec.prefill(&mut seq, &prefix).unwrap();
+    let mut row = prompt[(prefix.len() - 1) * vocab..].to_vec();
+    let (mut rows, mut tokens) = (Vec::new(), Vec::new());
+    for step in 0..12 {
+        rows.extend_from_slice(&row);
+        let next = row.iter().enumerate().filter(|(t, _)| !suppress.contains(&(*t as u32)) && !(step == 0 && begin.contains(&(*t as u32)))).max_by(|a, b| a.1.total_cmp(b.1)).map(|(t, _)| t as u32).unwrap();
+        tokens.push(next);
+        row = dec.step(&mut [&mut seq], &[next]).unwrap();
+    }
+    (prompt, rows, tokens)
+}
+
+#[test]
+fn the_whisper_decoder_runs_from_the_family_spec_and_matches_transformers() {
+    let states = encoder_states();
+    let meta = json(&tiny().join("reference.json"));
+    for (bf16, bar) in [(false, 1e-3), (true, 2e-2)] {
+        let dec = specrt::speech::decoder::HostDecoder::open(&tiny(), bf16).unwrap();
+        let (prompt, rows, tokens) = greedy_tokens(&dec, &states);
+        let (want_prefix, _) = reference("prefix.logits");
+        let (want_greedy, _) = reference("greedy.logits");
+        let (pe, ge) = (max_rel(&prompt, &want_prefix), max_rel(&rows, &want_greedy));
+        println!("host decoder bf16={bf16}: prefix.logits max rel {pe:.2e}, greedy.logits max rel {ge:.2e}");
+        assert!(pe < bar && ge < bar, "bf16={bf16}: {pe} {ge}");
+        assert_eq!(tokens, ids(&meta["greedy"]), "bf16={bf16}: the 12 greedy tokens");
+    }
+}
+
+#[test]
+fn two_whisper_sequences_batched_equal_each_alone() {
+    let states = encoder_states();
+    let dec = specrt::speech::decoder::HostDecoder::open(&tiny(), false).unwrap();
+    let quiet = vec![0.25f32; states.len()];
+    let prefix = ids(&json(&tiny().join("reference.json"))["prefix"]);
+    let alone = |s: &[f32], prompt: &[u32], next: &[u32]| {
+        let mut q = dec.new_sequence();
+        dec.window(&mut q, s).unwrap();
+        dec.prefill(&mut q, prompt).unwrap();
+        next.iter().map(|t| dec.step(&mut [&mut q], &[*t]).unwrap()).collect::<Vec<_>>()
+    };
+    let (a_next, b_next) = ([501u32, 257, 121], [300u32, 12, 7]);
+    let want_a = alone(&states, &prefix, &a_next);
+    let want_b = alone(&quiet, &prefix[..2], &b_next);
+    let (mut a, mut b) = (dec.new_sequence(), dec.new_sequence());
+    dec.window(&mut a, &states).unwrap();
+    dec.window(&mut b, &quiet).unwrap();
+    dec.prefill(&mut a, &prefix).unwrap();
+    dec.prefill(&mut b, &prefix[..2]).unwrap();
+    let vocab = dec.spec.dims.vocab;
+    for k in 0..3 {
+        let both = dec.step(&mut [&mut a, &mut b], &[a_next[k], b_next[k]]).unwrap();
+        assert_eq!(&both[..vocab], &want_a[k][..], "step {k}: sequence a batched differs from alone");
+        assert_eq!(&both[vocab..], &want_b[k][..], "step {k}: sequence b batched differs from alone");
+    }
+    assert_ne!(want_a[0], want_b[0], "the two windows give different logits, so the batch check sees a mixup");
+}
+
+#[test]
+fn the_cross_kv_state_is_declared_in_the_spec_and_needs_its_window() {
+    let text = std::fs::read_to_string(tiny().join("config.json")).unwrap();
+    let spec = specrt::spec::Spec::from_hf_config_speech(&text).unwrap();
+    let cross = spec.cross.as_ref().unwrap();
+    assert_eq!((cross.rows, cross.state.as_str()), (50, "cross_kv"));
+    let state = specrt::state::named(&spec, "cross_kv").unwrap();
+    assert_eq!(state.per, specrt::state::Per::Sequence);
+    assert_eq!(state.sequence_bytes(&spec), 2 * 2 * 50 * 64 * 4, "2 layers x k and v x 50 encoder rows x d 64, f32");
+    assert_eq!((spec.norm.kind, spec.attention.qkv_bias, spec.attention.k_bias, spec.attention.o_bias, spec.mlp.bias, spec.dims.tie_embeddings), (specrt::spec::NormKind::LayerNorm, true, false, true, true, true));
+    assert_eq!(spec.rope.nope_layers, vec![0, 1], "no rope anywhere");
+    let prefill = specrt::plan::Plan::build(&spec, specrt::plan::Phase::Prefill, true);
+    let decode = specrt::plan::Plan::build(&spec, specrt::plan::Phase::Decode, true);
+    assert_eq!(prefill.window, vec![specrt::plan::Op::CrossKv], "cross K and V are computed once per window, not per token");
+    let block = spec.block(0);
+    assert!(prefill.layer(block).contains(&specrt::plan::Op::CrossAttention { decode: false }));
+    assert!(decode.layer(block).contains(&specrt::plan::Op::CrossAttention { decode: true }));
+    assert!(!decode.layer(block).contains(&specrt::plan::Op::CrossKv), "no decode step recomputes cross K and V");
+    let dec = specrt::speech::decoder::HostDecoder::open(&tiny(), false).unwrap();
+    let mut seq = dec.new_sequence();
+    let err = dec.prefill(&mut seq, &[513]).unwrap_err();
+    assert!(format!("{err:#}").contains("has no cross_kv state; run the window first"), "{err:#}");
 }
 
 #[test]

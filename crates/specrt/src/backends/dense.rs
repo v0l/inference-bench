@@ -175,6 +175,7 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
                     NormKind::PostAttention => &l.expect("layer norm needs a layer").ln2,
                     NormKind::Final => m.final_norm.as_ref().expect("the last stage owns the final norm"),
                     NormKind::PreMlp | NormKind::PostMlp | NormKind::PostDense | NormKind::PostExperts => bail!("sandwich norms are not yet on wgpu"),
+                    NormKind::Cross => bail!("cross attention is not yet on wgpu"),
                 };
                 be.dispatch(kernels[0], &[&m.scratch.x, w, self.buf(into)], [row0 as u32, 0, 0, 0, 0, 0, 0, 0], [r, 1, 1])
             }
@@ -230,7 +231,7 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
             Op::AllReduce | Op::AllReduceNorm { .. } => bail!("tensor parallel is not on wgpu"),
             Op::Gemv { .. } | Op::GemvStore { .. } | Op::StepAttention | Op::GdnStep => bail!("the single row cuda plan is not on wgpu"),
             Op::HyperExpand | Op::HyperPre { .. } | Op::HyperPost | Op::HyperMean | Op::PerLayer { .. } => bail!("hyper-connections are not yet on wgpu"),
-            Op::Prelude { .. } | Op::Dit(_) | Op::BlockRes { .. } | Op::LatentNorm => bail!("{} is not supported on the wgpu backend", op.label()),
+            Op::Prelude { .. } | Op::Dit(_) | Op::BlockRes { .. } | Op::LatentNorm | Op::PositionAdd | Op::CrossKv | Op::CrossAttention { .. } => bail!("{} is not supported on the wgpu backend", op.label()),
         }
     }
 }

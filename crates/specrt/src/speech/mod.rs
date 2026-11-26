@@ -1,5 +1,6 @@
 pub mod compile;
 pub mod cuda;
+pub mod decoder;
 pub mod graph;
 pub mod host;
 
