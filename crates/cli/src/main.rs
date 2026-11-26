@@ -320,6 +320,21 @@ enum Cmd {
         #[arg(long, help = "Print the report as JSON")]
         json: bool,
     },
+    #[command(about = "Measure what quantising each layer costs in logits KL on a fixed prompt set and write a small per layer recipe (<model>.quantrecipe.toml)")]
+    Quantcheck {
+        #[arg(help = "Spec name or path, HF repo or checkpoint directory of a bf16 model")]
+        model: String,
+        #[arg(long, value_delimiter = ',', default_value = "nvfp4,fp8", help = "Formats to try: nvfp4 (nvfp4_g16), fp8 (fp8_channel)")]
+        formats: Vec<String>,
+        #[arg(long, value_delimiter = ',', default_value = "0.02", help = "Mean KL budget of the whole model against bf16; several values write one recipe each")]
+        kl: Vec<f64>,
+        #[arg(long, help = "Most GB of weights on the device")]
+        budget_gb: Option<f64>,
+        #[arg(long, help = "Recipe path; <model>.quantrecipe.toml when omitted (a KL suffix is added for several budgets)")]
+        out: Option<PathBuf>,
+        #[arg(long, default_value_t = 512)]
+        max_ctx: usize,
+    },
     #[command(about = "Spec files: where each comes from, and updates from GitHub")]
     Specs {
         #[command(subcommand)]
@@ -592,6 +607,49 @@ fn warmup_command(data: &Path, spec: &str, max_ctx: usize, slots: usize) -> Resu
     Ok(())
 }
 
+fn quantcheck_command(data: &Path, model: &str, formats: &[String], kl: &[f64], budget_gb: Option<f64>, out: Option<&Path>, max_ctx: usize) -> Result<()> {
+    use specrt::quantcheck::{Budget, Options, default_path};
+    use specrt::spec::Quant;
+    let spec = specrt::engine::resolve_spec(&resolve_spec_names(data, model))?;
+    let formats = formats
+        .iter()
+        .map(|f| match f.as_str() {
+            "nvfp4" | "nvfp4_g16" => Ok(Quant::Nvfp4G16),
+            "fp8" | "fp8_channel" => Ok(Quant::Fp8Channel),
+            other => bail!("--formats {other:?} is not nvfp4 or fp8"),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(!kl.is_empty() && kl.iter().all(|k| *k >= 0.0), "--kl needs one or more budgets of zero or more");
+    let bytes = budget_gb.map(|g| (g * 1e9) as u64);
+    let opts = Options { formats, budgets: kl.iter().map(|&k| Budget { kl: k, bytes }).collect(), max_ctx, tokens: None };
+    let report = specrt::quantcheck::run(&spec, &opts, &mut |line| println!("{line}"))?;
+    let gb = |b: u64| b as f64 / 1e9;
+    let base = out.map(Path::to_path_buf).unwrap_or_else(|| default_path(&spec));
+    for recipe in &report.recipes {
+        let path = if report.recipes.len() == 1 { base.clone() } else { base.with_extension(format!("kl{}.toml", recipe.kl_budget)) };
+        recipe.save(&path)?;
+        let check = recipe.check.unwrap_or_default();
+        let counts: Vec<String> = recipe.counts().iter().map(|(q, n)| format!("{n} {q:?}")).collect();
+        println!(
+            "recipe {} (KL budget {}): {} layers, weights {:.3} GB against {:.3} GB bf16, saves {:.3} GB; whole model mean KL {:.5}, max KL {:.4}, top-1 {:.1}%",
+            path.display(),
+            recipe.kl_budget,
+            counts.join(", "),
+            gb(recipe.bytes),
+            gb(recipe.bf16_bytes),
+            gb(recipe.bf16_bytes.saturating_sub(recipe.bytes)),
+            check.mean_kl,
+            check.max_kl,
+            100.0 * check.top1
+        );
+    }
+    for (q, m, bytes) in &report.blanket {
+        println!("blanket {q:?} (keep list edges bf16): weights {:.3} GB, mean KL {:.5}, max KL {:.4}, top-1 {:.1}%", gb(*bytes), m.mean_kl, m.max_kl, 100.0 * m.top1);
+    }
+    println!("quantcheck took {:.1} s over {} probes", report.secs, report.probes.len());
+    Ok(())
+}
+
 fn spec_command(model: &str, out: Option<&Path>, expect_act_quant: Option<&str>) -> Result<()> {
     use specrt::spec::ActQuant;
     let spec = specrt::engine::resolve_spec(model)?;
@@ -839,6 +897,7 @@ fn main() -> Result<()> {
             std::process::exit(report["exit"].as_i64().unwrap_or(2) as i32);
         }
         Cmd::Spec { model, out, expect_act_quant } => spec_command(model, out.as_deref(), expect_act_quant.as_deref())?,
+        Cmd::Quantcheck { model, formats, kl, budget_gb, out, max_ctx } => quantcheck_command(&data, model, formats, kl, *budget_gb, out.as_deref(), *max_ctx)?,
         Cmd::Warmup { spec, max_ctx, slots } => warmup_command(&data, spec, *max_ctx, *slots)?,
         Cmd::Kernels { spec, target, plan, fusion, compiled, tokens, context, phase, graph, size, text, frames } => {
             if (*fusion || *compiled) && !*plan {

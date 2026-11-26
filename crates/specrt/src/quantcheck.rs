@@ -205,6 +205,7 @@ pub struct Options {
     pub formats: Vec<Quant>,
     pub budgets: Vec<Budget>,
     pub max_ctx: usize,
+    pub tokens: Option<Vec<Vec<u32>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -224,9 +225,12 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn open(spec: &Spec, formats: &[Quant], max_ctx: usize) -> Result<Session> {
+    pub fn open(spec: &Spec, formats: &[Quant], max_ctx: usize, tokens: Option<Vec<Vec<u32>>>) -> Result<Session> {
         let s = probe_spec(spec, formats)?;
-        let tokens = prompt_tokens(&s)?;
+        let tokens = match tokens {
+            Some(t) => t,
+            None => prompt_tokens(&s)?,
+        };
         let longest = tokens.iter().map(Vec::len).max().unwrap_or(0);
         ensure!(longest <= max_ctx, "the longest quantcheck prompt has {longest} tokens, more than max_ctx {max_ctx}");
         let mut rt = crate::runtime::Runtime::load(&s, max_ctx)?;
@@ -274,7 +278,7 @@ pub fn run(spec: &Spec, opts: &Options, log: &mut dyn FnMut(String)) -> Result<R
     let mut formats = opts.formats.clone();
     formats.sort_by_key(|q| *q as u8);
     formats.dedup();
-    let mut session = Session::open(spec, &formats, opts.max_ctx)?;
+    let mut session = Session::open(spec, &formats, opts.max_ctx, opts.tokens.clone())?;
     let n = spec.layers.count;
     let bf16_bytes = session.runtime().layer_bytes();
     let fixed = session.runtime().weight_bytes - bf16_bytes.iter().sum::<u64>();

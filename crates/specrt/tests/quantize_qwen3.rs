@@ -33,6 +33,43 @@ fn load(spec: &Spec, prompts: &[(String, Vec<u32>)]) -> Load {
 
 #[test]
 #[ignore = "needs a CUDA GPU and Qwen/Qwen3-0.6B"]
+fn a_quantcheck_recipe_beats_blanket_nvfp4_on_top1_at_a_similar_size_on_qwen3_0_6b() {
+    use specrt::quantcheck::{Budget, Options, run};
+    use specrt::spec::{Quant, QuantPlan};
+    let base = spec(QuantizeChoice::Off);
+    let opts = Options { formats: vec![Quant::Nvfp4G16, Quant::Fp8Channel], budgets: vec![Budget { kl: 0.1, bytes: None }], max_ctx: 512, tokens: None };
+    let report = run(&base, &opts, &mut |l| eprintln!("{l}")).unwrap();
+    let recipe = &report.recipes[0];
+    let check = recipe.check.unwrap();
+    let (_, blanket, blanket_bytes) = *report.blanket.iter().find(|(q, _, _)| *q == Quant::Nvfp4G16).unwrap();
+    eprintln!("recipe: {} bytes, mean KL {:.4}, max KL {:.3}, top-1 {:.1}%; blanket nvfp4: {blanket_bytes} bytes, mean KL {:.4}, max KL {:.3}, top-1 {:.1}%", recipe.bytes, check.mean_kl, check.max_kl, 100.0 * check.top1, blanket.mean_kl, blanket.max_kl, 100.0 * blanket.top1);
+    assert!(recipe.bytes <= blanket_bytes + blanket_bytes / 20, "the recipe is within 5% of the blanket size");
+    assert!(check.top1 >= blanket.top1 + 0.03, "top-1 {} against {}", check.top1, blanket.top1);
+    assert!(check.mean_kl <= 0.1 && check.mean_kl < blanket.mean_kl && check.max_kl < blanket.max_kl);
+    let text = recipe.to_toml().unwrap();
+    assert!(text.len() < 8192);
+    let mut planned = base.clone();
+    planned.quant_plan = QuantPlan { layers: recipe.plan().layers, kernels: Vec::new() };
+    let prompts = prompts(&planned);
+    let fresh = load(&planned, &prompts);
+    assert_eq!(fresh.weight_bytes, recipe.bytes, "a fresh load of the recipe places the bytes quantcheck counted");
+    let reference = load(&base, &prompts);
+    let a: Vec<&[f32]> = reference.logits.iter().map(Vec::as_slice).collect();
+    let b: Vec<&[f32]> = fresh.logits.iter().map(Vec::as_slice).collect();
+    let s = logit_stats(&a, &b, base.dims.vocab);
+    assert_eq!((s.mean_kl, s.top1), (check.mean_kl, check.top1), "loading the recipe reproduces the check");
+    eprintln!("recipe load {:.2}s (search and plain rounding {:.2}s over {} tensors)", fresh.secs, fresh.quantize_secs, fresh.tensors);
+    let shortest = prompts.iter().map(|(_, ids)| ids.len()).min().unwrap();
+    let ids: Vec<Vec<u32>> = prompts.iter().map(|(_, ids)| ids[..shortest].to_vec()).collect();
+    let mut single = Runtime::load(&planned, 512).unwrap();
+    let one: Vec<Vec<u32>> = ids.iter().map(|p| single.generate_batch(std::slice::from_ref(p), 8).unwrap().tokens[0].clone()).collect();
+    drop(single);
+    let mut batched = Runtime::load_batched(&planned, 512, ids.len()).unwrap();
+    assert_eq!(batched.generate_batch(&ids, 8).unwrap().tokens, one, "batched decode of a mixed fp8 and nvfp4 model equals single stream");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and Qwen/Qwen3-0.6B"]
 fn quantize_at_load_stays_inside_its_kl_bound_on_qwen3_0_6b() {
     let base = spec(QuantizeChoice::Off);
     let vocab = base.dims.vocab;
