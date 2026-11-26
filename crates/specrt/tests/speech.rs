@@ -71,8 +71,8 @@ const WHISPER: &[Need] = &[
 const TTS: &[Need] = &[
     Need { piece: "Mimi decoder SEANet: causal conv k7 and k3 with ELU, constant pad, dilated residual blocks", state: "new graph entry over the codec convs; ELU is a new expression", evidence: Some(("specrt/src/codec/graph.rs", "\"conv\" =>")), slice: "e" },
     Need { piece: "Mimi transposed conv upsampling (ratios 4, 5, 6) with an overlap tail", state: "exists as codec conv_up", evidence: Some(("specrt/src/codec/graph.rs", "\"conv_up\" =>")), slice: "e" },
-    Need { piece: "Mimi depthwise transposed conv 12.5 Hz to 25 Hz upsample (groups = channels, no bias)", state: "new: conv_up is dense only", evidence: None, slice: "e" },
-    Need { piece: "Mimi decoder transformer: 2 layers, LayerNorm, layer scale, rope pairs, sliding context 250", state: "new graph (codec stack has no attention)", evidence: None, slice: "e" },
+    Need { piece: "Mimi depthwise transposed conv 12.5 Hz to 200 Hz upsample (groups = channels, no bias)", state: "new: conv_up is dense only", evidence: None, slice: "e" },
+    Need { piece: "Mimi decoder transformer at 200 Hz: 2 layers, LayerNorm, layer scale, rope pairs, sliding context 250", state: "new graph (codec stack has no attention)", evidence: None, slice: "e" },
     Need { piece: "flow LM backbone: 6 layer LayerNorm transformer, packed qkv, rope pairs, GELU MLP, no bias", state: "new family file and decoder graph entries (LayerNorm kind, GELU dense MLP)", evidence: Some(("specrt/src/spec.rs", "pub enum NormKind")), slice: "f" },
     Need { piece: "LSD flow head: adaLN res blocks with LayerNorm, two timestep embedders averaged, one step", state: "close to graphs/meanflow.toml: LayerNorm modulate, bias, rms-var timestep norm are new", evidence: Some(("specrt/src/denoiser.rs", "\"modulate\" =>")), slice: "f" },
     Need { piece: "EOS head with threshold and frames after EOS", state: "new sampler rule", evidence: None, slice: "f" },
