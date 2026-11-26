@@ -7,6 +7,7 @@ pub mod compose;
 pub mod conv;
 pub mod desc;
 pub mod dequant;
+pub mod duplex;
 pub mod expr;
 pub mod gemm;
 pub mod gemv;

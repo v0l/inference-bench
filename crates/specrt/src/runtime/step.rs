@@ -76,6 +76,30 @@ impl Stepper {
         sizes.sort();
         sizes
     }
+
+    pub fn row_logits(&self) -> &CudaSlice<f32> {
+        &self.bb.logits
+    }
+
+    pub fn row_tokens(&self) -> &CudaSlice<i32> {
+        &self.bb.tokens
+    }
+
+    pub fn row_slots(&self) -> &CudaSlice<i32> {
+        &self.bb.slots
+    }
+
+    pub fn row_params(&self) -> &CudaSlice<i32> {
+        &self.params
+    }
+
+    pub fn params_mut(&mut self) -> &mut CudaSlice<i32> {
+        &mut self.params
+    }
+}
+
+pub fn sample_params(sampling: Sampling, step: u32) -> [i32; 6] {
+    params(sampling, step)
 }
 
 pub(super) fn params(sampling: Sampling, step: u32) -> [i32; 6] {
@@ -198,6 +222,42 @@ impl Runtime {
         let graph = self.stream.end_capture(CUgraphInstantiate_flags(0))?;
         recorded?;
         graph.context("empty decode graph")
+    }
+
+    pub fn stage_rows(&mut self, st: &mut Stepper, rows: &[DecodeRow], pad_to: usize) -> Result<usize> {
+        ensure!(self.use_mma, "serving needs the tensor core path");
+        let live = rows.len();
+        ensure!(live >= 1 && live <= self.slots && pad_to >= live && pad_to < st.bb.tokens.len(), "{live} rows padded to {pad_to} for {} slots", self.slots);
+        ensure!(rows.iter().all(|r| r.slot < self.slots && r.pos < self.max_ctx), "decode row out of range");
+        let n = pad_to;
+        let pad = DecodeRow { slot: self.slots, token: 0, pos: 0, sampling: Sampling::GREEDY, step: 0 };
+        let padded: Vec<DecodeRow> = rows.iter().copied().chain(std::iter::repeat(pad)).take(n).collect();
+        let tokens: Vec<i32> = padded.iter().map(|r| r.token as i32).collect();
+        let pos: Vec<i32> = padded.iter().map(|r| r.pos as i32).collect();
+        let slots: Vec<i32> = padded.iter().map(|r| r.slot as i32).collect();
+        let p: Vec<i32> = padded.iter().flat_map(|r| params(r.sampling, r.step)).collect();
+        self.stream.memcpy_htod(&tokens, &mut st.bb.tokens.slice_mut(..n))?;
+        self.stream.memcpy_htod(&pos, &mut st.bb.pos.slice_mut(..n))?;
+        self.stream.memcpy_htod(&slots, &mut st.bb.slots.slice_mut(..n))?;
+        self.stream.memcpy_htod(&p, &mut st.params.slice_mut(..6 * n))?;
+        Ok(n)
+    }
+
+    pub fn forward_rows(&self, st: &Stepper, n: usize) -> Result<()> {
+        self.decode_rows(&st.bb, n)
+    }
+
+    pub fn sample_staged(&self, st: &Stepper, n: usize) -> Result<()> {
+        let mut b = self.launcher(self.kernel("sample_rows"));
+        b.arg(&st.bb.logits).arg(&st.bb.tokens).arg(&st.params);
+        unsafe { b.launch(cfg(n as u32, 1024)) }?;
+        Ok(())
+    }
+
+    pub fn prompt_logits_to_row(&self, st: &mut Stepper, row: usize) -> Result<()> {
+        let vocab = self.spec.dims.vocab;
+        self.stream.memcpy_dtod(&self.buf.logits.slice(..vocab), &mut st.bb.logits.slice_mut(row * vocab..(row + 1) * vocab))?;
+        Ok(())
     }
 
     pub fn decode(&mut self, st: &mut Stepper, rows: &[DecodeRow]) -> Result<Vec<u32>> {

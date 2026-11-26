@@ -104,7 +104,7 @@ fn geometry(t: &kir::Target, shape: ConvShape) -> Option<Geometry> {
     let k = ConvKernel::new(t, shape, ConvPrologue::None, ConvEpilogue { residual: false, stats: None, gelu: false }).ok()?;
     Some(match k.family {
         ConvFamily::Tile => Geometry { col_blocks: shape.cout.div_ceil(k.tile.bn), rows_block: k.tile.bm, owner: Owner::Tile { cols: k.tile.bn }, smem: k.smem_bytes() as u64, regs: k.regs(), k_tile: Some(k.tile.bk) },
-        ConvFamily::Direct => Geometry { col_blocks: shape.cout, rows_block: kir::conv::THREADS as usize, owner: Owner::Tile { cols: 1 }, smem: k.smem_bytes() as u64, regs: k.regs(), k_tile: Some(1) },
+        ConvFamily::Direct | ConvFamily::Rows => Geometry { col_blocks: shape.cout, rows_block: kir::conv::THREADS as usize, owner: Owner::Tile { cols: 1 }, smem: k.smem_bytes() as u64, regs: k.regs(), k_tile: Some(1) },
     })
 }
 
