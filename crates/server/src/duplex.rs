@@ -738,7 +738,7 @@ mod tests {
             (json!({"type": "start", "mode": "loud"}), "free or relay"),
             (json!({"type": "start", "temperature": 9}), "outside 0 to 2"),
             (json!({"type": "start", "voice": {"id": "voice_nope"}}), "no uploaded voice"),
-            (json!({"type": "start", "voice": "AAA="}), "odd byte count"),
+            (json!({"type": "start", "voice": "AAAA"}), "odd byte count"),
             (json!({"type": "start", "replay": {}}), "allow_replay"),
         ] {
             let e = parse_start(&s, &body, 24000, false).err().unwrap_or_else(|| panic!("{body} was accepted"));
