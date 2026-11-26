@@ -86,10 +86,10 @@ Printed by `cargo test -p inference-bench-specrt --test speech -- --nocapture th
 | Cross K and V once per window, kept per sequence | landed (#1478): the decoder graph's `[[window]]` section runs `cross_kv` once per window; the family's `[cross]` names the per sequence `[[state]] cross_kv` (`2 x cross_rows x hidden` f32 per layer, tiny 51 KB) that every decode step reads | state | b |
 | Decoder self attention with a KV cache, no rope | paged KV and `nope_all` (Nemotron-H) | exists | b |
 | Tied head | `tie_word_embeddings` | exists | |
-| Suppress, begin suppress, forced prefix | duplex `RowPlan { edits, allow }` and `duplex_allow` kernels | **new sampler plan rows** reusing the duplex logit edit kernels, lists read from `generation_config.json` | c |
-| Language detection | nothing | **new decoding rule** (one step, masked argmax) | c |
-| Timestamps, no speech, temperature fallback, compression ratio, average log probability | `logprobs.rs` has the log softmax | **new host rules** in a `[speech.decode]` section; the compression ratio needs zlib on the host | c |
-| Long audio seek and previous text prompt | nothing | **new host loop** | c |
+| Suppress, begin suppress, forced prefix | landed (#1479): `speech::decode::Rules::row` gives duplex `RowPlan { edits, allow }` rows, run on GPU1 by the duplex `duplex_edit_logits` and `duplex_allow` kernels (`speech::cuda::CudaRowPlans`) bit identical to the host; lists and ids read from `generation_config.json` through `[speech.decode]` | done | c |
+| Language detection | landed (#1479): `Rules::detect`, one decoder step on SOT through the language allow row | done | c |
+| Timestamps, no speech, temperature fallback, compression ratio, average log probability | landed (#1479): `Rules::row` (pairs, monotonic, `max_initial_timestamp_index`), `Rules::timestamp_rule` (summed timestamp probability), `no_speech_prob`, `compression_ratio` (zlib through `flate2` on the system zlib, byte equal to Python's `zlib.compress`), `avg_logprob`, `decide`; defaults in `[speech.decode]` | done | c |
+| Long audio seek and previous text prompt | landed (#1479): `speech::transcribe::HostTranscriber::transcribe_mel` (windows of `mel.frames`, seek by the last timestamp pair, `<\|startofprev\|>` plus the last `max_target_positions / 2 - 1` tokens, conditioning dropped above `condition_below`) | done | c |
 
 So two new ops (the mel front end, the decoder cross attention), one new state kind (cross KV), a new graph file and family for the encoder and decoder, and host decoding rules. Everything else is an op the denoiser IR already runs on CUDA (`denoiser_cuda.rs`) and on the host (`denoiser_host.rs`).
 
@@ -107,6 +107,14 @@ What slice b built (#1478):
 
 - Tiny fixture, CPU and GPU1: mel within 1e-4 absolute of `reference/mel.*` (the test's f64 reference DFT gets 8.3e-6), encoder states within 1e-4 relative of `encoder.out`, prefix and greedy logits within 1e-3 relative (bf16 weights: 2e-2) of `prefix.logits` and `greedy.logits`, the 12 greedy tokens and the detected language identical.
 - Real models: word error rate against transformers `generate` (same model, f32, greedy, no timestamps) on a fixed clip set: LibriSpeech test-clean, the first 200 utterances (about 25 minutes, CC BY 4.0), plus 5 long clips over 30 s from the same set joined, normalised with `EnglishTextNormalizer` from the transformers whisper folder. Gate: WER within 0.3 points absolute of transformers on `whisper-base.en` and `whisper-large-v3-turbo`, and at least 98% of utterances with an identical transcript. The same clips through agentbench's candle path give the parity line for slice h.
+
+### 2.6 Decoding rules (#1479)
+
+`specs/family-whisper.toml` `[speech.decode]` holds what is not in the checkpoint: `time_precision` 0.02, `top_k` 50 (transformers' sampling default), `condition_below` 0.5, OpenAI's temperatures and thresholds as defaults, the names of the `generation_config.json` keys (`suppress_tokens`, `begin_suppress_tokens`, `lang_to_id`, `task_to_id`, `forced_decoder_ids`, `is_multilingual`) and `[speech.decode.params]` for the token ids (`no_speech = no_timestamps_token_id - 1`, `timestamp_begin = no_timestamps_token_id + 1`, `prev_cutoff = floor(max_target_positions / 2) - 1`). `speech::decode::Rules` merges config and generation config; `Options::from_rules` gives the family defaults, a request overrides them.
+
+Order of a step, as transformers applies its processors: the row plan (suppress, begin suppress, timestamp masks) as logit edits plus an allow range, then the summed timestamp probability rule, then temperature and top k. Greedy picks the argmax; sampling draws from `sampler::uniform` (seeded splitmix), so sampled tokens are not torch's, and the fallback test feeds the sampled tokens transformers drew and checks that our rules allow each one.
+
+Tiny fixture, CPU, f32 host decoder: greedy `generate` (12 tokens), the timestamp run with language detection (2 windows, 122 tokens, segments and times), the 1.5 s two window clip with previous text (seek 78, the second prompt starts with `<|startofprev|>`), and the fallback run (temperatures 0, 0.4, 0.8: a window redone and kept at 0.4, a window skipped as silence) are token identical to transformers, every compression ratio equal, average log probability within 2e-3 when we decode (1e-5 on the recorded scores), and every fallback and skip decision identical.
 
 ## 3. Text to speech
 
@@ -213,10 +221,10 @@ What stays in agentbench: `agent-voice::voice` (audio helpers, WAV, resampling, 
 
 ## 6. Fixture and test
 
-`crates/specrt/tests/fixtures/speech/` (1.37 MB of the 2 MB cap the test sets; the Haru fixture is under 3 MB and the diffusion ones under 20 MB, there is no shared cap across fixtures beyond each test's own):
+`crates/specrt/tests/fixtures/speech/` (1.56 MB of the 2 MB cap the test sets; the Haru fixture is under 3 MB and the diffusion ones under 20 MB, there is no shared cap across fixtures beyond each test's own):
 
 - `tiny-whisper/`: a `WhisperForConditionalGeneration` with random weights (`init_std 0.2`, LayerNorm weights around 1), d 64, 2 encoder and 2 decoder layers, 2 heads, 80 mel bins, a 1 s window (50 encoder positions), vocab 589 laid out like the multilingual one (512 text tokens, EOT, SOT, 4 languages, translate, transcribe, startoflm, startofprev, nospeech, notimestamps, 64 timestamps), the real tensor kinds of `whisper-tiny.en` and its tied head. `generation_config.json` and `preprocessor_config.json` in the real format.
-- `tiny-whisper/reference/`: a 1 s chirp in noise and a 0.6 s cut of it, the mel bank, both log-mel inputs, the conv stem output, the encoder states, the language logits at SOT, the prefix logits, the 12 greedy step logits with suppress lists applied, and in `reference.json` the greedy tokens, `generate`'s tokens (equal) and the detected language.
+- `tiny-whisper/reference/`: a 1 s chirp in noise and a 0.6 s cut of it, the mel bank, both log-mel inputs, the conv stem output, the encoder states, the language logits at SOT, the prefix logits, the 12 greedy step logits with suppress lists applied, and in `reference.json` the greedy tokens, `generate`'s tokens (equal) and the detected language. #1479 adds a 1.5 s gated chirp (`audio.long`, `mel.long`, two windows) and `runs`: `timestamps` (detection, timestamps), `long` (two windows, previous text) and `fallback` (temperatures 0, 0.4, 0.8 with thresholds that make one redo and one skip), each with every window's seek, decoder prompt and attempts (tokens, compression ratio, average log probability, no speech probability, decision), and the scores of the sampled attempt as sparse rows.
 - Real model data, no weights: `whisper-tiny.en`, `whisper-base`, `whisper-large-v3-turbo` configs and generation configs, the `whisper-tiny.en` safetensors header; Phonon's config at the pinned revision and at the hub revision, its header and a voice header; VibeVoice-Realtime's config and its header without the acoustic encoder.
 
 Regenerate (CPU, 4 s, transformers 5.23, torch 2.14):

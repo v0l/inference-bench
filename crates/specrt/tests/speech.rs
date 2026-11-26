@@ -628,7 +628,7 @@ fn run_options(run: &Value) -> specrt::speech::decode::Options {
     let f = |k: &str| o[k].as_f64();
     specrt::speech::decode::Options {
         language: o["language"].as_str().map(str::to_string),
-        task: Some("transcribe".into()).filter(|_| o["language"].is_string()),
+        task: o["language"].is_string().then(|| "transcribe".into()),
         timestamps: true,
         temperatures: o["temperatures"].as_array().map_or(vec![0.0], |a| a.iter().map(|t| t.as_f64().unwrap()).collect()),
         compression_ratio_threshold: f("compression_ratio_threshold"),
