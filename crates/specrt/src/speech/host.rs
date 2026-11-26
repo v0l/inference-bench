@@ -118,3 +118,27 @@ impl HostSpeech {
         Ok((mel, stem))
     }
 }
+
+pub struct HostEncoder {
+    pub graph: crate::denoiser::DenoiserGraph,
+    pub spec: crate::denoiser::DenoiserSpec,
+    pub plan: crate::plan::Plan,
+    pub rows: usize,
+}
+
+impl HostEncoder {
+    pub fn new(config: &serde_json::Value) -> Result<HostEncoder> {
+        let (graph, spec) = super::graph::encoder(config)?;
+        let plan = graph.plan()?;
+        crate::denoiser::validate(&graph, &spec, &plan)?;
+        let rows = spec.size("positions")?;
+        Ok(HostEncoder { graph, spec, plan, rows })
+    }
+
+    pub fn encode(&self, ck: &crate::weights::Checkpoint, stem: &[f32]) -> Result<Vec<f32>> {
+        let host = crate::denoiser_host::HostDenoiser::load(&self.graph, &self.spec, &self.plan, ck, false)?;
+        ensure!(stem.len() == self.rows * self.spec.hidden(), "{} stem values, the encoder reads {} rows of {}", stem.len(), self.rows, self.spec.hidden());
+        let x = crate::denoiser_host::Inputs { latent: &[], text: &[], timestep: 0.0, ids: &[], image: self.rows, text_rows: 0, patch_h: 0, patch_w: 0, frames: 0 };
+        host.run(&x, &[("stem", stem.to_vec())], "states", &mut Default::default())
+    }
+}

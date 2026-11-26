@@ -14,6 +14,8 @@ struct GraphFile {
     kind: String,
     front: Vec<Front>,
     stem: Vec<StemGraph>,
+    #[serde(default)]
+    encoder: Vec<crate::denoiser::DenoiserGraph>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -226,6 +228,16 @@ pub fn plan(config: &serde_json::Value, preprocessor: &serde_json::Value) -> Res
 
 pub fn read_json(path: &Path) -> Result<serde_json::Value> {
     serde_json::from_str(&std::fs::read_to_string(path).with_context(|| path.display().to_string())?).with_context(|| path.display().to_string())
+}
+
+pub fn encoder(config: &serde_json::Value) -> Result<(crate::denoiser::DenoiserGraph, crate::denoiser::DenoiserSpec)> {
+    let model_type = config["model_type"].as_str().context("the config names no model_type")?;
+    let g = graph()?;
+    let e = g.encoder.into_iter().find(|e| e.classes.iter().any(|c| c == model_type)).with_context(|| format!("no speech encoder graph for model_type {model_type}"))?;
+    ensure!(e.kind == "encoder-graph", "speech encoder {} is a {}, not an encoder-graph", e.name, e.kind);
+    let configs = std::collections::BTreeMap::from([("model".to_string(), config.clone())]);
+    let spec = crate::denoiser::DenoiserSpec::from_configs(&e, &configs)?;
+    Ok((e, spec))
 }
 
 pub fn plan_dir(dir: &Path) -> Result<SpeechPlan> {

@@ -41,9 +41,9 @@ impl<'a> HostDenoiser<'a> {
             for op in ops {
                 let Op::Dit(d) = op else { continue };
                 let ws: Vec<String> = match d {
-                    DitOp::Linear { weight, bias, .. } => weight_names(weight, None).into_iter().flat_map(|(n, _)| {
+                    DitOp::Linear { weight, bias, .. } => weight_names(weight, None).into_iter().zip(crate::denoiser::biased_parts(weight)).flat_map(|((n, _), biased)| {
                         let b = n.strip_suffix(".weight").map(|s| format!("{s}.bias"));
-                        std::iter::once(n).chain(b.filter(|_| *bias))
+                        std::iter::once(n).chain(b.filter(|_| *bias && biased))
                     }).collect(),
                     DitOp::AxisRope { text, image, .. } => [text, image].iter().flat_map(|w| ["q", "k"].map(|q| format!("{w}_{q}.weight"))).collect(),
                     DitOp::TableAdd { table, .. } => vec![table.to_string()],
@@ -93,6 +93,11 @@ impl<'a> HostDenoiser<'a> {
     }
 
     pub fn forward(&self, x: &Inputs, trace: &mut Trace) -> Result<Vec<f32>> {
+        let inputs = [("latent", x.latent.to_vec()), ("text", x.text.to_vec()), ("timestep", vec![x.timestep])];
+        self.run(x, &inputs, "velocity", trace)
+    }
+
+    pub fn run(&self, x: &Inputs, inputs: &[(&str, Vec<f32>)], output: &str, trace: &mut Trace) -> Result<Vec<f32>> {
         let mut bufs: BTreeMap<&str, Vec<f32>> = BTreeMap::new();
         let width = |name: &str| -> Result<usize> { self.spec.size(&self.graph.decl(name).with_context(|| format!("no buffer {name}"))?.cols) };
         let total = x.image + x.text_rows;
@@ -105,9 +110,9 @@ impl<'a> HostDenoiser<'a> {
             };
             bufs.insert(Box::leak(b.name.clone().into_boxed_str()), vec![0.0; rows * width(&b.name)?]);
         }
-        bufs.insert("latent", x.latent.to_vec());
-        bufs.insert("text", x.text.to_vec());
-        bufs.insert("timestep", vec![x.timestep]);
+        for (name, v) in inputs {
+            bufs.insert(crate::denoiser::intern_name(name), v.clone());
+        }
         let mut planes = vec![0f32; total * 3 * self.spec.hidden()];        let run = |ops: &[Op], block: Option<usize>, bufs: &mut BTreeMap<&str, Vec<f32>>, planes: &mut Vec<f32>| -> Result<()> {
             for op in ops {
                 let Op::Dit(d) = op else { bail!("{} is not a denoiser op", op.label()) };
@@ -123,7 +128,7 @@ impl<'a> HostDenoiser<'a> {
             }
         }
         run(&self.plan.tail, None, &mut bufs, &mut planes)?;
-        bufs.remove("velocity").context("the plan wrote no velocity")
+        bufs.remove(output).with_context(|| format!("the plan wrote no {output}"))
     }
 
     fn patch_dims(&self, x: &Inputs) -> Result<(usize, usize, usize, usize)> {
@@ -189,10 +194,16 @@ impl<'a> HostDenoiser<'a> {
                 let parts = weight_names(weight, block);
                 let mut w = Vec::with_capacity(n * k);
                 let mut bv: Vec<f32> = Vec::new();
-                for (name, range) in &parts {
+                for ((name, range), biased) in parts.iter().zip(crate::denoiser::biased_parts(weight)) {
                     let full = self.weight(name)?;
-                    if bias {
+                    let part_rows = match range {
+                        Some(_) => n,
+                        None => full.len() / k,
+                    };
+                    if bias && biased {
                         bv.extend_from_slice(self.weight(&format!("{}.bias", name.strip_suffix(".weight").unwrap_or(name)))?);
+                    } else if bias {
+                        bv.extend(std::iter::repeat_n(0.0, part_rows));
                     }
                     match range {
                         Some((a, b)) => {
@@ -454,6 +465,7 @@ pub fn unpatchify_last(tokens: &[f32], channels: usize, p: usize, ph: usize, pw:
 fn activate(v: f32, act: u8) -> f32 {
     match act {
         1 => 0.5 * v * (1.0 + (0.797_884_6 * (v + 0.044715 * v * v * v)).tanh()),
+        2 => crate::codec::host::gelu(v),
         _ => v,
     }
 }

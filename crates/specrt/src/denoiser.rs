@@ -55,6 +55,8 @@ pub struct DitNode {
     #[serde(default)]
     pub bias: bool,
     #[serde(default)]
+    pub unbiased: Vec<String>,
+    #[serde(default)]
     pub act: Option<String>,
     #[serde(default)]
     pub table: Option<String>,
@@ -234,7 +236,7 @@ impl DenoiserSpec {
             let e = kir::expr::Expr::parse(c).map_err(anyhow::Error::msg)?;
             ensure!(e.eval(&|n| spec.values.get(n).copied()).is_some_and(|v| v != 0.0), "the {} denoiser graph needs {c}", graph.name);
         }
-        if spec.values.contains_key("head_dim") {
+        if spec.values.contains_key("head_dim") && spec.values.contains_key("rope_theta") {
             ensure!(spec.size("head_dim")? == spec.axes.iter().sum::<usize>(), "rope axes {:?} do not add up to head_dim {}", spec.axes, spec.size("head_dim")?);
         }
         ensure!(spec.axes.iter().all(|a| a % 2 == 0), "rope axes {:?} must be even", spec.axes);
@@ -318,7 +320,11 @@ impl DitNode {
             "timestep" => DitOp::TimestepEmbed { from: from()?, into: into()? },
             "linear" => {
                 let w = self.need(&self.weight, "weight")?;
-                let weight = intern(&w.split('+').map(|part| full(part)).collect::<Vec<_>>().join("+"));
+                for u in &self.unbiased {
+                    ensure!(self.bias && w.split('+').any(|p| p == u), "linear {w}: unbiased {u:?} is not one of its parts, or the linear has no bias");
+                }
+                let mark = |part: &str| if self.unbiased.iter().any(|u| u == part) { format!("{}!", full(part)) } else { full(part) };
+                let weight = intern(&w.split('+').map(mark).collect::<Vec<_>>().join("+"));
                 DitOp::Linear { weight, input: from()?, output: into()?, rows: self.rows()?, add: self.add, bias: self.bias, act }
             }
             "modulate" => {
@@ -476,10 +482,15 @@ impl DenoiserGraph {
     }
 }
 
+pub fn biased_parts(weight: &str) -> Vec<bool> {
+    weight.split('+').map(|w| !w.ends_with('!')).collect()
+}
+
 pub fn weight_names(weight: &str, block: Option<usize>) -> Vec<(String, Option<(String, String)>)> {
     weight
         .split('+')
         .map(|w| {
+            let w = w.trim_end_matches('!');
             let w = match block {
                 Some(i) => w.replace("{i}", &i.to_string()),
                 None => w.to_string(),

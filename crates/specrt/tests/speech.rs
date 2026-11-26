@@ -384,6 +384,21 @@ fn the_mel_bank_equals_transformers_filters() {
 }
 
 #[test]
+fn the_host_encoder_graph_matches_transformers() {
+    let host = specrt::speech::HostSpeech::open(&tiny()).unwrap();
+    let config = json(&tiny().join("config.json"));
+    let enc = specrt::speech::host::HostEncoder::new(&config).unwrap();
+    let ck = specrt::weights::Checkpoint::open(&tiny()).unwrap();
+    let (mel, _) = reference("mel.full");
+    let stem = host.stem(&frames_major(&mel, host.plan.mel.bins, host.plan.mel.frames)).unwrap();
+    let states = enc.encode(&ck, &stem).unwrap();
+    let (want, _) = reference("encoder.out");
+    let err = max_rel(&states, &want);
+    println!("host encoder.out: max rel {err:.2e}");
+    assert!(err < 1e-4, "{err}");
+}
+
+#[test]
 fn the_host_log_mel_and_stem_match_transformers() {
     let host = specrt::speech::HostSpeech::open(&tiny()).unwrap();
     let (bins, frames) = (host.plan.mel.bins, host.plan.mel.frames);
