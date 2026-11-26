@@ -11,6 +11,44 @@ pub fn usable(free: u64) -> u64 {
     free.saturating_sub(GPU_RESERVE)
 }
 
+pub fn quantised_weight_bytes(spec: &specrt::spec::Spec, format: specrt::spec::Quant) -> Option<u64> {
+    use specrt::spec::{LayerQuant, Quant, QuantPlan, QuantizeChoice};
+    let covered = match format {
+        Quant::Nvfp4G16 => true,
+        Quant::Fp8Channel => spec.moe.is_none(),
+        _ => false,
+    };
+    if !covered || spec.quant != Quant::Bf16 || spec.mlp.quant.is_some() {
+        return None;
+    }
+    let mut s = spec.clone();
+    s.runtime.quantize = QuantizeChoice::Off;
+    let n = s.layers.count;
+    s.quant_plan = QuantPlan::default();
+    s.quant_plan.layers = (0..n).map(|i| if s.quant_keep.keeps_layer(i, n) { LayerQuant::BF16 } else { LayerQuant::new(format, true) }).collect();
+    Some(ModelAnatomy::new(&s, 0, None).total_bytes)
+}
+
+pub fn quantised_fit(spec: &specrt::spec::Spec, e: &Estimate) -> Option<u64> {
+    let free = e.free?;
+    let plain = quantised_plain_bytes(spec)?;
+    let quantised = quantised_weight_bytes(spec, specrt::spec::Quant::Nvfp4G16)?;
+    let weights = (e.weights as f64 * quantised as f64 / plain as f64) as u64;
+    let total = weights + e.kv + e.state;
+    (total <= free).then_some(total)
+}
+
+fn quantised_plain_bytes(spec: &specrt::spec::Spec) -> Option<u64> {
+    use specrt::spec::{Quant, QuantPlan, QuantizeChoice};
+    if spec.quant != Quant::Bf16 || spec.mlp.quant.is_some() {
+        return None;
+    }
+    let mut s = spec.clone();
+    s.runtime.quantize = QuantizeChoice::Off;
+    s.quant_plan = QuantPlan::default();
+    Some(ModelAnatomy::new(&s, 0, None).total_bytes).filter(|b| *b > 0)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Estimate {
     pub weights: u64,

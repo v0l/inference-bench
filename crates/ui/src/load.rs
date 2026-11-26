@@ -823,6 +823,9 @@ fn result_card(ui: &mut egui::Ui, d: &LoadDialog, env: &Env, spread: &Option<Res
         }
         if let Some((ok, text)) = fit_line(d, env, e, spread) {
             status(ui, ok, &text);
+            if !ok && let Some(total) = d.view.as_ref().ok().and_then(|v| quantised_fit(&v.spec, e)) {
+                status(ui, true, &format!("fits if quantised to nvfp4 (est. {})", human_size(total)));
+            }
         } else {
             note(ui, "No GPU reading yet, so the estimate cannot be checked against free memory.", LEGEND);
         }

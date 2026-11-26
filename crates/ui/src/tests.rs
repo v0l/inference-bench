@@ -335,6 +335,50 @@ fn click_load_node(h: &mut Harness<'static, App>) -> bool {
 }
 
 #[test]
+fn the_load_page_offers_nvfp4_when_only_the_quantised_model_fits() {
+    for (name, size) in [("quant-hint-desktop", egui::vec2(1280.0, 1000.0)), ("quant-hint-phone", egui::vec2(390.0, 2600.0))] {
+        let mut h = harness_at(name, Tab::Models, size);
+        let m = real_model("Qwen3-0.6B");
+        h.state_mut().library[0] = m.clone();
+        with_gpu(&mut h, 0, 96 << 30);
+        h.state_mut().open_load_dialog(&m);
+        {
+            let d = h.state_mut().load.as_mut().unwrap();
+            d.ctx = 2048;
+            d.seqs = 1;
+            d.pin_kv = true;
+        }
+        h.run();
+        let spec = h.state().load.as_ref().unwrap().view.as_ref().unwrap().spec.clone();
+        let settled = |h: &Harness<'static, App>| h.state().load.as_ref().unwrap().estimate(Some(u64::MAX)).unwrap();
+        let e = settled(&h);
+        let total = e.total();
+        let quantised = inference_bench_core::fit::quantised_fit(&spec, &e).unwrap();
+        assert!(quantised < total, "{quantised} {total}");
+        let free = (quantised + total) / 2;
+        with_gpu(&mut h, (96 << 30) - free, 96 << 30);
+        h.run();
+        assert_eq!(settled(&h).total(), total);
+        h.get_by_label_contains("fits if quantised to nvfp4 (est.");
+        let out = shots_dir();
+        std::fs::create_dir_all(&out).unwrap();
+        h.render().unwrap().save(out.join(format!("{name}.png"))).unwrap();
+    }
+}
+
+#[test]
+fn the_load_page_shows_no_quantised_hint_when_the_model_fits() {
+    let mut h = harness("no-quant-hint", Tab::Models);
+    with_gpu(&mut h, 0, 96 << 30);
+    let m = real_model("Qwen3-0.6B");
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().open_load_dialog(&m);
+    h.run();
+    h.get_by_label("fits in free memory");
+    assert!(h.query_by_label_contains("fits if quantised").is_none());
+}
+
+#[test]
 fn the_estimate_turns_red_when_the_model_does_not_fit_free_memory() {
     let mut h = harness("estimate", Tab::Models);
     with_gpu(&mut h, 0, 96 << 30);
