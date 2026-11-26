@@ -1071,7 +1071,7 @@ mod tests {
         let config: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         let s = specrt_support(&config);
         assert!(!s.supported, "{}", s.reason);
-        assert!(s.reason.contains("MeanFlow") && s.reason.contains("codec") && s.reason.contains("duplex"), "{}", s.reason);
+        assert!(s.reason.contains("duplex") && s.reason.contains("#1431"), "{}", s.reason);
         assert_eq!(s.reason, specrt::spec::Spec::from_hf_config(&config.to_string()).unwrap_err().root_cause().to_string());
         assert!(!specrt_wgpu_support(&config).supported);
     }

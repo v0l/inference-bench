@@ -177,12 +177,12 @@ The card cannot change mid session: it sits at position 0. A new card means a ne
 |---|---|
 | Backbone, `lm.*` | **specrt** (#1427): `family-haru.toml` extends `family-qwen3_5`, reads `lm` as the text config (`text_config = "lm"`) and maps the `lm.` root to `model.` through `[tensors]`. The family stays refused until #1430 |
 | Tied logits, top k, top p, temperature | **specrt** sampler |
-| DRY penalty, f32 PAD and EOP logits, `eop_bias`, forced text | **new** sampler options, declared in the family `[duplex.sampling]` |
+| DRY penalty, f32 PAD and EOP logits, `eop_bias`, forced text | **specrt** (#1430): `[duplex.sampling]` in the family, host plans per row (`duplex::sampling`) applied by the `kir::duplex` kernels inside the frame graph |
 | Input sum with projectors | **specrt** (#1427): `[inputs]` in the family declares the streams and masks; six `[[inputs.node]]` plan ops (`Op::Input`, typed signatures, kir `group_map` descriptions) add `mask * fc2(rmsnorm(fc1((raw + latent_bias) * latent_scale)))` into `x` after the token gather, for prefill rows and decode rows alike (`Runtime::set_inputs`) |
 | MeanFlow head | **specrt** (#1428): `graphs/meanflow.toml` and `[head]`, `specrt::flow_head` (plan, hoist, report, host) and `flow_head_cuda` |
 | Codec 1D convs | partly from #1283: `kir::conv` implicit GEMM (the 1x1 `fc1` and `fc2` are its 1x1 case or the tile GEMM), the per pixel channel RMS norm (`VaeOp::RmsNorm`), the causal frame cache of the Wan VAE as streaming state, one latent frame per call. **new**: strided causal 1D conv (down), the transposed conv (lowers to a 2 tap causal conv to s x Cout channels plus an interleave, the generalisation of Wan's `time_up`, with the previous input column as state instead of the overlap tail), depthwise k 7 conv (a per channel stencil, a compose or rows kernel, not a GEMM), exact GELU (`erf` is not in the `Expr` unary table, `kir/src/expr.rs:69`) |
-| Session KV and state | **specrt**: paged KV for the 8 full layers, delta net state for the 24 linear layers, the #326 snapshot store. **new**: codec state, sampler state and the frame counter as declared session state |
-| Frame clock scheduler | **new** |
+| Session KV and state | **specrt** (#1430): paged KV for the 8 full layers, delta net state for the 24 linear layers, codec state, sampler state and the frame counter, declared as `[duplex] state`; snapshots through the #326 store with three extra sections |
+| Frame clock scheduler | **specrt** (#1430): `duplex::clock`, a fixed 133 ms tick per session, silence for a missing input frame, late frames sent and marked, the input backlog cut so latency comes back |
 | Audio websocket | **new** (axum is built without its `ws` feature today) |
 
 ## 7. Fixture
@@ -291,3 +291,63 @@ To be filed in agentbench (this session had no permission to file there), depend
 - The bridge of section 10: Whisper on the same microphone frames turns each user utterance into a supervisor text turn; supervisor replies go to the engine as `say` in short sentences (from `Converse`) with the session in `relay` mode; a barge in sends `interrupt` and passes the `said` part back as what the user heard. A fixed supervisor card and a voice clip the user records once, kept in settings.
 - Fallback: with no duplex model set, hands free uses today's speech to text, supervisor, text to speech path.
 - Tests with the app's own hooks (`voice_test_*`) against a fake duplex server: frames go out every 133 ms at 6400 bytes, replies play in order, a late frame plays silence, an utterance becomes a supervisor turn, a reply becomes `say` messages, a barge in sends `interrupt`. Pictures of the indicator at 1280 and 390. The real conversation with the real model is the user's check.
+
+## 13. Duplex sessions in specrt (#1430)
+
+`specrt::duplex` runs Haru sessions on the engine: one user frame in, one model frame out, batched over sessions. Everything that is model specific is data in `family-haru.toml` under `[duplex]`: frame and latent sizes read from the config, the user noise divisor (0.8), the PAD, EOP and EOS ids, the ChatML card template, the declared session state (`kv`, `recurrent`, `codec`, `sampler`, `frame`), `max_frames` (27,000), `window_frames` (0, off) and `[duplex.sampling]` (temperature 0.7, top k 25, top p 1, `eop_bias` 0, one forced text frame with PAD, EOP and EOS banned, f32 PAD and EOP logits, and DRY 0.8, 1.75, 1, 1024, 32, 32 with PAD, EOP and EOS exempt). `Spec::from_hf_config_duplex` reads it; the text serving path stays refused (`[[refuse]] part = "text"`) until the audio API of #1431.
+
+| Piece | Where |
+|---|---|
+| Prompt: card, voice reference (trimmed at -45 dBFS with 0.2 s margin, at most 180 s, encoded and noised with one scale for the clip), `speak_first` grid with room tone and silence, forced first text | `duplex::prompt`, `Engine::start` |
+| Prefill in chunks of `prefill_chunk` with per position masks, first frame from the last hidden state and the prompt logits | `Engine::start_prompt` |
+| Frame step: encode user PCM, noise the mean, sum the streams, one backbone position for every session as decode rows, exact PAD and EOP logits from the joined f32 hidden state, logit edits, allow list, sampling, MeanFlow head, decode | `Engine::step`, one CUDA graph per padded batch size (1, 2, 4, 8, 16, 32) |
+| Text controls: DRY history, `eop_bias`, forced text, say queue (only PAD, EOP and the next queued token), `relay` (only PAD and EOP) and `free`, `interrupt` (drops the queue, returns said and unsaid tokens) | `duplex::sampling::TextState`, host plans uploaded per frame, applied by `duplex_edit_logits` and `duplex_allow` |
+| Frame clock: 133 ms tick per session, silence for a missing frame, a late step is sent and marked late, the input side never waits, the backlog is cut by as many frames as the step was late | `duplex::clock::run` over the `FrameEngine` trait |
+| Codec state per session in a pool, moved into the batch before the graph and back after it | `duplex_state_move`, `CudaCodec::launch_frame` with fixed parity sessions |
+| `window_frames`: keep the prompt pages as a sink and the last W frames; the oldest page past the sink is reused for the newest positions, the rope position keeps counting through the mrope offset | `Engine::window`, `Runtime::set_position_offset` |
+| Snapshots: KV blocks in use, delta net state, codec state, sampler state and frame counter, seven sections in the #326 `SessionStore` | `Engine::snapshot`, `restore`, `park`, `resume` |
+
+The codec convs now pick a third `kir::conv` family, `Rows`, when the conv has few output rows and a long reduction (the 2048 wide blocks and the first and last up and down convs of a frame): one block per output channel, the reduction split over the block, eight rows at a time. On the real model this took the codec from 69.5 ms to 11.0 ms per frame at one session; the tile and direct families stay for long clips.
+
+### Tiny fixture on GPU1
+
+`tests/haru_duplex_gpu.rs` (`~/.agents/bin/gpu-run 1 --min-free 2000 -- <haru_duplex_gpu binary> --ignored --test-threads=1`, 4 s):
+
+- The six frame greedy session from the fixture prompt and `session.user_audio` with the recorded noise gives `session.token` exactly on all seven frames, eager and through the frame graph, and a second session on the same slot repeats it.
+- Fed the reference feedback each frame (its token and latent), the engine gives `session.user_latent` within 1.3e-6, `session.hidden` within 1.7e-4, `session.latent` within 1.8e-4 (per frame 2.3e-4, 6e-5, 1.8e-4, 1.8e-5, 2.2e-5, 2.9e-5, 2.1e-5) and `session.audio` within 2.4e-3, and its audio is bit identical to a fresh decode of the latents it emits. The codec alone gives `session.audio` within 8.5e-7 from `session.latent` (`haru_gpu.rs`).
+- Free running, the latent error grows from 2.3e-4 to 3.2e-2 over six frames: the bf16 backbone floor (3e-4 relative, the same as the text only control in `haru_backbone_gpu.rs`) is fed back through the model's own latent. The issue's 1e-4 bound on `session.latent` and `session.audio` sits below that floor, so the test holds tokens exactly, the latent and user stream at the backbone bound with reference feedback, and the decode exactly.
+- Two sessions batched in one step each give the same tokens and match the same session alone within 1e-5, with one captured graph for the batch of two.
+- A snapshot after three frames, written to the store, resumed in a fresh engine, gives the same next three tokens, frame indices, latents and audio (within 1e-6).
+- `relay` with an empty queue gives only PAD and EOP; a queued list comes out in order with only PAD and EOP between; `interrupt` returns what was said and what was not.
+- `max_frames` 5 ends the session on frame 4 and refuses another step; `window_frames` 32 with a 64 position context runs 120 frames with finite audio and keeps at most 64 positions.
+
+### Real Haru-4B on GPU1 (bf16, quiet GPU1, the user's app on GPU0)
+
+Frame step time, `haru bench <dir> --batches 1,4,16 --frames 60`, every session fed silence after a card prompt:
+
+| Sessions | Median ms | p95 ms | Budget ms |
+|---|---|---|---|
+| 1 | 20.3 | 20.4 | 133.3 |
+| 4 | 30.2 | 30.2 | 133.3 |
+| 16 | 54.5 | 54.7 | 133.3 |
+
+At one session nsys gives 20.3 ms of kernel time per frame: backbone 7.6 ms (325 launches, close to the 8 ms estimate), codec 11.0 ms (344 launches), head 1.0 ms, duplex glue 0.7 ms. The codec is the remaining gap to the 8 ms of section 8; its largest kernels are the direct and rows convs of the 2048 wide blocks. Sixteen sessions fit in 41% of the frame.
+
+Offline run of a recorded user clip (19.8 s, three TTS sentences with pauses, Kokoro Zoey), the English chat card from the reference package and a 13.8 s voice reference (Kokoro Harper), 149 frames each, through `haru run` and through the reference `haru-inference` (commit 7fe6b766, torch 2.11 CUDA in a private venv, `MemoryMax=16G`); Whisper large v3 turbo transcripts and RMS envelope metrics (100 ms windows, voiced above -40 dBFS) from `scripts/haru_eval.py`:
+
+| Run | Whisper transcript | Voiced | Voiced over the user |
+|---|---|---|---|
+| specrt, sampled | Hi, I'm Haru. I'm doing great. How about you? Oh, that sounds wonderful. Did you hike? Yes, I have done it. It's very fun. | 34% | 2% |
+| reference, sampled | Hello. I'm doing well, thank you. How are you? How was ba- How was ba- | 19% | 0% |
+| specrt, greedy text | Hi there, I'm Haru. I'm doing great. How are you? | 17% | 2% |
+| reference, greedy text | Hi, I'm Heru. I'm doing well, thank you. How are you? No, I haven't. What was it like? | 27% | 2% |
+
+Both engines greet, answer the question in the user's pause and keep quiet while the user talks. The RMS envelope correlation between specrt and the reference is 0.32 sampled and 0.44 greedy, against 0.48 between the reference's own sampled and greedy runs: the audio noise stream differs between the engines, so frame for frame identity is not expected and the two engines differ about as much as one engine with two sampling settings.
+
+Say queue, `haru say <dir> --sentences tests/fixtures/haru/say_sentences.txt --card card.txt --voice voice.wav`: 20 sentences, each queued after 8 frames of a relay session fed silence, up to 600 frames per sentence, Whisper on the produced audio:
+
+- 9 of 20 queues were spoken to the end; in the other 11 the model kept choosing PAD and EOP, which the queue allows, and said 0 to 8 of the queued tokens in 600 frames (80 s).
+- Word error rate over all 20 against the queued text: 3.07 (one sentence where the model laughed through 450 frames gives 44.5); median 1.0. Over the 9 completed: median 0.67, best 0.09 ("I set a reminder to call your sister on a Sunday. Evening.") and 0.18.
+- The words that come out are the queued words, but the model wraps them in its own sounds ("Oh, God.", laughter, "Thank you." repeated in long silences).
+
+So constrained text alone does not keep supervisor speech intelligible: the fallback of section 10 holds (text to speech for supervisor replies, Haru in `relay` for turn taking and backchannels) until the say path gets a stronger control, for example `eop_bias` while the queue is not empty or a card that tells the model it relays an assistant.

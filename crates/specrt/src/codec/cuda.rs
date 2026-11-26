@@ -187,8 +187,8 @@ impl CudaCodec {
             let (x, y) = (ptrs[l.input], ptrs[l.output]);
             let (t, to) = (l.t_in as i32, l.t_out as i32);
             match &l.kind {
-                Kind::Conv { shape, gelu, residual } => {
-                    let k = &self.kernels[&super::compile::conv_kernel(&self.target, *shape, *gelu, *residual)?.name()];
+                Kind::Conv { shape, gelu, residual, rows } => {
+                    let k = &self.kernels[&super::compile::conv_kernel(&self.target, *shape, *gelu, *residual, *rows)?.name()];
                     let dev = &which.weights[&l.op];
                     let st = match l.layer.and_then(|i| sessions.state.get(&i)) {
                         Some(pair) => dptr(&pair[0]),

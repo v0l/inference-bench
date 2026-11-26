@@ -412,7 +412,15 @@ fn engine_spec() -> Spec {
 #[test]
 fn the_haru_family_reads_the_lm_section_and_refuses_until_the_chain_runs() {
     let err = format!("{:#}", Spec::from_hf_config(&real_config().to_string()).unwrap_err());
-    assert!(err.contains("MeanFlow") && err.contains("codec") && err.contains("#1430"), "{err}");
+    assert!(err.contains("duplex") && err.contains("#1431"), "{err}");
+    let duplex = Spec::from_hf_config_duplex(&real_config().to_string()).unwrap();
+    let d = duplex.duplex.as_ref().unwrap();
+    assert_eq!((d.frame_samples, d.latent_dim, d.pad, d.eop, d.max_frames, d.window_frames), (3200, 64, 248076, 248071, 27000, 0));
+    assert_eq!((d.sampling.temperature, d.sampling.top_k, d.sampling.forced_bans.clone()), (0.7, 25, vec![248076, 248071, 248044]));
+    let dry = d.sampling.dry.as_ref().unwrap();
+    assert_eq!((dry.multiplier, dry.base, dry.allowed_length, dry.lookback, dry.max_match, dry.max_penalty), (0.8, 1.75, 1, 1024, 32, 32.0));
+    assert_eq!(dry.exempt_ids, vec![248076, 248071, 248044]);
+    assert!((d.noise_scale() - 0.625).abs() < 1e-6);
     let family = specrt::family::Registry::embedded().for_model_type("haru").unwrap();
     assert_eq!((family.name.as_str(), family.text_config.as_deref()), ("haru", Some("lm")));
     let real = Spec::from_hf_config_serving_in(&unrefused(), &real_config().to_string()).unwrap();

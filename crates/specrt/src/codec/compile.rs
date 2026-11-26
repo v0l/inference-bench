@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Kind {
-    Conv { shape: ConvShape, gelu: bool, residual: bool },
+    Conv { shape: ConvShape, gelu: bool, residual: bool, rows: bool },
     Depthwise { channels: usize, taps: usize },
     Rms { channels: usize, eps: f32 },
     Shift { channels: usize, context: usize },
@@ -93,8 +93,11 @@ impl LaunchPlan {
     pub fn kernels(&self, target: &kir::Target) -> Result<Vec<ConvKernel>> {
         let mut out = Vec::new();
         for l in &self.launches {
-            if let Kind::Conv { shape, gelu, residual } = &l.kind {
-                out.push(conv_kernel(target, *shape, *gelu, *residual)?);
+            if let Kind::Conv { shape, gelu, residual, .. } = &l.kind {
+                out.push(conv_kernel(target, *shape, *gelu, *residual, false)?);
+                if kir::conv::rows_fit(shape, 1) {
+                    out.push(conv_kernel(target, *shape, *gelu, *residual, true)?);
+                }
             }
         }
         out.sort_by_key(ConvKernel::name);
@@ -107,8 +110,12 @@ impl LaunchPlan {
     }
 }
 
-pub fn conv_kernel(target: &kir::Target, shape: ConvShape, gelu: bool, residual: bool) -> Result<ConvKernel> {
-    ConvKernel::new(target, shape, Prologue::None, Epilogue { residual, stats: None, gelu }).map_err(anyhow::Error::msg)
+pub fn conv_kernel(target: &kir::Target, shape: ConvShape, gelu: bool, residual: bool, rows: bool) -> Result<ConvKernel> {
+    let epilogue = Epilogue { residual, stats: None, gelu };
+    if rows {
+        return ConvKernel::rows(target, shape, epilogue).map_err(anyhow::Error::msg);
+    }
+    ConvKernel::new(target, shape, Prologue::None, epilogue).map_err(anyhow::Error::msg)
 }
 
 struct Buffers {
@@ -170,7 +177,8 @@ pub fn plan(stack: &Stack, steps: usize, sessions: usize) -> Result<LaunchPlan> 
                 let t_pad = t_out * shape.stride;
                 let out = bufs.fresh(&[input]);
                 bufs.grow(out, sessions * t_out * shape.cout);
-                launches.push(Launch { op: i, scale: None, kind: Kind::Conv { shape, gelu: false, residual: false }, input, output: out, layer: Some(i), t_in: t, t_out, t_pad, cin: *cin, cout: shape.cout });
+                let rows = kir::conv::rows_fit(&shape, sessions * t_out);
+                launches.push(Launch { op: i, scale: None, kind: Kind::Conv { shape, gelu: false, residual: false, rows }, input, output: out, layer: Some(i), t_in: t, t_out, t_pad, cin: *cin, cout: shape.cout });
                 if shape.context() > 0 {
                     launches.push(Launch { op: i, scale: None, kind: Kind::Shift { channels: *cin, context: shape.context() }, input, output: input, layer: Some(i), t_in: t, t_out, t_pad, cin: *cin, cout: *cin });
                     states.insert(i, shape.context() * cin);
@@ -199,7 +207,8 @@ pub fn plan(stack: &Stack, steps: usize, sessions: usize) -> Result<LaunchPlan> 
                     }
                 };
                 bufs.grow(out, sessions * t * cout);
-                launches.push(Launch { op: i, scale, kind: Kind::Conv { shape, gelu: *gelu, residual: scale.is_some() }, input, output: out, layer: None, t_in: t, t_out: t, t_pad: t, cin: *cin, cout: *cout });
+                let rows = kir::conv::rows_fit(&shape, sessions * t);
+                launches.push(Launch { op: i, scale, kind: Kind::Conv { shape, gelu: *gelu, residual: scale.is_some(), rows }, input, output: out, layer: None, t_in: t, t_out: t, t_pad: t, cin: *cin, cout: *cout });
                 if scale.is_none() {
                     bufs.slot.insert(op.output(), out);
                 } else {

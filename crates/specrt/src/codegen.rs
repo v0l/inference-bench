@@ -858,7 +858,7 @@ impl Module {
         let kir_hash = match &spec.duplex {
             Some(d) => {
                 let shape = kir::duplex::DuplexShape { hidden: spec.dims.hidden, vocab: spec.dims.vocab, latent: d.latent_dim };
-                source.append("\n", &kir::duplex::emit_cuda(&shape).map_err(anyhow::Error::msg)?);
+                source.append("\n", &kir::cuda::emit_duplex(&shape).map_err(anyhow::Error::msg)?);
                 kernels.extend_from_slice(kir::duplex::KERNELS);
                 kir::fold_hashes([kir_hash, shape.hash()])
             }
