@@ -75,8 +75,8 @@ Printed by `cargo test -p inference-bench-specrt --test speech -- --nocapture th
 
 | Piece | In specrt | Kind | Slice |
 |---|---|---|---|
-| Log-mel front end (STFT, mel bank, log10, global clamp, scale, 30 s pad) | nothing | **new op**: a kir `compose` or `rows` description, one frame per row for the windowed DFT as a GEMM against a fixed 400 x 402 cos/sin table (a constant weight, so `kir::gemm` does it), the mel bank as a second constant GEMM, then a block max reduction for the clamp | a |
-| Conv stem, k3 p1 and k3 s2 p1 with GELU | `kir::conv` line convs with exact GELU in the epilogue (`line_gelu`, Haru codec) are causal; Whisper pads both sides | **new graph entry** in a new `graphs/speech.toml` (centred padding is a conv attribute, not a new kernel) | a |
+| Log-mel front end (STFT, mel bank, log10, global clamp, scale, 30 s pad) | landed (#1477): `kir::mel::LogMel` (window, the DFT table and slaney bank built from `preprocessor_config.json`), `graphs/speech.toml` `[[front]]`, the DFT and the bank as constant line conv GEMMs, `kir::cuda::emit_mel` for framing, power, log, the global max and the scale; host `speech::host`, CUDA `speech::cuda` | op | a |
+| Conv stem, k3 p1 and k3 s2 p1 with GELU | landed (#1477): `graphs/speech.toml` `[[stem]]` nodes over `kir::conv` with `ConvShape::padded` (causal convs keep `PAD -1`), GELU fused into the conv epilogue by the fusion engine | graph entry | a |
 | Exact GELU | `kir::expr` macro `gelu` | exists | |
 | Learned position tables added to rows | `DitOp::TableAdd` | exists as an op | b |
 | LayerNorm with bias | `DitOp::LayerNorm` (`dit_layernorm`) | exists as an op | b |
