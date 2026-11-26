@@ -21,6 +21,7 @@ pub fn specrt_serving_factory() -> ServingFactory {
 }
 
 type StatsSource = Arc<Mutex<Vec<(String, Box<dyn Target>)>>>;
+type DuplexList = Arc<Mutex<Vec<(String, Arc<specrt::duplex::service::Service>)>>>;
 type LoadedList = Arc<Mutex<Vec<Loaded>>>;
 type LiveList = Arc<Mutex<Vec<Live>>>;
 
@@ -119,6 +120,8 @@ pub struct Engine {
     watching: Arc<AtomicBool>,
     stop_sampler: Arc<AtomicBool>,
     max_loaded: Arc<AtomicUsize>,
+    duplexes: DuplexList,
+    duplex_options: Arc<Mutex<specrt::duplex::service::ServiceOptions>>,
 }
 
 #[derive(Clone)]
@@ -130,9 +133,18 @@ pub struct Handle {
     idle: Live,
     stats: StatsSource,
     watching: Arc<AtomicBool>,
+    duplexes: DuplexList,
 }
 
 impl Handle {
+    pub fn duplex_of(&self, model: Option<&str>) -> Option<Arc<specrt::duplex::service::Service>> {
+        let id = match model {
+            Some(name) => self.loaded_named(name)?.model_id,
+            None => self.loaded()?.model_id,
+        };
+        self.duplexes.lock().unwrap().iter().find(|(m, _)| *m == id).map(|(_, s)| s.clone())
+    }
+
     pub fn loaded(&self) -> Option<Loaded> {
         self.loaded.lock().unwrap().first().cloned()
     }
@@ -317,11 +329,13 @@ impl Engine {
         let lives: LiveList = Arc::default();
         let idle = Live::new("");
         let stats: StatsSource = Arc::default();
+        let duplexes: DuplexList = Arc::default();
+        let duplex_options = Arc::new(Mutex::new(specrt::duplex::service::ServiceOptions::default()));
         let max_loaded = Arc::new(AtomicUsize::new(DEFAULT_MAX_LOADED));
         let watching = Arc::new(AtomicBool::new(false));
         let stop_sampler = Arc::new(AtomicBool::new(false));
-        let shared = Shared { loaded: loaded.clone(), suspended: suspended.clone(), lives: lives.clone(), stats: stats.clone(), max_loaded: max_loaded.clone() };
-        let this = Self { commands, events, loaded, suspended, lives, idle, stats, watching, stop_sampler, max_loaded };
+        let shared = Shared { loaded: loaded.clone(), suspended: suspended.clone(), lives: lives.clone(), stats: stats.clone(), max_loaded: max_loaded.clone(), duplexes: duplexes.clone(), duplex_options: duplex_options.clone() };
+        let this = Self { commands, events, loaded, suspended, lives, idle, stats, watching, stop_sampler, max_loaded, duplexes, duplex_options };
         let handle = this.handle();
         let (stop, wake_sampler) = (this.stop_sampler.clone(), wake.clone());
         std::thread::spawn(move || run(inbox, events_tx, shared, wake, factory, serving, gpu));
@@ -338,7 +352,12 @@ impl Engine {
             idle: self.idle.clone(),
             stats: self.stats.clone(),
             watching: self.watching.clone(),
+            duplexes: self.duplexes.clone(),
         }
+    }
+
+    pub fn set_duplex_options(&self, options: specrt::duplex::service::ServiceOptions) {
+        *self.duplex_options.lock().unwrap() = options;
     }
 
     pub fn reading(&self) -> Reading {
@@ -395,6 +414,8 @@ struct Shared {
     lives: LiveList,
     stats: StatsSource,
     max_loaded: Arc<AtomicUsize>,
+    duplexes: DuplexList,
+    duplex_options: Arc<Mutex<specrt::duplex::service::ServiceOptions>>,
 }
 
 struct Slot {
@@ -490,7 +511,20 @@ fn open(
     factory: &Factory,
     serving: &ServingFactory,
     progress: &specrt::progress::Sink,
+    duplex: &specrt::duplex::service::ServiceOptions,
 ) -> Result<Opened, BackendError> {
+    if specrt::duplex::service::resolve_dir(model_id).is_some() {
+        let device = engine.overrides.get(specrt::media::DEVICE_KEY).and_then(|v| v.as_u64()).map(|d| d as usize);
+        let mut opts = duplex.clone();
+        if let Some(c) = max_ctx {
+            opts.max_ctx = c;
+        }
+        let mut native = Native::with_factory(max_ctx, factory.clone()).on_device(device);
+        native.set_duplex(opts.clone());
+        native.set_progress(Some(progress.clone()));
+        native.load(model_id)?;
+        return Ok(Opened { backend: Backend::Single(native), vision: false, thinking: Default::default(), tools: Default::default(), seqs: opts.slots, note: None, speculation: None, share: None });
+    }
     if specrt::media::resolve_dir(model_id).is_some() {
         let device = engine.overrides.get(specrt::media::DEVICE_KEY).and_then(|v| v.as_u64()).map(|d| d as usize);
         let mut native = Native::with_factory(max_ctx, factory.clone()).on_device(device);
@@ -562,6 +596,7 @@ fn publish(shared: &Shared, slots: &[Slot], parked: &[Parked]) {
 fn drop_stats(shared: &Shared, model_id: &str) {
     shared.stats.lock().unwrap().retain(|(id, _)| id != model_id);
     shared.lives.lock().unwrap().retain(|l| l.model_id != model_id);
+    shared.duplexes.lock().unwrap().retain(|(id, _)| id != model_id);
 }
 
 fn run(
@@ -696,7 +731,11 @@ fn run(
                         wake();
                     })
                 };
-                match open(&model_id, max_ctx, seqs, kv_cache_bytes, &engine, &factory, &serving, &sink) {
+                let mut duplex_options = shared.duplex_options.lock().unwrap().clone();
+                if let Some(n) = max_num_seqs {
+                    duplex_options.slots = n.max(1);
+                }
+                match open(&model_id, max_ctx, seqs, kv_cache_bytes, &engine, &factory, &serving, &sink, &duplex_options) {
                     Ok(o) => {
                         let ctx = engine.solved.as_ref().map(|s| s.context).or(max_ctx).unwrap_or(specrt::engine::DEFAULT_CTX);
                         let after = gpu();
@@ -717,11 +756,16 @@ fn run(
                             tools: o.tools,
                             vram_bytes,
                             landed,
-                            kind: o.backend.media().map(|m| m.kind).unwrap_or_default(),
+                            kind: match &o.backend { Backend::Single(n) if n.duplex().is_some() => specrt::media::ModelKind::Duplex, b => b.media().map(|m| m.kind).unwrap_or_default() },
                             media: o.backend.media(),
                         };
                         if let Some(share) = o.share {
                             shared.stats.lock().unwrap().push((model_id.clone(), share));
+                        }
+                        if let Backend::Single(n) = &o.backend
+                            && let Some(d) = n.duplex()
+                        {
+                            shared.duplexes.lock().unwrap().push((model_id.clone(), d));
                         }
                         shared.lives.lock().unwrap().push(Live::new(&model_id));
                         slots.push(Slot { info: info.clone(), backend: o.backend, reload });

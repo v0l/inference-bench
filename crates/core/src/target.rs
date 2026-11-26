@@ -127,6 +127,12 @@ pub trait Target: Send {
         None
     }
 
+    fn duplex(&self) -> Option<std::sync::Arc<specrt::duplex::service::Service>> {
+        None
+    }
+
+    fn set_duplex(&mut self, _options: specrt::duplex::service::ServiceOptions) {}
+
     fn generate_media(&mut self, _job: &specrt::media::MediaJob, _on_event: &mut dyn FnMut(specrt::media::MediaEvent) -> bool) -> Result<specrt::media::MediaOutput, BackendError> {
         Err(BackendError::new(crate::result::ErrorKind::InvalidRequest, format!("{} generates text only; image and video jobs need an image or video model", self.name())))
     }

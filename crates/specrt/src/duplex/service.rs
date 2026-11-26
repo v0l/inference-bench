@@ -141,7 +141,8 @@ impl Service {
         let dir = dir.to_path_buf();
         let frame = Duration::from_secs_f64(duplex.frame_seconds());
         let max_queue = opts.max_queue.max(1);
-        Service::spawn(frame, duplex.frame_samples, max_queue, move || {
+        let sink = crate::progress::current();
+        Service::spawn(frame, duplex.frame_samples, max_queue, move || crate::progress::with_sink(sink, || {
             let engine = Engine::load(&dir, EngineOptions { slots: opts.slots.max(1), max_ctx: opts.max_ctx, graphs: opts.graphs, device, ..EngineOptions::default() })?;
             let store = match (&opts.store_dir, opts.keep_idle_secs) {
                 (Some(root), keep) if keep > 0 => Some(SessionStore::open(root, engine.rt.session_compat())?),
@@ -159,7 +160,7 @@ impl Service {
             let mut hosted = Hosted { engine, store, keep_idle_secs: opts.keep_idle_secs };
             hosted.warm()?;
             Ok((Box::new(hosted) as Box<dyn FrameEngine>, info))
-        })
+        }))
     }
 
     pub fn start(&self, request: StartRequest) -> Result<Session> {
@@ -227,7 +228,12 @@ impl FrameEngine for Hosted {
             let index = self.engine.live(id)?.frame;
             return Ok((id, Out { audio: Vec::new(), token: None, text: String::new(), index, late: false, done: false }));
         }
-        let (id, first) = self.engine.start(request.options)?;
+        let mut options = request.options;
+        if !request.card_fields.is_empty() {
+            anyhow::ensure!(options.card.is_empty(), "give the card as text or as fields, not both");
+            options.card = self.engine.duplex.card.render(&request.card_fields)?;
+        }
+        let (id, first) = self.engine.start(options)?;
         Ok((id, out_of(first)))
     }
 

@@ -47,6 +47,7 @@ pub struct StartOptions {
     pub seed: u64,
     pub guidance: Option<f32>,
     pub greedy: bool,
+    pub temperature: Option<f32>,
     pub mode: Mode,
     pub noise: Option<RecordedNoise>,
 }
@@ -80,6 +81,8 @@ pub struct Live {
     pub seed: u64,
     pub greedy: bool,
     pub guidance: f32,
+    #[serde(default)]
+    pub temperature: Option<f32>,
     pub noise: Option<RecordedNoise>,
 }
 
@@ -307,6 +310,7 @@ impl Engine {
             text: TextState { mode: o.mode, ..TextState::new(if o.speak_first { self.duplex.sampling.forced_text } else { 0 }) },
             seed: o.seed,
             greedy: o.greedy,
+            temperature: o.temperature,
             guidance,
             noise: o.noise,
         };
@@ -470,7 +474,7 @@ impl Engine {
             return Sampling::GREEDY;
         }
         let s = &self.duplex.sampling;
-        Sampling { temperature: s.temperature, seed: (live.seed as u32) ^ (live.slot as u32).wrapping_mul(0x9e37_79b9), top_k: s.top_k, top_p: s.top_p, min_p: 0.0, logprobs: None }
+        Sampling { temperature: live.temperature.unwrap_or(s.temperature), seed: (live.seed as u32) ^ (live.slot as u32).wrapping_mul(0x9e37_79b9), top_k: s.top_k, top_p: s.top_p, min_p: 0.0, logprobs: None }
     }
 
     fn noise_inputs(&mut self, ids: &[SessionId], n: usize, with_user: bool) -> Result<()> {

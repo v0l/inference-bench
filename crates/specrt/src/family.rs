@@ -814,6 +814,7 @@ pub struct FamilyDuplex {
     pub params: std::collections::BTreeMap<String, ParamSource>,
     pub tokens: std::collections::BTreeMap<String, ParamSource>,
     pub card_template: String,
+    pub card: crate::spec::CardTemplate,
     pub state: Vec<String>,
     pub sampling: FamilyDuplexSampling,
 }
@@ -874,6 +875,7 @@ impl FamilyDuplex {
             pad: *tokens.get("pad").context("[duplex.tokens] has no pad")?,
             eop: *tokens.get("eop").context("[duplex.tokens] has no eop")?,
             card_template: self.card_template.clone(),
+            card: self.card.clone(),
             state: self.state.clone(),
             sampling: crate::spec::DuplexSampling {
                 temperature: s.temperature as f32,

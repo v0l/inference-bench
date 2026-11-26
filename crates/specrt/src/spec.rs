@@ -1516,6 +1516,42 @@ pub struct DuplexSampling {
 
 pub const DUPLEX_STATE: &[&str] = &["kv", "recurrent", "codec", "sampler", "frame"];
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CardField {
+    pub name: String,
+    pub header: String,
+    pub values: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CardTemplate {
+    pub lead: String,
+    pub fields: Vec<CardField>,
+}
+
+impl CardTemplate {
+    pub fn render(&self, given: &std::collections::BTreeMap<String, String>) -> Result<String> {
+        if let Some(k) = given.keys().find(|k| !self.fields.iter().any(|f| &f.name == *k)) {
+            bail!("card field {k:?} is not one of {:?}", self.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>());
+        }
+        let mut lines = vec![self.lead.clone()];
+        for f in &self.fields {
+            let raw = given.get(&f.name).map(|v| v.trim()).unwrap_or("");
+            let value = match f.values.is_empty() || raw.is_empty() {
+                true => raw.to_string(),
+                false => f.values.get(raw).cloned().with_context(|| format!("card field {} takes one of {:?}, not {raw:?}", f.name, f.values.keys().collect::<Vec<_>>()))?,
+            };
+            if !value.is_empty() {
+                lines.push(f.header.clone());
+                lines.push(value);
+            }
+        }
+        Ok(lines.join("\n"))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Duplex {
@@ -1535,6 +1571,8 @@ pub struct Duplex {
     pub pad: u32,
     pub eop: u32,
     pub card_template: String,
+    #[serde(default)]
+    pub card: CardTemplate,
     pub state: Vec<String>,
     pub sampling: DuplexSampling,
 }

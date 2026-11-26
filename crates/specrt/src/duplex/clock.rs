@@ -16,6 +16,7 @@ pub struct Out {
 
 pub struct StartRequest {
     pub options: super::StartOptions,
+    pub card_fields: std::collections::BTreeMap<String, String>,
     pub resume: Option<String>,
 }
 
@@ -334,7 +335,7 @@ mod tests {
         let (ftx, frx) = channel();
         let (stx, srx) = channel();
         let (ctx, crx) = channel();
-        tx.send(Event::Start(StartRequest { options: Default::default(), resume: None }, ftx, stx)).unwrap();
+        tx.send(Event::Start(StartRequest { options: Default::default(), card_fields: Default::default(), resume: None }, ftx, stx)).unwrap();
         let driver = std::thread::spawn(move || {
             let (id, first) = srx.recv().unwrap().unwrap();
             assert_eq!(first.audio, vec![9.0; 4]);

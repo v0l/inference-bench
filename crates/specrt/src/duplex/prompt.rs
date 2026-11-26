@@ -145,6 +145,18 @@ mod tests {
     }
 
     #[test]
+    fn card_fields_render_under_the_lead_with_headers_and_option_labels() {
+        let d = duplex();
+        let given: std::collections::BTreeMap<String, String> = [("name", "Haru"), ("backchannel", "mid"), ("situation", "A first chat.")].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let text = d.card.render(&given).unwrap();
+        assert_eq!(text, "You are the person described below, talking with the other person by voice.\n[Your Name]\nHaru\n[Your Backchannels]\nmoderate\n[Situation]\nA first chat.");
+        let bad: std::collections::BTreeMap<String, String> = [("mood".to_string(), "x".to_string())].into();
+        assert!(d.card.render(&bad).unwrap_err().to_string().contains("mood"));
+        let wrong: std::collections::BTreeMap<String, String> = [("gender".to_string(), "robot".to_string())].into();
+        assert!(d.card.render(&wrong).is_err());
+    }
+
+    #[test]
     fn the_card_is_a_chatml_system_turn() {
         let d = duplex();
         assert_eq!(card_text(&d, "Be calm."), "<|im_start|>system\nBe calm.<|im_end|>\n");
