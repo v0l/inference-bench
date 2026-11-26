@@ -338,7 +338,7 @@ fn click_load_node(h: &mut Harness<'static, App>) -> bool {
 fn the_load_page_offers_nvfp4_when_only_the_quantised_model_fits() {
     for (name, size) in [("quant-hint-desktop", egui::vec2(1280.0, 1000.0)), ("quant-hint-phone", egui::vec2(390.0, 2600.0))] {
         let mut h = harness_at(name, Tab::Models, size);
-        let m = real_model("Qwen3-0.6B");
+        let m = real_model("Small-0.6B");
         h.state_mut().library[0] = m.clone();
         with_gpu(&mut h, 0, 96 << 30);
         h.state_mut().open_load_dialog(&m);
@@ -370,7 +370,7 @@ fn the_load_page_offers_nvfp4_when_only_the_quantised_model_fits() {
 fn the_load_page_shows_no_quantised_hint_when_the_model_fits() {
     let mut h = harness("no-quant-hint", Tab::Models);
     with_gpu(&mut h, 0, 96 << 30);
-    let m = real_model("Qwen3-0.6B");
+    let m = real_model("Small-0.6B");
     h.state_mut().library[0] = m.clone();
     h.state_mut().open_load_dialog(&m);
     h.run();
