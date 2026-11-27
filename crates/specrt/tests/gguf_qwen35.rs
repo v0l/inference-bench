@@ -245,6 +245,9 @@ fn the_hybrid_gguf_module_decodes_ggml_rows_in_the_linear_attention_kernels() {
 
 #[test]
 fn the_hybrid_gguf_module_compiles_with_nvrtc_without_a_device() {
+    if specrt::hardware::skip_without_nvrtc() {
+        return;
+    }
     use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
     for file in ["tiny-mtp-Q4_K_M.gguf", "tiny-mtp-Q8_0.gguf"] {
         let spec = gguf_spec(file);

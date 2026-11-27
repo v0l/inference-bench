@@ -108,6 +108,9 @@ fn a_rope_on_the_wrong_axes_fails_the_reference() {
 
 #[test]
 fn every_wan_kernel_builds_from_a_description_and_compiles_with_nvrtc() {
+    if specrt::hardware::skip_without_nvrtc() {
+        return;
+    }
     let graph = DenoiserGraph::for_pipeline(&fixture()).unwrap();
     let spec = DenoiserSpec::from_pipeline(&fixture()).unwrap();
     let p = specrt::sampler::Pipeline::from_dir(&fixture()).unwrap();
