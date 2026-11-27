@@ -715,6 +715,7 @@ impl Checkpoint {
         let v = self.shaped(name, shape)?;
         match v.dtype {
             Dtype::F32 => Ok(v.data.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()),
+            Dtype::F16 => Ok(v.data.as_chunks::<2>().0.iter().map(|b| f16_to_f32(u16::from_le_bytes(*b))).collect()),
             Dtype::F8_E4M3 if v.shape.len() == 2 => Ok(self.bf16(name, &v.shape.clone())?.iter().map(|&b| bf16_to_f32(b)).collect()),
             _ => Ok(self.bf16(name, shape)?.iter().map(|&b| bf16_to_f32(b)).collect()),
         }

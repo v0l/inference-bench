@@ -132,6 +132,7 @@ pub struct CudaSpeech {
     steps: Vec<Step>,
     gemms: BTreeMap<usize, Gemm>,
     pub launches: usize,
+    first_conv: usize,
 }
 
 fn flat(n: usize) -> LaunchConfig {
@@ -167,10 +168,50 @@ impl CudaSpeech {
             gemms.insert(i, Gemm { w: stream.clone_htod(&w)?, b: stream.clone_htod(&b)? });
         }
         let launches = steps.len();
-        Ok(CudaSpeech { stream: stream.clone(), target, mel: mel.clone(), fns, steps, gemms, launches })
+        let first_conv = host.plan.ops.iter().position(|o| matches!(o, SpeechOp::Conv { .. })).unwrap_or(host.plan.ops.len());
+        Ok(CudaSpeech { stream: stream.clone(), target, mel: mel.clone(), fns, steps, gemms, launches, first_conv })
     }
 
     pub fn run(&self, pcm: &[f32]) -> Result<(Vec<f32>, Vec<f32>)> {
+        let (mel, stem) = self.exec(pcm, false)?;
+        Ok((mel, self.stream.clone_dtoh(&stem)?))
+    }
+
+    pub fn mel(&self, pcm: &[f32]) -> Result<Vec<f32>> {
+        Ok(self.exec(pcm, true)?.0)
+    }
+
+    pub fn stem(&self, mel: &[f32]) -> Result<CudaSlice<f32>> {
+        let m = &self.mel;
+        ensure!(mel.len() == m.frames * m.bins, "{} mel values, the plan reads {} frames of {} bins", mel.len(), m.frames, m.bins);
+        let mut cur = self.stream.clone_htod(mel)?;
+        for step in &self.steps {
+            if let Step::Gemm { op, shape, gelu, t_in, t_out } = step
+                && *op >= self.first_conv
+            {
+                cur = self.gemm(&cur, *op, *shape, *gelu, *t_in, *t_out)?;
+            }
+        }
+        Ok(cur)
+    }
+
+    fn gemm(&self, cur: &CudaSlice<f32>, op: usize, shape: kir::conv::ConvShape, gelu: bool, t_in: usize, t_out: usize) -> Result<CudaSlice<f32>> {
+        let s = &self.stream;
+        let k = conv_kernel(&self.target, shape, gelu)?;
+        let g = &self.gemms[&op];
+        let y = s.alloc_zeros::<f32>(t_out * shape.cout)?;
+        let zero = s.alloc_zeros::<f32>(1)?;
+        let dptr = |v: &CudaSlice<f32>| v.device_ptr(s).0;
+        let (x, st, w, b, yp) = (dptr(cur), dptr(&zero), dptr(&g.w), dptr(&g.b), dptr(&y));
+        let (bb, t, to) = (1i32, t_in as i32, t_out as i32);
+        let (gx, gy, gz) = k.line_grid(t_out);
+        let mut lb = s.launch_builder(&self.fns[&k.name()]);
+        lb.arg(&x).arg(&st).arg(&w).arg(&b).arg(&st).arg(&yp).arg(&bb).arg(&t).arg(&to);
+        unsafe { lb.launch(LaunchConfig { grid_dim: (gx, gy, gz), block_dim: (kir::conv::THREADS, 1, 1), shared_mem_bytes: k.smem_bytes() }) }?;
+        Ok(y)
+    }
+
+    fn exec(&self, pcm: &[f32], mel_only: bool) -> Result<(Vec<f32>, CudaSlice<f32>)> {
         let s = &self.stream;
         let m = &self.mel;
         let (fr, freqs, bins) = (m.frames, m.freqs(), m.bins);
@@ -181,7 +222,6 @@ impl CudaSpeech {
         let mut mel_out: Option<Vec<f32>> = None;
         let top: CudaSlice<f32> = s.alloc_zeros(1)?;
         let dptr = |v: &CudaSlice<f32>| v.device_ptr(s).0;
-        let zero = s.alloc_zeros::<f32>(1)?;
         for step in &self.steps {
             match step {
                 Step::Frames => {
@@ -193,16 +233,10 @@ impl CudaSpeech {
                     cur = y;
                 }
                 Step::Gemm { op, shape, gelu, t_in, t_out } => {
-                    let k = conv_kernel(&self.target, *shape, *gelu)?;
-                    let g = &self.gemms[op];
-                    let y = s.alloc_zeros::<f32>(t_out * shape.cout)?;
-                    let (x, st, w, b, yp) = (dptr(&cur), dptr(&zero), dptr(&g.w), dptr(&g.b), dptr(&y));
-                    let (bb, t, to) = (1i32, *t_in as i32, *t_out as i32);
-                    let (gx, gy, gz) = k.line_grid(*t_out);
-                    let mut lb = s.launch_builder(&self.fns[&k.name()]);
-                    lb.arg(&x).arg(&st).arg(&w).arg(&b).arg(&st).arg(&yp).arg(&bb).arg(&t).arg(&to);
-                    unsafe { lb.launch(LaunchConfig { grid_dim: (gx, gy, gz), block_dim: (kir::conv::THREADS, 1, 1), shared_mem_bytes: k.smem_bytes() }) }?;
-                    cur = y;
+                    if mel_only && *op >= self.first_conv {
+                        break;
+                    }
+                    cur = self.gemm(&cur, *op, *shape, *gelu, *t_in, *t_out)?;
                 }
                 Step::Power => {
                     let y = s.alloc_zeros::<f32>(fr * freqs)?;
@@ -238,7 +272,7 @@ impl CudaSpeech {
                 Step::Gelu { .. } => anyhow::bail!("an unfused gelu has no speech kernel"),
             }
         }
-        let stem = s.clone_dtoh(&cur)?;
+        let stem = cur;
         Ok((mel_out.unwrap_or_default(), stem))
     }
 }

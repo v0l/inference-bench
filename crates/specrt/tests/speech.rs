@@ -804,7 +804,7 @@ fn a_two_window_clip_seeks_by_the_last_timestamp_and_conditions_on_the_previous_
     check_run("long", &got, run);
     assert_eq!(got.windows[1].decoder_input[0], 521, "the second window starts with <|startofprev|>");
     let (pcm, _) = reference("audio.long");
-    let host = specrt::speech::transcribe::log_mel_clip(&t.speech.plan, &pcm).unwrap();
+    let host = specrt::speech::transcribe::log_mel_clip(&t.plan, &pcm).unwrap();
     assert!(max_abs(&host, &mel) < 1e-4, "the long front end matches transformers");
 }
 
@@ -864,6 +864,59 @@ fn the_row_plans_on_the_gpu_duplex_kernels_equal_the_host_rules() {
         assert_eq!(&got[i * r.vocab..(i + 1) * r.vocab], &want[..], "row {i}");
     }
     println!("gpu row plans: {} rows bit identical to the host rules", plans.len());
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn the_gpu_transcriber_matches_transformers_and_the_host_on_every_tiny_run() {
+    use specrt::speech::transcribe::Engine;
+    let ctx = cudarc::driver::CudaContext::new(0).unwrap();
+    let cache = std::env::var_os("SPECRT_CACHE").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("specrt-speech-jit"));
+    let jit = specrt::jit::Jit::new(ctx.clone(), cache).unwrap();
+    let g = specrt::speech::gpu::GpuTranscriber::open(&ctx.default_stream(), &jit, &tiny()).unwrap();
+    let meta = json(&tiny().join("reference.json"));
+    let mel = frames_major_mel("mel.full");
+    let states = g.encode(&mel, 0, g.window_frames()).unwrap();
+    let (want, _) = reference("encoder.out");
+    let got = ctx.default_stream().clone_dtoh(&states).unwrap();
+    let err = max_rel(&got, &want);
+    println!("gpu encoder.out: max rel {err:.2e}");
+    assert!(err < 1e-4, "{err}");
+    let prompt = ids(&meta["prefix"]);
+    let mut seq = g.engine.start(&states).unwrap();
+    let logits = g.engine.prefill(&mut seq, &prompt).unwrap();
+    let (want_prefix, _) = reference("prefix.logits");
+    let pe = max_rel(&logits, &want_prefix);
+    let mut rows = logits[(prompt.len() - 1) * g.rules.vocab..].to_vec();
+    for &t in &ids(&meta["greedy"])[..ids(&meta["greedy"]).len() - 1] {
+        rows.extend(g.engine.step(&mut seq, t).unwrap());
+    }
+    let (want_greedy, _) = reference("greedy.logits");
+    let raw: Vec<f32> = rows.clone();
+    let host = transcriber();
+    let mut hseq = host.engine.start(&host.encode(&mel, 0, host.window_frames()).unwrap()).unwrap();
+    let mut hrows = host.engine.prefill(&mut hseq, &prompt).unwrap()[(prompt.len() - 1) * g.rules.vocab..].to_vec();
+    for &t in &ids(&meta["greedy"])[..ids(&meta["greedy"]).len() - 1] {
+        hrows.extend(host.engine.step(&mut hseq, t).unwrap());
+    }
+    let he = max_rel(&raw, &hrows);
+    let ge = max_rel(&raw, &want_greedy);
+    println!("gpu prefix.logits max rel {pe:.2e}, greedy.logits {ge:.2e}, greedy rows against the host {he:.2e}");
+    assert!(pe < 1e-3 && ge < 1e-3 && he < 1e-3, "{pe} {ge} {he}");
+    let (lang, _) = g.detect(&states).unwrap();
+    assert_eq!(u64::from(lang), meta["detected_language"].as_u64().unwrap());
+    let o = specrt::speech::decode::Options { language: Some("en".into()), task: Some("transcribe".into()), max_new_tokens: Some(12), ..specrt::speech::decode::Options::greedy() };
+    let (pcm, _) = reference("audio.full");
+    assert_eq!(g.transcribe(&pcm, &o).unwrap().windows[0].attempts[0].tokens, ids(&meta["generate"]), "generate from the audio through the GPU front end");
+    let ts = specrt::speech::decode::Options { timestamps: true, ..specrt::speech::decode::Options::greedy() };
+    check_run("gpu timestamps", &g.transcribe_mel(&mel, &ts, &mut |_, _, _, _, _| None).unwrap(), &meta["runs"]["timestamps"]);
+    let run = &meta["runs"]["long"];
+    check_run("gpu long", &g.transcribe_mel(&frames_major_mel("mel.long"), &run_options(run), &mut |_, _, _, _, _| None).unwrap(), run);
+    let run = &meta["runs"]["fallback"];
+    let windows = run["windows"].as_array().unwrap().clone();
+    let mut forced = |w: usize, a: usize, step: usize, _: &[f32], t: f64| (t != 0.0).then(|| ids(&windows[w]["attempts"][a]["tokens"])[step]);
+    check_run("gpu fallback", &g.transcribe_mel(&frames_major_mel("mel.long"), &run_options(run), &mut forced).unwrap(), run);
+    println!("gpu transcriber: greedy, timestamps, long and fallback runs equal transformers, {} weight bytes", g.engine.weight_bytes);
 }
 
 #[test]

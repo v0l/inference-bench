@@ -1,17 +1,72 @@
 use super::decode::{Decision, Options, Rules, Segment, segments};
 use super::decoder::{HostDecoder, Sequence};
 use super::host::{HostEncoder, HostSpeech};
+use super::graph::SpeechPlan;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::path::Path;
 
-pub struct HostTranscriber {
+pub trait Engine {
+    type States;
+    type Seq;
+    fn log_mel(&self, plan: &SpeechPlan, pcm: &[f32]) -> Result<Vec<f32>> {
+        log_mel_clip(plan, pcm)
+    }
+    fn encode(&self, window: &[f32]) -> Result<Self::States>;
+    fn start(&self, states: &Self::States) -> Result<Self::Seq>;
+    fn prefill(&self, seq: &mut Self::Seq, tokens: &[u32]) -> Result<Vec<f32>>;
+    fn step(&self, seq: &mut Self::Seq, token: u32) -> Result<Vec<f32>>;
+}
+
+pub struct HostEngine {
     pub speech: HostSpeech,
     pub encoder: HostEncoder,
     pub decoder: HostDecoder,
-    pub rules: Rules,
     ck: crate::weights::Checkpoint,
 }
+
+impl HostEngine {
+    pub fn open(dir: &Path, bf16: bool) -> Result<HostEngine> {
+        let speech = HostSpeech::open(dir)?;
+        let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
+        let encoder = HostEncoder::new(&config)?;
+        let decoder = HostDecoder::open(dir, bf16)?;
+        let ck = crate::weights::Checkpoint::open(dir)?;
+        Ok(HostEngine { speech, encoder, decoder, ck })
+    }
+}
+
+impl Engine for HostEngine {
+    type States = Vec<f32>;
+    type Seq = Sequence;
+
+    fn encode(&self, window: &[f32]) -> Result<Vec<f32>> {
+        let stem = self.speech.stem(window)?;
+        self.encoder.encode(&self.ck, &stem)
+    }
+
+    fn start(&self, states: &Vec<f32>) -> Result<Sequence> {
+        let mut seq = self.decoder.new_sequence();
+        self.decoder.window(&mut seq, states)?;
+        Ok(seq)
+    }
+
+    fn prefill(&self, seq: &mut Sequence, tokens: &[u32]) -> Result<Vec<f32>> {
+        self.decoder.prefill(seq, tokens)
+    }
+
+    fn step(&self, seq: &mut Sequence, token: u32) -> Result<Vec<f32>> {
+        self.decoder.step(&mut [seq], &[token])
+    }
+}
+
+pub struct Transcriber<E: Engine> {
+    pub plan: SpeechPlan,
+    pub rules: Rules,
+    pub engine: E,
+}
+
+pub type HostTranscriber = Transcriber<HostEngine>;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Attempt {
@@ -44,57 +99,53 @@ pub fn log_mel_clip(plan: &super::SpeechPlan, pcm: &[f32]) -> Result<Vec<f32>> {
     super::host::log_mel(&p, pcm)
 }
 
+pub fn rules_for(dir: &Path, decoder: &HostDecoder) -> Result<Rules> {
+    let decode = decoder.spec.speech_decode.clone().with_context(|| format!("the {} family declares no [speech.decode] section", decoder.spec.name))?;
+    let rules = Rules::open(dir, &decode)?;
+    ensure!(rules.vocab == decoder.spec.dims.vocab, "generation rules for {} tokens, the decoder has {}", rules.vocab, decoder.spec.dims.vocab);
+    Ok(rules)
+}
+
 pub type Picker<'a> = dyn FnMut(usize, usize, usize, &[f32], f64) -> Option<u32> + 'a;
 
 impl HostTranscriber {
     pub fn open(dir: &Path, bf16: bool) -> Result<HostTranscriber> {
-        let speech = HostSpeech::open(dir)?;
-        let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
-        let encoder = HostEncoder::new(&config)?;
-        let decoder = HostDecoder::open(dir, bf16)?;
-        let decode = decoder.spec.speech_decode.clone().with_context(|| format!("the {} family declares no [speech.decode] section", decoder.spec.name))?;
-        let rules = Rules::open(dir, &decode)?;
-        ensure!(rules.vocab == decoder.spec.dims.vocab, "generation rules for {} tokens, the decoder has {}", rules.vocab, decoder.spec.dims.vocab);
-        let ck = crate::weights::Checkpoint::open(dir)?;
-        Ok(HostTranscriber { speech, encoder, decoder, rules, ck })
+        let engine = HostEngine::open(dir, bf16)?;
+        let rules = rules_for(dir, &engine.decoder)?;
+        Ok(Transcriber { plan: engine.speech.plan.clone(), rules, engine })
     }
+}
 
+impl<E: Engine> Transcriber<E> {
     pub fn window_frames(&self) -> usize {
-        self.speech.plan.mel.frames
+        self.plan.mel.frames
     }
 
     pub fn stride(&self) -> usize {
-        self.speech.plan.mel.frames / self.speech.plan.positions
+        self.plan.mel.frames / self.plan.positions
     }
 
     pub fn feature_precision(&self) -> f64 {
-        self.speech.plan.mel.hop as f64 / self.speech.plan.mel.rate
+        self.plan.mel.hop as f64 / self.plan.mel.rate
     }
 
-    pub fn encode(&self, mel: &[f32], seek: usize, frames: usize) -> Result<Vec<f32>> {
-        let bins = self.speech.plan.mel.bins;
+    pub fn encode(&self, mel: &[f32], seek: usize, frames: usize) -> Result<E::States> {
+        let bins = self.plan.mel.bins;
         let mut window = vec![0f32; self.window_frames() * bins];
         window[..frames * bins].copy_from_slice(&mel[seek * bins..(seek + frames) * bins]);
-        let stem = self.speech.stem(&window)?;
-        self.encoder.encode(&self.ck, &stem)
+        self.engine.encode(&window)
     }
 
-    fn sequence(&self, states: &[f32]) -> Result<Sequence> {
-        let mut seq = self.decoder.new_sequence();
-        self.decoder.window(&mut seq, states)?;
-        Ok(seq)
-    }
-
-    pub fn detect(&self, states: &[f32]) -> Result<(u32, Vec<f32>)> {
-        let mut seq = self.sequence(states)?;
-        let logits = self.decoder.prefill(&mut seq, &[self.rules.sot])?;
+    pub fn detect(&self, states: &E::States) -> Result<(u32, Vec<f32>)> {
+        let mut seq = self.engine.start(states)?;
+        let logits = self.engine.prefill(&mut seq, &[self.rules.sot])?;
         Ok((self.rules.detect(&logits), logits))
     }
 
-    fn generate(&self, states: &[f32], prompt: &[u32], sot_at: usize, o: &Options, temperature: f64, draw: &mut u64, at: (usize, usize), picker: &mut Picker) -> Result<(Vec<u32>, Vec<Vec<f32>>, f64)> {
+    fn generate(&self, states: &E::States, prompt: &[u32], sot_at: usize, o: &Options, temperature: f64, draw: &mut u64, at: (usize, usize), picker: &mut Picker) -> Result<(Vec<u32>, Vec<Vec<f32>>, f64)> {
         let vocab = self.rules.vocab;
-        let mut seq = self.sequence(states)?;
-        let logits = self.decoder.prefill(&mut seq, prompt)?;
+        let mut seq = self.engine.start(states)?;
+        let logits = self.engine.prefill(&mut seq, prompt)?;
         let no_speech = self.rules.no_speech_prob(&logits[sot_at * vocab..(sot_at + 1) * vocab]);
         let total = (self.rules.max_length + prompt.len().min(self.rules.prev_cutoff)).min(self.rules.max_target);
         let budget = o.max_new_tokens.map_or(total.saturating_sub(prompt.len()), |m| m.min(self.rules.max_target - prompt.len()));
@@ -113,18 +164,18 @@ impl HostTranscriber {
             if next == self.rules.eot || tokens.len() == budget {
                 break;
             }
-            row = self.decoder.step(&mut [&mut seq], &[next])?;
+            row = self.engine.step(&mut seq, next)?;
         }
         Ok((tokens, scores, no_speech))
     }
 
     pub fn transcribe(&self, pcm: &[f32], o: &Options) -> Result<Transcript> {
-        let mel = log_mel_clip(&self.speech.plan, pcm)?;
+        let mel = self.engine.log_mel(&self.plan, pcm)?;
         self.transcribe_mel(&mel, o, &mut |_, _, _, _, _| None)
     }
 
     pub fn transcribe_mel(&self, mel: &[f32], o: &Options, picker: &mut Picker) -> Result<Transcript> {
-        let bins = self.speech.plan.mel.bins;
+        let bins = self.plan.mel.bins;
         let total = mel.len() / bins;
         let span = self.window_frames();
         ensure!(o.timestamps || total <= span, "audio over one window needs timestamps to seek");

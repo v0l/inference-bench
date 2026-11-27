@@ -72,7 +72,11 @@ impl HostDecoder {
         self.weights.get(name).map(Vec::as_slice).with_context(|| format!("weight {name} is not loaded"))
     }
 
-    fn layer_w(&self, layer: Option<usize>, t: &str) -> Result<&[f32]> {
+    pub fn tensor(&self, name: &str) -> Result<&[f32]> {
+        self.w(name)
+    }
+
+    pub fn layer_w(&self, layer: Option<usize>, t: &str) -> Result<&[f32]> {
         match layer {
             Some(i) => self.w(&format!("model.layers.{i}.{t}")),
             None if t.starts_with("lm_head") => self.w(t),
@@ -156,7 +160,7 @@ impl HostDecoder {
         Ok(out)
     }
 
-    fn linear(&self, weight: Weight, layer: Option<usize>, x: &[f32], rows: usize) -> Result<Vec<f32>> {
+    pub fn linear_weights(&self, weight: Weight, layer: Option<usize>) -> Result<(Vec<f32>, Vec<f32>, usize, usize)> {
         let s = crate::gemm::linear_shape(&self.spec, weight.name());
         let names = weight.tensors(&self.spec);
         let mut w = Vec::with_capacity(s.n * s.k);
@@ -173,8 +177,23 @@ impl HostDecoder {
             at += n;
         }
         ensure!(w.len() == s.n * s.k && at == s.n, "{}: {} weights for {} x {}", weight.name(), w.len(), s.n, s.k);
-        ensure!(x.len() == rows * s.k, "{}: {} inputs for {rows} rows of {}", weight.name(), x.len(), s.k);
-        Ok(crate::speech::host::matmul(x, rows, s.k, &w, s.n, Some(&bias)))
+        Ok((w, bias, s.n, s.k))
+    }
+
+    pub fn norm_weights(&self, which: NormKind, layer: Option<usize>) -> Result<(Vec<f32>, Vec<f32>)> {
+        let t = which.tensor();
+        let g = self.layer_w(layer, t)?.to_vec();
+        let b = match self.spec.norm.kind {
+            crate::spec::NormKind::LayerNorm => self.layer_w(layer, &t.replace(".weight", ".bias"))?.to_vec(),
+            _ => vec![0f32; g.len()],
+        };
+        Ok((g, b))
+    }
+
+    fn linear(&self, weight: Weight, layer: Option<usize>, x: &[f32], rows: usize) -> Result<Vec<f32>> {
+        let (w, bias, n, k) = self.linear_weights(weight, layer)?;
+        ensure!(x.len() == rows * k, "{}: {} inputs for {rows} rows of {k}", weight.name(), x.len());
+        Ok(crate::speech::host::matmul(x, rows, k, &w, n, Some(&bias)))
     }
 
     fn act(&self, v: &mut [f32]) -> Result<()> {
