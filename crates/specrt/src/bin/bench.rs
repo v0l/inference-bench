@@ -332,6 +332,9 @@ fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize, samp
                 tokens += r.decode_rows + r.accepted;
                 *rows_per_step.entry(r.decode_rows).or_default() += 1;
                 if r.decode_rows == batch {
+                    if flags().profile && full_steps == 0 {
+                        unsafe { cudarc::driver::sys::cuProfilerStart() };
+                    }
                     full_secs += r.decode_secs;
                     full_tokens += r.decode_rows + r.accepted;
                     full_steps += 1;
@@ -350,6 +353,9 @@ fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize, samp
             }
         }
         let after = sched.exec.rt.spec_stats();
+        if flags().profile {
+            unsafe { cudarc::driver::sys::cuProfilerStop() };
+        }
         if let Some(c) = sched.draft_chooser() {
             println!("  adaptive steps per k (0..=3) {:?}", c.chosen());
         }

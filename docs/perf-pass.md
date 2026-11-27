@@ -80,6 +80,24 @@ crates/specrt/scripts/vllm27b-nsys.sh
 
 and the nsys tables for the 27B with `crates/specrt/scripts/nsys617.sh` (`SEQS=1` and `SEQS=8`). Put the numbers in `docs/perf/qwen3_5/<date>.md` with `desktop` in the title and add the row by hand with `perfpass_report.py merge`.
 
+### Per round kernel breakdown (decode at N sequences)
+
+Profile the steady decode with graph nodes traced, export to sqlite, then cut the kernel list per MTP round (at each `spec_accept`, whose `gridX` is the round's sequence count) or per plain step (at `sample_rows`). Only rounds with the asked sequence count and the modal kernel count are kept; each kernel prints its median total per round, share of the kernel sum, calls, us per call and grid, with the round wall and kernel sum on top.
+
+```bash
+~/.agents/bin/gpu-run 1 -- nsys profile -t cuda --cuda-graph-trace=node --capture-range=cudaProfilerApi --capture-range-end=none -o /tmp/r16 --force-overwrite true \
+    bench --speculative --profile --kv-gb 20 crates/specrt/tests/fixtures/qwen3.8-27b-nvfp4.toml 512 256 16
+nsys export -t sqlite -o /tmp/r16.sqlite /tmp/r16.nsys-rep
+python3 crates/specrt/scripts/nsys_rounds.py /tmp/r16.sqlite 28 16
+python3 crates/specrt/scripts/nsys_rounds.py /tmp/r16.sqlite 28 16 --plain
+```
+
+`bench --speculative --profile` starts the capture at the first full batch MTP round; `--capture-range-end=none` keeps it running through the plain (MTP off) half that follows, so one export holds both. The second command reads the plain steps after the last `spec_accept`.
+
+### Same harness as the vLLM baseline
+
+`crates/specrt/scripts/specrt_baseline.sh` serves the 27B on GPU1 with vLLM's launch equivalent and runs `vllm_baseline.py` against it; `baseline_report.py docs/qwen27-run` prints both engines side by side. See `docs/qwen3.8-27b-vllm-baseline.md`.
+
 ## Gaps from the first pass (#817)
 
 - qwen3_moe: measured on `Qwen/Qwen3-30B-A3B-FP8` (31 GB, fits the Spark gate), not the 61 GB bf16 checkpoint. specrt decode is ahead of vLLM (52.6 vs 40.3 tok/s b1, 158.7 vs 133.3 b8) but prefill is 306 tok/s against vLLM's 3959 (ratio 0.08). SGLang did not fit beside the resident Spark load at 0.45 memory fraction (needs above 0.533): not run.
