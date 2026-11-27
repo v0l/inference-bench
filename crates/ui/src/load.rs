@@ -280,6 +280,7 @@ impl LoadDialog {
         }
         if !locked && let Some(kv) = self.kv_bytes() {
             self.kv_gb = kv as f64 / GB;
+            self.pin_seqs = true;
         }
         self.pin_kv = !locked;
         self.sync();

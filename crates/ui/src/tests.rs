@@ -2655,6 +2655,7 @@ fn unlocking_keeps_the_pool_and_the_parallel_requests_the_lock_showed() {
     h.run();
     let d = h.state().load.as_ref().unwrap();
     assert!(!d.locked());
+    assert!(d.pin_seqs, "unlocking must not hand the request count back to the solver");
     assert_eq!(d.seqs, seqs);
     assert!(d.kv_bytes().unwrap().abs_diff(pool) < 1 << 20, "{} {pool}", d.kv_bytes().unwrap());
     h.get_by_label(crate::load::LOCK_LABEL).click();
