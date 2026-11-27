@@ -54,7 +54,7 @@ pub struct Speaker {
     tok: tokenizers::Tokenizer,
     norm: text::Normalize,
     back: Back,
-    voices: BTreeMap<PathBuf, Voice>,
+    voices: BTreeMap<PathBuf, crate::speech::decoder::Sequence>,
     catalogue: Catalogue,
     info: SpeakerInfo,
     voice_width: usize,
@@ -91,18 +91,22 @@ impl Speaker {
         Speaker::with(dir, Back::Cuda { head, codec, _jit: jit }, frame, "GPU")
     }
 
-    fn voice(&mut self, path: &Path) -> Result<&Voice> {
+    fn voice(&mut self, path: &Path) -> Result<()> {
         if !self.voices.contains_key(path) {
             let v = Voice::open(path, &self.tts.tts, self.voice_width)?;
-            self.voices.insert(path.to_path_buf(), v);
+            let prefix = self.tts.voice_prefix(&v)?;
+            self.voices.insert(path.to_path_buf(), prefix);
         }
-        Ok(&self.voices[path])
+        Ok(())
     }
 
-    fn chunk(&self, voice: Option<&Voice>, chunk: &plan::Chunk, seed: u64, frame: &mut u64, emit: &mut dyn FnMut(&[f32]) -> bool) -> Result<(usize, bool)> {
+    fn chunk(&self, voice: Option<&crate::speech::decoder::Sequence>, chunk: &plan::Chunk, seed: u64, frame: &mut u64, emit: &mut dyn FnMut(&[f32]) -> bool) -> Result<(usize, bool)> {
         let t = &self.tts;
         let d = t.latent_dim();
-        let (mut s, mut hidden, mut eos) = t.start(voice, &chunk.tokens)?;
+        let (mut s, mut hidden, mut eos) = match voice {
+            Some(prefix) => t.start_after(prefix, &chunk.tokens)?,
+            None => t.start(None, &chunk.tokens)?,
+        };
         let mut rule = t.rules.eos(chunk.frames_after_eos);
         let mut samples = 0;
         let noise = |frame: &mut u64| -> Vec<f32> {

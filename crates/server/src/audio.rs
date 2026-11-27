@@ -228,7 +228,7 @@ pub fn pick_speaker(state: &AppState, asked: &str) -> Result<String, ApiError> {
         .first()
         .map(|(id, _)| id.clone())
         .or_else(|| ids.first().cloned())
-        .ok_or_else(|| ApiError::not_found("no text to speech model is configured; add a Phonon model folder to the server config").with_code("model_not_found", "model"))
+        .ok_or_else(|| ApiError::not_found("no text to speech model is configured; add a text to speech model folder to the server config").with_code("model_not_found", "model"))
 }
 
 type Frames = tokio::sync::mpsc::Receiver<Result<Vec<f32>, String>>;
