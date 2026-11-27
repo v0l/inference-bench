@@ -664,7 +664,7 @@ fn the_padded_line_conv_is_its_own_kernel_and_refuses_a_wide_pad() {
     let b = kir::conv::ConvKernel::new(&t, padded, kir::conv::Prologue::None, e).unwrap();
     assert_ne!(a.name(), b.name());
     let src = kir::cuda::emit_line(&[a, b]).unwrap();
-    assert!(src.contains("true, -1>(x, st") && src.contains("true, 1>(x, st"), "causal convs keep PAD -1, the stem gets PAD 1");
+    assert!(src.contains("true, -1, 0>(x, st") && src.contains("true, 1, 0>(x, st"), "causal convs keep PAD -1, the stem gets PAD 1, neither has an input activation");
     assert!(kir::conv::ConvKernel::new(&t, kir::conv::ConvShape::padded(64, 64, 3, 1, 3), kir::conv::Prologue::None, e).is_err());
 }
 

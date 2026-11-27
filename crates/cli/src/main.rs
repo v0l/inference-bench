@@ -562,6 +562,10 @@ fn codec_kernels_command(path: &Path, target: Option<&str>, frames: usize, sessi
     };
     let frames = frames.max(1);
     for (name, stack, steps) in [("encoder", &plan.encoder, frames * plan.frame_samples), ("decoder", &plan.decoder, frames)] {
+        if stack.empty() {
+            println!("== codec {} has no {name}\n", plan.graph);
+            continue;
+        }
         let p = specrt::codec::compile::plan(stack, steps, sessions.max(1))?;
         let kernels = p.kernels(&target)?;
         println!("== codec {} {name}, {frames} frame(s), {} session(s), {} weights, {} conv kernels", plan.graph, sessions.max(1), stack.params(), kernels.len());
