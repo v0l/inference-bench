@@ -1,5 +1,7 @@
 pub mod plan;
+pub mod service;
 pub mod text;
+pub mod voices;
 
 use super::decoder::{HostDecoder, Sequence};
 use crate::flow_head::{FlowHead, HostHead};

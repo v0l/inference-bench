@@ -20,6 +20,7 @@ pub enum ModelKind {
     Video,
     Duplex,
     Transcription,
+    Speech,
 }
 
 impl ModelKind {
@@ -30,6 +31,7 @@ impl ModelKind {
             ModelKind::Video => "video",
             ModelKind::Duplex => "duplex",
             ModelKind::Transcription => "transcription",
+            ModelKind::Speech => "speech",
         }
     }
 
@@ -40,6 +42,7 @@ impl ModelKind {
             "video" => Some(ModelKind::Video),
             "duplex" => Some(ModelKind::Duplex),
             "transcription" => Some(ModelKind::Transcription),
+            "speech" => Some(ModelKind::Speech),
             _ => None,
         }
     }
@@ -578,8 +581,8 @@ mod tests {
 
     #[test]
     fn every_kind_label_parses_back_and_the_old_ones_keep_their_names() {
-        let kinds = [ModelKind::Text, ModelKind::Image, ModelKind::Video, ModelKind::Duplex, ModelKind::Transcription];
-        assert_eq!(kinds.map(|k| k.label()), ["text", "image", "video", "duplex", "transcription"]);
+        let kinds = [ModelKind::Text, ModelKind::Image, ModelKind::Video, ModelKind::Duplex, ModelKind::Transcription, ModelKind::Speech];
+        assert_eq!(kinds.map(|k| k.label()), ["text", "image", "video", "duplex", "transcription", "speech"]);
         for k in kinds {
             assert_eq!(ModelKind::parse(k.label()), Some(k));
             assert_eq!(serde_json::to_value(k).unwrap(), serde_json::json!(k.label()));

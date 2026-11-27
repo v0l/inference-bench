@@ -1603,9 +1603,19 @@ pub struct Tts {
     pub conditions: String,
     pub frame_budget: String,
     pub language: String,
+    #[serde(default)]
+    pub voices: TtsVoices,
     pub params: std::collections::BTreeMap<String, f64>,
     pub tokens: std::collections::BTreeMap<String, f64>,
     pub condition: TtsCondition,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TtsVoices {
+    pub repo: String,
+    pub catalogue: String,
+    pub default: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
