@@ -270,6 +270,14 @@ pub fn nvrtc_present() -> bool {
     unsafe { cudarc::nvrtc::sys::is_culib_present() }
 }
 
+pub fn skip_without_nvrtc() -> bool {
+    let missing = !nvrtc_present();
+    if missing {
+        eprintln!("nvrtc not found, skipped");
+    }
+    missing
+}
+
 pub fn driver_version() -> Option<(u32, u32)> {
     if !cuda_present() {
         return None;

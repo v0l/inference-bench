@@ -191,8 +191,10 @@ fn the_patchify_layout_matches_the_pipeline_unpatchify() {
 }
 
 #[test]
-#[ignore = "needs CUDA nvrtc"]
 fn the_denoiser_modules_compile_with_nvrtc_for_sm_120() {
+    if specrt::hardware::skip_without_nvrtc() {
+        return;
+    }
     let graph = DenoiserGraph::embedded();
     let s = spec();
     let plan = sampling_plan(true);

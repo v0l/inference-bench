@@ -103,6 +103,9 @@ fn the_option_adds_only_the_ggml_expert_kernels_and_leaves_the_rest_of_the_modul
 
 #[test]
 fn the_ggml_expert_module_compiles_with_nvrtc_without_a_device() {
+    if specrt::hardware::skip_without_nvrtc() {
+        return;
+    }
     use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
     for file in FILES {
         let module = Module::generate(&spec(file, true), 256).unwrap();
@@ -136,6 +139,9 @@ fn each_expert_of_a_ggml_stack_is_one_fixed_size_slot_for_the_expert_cache() {
 
 #[test]
 fn the_pointer_table_gets_ggml_table_kernels_that_resolve_slots_and_read_bias_by_expert_id() {
+    if specrt::hardware::skip_without_nvrtc() {
+        return;
+    }
     use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
     let mut s = spec(FILES[0], true);
     s.runtime.offload.pointer_table = true;
