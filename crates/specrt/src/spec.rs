@@ -1013,8 +1013,19 @@ pub struct Dims {
     pub logit_scale: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub positions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<NamedHead>,
     #[serde(skip)]
     pub head_rows: Option<std::ops::Range<usize>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedHead {
+    pub tensor: String,
+    pub rows: usize,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bias: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1465,6 +1476,8 @@ pub struct Spec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speech_decode: Option<crate::family::SpeechDecode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tts: Option<Tts>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtp: Option<Mtp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<crate::vision::Vision>,
@@ -1575,6 +1588,43 @@ pub struct Cross {
     pub source: String,
     pub rows: usize,
     pub state: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tts {
+    pub latent: String,
+    pub latent_mask: String,
+    pub voice: String,
+    pub voice_mask: String,
+    pub voice_tensor: String,
+    pub voice_layout: String,
+    pub bos: String,
+    pub conditions: String,
+    pub frame_budget: String,
+    pub language: String,
+    pub params: std::collections::BTreeMap<String, f64>,
+    pub tokens: std::collections::BTreeMap<String, f64>,
+    pub condition: TtsCondition,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TtsCondition {
+    pub lut: String,
+    pub lut_proj: String,
+    pub sine_proj: String,
+    pub params: std::collections::BTreeMap<String, f64>,
+}
+
+impl Tts {
+    pub fn param(&self, name: &str) -> Result<f64> {
+        self.params.get(name).copied().with_context(|| format!("[tts.params] has no {name}"))
+    }
+
+    pub fn token(&self, name: &str) -> Result<u32> {
+        self.tokens.get(name).map(|v| *v as u32).with_context(|| format!("[tts.tokens] has no {name}"))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2252,6 +2302,13 @@ impl Spec {
         Ok(spec)
     }
 
+    pub fn from_hf_config_tts(json: &str) -> Result<Self> {
+        let spec = Self::duplex_in(&crate::family::active(), json)?;
+        ensure!(spec.tts.is_some(), "the {} family declares no [tts] section, so it does not speak", spec.name);
+        ensure!(spec.inputs.is_some() && spec.dims.head.is_some(), "the {} family speaks through [inputs] and a named [embedding] head", spec.name);
+        Ok(spec)
+    }
+
     fn duplex_in(registry: &crate::family::Registry, json: &str) -> Result<Self> {
         let spec = Self::hf_config(registry, json, true)?;
         spec.validate()?;
@@ -2616,6 +2673,7 @@ impl Spec {
                 logit_softcap: hf.final_logit_softcapping,
                 logit_scale: multiplier(&family.multipliers.logits_divisor).filter(|d| *d > 0.0).map(|d| 1.0 / d),
                 positions: family.embedding.positions.clone(),
+                head: family.embedding.head.clone().map(|tensor| NamedHead { tensor, rows: family.embedding.head_rows.unwrap_or(1), bias: family.embedding.head_bias }),
                 head_rows: None,
             },
             layers: Layers { count: hf.num_hidden_layers, window: hf.sliding_window.filter(|_| pattern.iter().any(|b| b.windowed())), pattern, split: family.blocks.split, shared_tail: family.blocks.shared_tail_key.as_deref().and_then(|k| value.get(k)?.as_u64()).unwrap_or(0) as usize },
@@ -2689,6 +2747,7 @@ impl Spec {
             duplex: family.duplex.read(&outer)?,
             cross: family.cross.read(&value)?,
             speech_decode: family.speech.decode.clone(),
+            tts: family.tts.read(&outer)?,
             tensors: family.tensors.clone(),
             vision: if strict { crate::vision::Vision::from_hf_config(json)? } else { None },
             state: if family.state.is_empty() { crate::state::stock() } else { family.state.clone() },
@@ -2883,6 +2942,9 @@ impl Spec {
     }
 
     pub fn head_rows(&self) -> std::ops::Range<usize> {
+        if let Some(h) = &self.dims.head {
+            return 0..h.rows;
+        }
         self.dims.head_rows.clone().unwrap_or(0..self.dims.vocab)
     }
 

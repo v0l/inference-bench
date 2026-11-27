@@ -9,6 +9,7 @@ pub struct HostDecoder {
     pub prefill: Plan,
     pub decode: Plan,
     weights: BTreeMap<String, Vec<f32>>,
+    inputs: Vec<kir::Kernel>,
     pub bf16: bool,
 }
 
@@ -20,9 +21,16 @@ pub struct Sequence {
     pub len: usize,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct Out {
+    pub logits: Vec<f32>,
+    pub hidden: Vec<f32>,
+}
+
 struct Rows<'a> {
     seqs: Vec<&'a mut Sequence>,
     tokens: Vec<Vec<u32>>,
+    streams: BTreeMap<String, Vec<f32>>,
 }
 
 fn bf16_round(v: f32) -> f32 {
@@ -38,7 +46,11 @@ impl HostDecoder {
     }
 
     pub fn load(spec: Spec, ck: &Checkpoint, bf16: bool) -> Result<HostDecoder> {
-        ensure!(spec.cross.is_some(), "the {} spec has no [cross] section", spec.name);
+        HostDecoder::load_with(spec, ck, bf16, BTreeMap::new())
+    }
+
+    pub fn load_with(spec: Spec, ck: &Checkpoint, bf16: bool, extra: BTreeMap<String, Vec<f32>>) -> Result<HostDecoder> {
+        ensure!(spec.cross.is_some() || spec.inputs.is_some(), "the {} spec has neither a [cross] section nor [inputs]", spec.name);
         ensure!(spec.attention.kv_heads == spec.attention.heads, "the host decoder runs equal query and key heads");
         let prefill = Plan::build(&spec, Phase::Prefill, true);
         let decode = Plan::build(&spec, Phase::Decode, true);
@@ -58,6 +70,10 @@ impl HostDecoder {
         names.dedup();
         let mut weights = BTreeMap::new();
         for n in names {
+            if let Some(v) = extra.get(&n) {
+                weights.insert(n, v.clone());
+                continue;
+            }
             let shape = ck.shape_of(&n).with_context(|| format!("the {} plan reads {n}", spec.name))?;
             let mut v = ck.f32_values(&n, &shape)?;
             if bf16 {
@@ -65,7 +81,8 @@ impl HostDecoder {
             }
             weights.insert(n, v);
         }
-        Ok(HostDecoder { spec, prefill, decode, weights, bf16 })
+        let inputs = crate::codegen::input_kernels(&spec, &kir::Target::sm_120())?;
+        Ok(HostDecoder { spec, prefill, decode, weights, inputs, bf16 })
     }
 
     fn w(&self, name: &str) -> Result<&[f32]> {
@@ -108,17 +125,25 @@ impl HostDecoder {
     }
 
     pub fn prefill(&self, seq: &mut Sequence, tokens: &[u32]) -> Result<Vec<f32>> {
-        let mut rows = Rows { seqs: vec![seq], tokens: vec![tokens.to_vec()] };
+        Ok(self.prefill_with(seq, tokens, BTreeMap::new())?.logits)
+    }
+
+    pub fn prefill_with(&self, seq: &mut Sequence, tokens: &[u32], streams: BTreeMap<String, Vec<f32>>) -> Result<Out> {
+        let mut rows = Rows { seqs: vec![seq], tokens: vec![tokens.to_vec()], streams };
         self.run(&self.prefill, &mut rows)
     }
 
     pub fn step(&self, seqs: &mut [&mut Sequence], tokens: &[u32]) -> Result<Vec<f32>> {
+        Ok(self.step_with(seqs, tokens, BTreeMap::new())?.logits)
+    }
+
+    pub fn step_with(&self, seqs: &mut [&mut Sequence], tokens: &[u32], streams: BTreeMap<String, Vec<f32>>) -> Result<Out> {
         ensure!(seqs.len() == tokens.len(), "{} sequences and {} tokens", seqs.len(), tokens.len());
-        let mut rows = Rows { seqs: seqs.iter_mut().map(|s| &mut **s).collect(), tokens: tokens.iter().map(|t| vec![*t]).collect() };
+        let mut rows = Rows { seqs: seqs.iter_mut().map(|s| &mut **s).collect(), tokens: tokens.iter().map(|t| vec![*t]).collect(), streams };
         self.run(&self.decode, &mut rows)
     }
 
-    fn run(&self, plan: &Plan, rows: &mut Rows) -> Result<Vec<f32>> {
+    fn run(&self, plan: &Plan, rows: &mut Rows) -> Result<Out> {
         let h = self.spec.dims.hidden;
         let total: usize = rows.tokens.iter().map(Vec::len).sum();
         let mut bufs: BTreeMap<Buf, Vec<f32>> = BTreeMap::new();
@@ -137,7 +162,8 @@ impl HostDecoder {
         for (s, t) in rows.seqs.iter_mut().zip(&rows.tokens) {
             s.len += t.len();
         }
-        bufs.remove(&Buf::Logits).context("the plan wrote no logits")
+        let hidden = bufs.remove(&Buf::XnPlanes).unwrap_or_default();
+        Ok(Out { logits: bufs.remove(&Buf::Logits).context("the plan wrote no logits")?, hidden })
     }
 
     fn norm(&self, which: NormKind, layer: Option<usize>, x: &[f32]) -> Result<Vec<f32>> {
@@ -299,6 +325,7 @@ impl HostDecoder {
             }
             Op::KvRope | Op::DecodeRope => {
                 let i = layer.context("the kv write runs inside a layer")?;
+                self.rope(rows, bufs, i)?;
                 let qkv = bufs[&Buf::Qkv].clone();
                 for (s, part) in rows.seqs.iter_mut().zip(Self::per_seq(&rows.tokens, &qkv, 3 * qd)) {
                     for row in part.chunks(3 * qd) {
@@ -331,8 +358,79 @@ impl HostDecoder {
                 }
                 bufs.insert(Buf::AttnPlanes, out);
             }
+            Op::Input { node } => self.input(node as usize, rows, bufs)?,
             ref other => bail!("the host decoder does not run {}", other.label()),
         }
+        Ok(())
+    }
+
+    fn rope(&self, rows: &Rows, bufs: &mut BTreeMap<Buf, Vec<f32>>, layer: usize) -> Result<()> {
+        if self.spec.nope(layer) {
+            return Ok(());
+        }
+        let a = &self.spec.attention;
+        let (hd, qd) = (a.head_dim, self.spec.q_dim());
+        let rot = self.spec.rotary_dim();
+        let theta = self.spec.rope.theta.context("the spec has no rope theta")?;
+        ensure!(self.spec.rope.scaling.is_none() && self.spec.rope.mrope.is_none(), "the host decoder runs plain rope");
+        let half = rot / 2;
+        let inv: Vec<f64> = (0..half).map(|i| 1.0 / theta.powf(2.0 * i as f64 / rot as f64)).collect();
+        let qkv = bufs.get_mut(&Buf::Qkv).context("rope reads qkv")?;
+        let mut r = 0;
+        for (s, t) in rows.seqs.iter().zip(&rows.tokens) {
+            for p in s.len..s.len + t.len() {
+                let row = &mut qkv[r * 3 * qd..(r + 1) * 3 * qd];
+                for part in 0..2 {
+                    for head in 0..qd / hd {
+                        let v = &mut row[part * qd + head * hd..part * qd + (head + 1) * hd];
+                        for (i, f) in inv.iter().enumerate() {
+                            let (sin, cos) = ((p as f64) * f).sin_cos();
+                            let (a, b) = match self.spec.rope.style {
+                                crate::spec::RopeStyle::Pairs => (2 * i, 2 * i + 1),
+                                crate::spec::RopeStyle::Neox => (i, i + half),
+                            };
+                            let (x, y) = (v[a], v[b]);
+                            v[a] = (f64::from(x) * cos - f64::from(y) * sin) as f32;
+                            v[b] = (f64::from(y) * cos + f64::from(x) * sin) as f32;
+                        }
+                    }
+                }
+                r += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn input(&self, node: usize, rows: &Rows, bufs: &mut BTreeMap<Buf, Vec<f32>>) -> Result<()> {
+        let p = self.spec.inputs.as_ref().context("an input node needs [inputs]")?;
+        let n = &p.node[node];
+        let kernel = self.inputs.get(node).context("the input node has no kernel")?;
+        let kir::Body::Seq(kir::recur::SeqBody::GroupMap(g)) = &kernel.body else { bail!("input node {node} ({}) is not a group_map kernel", kernel.name) };
+        let total: usize = rows.tokens.iter().map(Vec::len).sum();
+        let x_in = bufs[&Buf::X].clone();
+        let mut owned: Vec<Vec<f32>> = Vec::new();
+        let mut out_at = None;
+        for param in &kernel.params {
+            let v = match n.bind.get(param.name) {
+                Some(crate::graph::Bind::Weight { weight, .. }) => self.w(weight)?.to_vec(),
+                Some(crate::graph::Bind::Buffer { buffer }) if buffer == "x" && param.access == kir::Access::Write => {
+                    out_at = Some(owned.len());
+                    x_in.clone()
+                }
+                Some(crate::graph::Bind::Buffer { buffer }) if buffer == "x" => x_in.clone(),
+                Some(crate::graph::Bind::Buffer { buffer }) => match rows.streams.get(buffer) {
+                    Some(v) => v.clone(),
+                    None => vec![0.0; total * p.width_of(buffer).with_context(|| format!("input buffer {buffer} has no width"))?],
+                },
+                other => bail!("input node {node} binds {} to {other:?}, which the host does not run", param.name),
+            };
+            owned.push(v);
+        }
+        let groups = crate::state::dim(&self.spec, &n.grid[0])?;
+        let mut views: Vec<&mut [f32]> = owned.iter_mut().map(|v| v.as_mut_slice()).collect();
+        g.eval(&kernel.params, (groups, total), &mut views).map_err(|e| anyhow::anyhow!("input node {node} ({}): {e}", kernel.name))?;
+        let at = out_at.context("the input node writes no x")?;
+        bufs.insert(Buf::X, std::mem::take(&mut owned[at]));
         Ok(())
     }
 }

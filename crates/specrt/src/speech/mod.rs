@@ -7,6 +7,7 @@ pub mod graph;
 pub mod host;
 pub mod service;
 pub mod transcribe;
+pub mod tts;
 
 pub use graph::{SpeechOp, SpeechPlan};
 pub use host::HostSpeech;

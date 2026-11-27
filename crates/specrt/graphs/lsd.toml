@@ -1,0 +1,382 @@
+name = "lsd"
+kind = "flow-head-graph"
+frame = ["hidden", "noise"]
+constants = ["latent_mean", "latent_std"]
+vectors = ["latent_mean", "latent_std"]
+
+[scalars]
+s = "step / num_steps"
+t = "(step + 1) / num_steps"
+h_step = "1 / num_steps"
+
+[symbols]
+mod3 = "3 * hidden"
+mod2 = "2 * hidden"
+
+[[input]]
+name = "hidden"
+rows = "seqs"
+cols = "cond"
+
+[[input]]
+name = "noise"
+rows = "seqs"
+cols = "latent_dim"
+
+[[input]]
+name = "s"
+rows = "seqs"
+cols = "1"
+
+[[input]]
+name = "t"
+rows = "seqs"
+cols = "1"
+
+[[input]]
+name = "h_step"
+rows = "seqs"
+cols = "1"
+
+[[output]]
+name = "latent"
+rows = "seqs"
+cols = "latent_dim"
+
+[[output]]
+name = "codec"
+rows = "seqs"
+cols = "latent_dim"
+
+[[buffer]]
+name = "hidden_planes"
+rows = "seqs"
+cols = "cond"
+planes = true
+
+[[buffer]]
+name = "cond_emb"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "s_freq"
+rows = "seqs"
+cols = "freq"
+planes = true
+
+[[buffer]]
+name = "s_mid"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "s_act"
+rows = "seqs"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "s_out"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "s_emb"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "t_freq"
+rows = "seqs"
+cols = "freq"
+planes = true
+
+[[buffer]]
+name = "t_mid"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "t_act"
+rows = "seqs"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "t_out"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "t_emb"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "c"
+rows = "seqs"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "z"
+rows = "seqs"
+cols = "latent_dim"
+
+[[buffer]]
+name = "z_planes"
+rows = "seqs"
+cols = "latent_dim"
+planes = true
+
+[[buffer]]
+name = "x"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "xn"
+rows = "seqs"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "mod"
+rows = "seqs"
+cols = "mod3"
+
+[[buffer]]
+name = "mid"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "act"
+rows = "seqs"
+cols = "hidden"
+planes = true
+
+[[buffer]]
+name = "branch"
+rows = "seqs"
+cols = "hidden"
+
+[[buffer]]
+name = "mod_out"
+rows = "seqs"
+cols = "mod2"
+
+[[buffer]]
+name = "u"
+rows = "seqs"
+cols = "latent_dim"
+
+[[head]]
+op = "timestep"
+table = "time_embed.0.freqs"
+in = "s"
+out = "s_freq"
+
+[[head]]
+op = "linear"
+weight = "time_embed.0.mlp.0"
+bias = true
+in = "s_freq"
+out = "s_mid"
+rows = "seqs"
+
+[[head]]
+op = "silu_split"
+in = "s_mid"
+out = "s_act"
+rows = "seqs"
+
+[[head]]
+op = "linear"
+weight = "time_embed.0.mlp.2"
+bias = true
+in = "s_act"
+out = "s_out"
+rows = "seqs"
+
+[[head]]
+op = "rms_norm"
+weight = "time_embed.0.mlp.3.alpha"
+eps = "rms_eps"
+in = "s_out"
+out = "s_emb"
+rows = "seqs"
+
+[[head]]
+op = "timestep"
+table = "time_embed.1.freqs"
+in = "t"
+out = "t_freq"
+
+[[head]]
+op = "linear"
+weight = "time_embed.1.mlp.0"
+bias = true
+in = "t_freq"
+out = "t_mid"
+rows = "seqs"
+
+[[head]]
+op = "silu_split"
+in = "t_mid"
+out = "t_act"
+rows = "seqs"
+
+[[head]]
+op = "linear"
+weight = "time_embed.1.mlp.2"
+bias = true
+in = "t_act"
+out = "t_out"
+rows = "seqs"
+
+[[head]]
+op = "rms_norm"
+weight = "time_embed.1.mlp.3.alpha"
+eps = "rms_eps"
+in = "t_out"
+out = "t_emb"
+rows = "seqs"
+
+[[head]]
+op = "split"
+in = "hidden"
+out = "hidden_planes"
+rows = "seqs"
+
+[[head]]
+op = "linear"
+weight = "cond_embed"
+bias = true
+in = "hidden_planes"
+out = "cond_emb"
+rows = "seqs"
+
+[[head]]
+op = "map"
+out = "c"
+rows = "seqs"
+expr = "silu(cond_emb + (s_emb + t_emb) / 2)"
+
+[[start]]
+op = "copy"
+in = "noise"
+out = "z"
+rows = "seqs"
+
+[[head]]
+op = "split"
+in = "z"
+out = "z_planes"
+rows = "seqs"
+
+[[head]]
+op = "linear"
+weight = "input_proj"
+bias = true
+in = "z_planes"
+out = "x"
+rows = "seqs"
+
+[[block]]
+name = "res_blocks"
+prefix = "res_blocks"
+count = "layers"
+
+[[block.node]]
+op = "linear"
+weight = "adaLN_modulation.1"
+bias = true
+in = "c"
+out = "mod"
+rows = "seqs"
+
+[[block.node]]
+op = "modulate"
+norm = "layer"
+weight = "in_ln"
+in = "x"
+out = "xn"
+rows = "seqs"
+set = "mod"
+shift = 0
+scale = 1
+
+[[block.node]]
+op = "linear"
+weight = "mlp.0"
+bias = true
+in = "xn"
+out = "mid"
+rows = "seqs"
+
+[[block.node]]
+op = "silu_split"
+in = "mid"
+out = "act"
+rows = "seqs"
+
+[[block.node]]
+op = "linear"
+weight = "mlp.2"
+bias = true
+in = "act"
+out = "branch"
+rows = "seqs"
+
+[[block.node]]
+op = "gated_add"
+in = "branch"
+rows = "seqs"
+set = "mod"
+gate = 2
+
+[[tail]]
+op = "linear"
+weight = "final_layer.adaLN_modulation.1"
+bias = true
+in = "c"
+out = "mod_out"
+rows = "seqs"
+
+[[tail]]
+op = "modulate"
+norm = "layer"
+in = "x"
+out = "xn"
+rows = "seqs"
+set = "mod_out"
+shift = 0
+scale = 1
+
+[[tail]]
+op = "linear"
+weight = "final_layer.linear"
+bias = true
+in = "xn"
+out = "u"
+rows = "seqs"
+
+[[tail]]
+op = "map"
+out = "z"
+rows = "seqs"
+expr = "z + h_step * u"
+
+[[finish]]
+op = "map"
+out = "latent"
+rows = "seqs"
+expr = "z"
+
+[[finish]]
+op = "map"
+out = "codec"
+rows = "seqs"
+expr = "z * latent_std + latent_mean"

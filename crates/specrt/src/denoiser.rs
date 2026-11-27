@@ -72,6 +72,8 @@ pub struct DitNode {
     pub norm: Option<String>,
     #[serde(default)]
     pub expr: Option<String>,
+    #[serde(default)]
+    pub eps: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -119,6 +121,8 @@ pub struct DenoiserGraph {
     pub scalars: BTreeMap<String, String>,
     #[serde(default)]
     pub constants: Vec<String>,
+    #[serde(default)]
+    pub vectors: Vec<String>,
     #[serde(default)]
     pub start: Vec<DitNode>,
     #[serde(default)]
@@ -317,7 +321,8 @@ impl DitNode {
             "split" => DitOp::Split { from: from()?, into: into()?, rows: self.rows()?, act: false },
             "silu_split" => DitOp::Split { from: from()?, into: into()?, rows: self.rows()?, act: true },
             "copy" => DitOp::Copy { from: from()?, into: into()?, rows: self.rows()? },
-            "timestep" => DitOp::TimestepEmbed { from: from()?, into: into()? },
+            "timestep" => DitOp::TimestepEmbed { from: from()?, into: into()?, table: self.table.as_deref().map(|t| intern(&full(t))) },
+            "rms_norm" => DitOp::RmsNorm { from: from()?, into: into()?, rows: self.rows()?, weight: intern(&full(self.need(&self.weight, "weight")?)), eps: intern(self.eps.as_deref().unwrap_or("norm_eps")) },
             "linear" => {
                 let w = self.need(&self.weight, "weight")?;
                 for u in &self.unbiased {
@@ -333,7 +338,7 @@ impl DitNode {
                     Some("rms") => true,
                     Some(other) => bail!("modulate norm {other:?} is not layer or rms"),
                 };
-                ensure!(rms || self.weight.is_none(), "a layer norm modulate takes no weight");
+                ensure!(rms || self.weight.is_none() || self.rows()? == Stream::Seqs, "a layer norm modulate takes a weight only on session rows");
                 DitOp::Modulate { from: from()?, into: into()?, rows: self.rows()?, set: set()?, shift: self.shift.context("modulate needs shift")?, scale: self.scale.context("modulate needs scale")?, rms, weight: self.weight.as_deref().map(|w| intern(&full(w))) }
             }
             "map" => {
@@ -541,7 +546,18 @@ impl Signer<'_> {
         Ok(match *op {
             DitOp::Patchify { from, into } | DitOp::Unpatchify { from, into, .. } => sig(Class::Gather, vec![self.t(from, None)?], vec![self.t(into, None)?], 0),
             DitOp::Split { from, into, rows, .. } | DitOp::Copy { from, into, rows } => sig(Class::Elementwise, vec![self.t(from, Some(rows))?], vec![self.t(into, Some(rows))?], 0),
-            DitOp::TimestepEmbed { from, into } => sig(Class::Elementwise, vec![self.t(from, None)?], vec![self.t(into, None)?], 0),
+            DitOp::TimestepEmbed { from, into, table } => {
+                let mut reads = vec![self.t(from, None)?];
+                if let Some(t) = table {
+                    let into_t = self.t(into, None)?;
+                    reads.push(weight(t, 1, into_t.cols / 2));
+                }
+                sig(Class::Elementwise, reads, vec![self.t(into, None)?], 0)
+            }
+            DitOp::RmsNorm { from, into, rows, weight: w, .. } => {
+                let out = self.t(into, Some(rows))?;
+                sig(Class::RowReduce, vec![self.t(from, Some(rows))?, weight(w, 1, out.cols)], vec![out], 0)
+            }
             DitOp::Linear { weight: w, input, output, rows, add, bias, .. } => {
                 let (n, k) = self.linear_shape(w, input, output)?;
                 let input_t = Tensor { cols: k, ..self.t(input, Some(rows))? };
@@ -555,10 +571,13 @@ impl Signer<'_> {
                 }
                 sig(Class::Gemm, reads, vec![out], (2 * n * k) as u64)
             }
-            DitOp::Modulate { from, into, rows, set, weight: w, .. } => {
+            DitOp::Modulate { from, into, rows, set, weight: w, rms, .. } => {
                 let mut reads = vec![self.t(from, Some(rows))?, self.t(set, None)?];
                 if let Some(w) = w {
                     reads.push(weight(&format!("{w}.weight"), 1, h));
+                    if !rms {
+                        reads.push(weight(&format!("{w}.bias"), 1, h));
+                    }
                 }
                 sig(Class::RowReduce, reads, vec![self.t(into, Some(rows))?], 0)
             }
@@ -571,6 +590,7 @@ impl Signer<'_> {
                 for n in &names {
                     match name_kind(self.graph, self.spec, n) {
                         NameKind::Value => {}
+                        NameKind::Constant if self.graph.vectors.iter().any(|v| v == n) => reads.push(weight(n, 1, out.cols)),
                         NameKind::Constant => reads.push(weight(n, 1, 1)),
                         NameKind::Buffer => {
                             let t = self.t(n, Some(rows))?;
@@ -935,6 +955,19 @@ pub fn kernel_key(op: &DitOp, graph: &DenoiserGraph, spec: &DenoiserSpec) -> Res
             let s = width(set)?;
             (format!("dit_row_gated_add_{s}"), "dit_row_gated_add".into(), vec![("mod_stride".into(), s)])
         }
+        DitOp::Modulate { rms: false, rows: Stream::Seqs, set, weight, .. } => {
+            let s = width(set)?;
+            let base = if weight.is_some() { "dit_layer_modulate_w" } else { "dit_layer_modulate" };
+            (format!("{base}_{s}"), base.into(), vec![("mod_stride".into(), s)])
+        }
+        DitOp::RmsNorm { into, eps, .. } => {
+            let (w, e) = (width(into)?, spec.get(eps)?);
+            (format!("dit_rms_norm_{w}_{}", &kir::fnv_hash(&format!("{e:?}"))[..8]), "dit_rms_norm".into(), vec![("row_width".into(), w), ("row_eps".into(), e)])
+        }
+        DitOp::TimestepEmbed { table: Some(_), into, .. } => {
+            let w = width(into)?;
+            (format!("dit_timestep_table_{w}"), "dit_timestep_table".into(), vec![("freq_width".into(), w), ("freq_half".into(), w / 2.0)])
+        }
         DitOp::Map { into, expr, .. } => (format!("dit_map_{}", &kir::fnv_hash(&format!("{into} {expr}"))[..8]), "dit_map".into(), Vec::new()),
         DitOp::Modulate { .. } => ("dit_modulate".into(), "dit_modulate".into(), Vec::new()),
         DitOp::GatedAdd { .. } => ("dit_gated_add".into(), "dit_gated_add".into(), Vec::new()),
@@ -995,8 +1028,11 @@ pub fn map_description(op: &DitOp, graph: &DenoiserGraph, spec: &DenoiserSpec) -
         let src = if n == into { "p_out".to_string() } else { format!("p_{n}") };
         t.push_str(&format!("\n[[stage]]\nop = \"tile_load\"\nname = \"v_{n}\"\nsrc = \"{src}\"\n"));
     }
-    for n in scalar.iter().chain(&consts) {
+    for n in scalar.iter().chain(consts.iter().filter(|c| !graph.vectors.contains(c))) {
         t.push_str(&format!("\n[[stage]]\nop = \"tile_load\"\nname = \"v_{n}\"\nsrc = \"p_{n}\"\nlayout = \"(width):(0)\"\nat = [\"i\"]\n"));
+    }
+    for n in consts.iter().filter(|c| graph.vectors.contains(c)) {
+        t.push_str(&format!("\n[[stage]]\nop = \"tile_load\"\nname = \"v_{n}\"\nsrc = \"p_{n}\"\nlayout = \"(width):(1)\"\nat = [\"i\"]\n"));
     }
     let body = e.subst(&|n| match name_kind(graph, spec, n) {
         NameKind::Value => spec.get(n).ok().map(|v| kir::expr::Expr::Lit(format!("{v:?}"))),

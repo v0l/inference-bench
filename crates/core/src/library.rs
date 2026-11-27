@@ -248,7 +248,10 @@ pub fn specrt_support(config: &Value) -> Support {
             Ok(spec) => Support::yes("specrt", &format!("full duplex speech, {} family, served on /v1/duplex on CUDA", spec.name)),
             Err(_) => match specrt::spec::Spec::from_hf_config_speech(&text) {
                 Ok(spec) if spec.speech_decode.is_some() => Support::yes("specrt", &format!("speech to text, {} family, served on /v1/audio/transcriptions on CUDA or the CPU", spec.name)),
-                _ => Support::no("specrt", e.root_cause().to_string()),
+                _ => match specrt::spec::Spec::from_hf_config_tts(&text) {
+                    Ok(spec) => Support::yes("specrt", &format!("text to speech, {} family, runs on the CPU, no speech route yet", spec.name)),
+                    Err(_) => Support::no("specrt", e.root_cause().to_string()),
+                },
             },
         },
     }
@@ -1049,6 +1052,9 @@ mod tests {
             let engine = specrt::spec::Spec::from_hf_config(&config.to_string()).or_else(|_| specrt::spec::Spec::from_hf_config_duplex(&config.to_string())).or_else(|e| match specrt::speech::service::is_speech_config(&config.to_string()) {
                 true => specrt::spec::Spec::from_hf_config_speech(&config.to_string()),
                 false => Err(e),
+            }).or_else(|e| match specrt::speech::tts::is_tts_config(&config.to_string()) {
+                true => specrt::spec::Spec::from_hf_config_tts(&config.to_string()),
+                false => Err(e),
             });
             let s = specrt_support(config);
             assert_eq!(s.supported, engine.is_ok(), "{name}: library says {:?}, engine says {:?}", s, engine.err());
@@ -1097,6 +1103,19 @@ mod tests {
         let tiny = local_model_at(&speech.join("tiny-whisper")).unwrap();
         assert!(is_transcription(&tiny) && tiny.support_for("specrt").unwrap().supported);
         assert_eq!(tiny.model_id("specrt"), tiny.path.display().to_string(), "a local speech folder loads by its path");
+    }
+
+    #[test]
+    fn phonon_is_reported_as_text_to_speech_from_the_engine_spec() {
+        let speech = Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures/speech");
+        for path in [speech.join("phonon-31m-en.hub-92741c5.config.json"), speech.join("tiny-phonon/config.json")] {
+            let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let s = specrt_support(&config);
+            assert_eq!(s.supported, specrt::spec::Spec::from_hf_config_tts(&config.to_string()).is_ok(), "{}", path.display());
+            assert!(s.supported && s.reason.contains("text to speech"), "{}: {}", path.display(), s.reason);
+            assert!(specrt::spec::Spec::from_hf_config(&config.to_string()).is_err(), "text chat stays refused");
+            assert!(!specrt_wgpu_support(&config).supported);
+        }
     }
 
     #[test]

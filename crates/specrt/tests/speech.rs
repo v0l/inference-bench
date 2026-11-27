@@ -73,11 +73,11 @@ const TTS: &[Need] = &[
     Need { piece: "Mimi transposed conv upsampling (ratios 6, 5, 4) with an overlap tail", state: "exists as codec conv_up", evidence: Some(("specrt/src/codec/graph.rs", "\"conv_up\" =>")), slice: "e" },
     Need { piece: "Mimi depthwise transposed conv 12.5 Hz to 200 Hz upsample (groups = channels, no bias)", state: "exists: conv_up groups = channels, the line_dwup kernel", evidence: Some(("specrt/src/codec/host.rs", "pub fn lower_dw_up(")), slice: "e" },
     Need { piece: "Mimi decoder transformer at 200 Hz: 2 layers, LayerNorm, layer scale, rope pairs, sliding context 250", state: "exists: codec attention node over a per session ring KV of context steps, layer_norm node", evidence: Some(("specrt/src/codec/graph.rs", "\"attention\" =>")), slice: "e" },
-    Need { piece: "flow LM backbone: 6 layer LayerNorm transformer, packed qkv, rope pairs, GELU MLP, no bias", state: "new family file and decoder graph entries (LayerNorm kind, GELU dense MLP)", evidence: Some(("specrt/src/spec.rs", "pub enum NormKind")), slice: "f" },
-    Need { piece: "LSD flow head: adaLN res blocks with LayerNorm, two timestep embedders averaged, one step", state: "close to graphs/meanflow.toml: LayerNorm modulate, bias, rms-var timestep norm are new", evidence: Some(("specrt/src/denoiser.rs", "\"modulate\" =>")), slice: "f" },
-    Need { piece: "EOS head with threshold and frames after EOS", state: "new sampler rule", evidence: None, slice: "f" },
-    Need { piece: "voice conditioning: 125 Mimi frames through speaker_proj, prefilled before the text", state: "new input node; prefill of embedding rows exists", evidence: Some(("specrt/src/plan.rs", "Splice")), slice: "f" },
-    Need { piece: "sentence chunking and normalisation, sentencepiece tokenizer", state: "new host code", evidence: None, slice: "f" },
+    Need { piece: "flow LM backbone: 6 layer LayerNorm transformer, packed qkv, rope pairs, GELU MLP, no bias", state: "exists: specs/family-gradium_phonon_tts.toml on graphs/decoder.toml, [norm] kind = layer_norm, fused_qkv, rope interleaved, mapped gelu, named eos head", evidence: Some(("specrt/specs/family-gradium_phonon_tts.toml", "kind = \"layer_norm\"")), slice: "f" },
+    Need { piece: "LSD flow head: adaLN res blocks with LayerNorm, two timestep embedders averaged, one step", state: "exists: graphs/lsd.toml, layer modulate with weight and bias, rms_norm with alpha, stored timestep table, biased rows GEMV", evidence: Some(("specrt/graphs/lsd.toml", "expr = \"silu(cond_emb + (s_emb + t_emb) / 2)\"")), slice: "f" },
+    Need { piece: "EOS head with threshold and frames after EOS", state: "exists: [embedding] head = eos_head, speech::tts::plan::Eos from [tts.params]", evidence: Some(("specrt/src/speech/tts/plan.rs", "pub fn should_stop(&mut self, logit: f32) -> bool")), slice: "f" },
+    Need { piece: "voice conditioning: 125 Mimi frames through speaker_proj, prefilled before the text", state: "exists: [[inputs.node]] stream_replace_unbiased on the voice stream, prompt positions before the text", evidence: Some(("specrt/specs/stream_replace_unbiased.toml", "name = \"stream_replace_unbiased\"")), slice: "f" },
+    Need { piece: "sentence chunking and normalisation, sentencepiece tokenizer", state: "exists: speech::tts::text (normalisation and rewrite rules) and speech::tts::plan, tokenizer.json through tokenizers", evidence: Some(("specrt/src/speech/tts/plan.rs", "pub fn chunks(")), slice: "f" },
 ];
 
 fn engine_source(rel: &str) -> String {
@@ -116,7 +116,7 @@ fn the_engine_refuses_whisper_as_text_chat_and_says_which_ops_are_missing() {
     for m in &missing {
         println!("  {m}");
     }
-    assert_eq!(missing.len(), 2, "{missing:#?}");
+    assert_eq!(missing.len(), 0, "{missing:#?}");
     for slice in ["a", "b", "c", "e", "f"] {
         assert!(WHISPER.iter().chain(TTS).any(|n| n.slice == slice), "slice {slice} has no gap");
     }
@@ -1116,5 +1116,313 @@ fn the_gpu_log_mel_and_stem_match_transformers() {
             println!("gpu encoder.stem: max rel {err:.2e}, {} launches", gpu.launches);
             assert!(err < 1e-4, "{err}");
         }
+    }
+}
+
+fn phonon() -> PathBuf {
+    dir().join("tiny-phonon")
+}
+
+fn phonon_ref(key: &str) -> (Vec<f32>, Vec<usize>) {
+    let meta = json(&phonon().join("reference.json"));
+    let entry = &meta["files"][key];
+    let shape: Vec<usize> = entry["shape"].as_array().unwrap_or_else(|| panic!("{key}")).iter().map(|d| d.as_u64().unwrap() as usize).collect();
+    let bytes = std::fs::read(phonon().join("reference").join(entry["file"].as_str().unwrap())).unwrap();
+    let values: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+    assert_eq!(values.len(), shape.iter().product::<usize>(), "{key}");
+    (values, shape)
+}
+
+fn lsd_head(steps: Option<usize>) -> specrt::flow_head::HostHead {
+    let head = specrt::flow_head::FlowHead::from_dir(&phonon(), steps).unwrap();
+    specrt::flow_head::HostHead::load(head, &phonon()).unwrap()
+}
+
+#[test]
+fn the_lsd_flow_head_matches_transformers_with_the_recorded_noise() {
+    let host = lsd_head(None);
+    assert_eq!(host.head.graph.name, "lsd");
+    assert_eq!(host.head.steps, 1);
+    let (hidden, hshape) = phonon_ref("frames.hidden");
+    let (noise, _) = phonon_ref("noise");
+    let (want, _) = phonon_ref("frames.latent");
+    let frames = hshape[0];
+    let mut s = host.session(&vec![1.0; frames]).unwrap();
+    let got = host.frame(&mut s, &hidden, &noise).unwrap();
+    let e = max_rel(&got, &want);
+    println!("lsd head, {frames} frames as one batch: max rel {e:.2e} against transformers");
+    assert!(e < 1e-4, "{e}");
+    let mut one = host.session(&[1.0]).unwrap();
+    let d = noise.len() / frames;
+    let h = hidden.len() / frames;
+    for f in 0..frames {
+        let row = host.frame(&mut one, &hidden[f * h..(f + 1) * h], &noise[f * d..(f + 1) * d]).unwrap();
+        assert_eq!(row, got[f * d..(f + 1) * d], "frame {f} alone equals the batch");
+    }
+    let two = lsd_head(Some(2));
+    let (want2, _) = phonon_ref("frames.steps2");
+    let mut s2 = two.session(&[1.0]).unwrap();
+    let got2 = two.frame(&mut s2, &hidden[..h], &noise[..d]).unwrap();
+    let e2 = max_rel(&got2, &want2[..d]);
+    println!("lsd head, two steps on the first frame: max rel {e2:.2e}");
+    assert!(e2 < 1e-4, "{e2}");
+    assert!(max_rel(&got2, &got[..d]) > 1e-3, "two steps move the latent away from one");
+}
+
+fn phonon_tts() -> specrt::speech::tts::HostTts {
+    specrt::speech::tts::HostTts::open(&phonon()).unwrap()
+}
+
+fn phonon_voice(t: &specrt::speech::tts::HostTts) -> specrt::speech::tts::Voice {
+    let w = t.spec.inputs.as_ref().unwrap().width_of(&t.tts.voice).unwrap();
+    specrt::speech::tts::Voice::open(&phonon().join("voice.safetensors"), &t.tts, w).unwrap()
+}
+
+fn recorded_tokens() -> Vec<u32> {
+    ids(&json(&phonon().join("reference.json"))["tokens"])
+}
+
+#[test]
+fn the_summed_default_conditions_match_transformers() {
+    let raw = specrt::weights::Checkpoint::open(&phonon()).unwrap();
+    let spec = phonon_spec();
+    let got = specrt::speech::tts::conditions(spec.tts.as_ref().unwrap(), &raw, spec.dims.hidden).unwrap();
+    let (want, _) = phonon_ref("conditions");
+    let e = max_rel(&got, &want);
+    println!("conditions: max rel {e:.2e}");
+    assert!(e < 1e-5, "{e}");
+}
+
+#[test]
+fn the_voice_prefill_and_flow_lm_steps_match_transformers() {
+    let t = phonon_tts();
+    let voice = phonon_voice(&t);
+    let meta = json(&phonon().join("reference.json"));
+    let (prompt, _) = t.prompt(Some(&voice), &recorded_tokens()).unwrap();
+    assert_eq!(prompt, ids(&meta["prompt"]), "voice placeholders, the text, then the audio BOS");
+    let (want_prefill, _) = phonon_ref("prefill.hidden");
+    let prefill = t.prefill_hidden(Some(&voice), &recorded_tokens()).unwrap();
+    let e = max_rel(&prefill, &want_prefill);
+    println!("prefill hidden over {} positions: max rel {e:.2e}", prompt.len());
+    assert!(e < 1e-3, "{e}");
+    let (hidden, hshape) = phonon_ref("frames.hidden");
+    let (eos, _) = phonon_ref("frames.eos");
+    let (latents, _) = phonon_ref("frames.latent");
+    let (noise, _) = phonon_ref("noise");
+    let (h, d) = (hshape[1], t.latent_dim());
+    let (mut s, mut hid, mut logit) = t.start(Some(&voice), &recorded_tokens()).unwrap();
+    let (mut worst_h, mut worst_e, mut worst_z) = (0f32, 0f32, 0f32);
+    for f in 0..hshape[0] {
+        worst_h = worst_h.max(max_rel(&hid, &hidden[f * h..(f + 1) * h]));
+        worst_e = worst_e.max((logit - eos[f]).abs() / eos.iter().fold(0f32, |m, v| m.max(v.abs())));
+        let frame = t.sample(&mut s, &hid, logit, &noise[f * d..(f + 1) * d]).unwrap();
+        worst_z = worst_z.max(max_rel(&frame.latent, &latents[f * d..(f + 1) * d]));
+        (hid, logit) = t.advance(&mut s, &latents[f * d..(f + 1) * d]).unwrap();
+    }
+    println!("{} frames fed the reference latents: hidden {worst_h:.2e}, eos logit {worst_e:.2e}, latent {worst_z:.2e} max rel", hshape[0]);
+    assert!(worst_h < 1e-3 && worst_e < 1e-3, "{worst_h} {worst_e}");
+    assert!(worst_z < 1e-4, "{worst_z}");
+}
+
+#[test]
+fn free_running_generation_stops_where_transformers_generate_does_and_the_codec_gives_its_audio() {
+    let t = phonon_tts();
+    let voice = phonon_voice(&t);
+    let meta = json(&phonon().join("reference.json"));
+    let (noise, _) = phonon_ref("noise");
+    let d = t.latent_dim();
+    let tail = meta["frames_after_eos"].as_u64().unwrap() as usize;
+    assert_eq!(t.rules.eos_threshold, meta["eos_threshold"].as_f64().unwrap() as f32, "the threshold comes from the config");
+    let frames = t.generate(Some(&voice), &recorded_tokens(), tail, 10, |f| noise[f * d..(f + 1) * d].to_vec()).unwrap();
+    assert_eq!(frames.len(), meta["generated_frames"].as_u64().unwrap() as usize, "EOS at frame {} then {tail} more", meta["eos_frame"]);
+    let (want_codec, _) = phonon_ref("frames.codec_latent");
+    let codec: Vec<f32> = frames.iter().flat_map(|f| f.codec.clone()).collect();
+    let e = max_rel(&codec, &want_codec);
+    println!("{} free running frames: codec latents max rel {e:.2e}", frames.len());
+    assert!(e < 1e-3, "{e}");
+    let mimi = specrt::codec::HostCodec::open(&mimi()).unwrap();
+    let audio = mimi.decode(&codec).unwrap();
+    let (want, _) = phonon_ref("audio");
+    let a = max_rel(&audio, &want);
+    println!("end to end audio through the Mimi codec: {} samples, max rel {a:.2e}", audio.len());
+    assert!(a < 1e-3, "{a}");
+    let mut early = t.rules.clone();
+    early.eos_threshold = f32::INFINITY;
+    let mut rule = early.eos(tail);
+    assert!(frames.iter().all(|f| !rule.should_stop(f.eos)), "with no threshold crossing the rule never stops");
+}
+
+#[test]
+fn a_shuffled_voice_changes_the_prefill() {
+    let t = phonon_tts();
+    let mut voice = phonon_voice(&t);
+    let (want, _) = phonon_ref("prefill.hidden");
+    let w = voice.rows.len() / voice.frames;
+    voice.rows.rotate_left(w);
+    let got = t.prefill_hidden(Some(&voice), &recorded_tokens()).unwrap();
+    assert!(max_rel(&got, &want) > 1e-2, "the voice frames reach the backbone through speaker_proj");
+}
+
+#[test]
+#[ignore = "needs nvrtc, no GPU: compiles the LSD head and the input node kernels of the real Phonon config for sm_120"]
+fn every_lsd_head_and_input_kernel_of_the_real_config_compiles_with_nvrtc() {
+    let config = json(&dir().join("phonon-31m-en.hub-92741c5.config.json"));
+    let t = kir::Target::sm_120();
+    let opts = || cudarc::nvrtc::CompileOptions { arch: Some("compute_120"), options: vec!["--std=c++17".into()], ..Default::default() };
+    for steps in [1, 2] {
+        let head = specrt::flow_head::FlowHead::from_config(&config, Some(steps)).unwrap();
+        let ks = specrt::flow_head_cuda::kernels(&head, &t, &head.gated_epilogues(1, &t).unwrap()).unwrap();
+        let src = ks.source().unwrap();
+        let ptx = cudarc::nvrtc::compile_ptx_with_opts(src.as_str(), opts()).unwrap_or_else(|e| panic!("{e:?}\n{}", src.as_str())).to_src();
+        for n in ks.names() {
+            assert!(ptx.contains(&format!(".entry {n}(")), "{n} missing from the PTX");
+        }
+        assert!(ks.names().iter().any(|n| n.ends_with("_gated_bias")), "the res block fc2 carries its bias and the gated residual");
+        println!("{steps} step: {} head kernels", ks.names().len());
+    }
+    let spec = specrt::spec::Spec::from_hf_config_tts(&config.to_string()).unwrap();
+    let inputs = specrt::codegen::input_kernels(&spec, &t).unwrap();
+    let src = kir::cuda::emit_module(&inputs).unwrap();
+    let ptx = cudarc::nvrtc::compile_ptx_with_opts(src.as_str(), opts()).unwrap_or_else(|e| panic!("{e:?}\n{}", src.as_str())).to_src();
+    for k in &inputs {
+        assert!(ptx.contains(&format!(".entry {}(", k.name)), "{} missing from the PTX", k.name);
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn the_gpu_lsd_head_matches_transformers_and_the_host() {
+    use specrt::flow_head::FlowHead;
+    use specrt::flow_head_cuda::CudaHead;
+    let ctx = cudarc::driver::CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+    let cache = std::env::var_os("SPECRT_CACHE").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("specrt-lsd-jit"));
+    let jit = specrt::jit::Jit::new(ctx.clone(), cache).unwrap();
+    let (hidden, hshape) = phonon_ref("frames.hidden");
+    let (noise, _) = phonon_ref("noise");
+    let (latents, _) = phonon_ref("frames.latent");
+    let (steps2, _) = phonon_ref("frames.steps2");
+    let host = lsd_head(None);
+    let mut hs = host.session(&vec![1.0; hshape[0]]).unwrap();
+    let host_latent = host.frame(&mut hs, &hidden, &noise).unwrap();
+    let host_codec = host.output(&hs, "codec").unwrap().to_vec();
+    let (h, d) = (hshape[1], noise.len() / hshape[0]);
+    for fuse in [true, false] {
+        let head = CudaHead::load(&stream, &jit, FlowHead::from_dir(&phonon(), None).unwrap(), &phonon(), fuse).unwrap();
+        let mut s = head.session(&vec![1.0; hshape[0]]).unwrap();
+        let got = head.frame(&mut s, &hidden, &noise).unwrap();
+        let codec = head.read(&s, "codec").unwrap();
+        let (e, eh, c) = (max_rel(&got, &latents), max_rel(&got, &host_latent), max_rel(&codec, &host_codec));
+        println!("gpu lsd head fuse {fuse}: max rel {e:.2e} against transformers, {eh:.2e} against the host, codec latent {c:.2e}, {} launches", s.launches);
+        assert!(e < 1e-4 && eh < 1e-4 && c < 1e-4, "{e} {eh} {c}");
+        let mut one = head.session(&[1.0]).unwrap();
+        let alone: Vec<f32> = (0..hshape[0]).flat_map(|f| head.frame(&mut one, &hidden[f * h..(f + 1) * h], &noise[f * d..(f + 1) * d]).unwrap()).collect();
+        assert!(max_rel(&alone, &got) < 1e-5, "one session at a time equals the batch");
+    }
+    let two = CudaHead::load(&stream, &jit, FlowHead::from_dir(&phonon(), Some(2)).unwrap(), &phonon(), true).unwrap();
+    let mut s = two.session(&[1.0]).unwrap();
+    let got = two.frame(&mut s, &hidden[..h], &noise[..d]).unwrap();
+    let e = max_rel(&got, &steps2[..d]);
+    println!("gpu lsd head two steps: max rel {e:.2e}");
+    assert!(e < 1e-4, "{e}");
+}
+
+#[test]
+fn neox_rope_or_a_dropped_bos_latent_misses_the_reference() {
+    let (want, _) = phonon_ref("prefill.hidden");
+    let mut config = json(&phonon().join("config.json"));
+    let tmp = std::env::temp_dir().join(format!("specrt-phonon-neox-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    for f in ["model.safetensors", "tokenizer.json"] {
+        std::fs::copy(phonon().join(f), tmp.join(f)).unwrap();
+    }
+    config["eos_threshold"] = 0.0.into();
+    std::fs::write(tmp.join("config.json"), config.to_string()).unwrap();
+    let mut t = specrt::speech::tts::HostTts::open(&tmp).unwrap();
+    let voice = phonon_voice(&t);
+    let good = t.prefill_hidden(Some(&voice), &recorded_tokens()).unwrap();
+    assert!(max_rel(&good, &want) < 1e-3);
+    t.decoder.spec.rope.style = specrt::spec::RopeStyle::Neox;
+    let neox = t.prefill_hidden(Some(&voice), &recorded_tokens()).unwrap();
+    let e = max_rel(&neox, &want);
+    println!("rotate half rope instead of pairs: max rel {e:.2e}");
+    assert!(e > 1e-2, "{e}");
+    t.decoder.spec.rope.style = specrt::spec::RopeStyle::Pairs;
+    let (tokens, mut streams) = t.prompt(Some(&voice), &recorded_tokens()).unwrap();
+    streams.get_mut(&t.tts.latent_mask).unwrap().iter_mut().for_each(|m| *m = 0.0);
+    let mut seq = t.decoder.new_sequence();
+    let no_bos = t.decoder.prefill_with(&mut seq, &tokens, streams).unwrap().hidden;
+    let b = max_rel(&no_bos[no_bos.len() - 32..], &want[want.len() - 32..]);
+    println!("the BOS position left as its token embedding: max rel {b:.2e} at the last position");
+    assert!(b > 1e-2, "{b}");
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn the_tiny_phonon_fixture_keeps_every_real_tensor_kind() {
+    let real = header("phonon-31m-en.header.json");
+    let bytes = std::fs::read(phonon().join("model.safetensors")).unwrap();
+    let st = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+    let names: Vec<String> = st.names().into_iter().map(str::to_string).collect();
+    let flow = |k: &String| k.starts_with("flow_lm.");
+    assert_eq!(kinds(names.iter().filter(|k| flow(k))), kinds(real.keys().filter(|k| flow(k))), "tensor kinds differ from gradium/phonon-31m-en");
+    for n in &names {
+        assert_eq!(st.tensor(n).unwrap().dtype(), safetensors::Dtype::BF16, "{n} is bf16 as in the release");
+    }
+    let voice = std::fs::read(phonon().join("voice.safetensors")).unwrap();
+    let v = safetensors::SafeTensors::deserialize(&voice).unwrap();
+    assert_eq!(v.names(), vec!["speaker_wavs"]);
+    assert_eq!(v.tensor("speaker_wavs").unwrap().dtype(), safetensors::Dtype::F32, "voices are f32 as in phonon-voices");
+}
+
+#[test]
+fn the_text_is_normalised_and_cut_into_sentence_chunks_with_their_budgets() {
+    use specrt::speech::tts::{plan, text};
+    let t = phonon_tts();
+    let tok = tokenizers::Tokenizer::from_file(phonon().join("tokenizer.json")).unwrap();
+    let norm = text::Normalize::from(t.tts.language.parse::<text::Lang>().unwrap());
+    assert_eq!(norm.apply("I am fine \u{1F600} (ok)"), "I am fine, ok,");
+    assert_eq!(norm.apply("It costs $1500 today."), "It costs 1 thousand 500 dollars today.");
+    let meta = json(&phonon().join("reference.json"));
+    let chunks = plan::chunks(&tok, meta["text"].as_str().unwrap(), &t.rules).unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].tokens, recorded_tokens(), "the chunk tokenises as transformers' processor did");
+    assert_eq!(chunks[0].frames_after_eos, 1, "more than four words keep one frame after EOS");
+    assert_eq!(chunks[0].frame_budget, ((11.0f64 / 3.0 + 2.0) * 12.5).ceil() as usize);
+    let mut small = t.rules.clone();
+    small.max_tokens = 6;
+    let parts = plan::chunks(&tok, "Hello there, how are you? I am fine. Ok", &small).unwrap();
+    assert_eq!(parts.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["Hello there, how are you?", "I am fine. Ok."]);
+    assert_eq!(parts[1].frames_after_eos, 3, "a short chunk keeps three frames after EOS");
+}
+
+fn phonon_spec() -> specrt::spec::Spec {
+    specrt::spec::Spec::from_hf_config_tts(&std::fs::read_to_string(phonon().join("config.json")).unwrap()).unwrap()
+}
+
+#[test]
+fn the_phonon_family_spec_is_a_tts_decoder_refused_as_text_chat() {
+    for path in [phonon().join("config.json"), dir().join("phonon-31m-en.hub-92741c5.config.json")] {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let err = specrt::spec::Spec::from_hf_config(&text).unwrap_err();
+        assert!(format!("{err:#}").contains("Phonon is a text to speech model"), "{}: {err:#}", path.display());
+        assert!(specrt::spec::Spec::from_hf_config_speech(&text).is_err() && specrt::spec::Spec::from_hf_config_duplex(&text).is_err());
+        let spec = specrt::spec::Spec::from_hf_config_tts(&text).unwrap_or_else(|e| panic!("{}: {e:#}", path.display()));
+        assert_eq!(spec.norm.kind, specrt::spec::NormKind::LayerNorm);
+        assert!(spec.attention.fused_qkv && !spec.attention.qkv_bias && !spec.attention.o_bias && !spec.mlp.bias);
+        assert_eq!(spec.rope.style, specrt::spec::RopeStyle::Pairs);
+        assert_eq!(spec.mlp.activation, specrt::spec::Activation::Mapped);
+        assert_eq!(spec.dims.head.as_ref().map(|h| (h.tensor.as_str(), h.rows, h.bias)), Some(("eos_head", 1, true)));
+        let tts = spec.tts.as_ref().unwrap();
+        assert_eq!((tts.token("prompt").unwrap(), tts.token("bos").unwrap(), tts.token("latent").unwrap()), (5, 4, 6));
+        for phase in [specrt::plan::Phase::Prefill, specrt::plan::Phase::Decode] {
+            let plan = specrt::plan::Plan::build(&spec, phase, true);
+            specrt::signature::validate_plan(&plan, &spec).unwrap_or_else(|e| panic!("{phase:?}: {e:#}"));
+            assert_eq!(plan.head.iter().filter(|o| matches!(o, specrt::plan::Op::Input { .. })).count(), 2, "the latent and the voice streams");
+            assert!(matches!(plan.tail.last(), Some(specrt::plan::Op::Linear { weight: specrt::plan::Weight::LmHead, .. })));
+        }
+        let lm = specrt::gemm::linear_shape(&spec, "lm_head");
+        assert_eq!((lm.n, lm.bias), (1, true), "the head is the one row EOS logit with its bias");
+        assert_eq!(specrt::plan::Weight::LmHead.tensors(&spec), ["eos_head.weight", "eos_head.bias"]);
     }
 }

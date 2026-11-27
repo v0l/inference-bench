@@ -66,9 +66,10 @@ pub enum Expr {
     Call(&'static str, Vec<Expr>),
 }
 
-const UNARY: [(&str, &str, &str); 10] = [
+const UNARY: [(&str, &str, &str); 11] = [
     ("erf", "erff", ""),
     ("floor", "floorf", "floor"),
+    ("ceil", "ceilf", "ceil"),
     ("sin", "sinf", "sin"),
     ("cos", "cosf", "cos"),
     ("tanh", "tanhf", "tanh"),
@@ -367,6 +368,7 @@ impl Expr {
                     ("min", [a, b]) => a.min(*b),
                     ("max", [a, b]) => a.max(*b),
                     ("floor", [a]) => a.floor(),
+                    ("ceil", [a]) => a.ceil(),
                     ("sin", [a]) => a.sin(),
                     ("cos", [a]) => a.cos(),
                     ("tanh", [a]) => a.tanh(),

@@ -3,7 +3,6 @@ use crate::denoiser::{DenoiserGraph, kernel_key, map_description, map_params};
 use crate::flow_head::{FlowHead, Level, load_weights};
 use crate::jit::Jit;
 use crate::plan::{DitOp, Op};
-use crate::weights::Checkpoint;
 use anyhow::{Context, Result, bail, ensure};
 use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
 use kir::gemv::{BA_ROWS_MAX_TOKENS, BA_ROWS_THREADS, Gemv, GemvKernel};
@@ -13,6 +12,8 @@ use std::sync::Arc;
 
 pub const STORE: &str = "acc";
 pub const GATED: &str = "old + g * acc";
+pub const BIASED: &str = "acc + b";
+pub const GATED_BIASED: &str = "old + g * (acc + b)";
 
 fn dit(op: &Op) -> Result<&DitOp> {
     match op {
@@ -22,7 +23,22 @@ fn dit(op: &Op) -> Result<&DitOp> {
 }
 
 pub fn rows_name(n: usize, k: usize, epilogue: &str) -> String {
-    format!("head_rows_{n}_{k}_{}", if epilogue == STORE { "store" } else { "gated" })
+    let tag = match epilogue {
+        STORE => "store",
+        GATED => "gated",
+        BIASED => "bias",
+        _ => "gated_bias",
+    };
+    format!("head_rows_{n}_{k}_{tag}")
+}
+
+fn epilogue(bias: bool, gated: bool) -> &'static str {
+    match (bias, gated) {
+        (false, false) => STORE,
+        (false, true) => GATED,
+        (true, false) => BIASED,
+        (true, true) => GATED_BIASED,
+    }
 }
 
 pub struct Kernels {
@@ -57,11 +73,12 @@ pub fn kernels(head: &FlowHead, target: &kir::Target, fused: &[BTreeSet<usize>])
     let mut rows: BTreeMap<String, GemvKernel> = BTreeMap::new();
     for op in all_ops(head) {
         let d = dit(op)?;
-        if let DitOp::Linear { weight, input, output, .. } = *d {
+        if let DitOp::Linear { weight, input, output, bias, .. } = *d {
             let (n, k) = signer.linear_shape(weight, input, output)?;
-            let name = rows_name(n, k, STORE);
+            let e = epilogue(bias, false);
+            let name = rows_name(n, k, e);
             if !rows.contains_key(&name) {
-                rows.insert(name.clone(), GemvKernel::new(target, &name, Gemv::Rows { n, k, epilogue: STORE.into() }).map_err(anyhow::Error::msg)?);
+                rows.insert(name.clone(), GemvKernel::new(target, &name, Gemv::Rows { n, k, epilogue: e.into() }).map_err(anyhow::Error::msg)?);
             }
             continue;
         }
@@ -82,11 +99,12 @@ pub fn kernels(head: &FlowHead, target: &kir::Target, fused: &[BTreeSet<usize>])
     }
     for (b, f) in head.plan.blocks.iter().zip(fused) {
         for &i in f {
-            let DitOp::Linear { weight, input, output, .. } = *dit(&b.ops[i])? else { bail!("a fused gated add follows a linear") };
+            let DitOp::Linear { weight, input, output, bias, .. } = *dit(&b.ops[i])? else { bail!("a fused gated add follows a linear") };
             let (n, k) = signer.linear_shape(weight, input, output)?;
-            let name = rows_name(n, k, GATED);
+            let e = epilogue(bias, true);
+            let name = rows_name(n, k, e);
             if !rows.contains_key(&name) {
-                rows.insert(name.clone(), GemvKernel::new(target, &name, Gemv::Rows { n, k, epilogue: GATED.into() }).map_err(anyhow::Error::msg)?);
+                rows.insert(name.clone(), GemvKernel::new(target, &name, Gemv::Rows { n, k, epilogue: e.into() }).map_err(anyhow::Error::msg)?);
             }
         }
     }
@@ -130,7 +148,7 @@ impl CudaHead {
         for n in names {
             fns.insert(n.to_string(), loaded.function(n)?);
         }
-        let ck = Checkpoint::open(dir)?;
+        let ck = head.checkpoint(dir)?;
         let mut linears = BTreeMap::new();
         let mut vectors = BTreeMap::new();
         let weight_bytes = std::cell::Cell::new(0usize);
@@ -192,6 +210,11 @@ impl CudaHead {
         self.run_frame(s)?;
         let out = &s.bufs[self.head.graph.output[0].name.as_str()];
         Ok(self.stream.clone_dtoh(out.f32.as_ref().unwrap())?)
+    }
+
+    pub fn read(&self, s: &CudaSession, name: &str) -> Result<Vec<f32>> {
+        ensure!(self.head.graph.output.iter().any(|o| o.name == name), "the {} head has no output {name}", self.head.graph.name);
+        Ok(self.stream.clone_dtoh(s.bufs[name].f32.as_ref().context("a head output is f32")?)?)
     }
 
     pub fn input_mut<'a>(&self, s: &'a mut CudaSession, name: &str) -> Result<&'a mut CudaSlice<f32>> {
@@ -280,7 +303,7 @@ impl CudaHead {
         let h = self.head.spec.hidden();
         let at = |w: &str| block.map_or(w.to_string(), |i| w.replace("{i}", &i.to_string()));
         match *d {
-            DitOp::Linear { weight, input, output, .. } => {
+            DitOp::Linear { weight, input, output, bias, .. } => {
                 let (w, n, k) = self.linears.get(&at(weight)).with_context(|| format!("linear {} is not loaded", at(weight)))?;
                 let (xh, xl) = self.planes(s, input)?;
                 let out = self.f32_ptr(s, output)?;
@@ -293,18 +316,37 @@ impl CudaHead {
                 } else {
                     (0, 0, out)
                 };
-                let f = &self.fns[&rows_name(*n, *k, if gated { GATED } else { STORE })];
+                let f = &self.fns[&rows_name(*n, *k, epilogue(bias, gated))];
                 let (t, os) = (rows as i32, s.bufs[output].cols as i32);
+                let bias_ptr = if bias { Some(self.vectors.get(&format!("{}.bias", at(weight))).with_context(|| format!("bias of {} is not loaded", at(weight)))?.device_ptr(st).0) } else { None };
                 let mut b = st.launch_builder(f);
                 b.arg(w).arg(&xh).arg(&xl).arg(&out).arg(&aux).arg(&t).arg(&os).arg(&aux_stride);
+                if let Some(p) = &bias_ptr {
+                    b.arg(p);
+                }
                 unsafe { b.launch(LaunchConfig { grid_dim: (*n as u32, rows.div_ceil(BA_ROWS_MAX_TOKENS) as u32, 1), block_dim: (BA_ROWS_THREADS, 1, 1), shared_mem_bytes: 0 }) }?;
             }
-            DitOp::TimestepEmbed { from, into } => {
+            DitOp::TimestepEmbed { from, into, table } => {
                 let src = self.f32_ptr(s, from)?;
                 let (hi, lo) = self.planes(s, into)?;
                 let mut b = st.launch_builder(self.compose(d)?);
-                b.arg(&src).arg(&hi).arg(&lo);
+                b.arg(&src);
+                let freqs = match table {
+                    Some(t) => Some(self.vectors.get(&at(t)).with_context(|| format!("timestep table {t} is not loaded"))?.device_ptr(st).0),
+                    None => None,
+                };
+                if let Some(f) = &freqs {
+                    b.arg(f);
+                }
+                b.arg(&hi).arg(&lo);
                 unsafe { b.launch(Self::grid(s.bufs[into].cols, rows)) }?;
+            }
+            DitOp::RmsNorm { from, into, weight, .. } => {
+                let (x, out) = (self.f32_ptr(s, from)?, self.f32_ptr(s, into)?);
+                let g = self.vectors.get(&at(weight)).with_context(|| format!("rms norm weight {weight} is not loaded"))?.device_ptr(st).0;
+                let mut b = st.launch_builder(self.compose(d)?);
+                b.arg(&x).arg(&g).arg(&out);
+                unsafe { b.launch(LaunchConfig { grid_dim: (rows as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
             }
             DitOp::Split { from, into, .. } => {
                 let src = self.f32_ptr(s, from)?;
@@ -326,7 +368,7 @@ impl CudaHead {
                 b.arg(&src).arg(&hi).arg(&lo);
                 unsafe { b.launch(Self::grid(s.bufs[into].cols, rows)) }?;
             }
-            DitOp::Modulate { from, into, set, shift, scale, weight, .. } => {
+            DitOp::Modulate { from, into, set, shift, scale, weight, rms, .. } => {
                 let x = self.f32_ptr(s, from)?;
                 let base = self.f32_ptr(s, set)?;
                 let (sh, sc) = (base + (shift as usize * h * 4) as u64, base + (scale as usize * h * 4) as u64);
@@ -339,6 +381,13 @@ impl CudaHead {
                 };
                 if let Some(g) = &gamma {
                     b.arg(g);
+                }
+                let beta = match weight {
+                    Some(w) if !rms => Some(self.vectors.get(&format!("{}.bias", at(w))).context("modulate bias is not loaded")?.device_ptr(st).0),
+                    _ => None,
+                };
+                if let Some(be) = &beta {
+                    b.arg(be);
                 }
                 b.arg(&hi).arg(&lo);
                 unsafe { b.launch(LaunchConfig { grid_dim: (rows as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;

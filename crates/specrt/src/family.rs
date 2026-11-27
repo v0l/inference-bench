@@ -370,6 +370,61 @@ pub struct FamilySpeech {
     pub decode: Option<SpeechDecode>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyTts {
+    pub latent: String,
+    pub latent_mask: String,
+    pub voice: String,
+    pub voice_mask: String,
+    pub voice_tensor: String,
+    pub voice_layout: String,
+    pub bos: String,
+    pub conditions: String,
+    pub frame_budget: String,
+    pub language: String,
+    pub params: std::collections::BTreeMap<String, ParamSource>,
+    pub tokens: std::collections::BTreeMap<String, ParamSource>,
+    pub condition: FamilyTtsCondition,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyTtsCondition {
+    pub lut: String,
+    pub lut_proj: String,
+    pub sine_proj: String,
+    pub params: std::collections::BTreeMap<String, ParamSource>,
+}
+
+impl FamilyTts {
+    pub fn read(&self, config: &serde_json::Value) -> Result<Option<crate::spec::Tts>> {
+        if self.latent.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(crate::spec::Tts {
+            latent: self.latent.clone(),
+            latent_mask: self.latent_mask.clone(),
+            voice: self.voice.clone(),
+            voice_mask: self.voice_mask.clone(),
+            voice_tensor: self.voice_tensor.clone(),
+            voice_layout: self.voice_layout.clone(),
+            bos: self.bos.clone(),
+            conditions: self.conditions.clone(),
+            frame_budget: self.frame_budget.clone(),
+            language: self.language.clone(),
+            params: read_params(&self.params, config).context("[tts.params]")?,
+            tokens: read_params(&self.tokens, config).context("[tts.tokens]")?,
+            condition: crate::spec::TtsCondition {
+                lut: self.condition.lut.clone(),
+                lut_proj: self.condition.lut_proj.clone(),
+                sine_proj: self.condition.sine_proj.clone(),
+                params: read_params(&self.condition.params, config).context("[tts.condition.params]")?,
+            },
+        }))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpeechDecode {
@@ -577,6 +632,9 @@ pub struct FamilyEmbedding {
     pub scale: Option<String>,
     pub tie: Option<bool>,
     pub positions: Option<String>,
+    pub head: Option<String>,
+    pub head_rows: Option<usize>,
+    pub head_bias: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -857,6 +915,7 @@ pub struct FamilyHead {
     pub graph: String,
     pub root: String,
     pub params: std::collections::BTreeMap<String, ParamSource>,
+    pub tensors: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1036,6 +1095,8 @@ pub struct Family {
     pub cross: FamilyCross,
     #[serde(default)]
     pub speech: FamilySpeech,
+    #[serde(default)]
+    pub tts: FamilyTts,
 }
 
 impl Family {
@@ -1059,7 +1120,7 @@ impl Family {
         for s in &self.inputs.streams {
             push(&s.width, &mut out);
         }
-        for (_, key) in self.attention.params.iter().chain(self.mixer.params.iter()).chain(self.inputs.params.iter()).chain(self.gated_residual.params.iter()).chain(self.per_layer.params.iter()).chain(self.prelude.params.iter()).chain(self.head.params.iter()).chain(self.duplex.params.iter()).chain(self.duplex.tokens.iter()) {
+        for (_, key) in self.attention.params.iter().chain(self.mixer.params.iter()).chain(self.inputs.params.iter()).chain(self.gated_residual.params.iter()).chain(self.per_layer.params.iter()).chain(self.prelude.params.iter()).chain(self.head.params.iter()).chain(self.duplex.params.iter()).chain(self.duplex.tokens.iter()).chain(self.tts.params.iter()).chain(self.tts.tokens.iter()).chain(self.tts.condition.params.iter()) {
             match key {
                 ParamSource::Config { config, alt, .. } => {
                     push(config, &mut out);

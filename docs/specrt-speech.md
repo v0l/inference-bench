@@ -178,11 +178,11 @@ One frame: input linear of the previous latent (BOS first) plus the summed defau
 | Transposed conv with an overlap tail (ratios 6, 5, 4, kernel 2s) | `conv_up` lowered to a 2 tap causal conv plus interleave | exists | e |
 | Depthwise transposed conv k32 s16, no bias | `conv_up` is dense only | **new**: a depthwise flag on `conv_up` (the lowering is the same 2 tap form per channel) | e |
 | Mimi decoder transformer (LayerNorm, layer scale, rope pairs, a 250 frame window, Mimi's interleaved qkv packing) | the codec stack has no attention | **new graph**: the codec macro graph gains an `attention` node over a ring KV of `transformer_context` frames per session, or the stack is split and the transformer runs as decoder graph layers | e |
-| Flow LM backbone: LayerNorm, packed qkv, rope pairs, dense GELU MLP, no bias | `NormKind` is `Rmsnorm` only; `fused_qkv` exists (Phi-3); rope `Pairs` exists; MLP is gated or `mapped` | **new**: a `layer_norm` norm kind and a dense (ungated) GELU MLP in the decoder graph, a `family-gradium_phonon_tts.toml` | f |
-| LSD flow head | `graphs/meanflow.toml` and `flow_head.rs` (Haru): RMS modulate, SwiGLU, gated add, timestep embed, hoisting | close: **new** LayerNorm modulate with bias, SiLU MLP with bias, the RMS var timestep norm with `alpha`, the two embedder average; all `Map`, `Modulate` and `Linear { bias }` nodes of the denoiser IR | f |
-| EOS head and frames after EOS | nothing | **new** sampler rule | f |
-| Voice prefill (`speaker_proj` of 125 frames) | `[inputs]` nodes and embedding row prefill (Haru) | exists as a mechanism; **new** input node | f |
-| Text normalisation, sentence chunking, sentencepiece | tokenizers in specrt | **new** host code, ported from `phonon/text` and `plan.rs` (1,640 lines, plain Rust, no candle) | f |
+| Flow LM backbone: LayerNorm, packed qkv, rope pairs, dense GELU MLP, no bias | landed (#1483): `family-gradium_phonon_tts.toml` with `[norm] kind = "layer_norm"`, `fused_qkv`, `[rope] interleaved`, the mapped GELU MLP, a named one row EOS head (3.2.2) | spec | f |
+| LSD flow head | landed (#1483): `graphs/lsd.toml` with the new `rms_norm`, table `timestep`, LayerNorm modulate with weight and bias and the biased rows GEMV | graph | f |
+| EOS head and frames after EOS | landed (#1483): `[embedding] head`, `speech::tts::plan::Eos` from `[tts.params]` | rule | f |
+| Voice prefill (`speaker_proj` of 125 frames) | landed (#1483): `[[inputs.node]]` `stream_replace_unbiased` on the voice stream | input node | f |
+| Text normalisation, sentence chunking, sentencepiece | landed (#1483): `speech::tts::text` and `speech::tts::plan`, ported | host code | f |
 | Frame noise from a seed | `sampler::noise` (splitmix64 Box-Muller) | exists; numbers differ from `rand` `StdRng`, so audio is not bit identical to the candle path, only statistically | f |
 
 What is reusable from Haru: the causal conv and transposed conv lowering, the streaming tail state, the codec batching over sessions, the flow head machinery and its hoisting, the input node prefill, the frame loop shape of `specrt::duplex`. What differs: Mimi's 200 Hz inner transformer with a 250 step window, ELU instead of ConvNeXt blocks, LayerNorm everywhere, and the 12.5 Hz frame (80 ms) against Haru's 7.5 Hz (133 ms).
@@ -203,6 +203,45 @@ Fixture: `tests/fixtures/speech/tiny-mimi/` (212 KB, `scripts/tiny_mimi.py`, CPU
 cargo test -p inference-bench-specrt --test speech mimi
 B=$(cargo test -p inference-bench-specrt --test speech --no-run 2>&1 | grep -o '/[^ ]*speech-[0-9a-f]*')
 ~/.agents/bin/gpu-run 1 --min-free 2000 -- $B --ignored mimi --test-threads=1
+```
+
+### 3.2.2 The flow LM, LSD head and sampling, landed (#1483)
+
+The Phonon model is spec data over the existing graphs, with no Rust naming it:
+
+- `specs/family-gradium_phonon_tts.toml`: the 6 layer flow LM on `graphs/decoder.toml` with `[norm] kind = "layer_norm"` (`layer_norm_eps` read as the norm eps), `[attention] fused_qkv` (the packed `in_proj` read as `self_attn.qkv_proj`), `[rope] interleaved` (pairs 2i and 2i+1, as the checkpoint stores q and k), the mapped GELU dense MLP with no bias, and `[tensors]` renaming the `flow_lm.*` checkpoint onto the decoder names. `[[refuse]] part = "text"` keeps it out of text chat; `Spec::from_hf_config_tts` loads it.
+- The EOS head is a named `[embedding] head` (`eos_head`, one row, with bias): `Weight::LmHead` reads it, so the decoder tail emits the one EOS logit instead of vocab logits, and the normed hidden state is the flow head's condition.
+- Inputs are two `[[inputs.node]]` kir `group_map` descriptions. `stream_replace` puts `input_linear(previous latent) + conditions` in place of the latent placeholder token (the learnt BOS latent at the BOS position), and `stream_replace_unbiased` puts `speaker_proj(voice frame)` in place of each voice placeholder, so a voice (`speaker_wavs` `[1, 512, 125]`, channels first) is prefilled ahead of the text. The summed default conditions (the `num_speakers` table row through its projection plus the sinusoid of `duration_delta`) are folded once at load from `[tts.condition]` into the `conditions` vector the node adds. `kir::group::GroupMap::eval` runs the same descriptions on the host.
+- `graphs/lsd.toml`, a flow head graph beside `meanflow.toml`, bound by `[head]`: the two timestep embedders read their stored `freqs` table (`timestep` with `table`, kernel `dit_timestep_table`), a biased MLP with SiLU, and the RMS norm with `alpha` (`rms_norm`, kernel `dit_rms_norm`; transformers' `TimestepNorm` is the plain mean square, the `rms` of the pinned config); the average of the two goes into `silu(cond + (s + t) / 2)`. Res blocks are `modulate` with `norm = "layer"` and the block's LayerNorm weight and bias (kernel `dit_layer_modulate_w`), a biased SiLU MLP and the gated residual; the final layer is the plain LayerNorm modulate (`dit_layer_modulate`). Every head linear has its bias in the rows GEMV epilogue (`acc + b`, and `old + g * (acc + b)` when the fusion pass folds the gated add into fc2). The scalars `s = step / num_steps`, `t = (step + 1) / num_steps` and the step `z + h_step * u` are expressions, so `lsd_decode_steps` from the config sets the step count. The head has two outputs: the normalised `latent` (fed back) and `codec = z * latent_std + latent_mean`, the codec's input; `latent_mean` and `latent_std` are vector constants (`[head.tensors]` renames `flow_lm.emb_mean` and `emb_std`).
+- Sampling: `[tts.params]` holds `eos_threshold` (from the config), frames after EOS (1, or 3 for a chunk of at most 4 words, the processor's numbers), `min_frames_before_eos`, temperature 0.3, 50 tokens a chunk and `frame_budget = "ceil((tokens / 3 + 2) * frame_rate)"` (`ceil` is a new `kir::expr` function). `speech::tts::plan::Eos` is the end rule of transformers' `PocketTTSEosThresholdCriteria`: the first logit above the threshold starts a countdown of the frames after EOS, and those frames are kept. `[tts.tokens]` names the prompt, BOS and latent placeholder ids from the config.
+- Host text code: `speech::tts::text` (normalisation and the rewrite rules for numbers, currency, dates, times, phones, emails, URLs, abbreviations) and `speech::tts::plan` (prepare, sentence chunks, budgets), ported from agentbench `phonon/text` and `plan.rs` with their 26 tests; the language comes from `[tts] language`. Text is tokenised with the checkpoint's `tokenizer.json`.
+- `speech::tts::HostTts` runs it all on the CPU: prompt (voice placeholders, text, BOS), prefill, then per frame the flow head on the last hidden state with the frame noise, the EOS rule, and one decode step on the new latent. The codec latents go to slice e's `codec::HostCodec`.
+
+Fixture: `tests/fixtures/speech/tiny-phonon/` (190 KB, `scripts/tiny_phonon.py`, CPU, seeded, regenerates byte identical): the checkpoint's own `flow_lm.*` names and tensor kinds in bf16 at d 32, 2 layers, 2 heads, a 2 block head of 48, latent 8, prompt width 16, a 75 piece Unigram tokenizer of the real format, a 5 frame f32 voice, and the `tiny-mimi` codec. The reference is transformers 5.23 `GradiumPhononTTSForConditionalGeneration.from_pretrained` on the folder (its own weight conversion, so the rope permutation and the renames are transformers'), eager attention, f32: the prefill hidden states, 10 frames of hidden state, EOS logit and latent with recorded noise, a two step head run, `generate` with the same noise (EOS crosses at frame 3, 6 frames kept), and the audio of those latents through the tiny Mimi decoder.
+
+| Check (tiny fixture, CPU f32) | Bar | Result |
+|---|---|---|
+| summed default conditions | | 3.2e-8 |
+| prefill hidden states over 17 positions (5 voice, 11 text, BOS) | 1e-3 | 1.0e-6 |
+| flow LM hidden state, 10 frames fed the reference latents | 1e-3 | 1.0e-6 |
+| EOS logits, same 10 frames | 1e-3 | 2.8e-7 |
+| flow head latent with the recorded noise, one step | 1e-4 | 5.1e-7 (8.8e-7 inside the frame loop) |
+| flow head latent, two steps | 1e-4 | 1.8e-7 |
+| free running: frames kept by the EOS rule | equal to `generate` | 6 of 6 |
+| free running codec latents | | 5.1e-6 |
+| end to end audio through the Mimi codec (11,520 samples) | 1e-3 | 3.8e-6 |
+| GPU1 LSD head against transformers and the host, fused and not (22 and 24 launches a frame) | 1e-4 | 7.0e-6 and 6.9e-6 |
+| GPU1 LSD head, two steps | 1e-4 | 2.1e-6 |
+
+Rotate half rope in place of pairs gives 1.3 relative on the prefill, and leaving the BOS position as its token embedding gives 0.85 at the last position, so both are seen by the bar (`neox_rope_or_a_dropped_bos_latent_misses_the_reference`); a shifted voice moves the prefill by more than 1e-2.
+
+The flow LM runs on the CPU host decoder only, and `Runtime::load` refuses a `[tts]` spec by name. The CUDA flow LM, the speech route and serving are slice g, and the real checkpoint and quality run are slice f2. The LSD head and both input kernels compile for sm_120 from the real config (`every_lsd_head_and_input_kernel_of_the_real_config_compiles_with_nvrtc`).
+
+```
+cargo test -p inference-bench-specrt --test speech phonon
+cargo test -p inference-bench-specrt --lib speech::tts
+B=$(cargo test -p inference-bench-specrt --test speech --no-run 2>&1 | grep -o '/[^ ]*speech-[0-9a-f]*')
+~/.agents/bin/gpu-run 1 --min-free 2000 -- $B --ignored lsd --test-threads=1
 ```
 
 ### 3.3 Alternatives, from the cards
@@ -286,7 +325,7 @@ What stays in agentbench: `agent-voice::voice` (audio helpers, WAV, resampling, 
 
 ## 6. Fixture and test
 
-`crates/specrt/tests/fixtures/speech/` (1.56 MB of the 2 MB cap the test sets; the Haru fixture is under 3 MB and the diffusion ones under 20 MB, there is no shared cap across fixtures beyond each test's own):
+`crates/specrt/tests/fixtures/speech/` (1.99 MB of the 2 MB cap the test sets, with `tiny-mimi` and `tiny-phonon`; the Haru fixture is under 3 MB and the diffusion ones under 20 MB, there is no shared cap across fixtures beyond each test's own):
 
 - `tiny-whisper/`: a `WhisperForConditionalGeneration` with random weights (`init_std 0.2`, LayerNorm weights around 1), d 64, 2 encoder and 2 decoder layers, 2 heads, 80 mel bins, a 1 s window (50 encoder positions), vocab 589 laid out like the multilingual one (512 text tokens, EOT, SOT, 4 languages, translate, transcribe, startoflm, startofprev, nospeech, notimestamps, 64 timestamps), the real tensor kinds of `whisper-tiny.en` and its tied head. `generation_config.json` and `preprocessor_config.json` in the real format.
 - `tiny-whisper/reference/`: a 1 s chirp in noise and a 0.6 s cut of it, the mel bank, both log-mel inputs, the conv stem output, the encoder states, the language logits at SOT, the prefix logits, the 12 greedy step logits with suppress lists applied, and in `reference.json` the greedy tokens, `generate`'s tokens (equal) and the detected language. #1479 adds a 1.5 s gated chirp (`audio.long`, `mel.long`, two windows) and `runs`: `timestamps` (detection, timestamps), `long` (two windows, previous text) and `fallback` (temperatures 0, 0.4, 0.8 with thresholds that make one redo and one skip), each with every window's seek, decoder prompt and attempts (tokens, compression ratio, average log probability, no speech probability, decision), and the scores of the sampled attempt as sparse rows.

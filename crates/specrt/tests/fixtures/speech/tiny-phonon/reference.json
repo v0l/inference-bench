@@ -1,0 +1,111 @@
+{
+  "eos_frame": 3,
+  "eos_threshold": -1.2511299848556519,
+  "files": {
+    "audio": {
+      "file": "audio.bin",
+      "shape": [
+        11520
+      ]
+    },
+    "conditions": {
+      "file": "conditions.bin",
+      "shape": [
+        32
+      ]
+    },
+    "frames.codec_latent": {
+      "file": "frames.codec_latent.bin",
+      "shape": [
+        6,
+        8
+      ]
+    },
+    "frames.eos": {
+      "file": "frames.eos.bin",
+      "shape": [
+        10
+      ]
+    },
+    "frames.hidden": {
+      "file": "frames.hidden.bin",
+      "shape": [
+        10,
+        32
+      ]
+    },
+    "frames.latent": {
+      "file": "frames.latent.bin",
+      "shape": [
+        10,
+        8
+      ]
+    },
+    "frames.steps2": {
+      "file": "frames.steps2.bin",
+      "shape": [
+        3,
+        8
+      ]
+    },
+    "noise": {
+      "file": "noise.bin",
+      "shape": [
+        10,
+        8
+      ]
+    },
+    "prefill.hidden": {
+      "file": "prefill.hidden.bin",
+      "shape": [
+        17,
+        32
+      ]
+    },
+    "voice": {
+      "file": "voice.bin",
+      "shape": [
+        5,
+        16
+      ]
+    }
+  },
+  "frames_after_eos": 2,
+  "generated_frames": 6,
+  "prompt": [
+    5,
+    5,
+    5,
+    5,
+    5,
+    20,
+    21,
+    9,
+    18,
+    16,
+    17,
+    10,
+    14,
+    15,
+    19,
+    8,
+    4
+  ],
+  "seed": 2,
+  "source": "transformers.models.gradium_phonon_tts GradiumPhononTTSForConditionalGeneration (from_pretrained on this folder, f32, eager), generate with the recorded noise; audio from tests/fixtures/speech/tiny-mimi through PocketTTSAudioTokenizerModel.decode",
+  "temperature": 0.3,
+  "text": "Hello there, how are you? I am fine.",
+  "tokens": [
+    20,
+    21,
+    9,
+    18,
+    16,
+    17,
+    10,
+    14,
+    15,
+    19,
+    8
+  ]
+}

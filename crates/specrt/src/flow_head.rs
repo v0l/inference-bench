@@ -7,11 +7,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 pub const MEANFLOW: &str = include_str!("../graphs/meanflow.toml");
+pub const LSD: &str = include_str!("../graphs/lsd.toml");
 pub const KIND: &str = "flow-head-graph";
 
 pub fn graphs() -> &'static [DenoiserGraph] {
     static GRAPHS: std::sync::OnceLock<Vec<DenoiserGraph>> = std::sync::OnceLock::new();
-    GRAPHS.get_or_init(|| [MEANFLOW].iter().map(|t| DenoiserGraph::parse_kind(t, KIND).expect("an embedded flow head graph parses")).collect())
+    GRAPHS.get_or_init(|| [MEANFLOW, LSD].iter().map(|t| DenoiserGraph::parse_kind(t, KIND).expect("an embedded flow head graph parses")).collect())
 }
 
 pub fn graph(name: &str) -> Result<&'static DenoiserGraph> {
@@ -44,6 +45,7 @@ pub struct FlowHead {
     pub plan: Plan,
     pub finish: Vec<Op>,
     pub steps: usize,
+    pub tensors: BTreeMap<String, String>,
 }
 
 fn dit(op: &Op) -> Result<&DitOp> {
@@ -64,7 +66,9 @@ impl FlowHead {
         }
         let graph = graph(&family.head.graph)?;
         let spec = DenoiserSpec::from_values(graph, values, Vec::new())?;
-        FlowHead::new(graph, spec, &family.head.root)
+        let mut head = FlowHead::new(graph, spec, &family.head.root)?;
+        head.tensors = family.head.tensors.clone();
+        Ok(head)
     }
 
     pub fn from_dir(dir: &Path, steps: Option<usize>) -> Result<FlowHead> {
@@ -82,7 +86,7 @@ impl FlowHead {
         let plan = Plan { phase: Phase::Decode, tensor_core: false, head: lower(&graph.head, root)?, blocks, per_layer: Vec::new(), tail: lower(&graph.tail, root)?, mtp: Vec::new(), mtp_head: Vec::new(), window: Vec::new() };
         let steps = spec.size("num_steps")?;
         ensure!(steps >= 1, "num_steps is {steps}");
-        let head = FlowHead { graph, spec, root: root.to_string(), start: lower(&graph.start, root)?, plan, finish: lower(&graph.finish, root)?, steps };
+        let head = FlowHead { graph, spec, root: root.to_string(), start: lower(&graph.start, root)?, plan, finish: lower(&graph.finish, root)?, steps, tensors: BTreeMap::new() };
         head.validate()?;
         Ok(head)
     }
@@ -106,11 +110,20 @@ impl FlowHead {
         self.graph.scalars.iter().filter(|(_, e)| self.steps > 1 && e.split(|c: char| !c.is_alphanumeric() && c != '_').any(|w| w == "step")).map(|(n, _)| n.as_str()).collect()
     }
 
+    pub fn checkpoint(&self, dir: &Path) -> Result<Checkpoint> {
+        Ok(Checkpoint::open(dir)?.renamed(&self.tensors))
+    }
+
+    pub fn input_width(&self, name: &str) -> Result<usize> {
+        self.spec.size(&self.graph.decl(name).with_context(|| format!("the {} head has no buffer {name}", self.graph.name))?.cols)
+    }
+
     pub fn scalar_values(&self, step: usize, guidance: &[f32]) -> Result<BTreeMap<&str, Vec<f32>>> {
-        let (lo, hi) = (self.spec.get("guidance_min")?, self.spec.get("guidance_max")?);
         let mut out = BTreeMap::new();
-        for g in guidance {
-            ensure!((lo..=hi).contains(&f64::from(*g)), "guidance {g} is outside the model's range [{lo}, {hi}]");
+        if let (Ok(lo), Ok(hi)) = (self.spec.get("guidance_min"), self.spec.get("guidance_max")) {
+            for g in guidance {
+                ensure!((lo..=hi).contains(&f64::from(*g)), "guidance {g} is outside the model's range [{lo}, {hi}]");
+            }
         }
         for (name, text) in &self.graph.scalars {
             let e = kir::expr::Expr::parse(text).map_err(anyhow::Error::msg)?;
@@ -361,21 +374,42 @@ pub fn load_weights(head: &FlowHead, ck: &Checkpoint, mut linear: impl FnMut(Str
         for block in blocks.map_or(vec![None], |n| (0..n).map(Some).collect()) {
             for op in ops {
                 match *dit(op)? {
-                    DitOp::Linear { weight, input, output, .. } => {
+                    DitOp::Linear { weight, input, output, bias, .. } => {
                         let key = block.map_or(weight.to_string(), |i| weight.replace("{i}", &i.to_string()));
                         if !seen.insert(key.clone()) {
                             continue;
                         }
                         let (n, k) = signer.linear_shape(weight, input, output)?;
                         let mut w = Vec::with_capacity(n * k);
-                        for (name, _) in weight_names(weight, block) {
-                            w.extend(ck.f32_values(&name, &ck.shape_of(&name)?)?);
+                        let mut b = Vec::with_capacity(n);
+                        for ((name, _), biased) in weight_names(weight, block).into_iter().zip(crate::denoiser::biased_parts(weight)) {
+                            let part = ck.f32_values(&name, &ck.shape_of(&name)?)?;
+                            let rows = part.len() / k.max(1);
+                            w.extend(part);
+                            let bname = name.replace(".weight", ".bias");
+                            match bias && biased {
+                                true => b.extend(ck.f32_values(&bname, &ck.shape_of(&bname)?)?),
+                                false => b.extend(std::iter::repeat_n(0.0, rows)),
+                            }
                         }
                         ensure!(w.len() == n * k, "{key}: {} values, expected {n} x {k}", w.len());
+                        if bias {
+                            ensure!(b.len() == n, "{key}: {} bias values, expected {n}", b.len());
+                            vector(format!("{key}.bias"), b)?;
+                        }
                         linear(key, w, n, k)?;
                     }
-                    DitOp::Modulate { weight: Some(w), .. } => {
-                        let name = format!("{}.weight", block.map_or(w.to_string(), |i| w.replace("{i}", &i.to_string())));
+                    DitOp::Modulate { weight: Some(w), rms, .. } => {
+                        let base = block.map_or(w.to_string(), |i| w.replace("{i}", &i.to_string()));
+                        for part in if rms { &["weight"][..] } else { &["weight", "bias"][..] } {
+                            let name = format!("{base}.{part}");
+                            if seen.insert(name.clone()) {
+                                vector(name.clone(), ck.f32_values(&name, &ck.shape_of(&name)?)?)?;
+                            }
+                        }
+                    }
+                    DitOp::RmsNorm { weight: w, .. } | DitOp::TimestepEmbed { table: Some(w), .. } => {
+                        let name = block.map_or(w.to_string(), |i| w.replace("{i}", &i.to_string()));
                         if seen.insert(name.clone()) {
                             vector(name.clone(), ck.f32_values(&name, &ck.shape_of(&name)?)?)?;
                         }
@@ -407,7 +441,7 @@ pub fn load_weights(head: &FlowHead, ck: &Checkpoint, mut linear: impl FnMut(Str
 
 impl HostHead {
     pub fn load(head: FlowHead, dir: &Path) -> Result<HostHead> {
-        let ck = Checkpoint::open(dir)?;
+        let ck = head.checkpoint(dir)?;
         let mut linears = BTreeMap::new();
         let mut vectors = BTreeMap::new();
         load_weights(&head, &ck, |k, w, n, kk| {
@@ -450,7 +484,7 @@ impl HostHead {
 
     pub fn frame(&self, s: &mut HostSession, hidden: &[f32], noise: &[f32]) -> Result<Vec<f32>> {
         let spec = &self.head.spec;
-        ensure!(hidden.len() == s.rows * spec.hidden() && noise.len() == s.rows * spec.size("latent_dim")?, "a frame takes one hidden row and one noise row per session");
+        ensure!(hidden.len() == s.rows * self.head.input_width("hidden")? && noise.len() == s.rows * spec.size("latent_dim")?, "a frame takes one hidden row and one noise row per session");
         s.ran.clear();
         s.bufs.insert("hidden", hidden.to_vec());
         s.bufs.insert("noise", noise.to_vec());
@@ -494,6 +528,11 @@ impl HostHead {
         Ok(s.bufs[self.head.graph.output[0].name.as_str()].clone())
     }
 
+    pub fn output<'a>(&self, s: &'a HostSession, name: &str) -> Result<&'a [f32]> {
+        ensure!(self.head.graph.output.iter().any(|o| o.name == name), "the {} head has no output {name}", self.head.graph.name);
+        Ok(&s.bufs[name])
+    }
+
     fn width(&self, name: &str) -> Result<usize> {
         self.head.spec.size(&self.head.graph.decl(name).with_context(|| format!("no buffer {name}"))?.cols)
     }
@@ -505,19 +544,43 @@ impl HostHead {
         let eps = self.head.spec.get("norm_eps")? as f32;
         let at = |w: &str| block.map_or(w.to_string(), |i| w.replace("{i}", &i.to_string()));
         match *d {
-            DitOp::TimestepEmbed { from, into } => {
+            DitOp::TimestepEmbed { from, into, table } => {
                 let freq = self.width(into)?;
-                let scale = self.head.spec.get("time_scale")? as f32;
-                let out: Vec<f32> = s.bufs[from].iter().flat_map(|t| crate::denoiser_host::timestep_embedding(t * scale, freq)).collect();
+                let out: Vec<f32> = match table {
+                    Some(t) => {
+                        let f = self.vectors.get(&at(t)).with_context(|| format!("timestep table {t} is not loaded"))?;
+                        ensure!(f.len() * 2 == freq, "timestep table {t} has {} values for {freq} columns", f.len());
+                        s.bufs[from].iter().flat_map(|t| f.iter().map(|x| (t * x).cos()).chain(f.iter().map(|x| (t * x).sin())).collect::<Vec<_>>()).collect()
+                    }
+                    None => {
+                        let scale = self.head.spec.get("time_scale")? as f32;
+                        s.bufs[from].iter().flat_map(|t| crate::denoiser_host::timestep_embedding(t * scale, freq)).collect()
+                    }
+                };
                 s.bufs.insert(into, out);
             }
-            DitOp::Linear { weight, input, output, add, .. } => {
+            DitOp::RmsNorm { from, into, weight, eps, .. } => {
+                let g = self.vectors.get(&at(weight)).with_context(|| format!("rms norm weight {weight} is not loaded"))?.clone();
+                let e = self.head.spec.get(eps)? as f32;
+                let w = self.width(into)?;
+                let x = s.bufs[from].clone();
+                let dst = s.bufs.get_mut(into).unwrap();
+                for r in 0..rows {
+                    let row = &x[r * w..(r + 1) * w];
+                    let inv = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() / w as f32 + e).sqrt();
+                    for c in 0..w {
+                        dst[r * w + c] = g[c] * row[c] * inv;
+                    }
+                }
+            }
+            DitOp::Linear { weight, input, output, add, bias, .. } => {
                 let (w, n, k) = self.linears.get(&at(weight)).with_context(|| format!("linear {} is not loaded", at(weight)))?;
+                let b = if bias { Some(self.vectors.get(&format!("{}.bias", at(weight))).with_context(|| format!("bias of {} is not loaded", at(weight)))?) } else { None };
                 let x = s.bufs[input].clone();
                 let dst = s.bufs.get_mut(output).unwrap();
                 for r in 0..rows {
                     for o in 0..*n {
-                        let v: f32 = w[o * k..(o + 1) * k].iter().zip(&x[r * k..(r + 1) * k]).map(|(a, b)| a * b).sum();
+                        let v: f32 = w[o * k..(o + 1) * k].iter().zip(&x[r * k..(r + 1) * k]).map(|(a, b)| a * b).sum::<f32>() + b.map_or(0.0, |b| b[o]);
                         dst[r * n + o] = if add { dst[r * n + o] + v } else { v };
                     }
                 }
@@ -535,6 +598,10 @@ impl HostHead {
                     Some(w) => Some(self.vectors.get(&format!("{}.weight", at(w))).context("modulate weight is not loaded")?.clone()),
                     None => None,
                 };
+                let beta = match weight {
+                    Some(w) if !rms => Some(self.vectors.get(&format!("{}.bias", at(w))).context("modulate bias is not loaded")?.clone()),
+                    _ => None,
+                };
                 let m = s.bufs[set].clone();
                 let ms = self.width(set)?;
                 let x = s.bufs[from].clone();
@@ -545,7 +612,8 @@ impl HostHead {
                     let inv = 1.0 / (row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / h as f32 + eps).sqrt();
                     for c in 0..h {
                         let g = gamma.as_ref().map_or(1.0, |g| g[c]);
-                        dst[r * h + c] = (row[c] - mean) * inv * g * (1.0 + m[r * ms + scale as usize * h + c]) + m[r * ms + shift as usize * h + c];
+                        let b = beta.as_ref().map_or(0.0, |b| b[c]);
+                        dst[r * h + c] = ((row[c] - mean) * inv * g + b) * (1.0 + m[r * ms + scale as usize * h + c]) + m[r * ms + shift as usize * h + c];
                     }
                 }
             }
@@ -585,6 +653,7 @@ impl HostHead {
                                     let w = widths[n];
                                     Some(f64::from(s.bufs[n][if w == wide { r * w + c } else { r }]))
                                 }
+                                NameKind::Constant if self.head.graph.vectors.iter().any(|v| v == n) => self.vectors.get(n).and_then(|v| v.get(c)).map(|v| f64::from(*v)),
                                 NameKind::Constant => self.vectors.get(n).map(|v| f64::from(v[0])),
                                 NameKind::Value => self.head.spec.values.get(n).copied(),
                                 NameKind::Unknown => None,

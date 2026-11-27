@@ -1,0 +1,142 @@
+name = "gradium_phonon_tts"
+kind = "family"
+extends = "base"
+
+[match]
+model_types = ["gradium_phonon_tts"]
+architectures = ["GradiumPhononTTSForConditionalGeneration"]
+
+[[refuse]]
+when = "hidden_size > 0"
+part = "text"
+message = "Phonon is a text to speech model: its flow LM reads text and emits audio latents through a flow head and a codec, so it speaks text and does not serve text chat"
+
+[fields]
+rms_norm_eps = ["layer_norm_eps"]
+
+[activation.map]
+gelu = "mapped"
+
+[mlp.mapped]
+expr = "gelu(x)"
+
+[norm]
+kind = "layer_norm"
+
+[attention]
+fused_qkv = true
+
+[rope]
+interleaved = true
+
+[embedding]
+head = "eos_head"
+head_rows = 1
+head_bias = true
+
+[tensors]
+"flow_lm.transformer.layers." = "model.layers."
+"self_attn.in_proj." = "self_attn.qkv_proj."
+"self_attn.out_proj." = "self_attn.o_proj."
+"linear1." = "mlp.up_proj."
+"linear2." = "mlp.down_proj."
+"norm1." = "input_layernorm."
+"norm2." = "post_attention_layernorm."
+"flow_lm.out_norm." = "model.norm."
+"flow_lm.out_eos." = "model.eos_head."
+"flow_lm.condition_provider.conditioners.transcript_in_segment.embed." = "model.embed_tokens."
+
+[tts]
+latent = "previous_latent"
+latent_mask = "latent_mask"
+voice = "voice"
+voice_mask = "voice_mask"
+voice_tensor = "speaker_wavs"
+voice_layout = "channels_first"
+bos = "flow_lm.bos_emb"
+conditions = "conditions"
+frame_budget = "ceil((tokens / 3 + 2) * frame_rate)"
+language = "en"
+
+[tts.params]
+eos_threshold = { config = "eos_threshold" }
+frames_after_eos = 1
+frames_after_eos_short = 3
+short_words = 4
+min_frames_before_eos = 0
+temperature = 0.3
+max_tokens_per_chunk = 50
+frame_rate = { config = "frame_rate", alt = "mimi.frame_rate" }
+
+[tts.tokens]
+prompt = { config = "audio_prompt_token_id" }
+bos = { config = "audio_bos_token_id" }
+latent = { config = "audio_latent_token_id" }
+
+[tts.condition]
+lut = "flow_lm.condition_provider.conditioners.num_speakers.embed.weight"
+lut_proj = "flow_lm.condition_provider.conditioners.num_speakers.output_proj.weight"
+sine_proj = "flow_lm.condition_provider.conditioners.duration_delta.output_proj.weight"
+
+[tts.condition.params]
+lut_row = { config = "num_speakers", default = 1 }
+sine_value = { config = "duration_delta", default = 0 }
+sine_scale = { config = "duration_delta_scale", default = 1000 }
+sine_period = { config = "duration_delta_max_period", default = 10000 }
+
+[head]
+graph = "lsd"
+root = "flow_lm.flow_net"
+
+[head.params]
+hidden = { config = "flow_head_config.hidden_size" }
+cond = { config = "flow_head_config.condition_dim", alt = "hidden_size" }
+latent_dim = { config = "flow_head_config.latent_dim", alt = "latent_dim" }
+layers = { config = "flow_head_config.num_hidden_layers" }
+freq = { config = "flow_head_config.frequency_embedding_size", default = 256 }
+norm_eps = { config = "flow_head_config.layer_norm_eps", default = 1e-6 }
+rms_eps = { config = "flow_head_config.rms_norm_eps", default = 1e-5 }
+num_steps = { config = "lsd_decode_steps", default = 1 }
+
+[head.tensors]
+"flow_lm.emb_mean" = "latent_mean"
+"flow_lm.emb_std" = "latent_std"
+
+[[inputs.streams]]
+name = "previous_latent"
+width = "latent_dim"
+mask = "latent_mask"
+
+[[inputs.streams]]
+name = "voice"
+width = "audio_prompt_dim"
+mask = "voice_mask"
+
+[inputs.params]
+latent_dim = { config = "latent_dim" }
+prompt_dim = { config = "audio_prompt_dim" }
+
+[[inputs.node]]
+op = "input"
+kernel = "stream_replace"
+grid = ["hidden", "rows"]
+
+[inputs.node.bind]
+raw = { buffer = "previous_latent" }
+w = { weight = "flow_lm.input_linear.weight", len = "hidden * latent_dim" }
+b = { weight = "conditions", len = "hidden" }
+m = { buffer = "latent_mask" }
+xin = { buffer = "x" }
+x = { buffer = "x" }
+
+[[inputs.node]]
+op = "input"
+kernel = "stream_replace_unbiased"
+grid = ["hidden", "rows"]
+
+[inputs.node.bind]
+raw = { buffer = "voice" }
+w = { weight = "flow_lm.condition_provider.conditioners.speaker_wavs.output_proj.weight", len = "hidden * prompt_dim" }
+m = { buffer = "voice_mask" }
+xin = { buffer = "x" }
+x = { buffer = "x" }
