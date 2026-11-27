@@ -240,4 +240,66 @@ impl GroupMap {
         let scratch = if self.has_sum() { "    __shared__ float scratch[32];\n" } else { "" };
         Ok(format!("{head}    constexpr int WIDTH = {};\n{scratch}    const int grp = blockIdx.x;\n    const int row = blockIdx.y;\n{}}}\n\n", self.width, self.body(&k.params)?))
     }
+
+    pub fn eval(&self, params: &[Param], grid: (usize, usize), bufs: &mut [&mut [f32]]) -> Result<(), String> {
+        if params.len() != bufs.len() {
+            return Err(format!("group_map eval takes one buffer per param, {} for {}", bufs.len(), params.len()));
+        }
+        if self.stages.iter().any(|s| matches!(s, GroupStage::Load { index: Some(_), .. } | GroupStage::Load { shift: Some(_), .. } | GroupStage::Planes { .. })) || !self.scales.is_empty() {
+            return Err("group_map eval runs plain loads, picks, sums, values, scalars, stores and puts".into());
+        }
+        let at = |name: &str| params.iter().position(|p| p.name == name).ok_or_else(|| format!("group_map names unknown param {name:?}"));
+        let width = self.width as usize;
+        let consts = self.consts.clone();
+        for row in 0..grid.1 {
+            for grp in 0..grid.0 {
+                let mut elements: Vec<(String, Vec<f64>)> = Vec::new();
+                let mut scalars: Vec<(String, f64)> = Vec::new();
+                let element = |e: &Expr, elements: &[(String, Vec<f64>)], scalars: &[(String, f64)], i: usize| -> Result<f64, String> {
+                    e.clone().bind(&consts).eval(&|n| elements.iter().find(|(k, _)| k == n).map(|(_, v)| v[i]).or_else(|| scalars.iter().find(|(k, _)| k == n).map(|(_, v)| *v))).ok_or_else(|| format!("group_map expression {e} does not evaluate"))
+                };
+                for s in &self.stages {
+                    match s {
+                        GroupStage::Load { dst, src, row: r, group: g, offset: o, step, .. } => {
+                            let b = &bufs[at(src)?];
+                            let v = (0..width).map(|i| b.get(row * *r as usize + grp * *g as usize + *o as usize + i * *step as usize).copied().map(f64::from).ok_or_else(|| format!("group_map load {dst} reads past {src}"))).collect::<Result<Vec<_>, _>>()?;
+                            elements.push((dst.clone(), v));
+                        }
+                        GroupStage::Pick { dst, src, row: r, group: g, offset: o } => {
+                            let b = &bufs[at(src)?];
+                            let v = *b.get(row * *r as usize + grp * *g as usize + *o as usize).ok_or_else(|| format!("group_map pick {dst} reads past {src}"))?;
+                            scalars.push((dst.clone(), f64::from(v)));
+                        }
+                        GroupStage::Value { dst, expr } => {
+                            let v = (0..width).map(|i| element(expr, &elements, &scalars, i)).collect::<Result<Vec<_>, _>>()?;
+                            elements.push((dst.clone(), v));
+                        }
+                        GroupStage::Sum { dst, expr } => {
+                            let v = (0..width).map(|i| element(expr, &elements, &scalars, i).map(|x| x as f32)).sum::<Result<f32, _>>()?;
+                            scalars.push((dst.clone(), f64::from(v)));
+                        }
+                        GroupStage::Scalar { dst, expr } => {
+                            let v = element(expr, &[], &scalars, 0)?;
+                            scalars.push((dst.clone(), v));
+                        }
+                        GroupStage::Store { dst, value, row: r, group: g, offset: o } => {
+                            let v = (0..width).map(|i| element(value, &elements, &scalars, i)).collect::<Result<Vec<_>, _>>()?;
+                            let b = &mut bufs[at(dst)?];
+                            for (i, x) in v.into_iter().enumerate() {
+                                let p = row * *r as usize + grp * *g as usize + *o as usize + i;
+                                *b.get_mut(p).ok_or_else(|| format!("group_map store writes past {dst}"))? = x as f32;
+                            }
+                        }
+                        GroupStage::Put { dst, value, row: r, group: g, offset: o } => {
+                            let v = element(value, &[], &scalars, 0)?;
+                            let p = row * *r as usize + grp * *g as usize + *o as usize;
+                            *bufs[at(dst)?].get_mut(p).ok_or_else(|| format!("group_map put writes past {dst}"))? = v as f32;
+                        }
+                        GroupStage::Planes { .. } => unreachable!("refused above"),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
