@@ -90,6 +90,8 @@ pub struct Transcript {
     pub sequence: Vec<u32>,
     pub segments: Vec<Segment>,
     pub windows: Vec<Window>,
+    #[serde(skip)]
+    pub segment_windows: Vec<usize>,
 }
 
 pub fn log_mel_clip(plan: &super::SpeechPlan, pcm: &[f32]) -> Result<Vec<f32>> {
@@ -197,6 +199,8 @@ impl<E: Engine> Transcriber<E> {
             let mut prompt = Vec::new();
             if condition && !done.is_empty() {
                 prompt = self.rules.condition_tokens(&done)?;
+            } else if done.is_empty() && !o.prompt.is_empty() {
+                prompt = self.rules.condition_tokens(std::slice::from_ref(&o.prompt))?;
             }
             let sot_at = prompt.len();
             prompt.extend_from_slice(&init);
@@ -226,9 +230,11 @@ impl<E: Engine> Transcriber<E> {
                 continue;
             }
             let offset_time = seek as f64 * self.rules.decode.time_precision / self.stride() as f64;
+            let window_at = out.windows.len() - 1;
             if !o.timestamps {
                 out.sequence.extend_from_slice(&tokens);
                 out.segments.push(Segment { start: offset_time, end: offset_time + frames as f64 * self.feature_precision(), tokens: tokens.clone() });
+                out.segment_windows.push(window_at);
                 done.push(tokens);
                 seek += frames;
                 continue;
@@ -237,6 +243,7 @@ impl<E: Engine> Transcriber<E> {
             for s in &segs {
                 out.sequence.extend_from_slice(&s.tokens);
                 done.push(s.tokens.clone());
+                out.segment_windows.push(window_at);
             }
             out.segments.extend(segs);
             seek += advance.max(1);

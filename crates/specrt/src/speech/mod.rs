@@ -5,6 +5,7 @@ pub mod decoder;
 pub mod gpu;
 pub mod graph;
 pub mod host;
+pub mod service;
 pub mod transcribe;
 
 pub use graph::{SpeechOp, SpeechPlan};
