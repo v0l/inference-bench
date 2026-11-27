@@ -1,0 +1,34 @@
+{
+  "architectures": [
+    "GradiumPhononTTSForConditionalGeneration"
+  ],
+  "mimi": {
+    "channels": 1,
+    "compress": 2,
+    "dilation_base": 2,
+    "dimension": 32,
+    "frame_rate": 12.5,
+    "gelu": "erf",
+    "kernel_size": 7,
+    "last_kernel_size": 3,
+    "n_filters": 4,
+    "n_residual_layers": 1,
+    "quantizer_dimension": 8,
+    "quantizer_output_dimension": 32,
+    "ratios": [
+      6,
+      5,
+      4
+    ],
+    "residual_kernel_size": 3,
+    "sample_rate": 24000,
+    "transformer_context": 20,
+    "transformer_d_model": 32,
+    "transformer_dim_feedforward": 64,
+    "transformer_layer_scale": 0.01,
+    "transformer_max_period": 10000.0,
+    "transformer_num_heads": 2,
+    "transformer_num_layers": 2
+  },
+  "model_type": "gradium_phonon_tts"
+}
