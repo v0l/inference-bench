@@ -31,12 +31,14 @@ fn check(rows: usize, cols: usize, w: Vec<u16>) {
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn device_quantiser_is_byte_identical_to_the_cpu_path() {
     check(37, 64, head_rows(37, 64));
     check(4099, 128, head_rows(4099, 128));
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn device_quantiser_matches_the_cpu_path_on_the_tiny_fixture_draft_head() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-qwen3.5-mtp");
     let mut spec = specrt::spec::Spec::from_hf_config(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
@@ -72,6 +74,7 @@ fn head_sized_timing() {
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn device_quantiser_handles_an_all_zero_head() {
     check(4, 64, vec![0u16; 4 * 64]);
 }

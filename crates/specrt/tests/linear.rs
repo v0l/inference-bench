@@ -251,7 +251,7 @@ fn fp8_fixture_is_sharded_with_block_scales_and_the_spec_says_so() {
     assert!(matches!(layer.gate_up, specrt::weights::Matrix::Fp8 { .. }));
     let mut bf16 = s.clone();
     bf16.quant = specrt::spec::Quant::Bf16;
-    assert!(ck.layer(&bf16, 0).is_err(), "an FP8 checkpoint under a bf16 spec is refused");
+    assert!(matches!(ck.layer(&bf16, 0).unwrap().gate_up, specrt::weights::Matrix::Bf16(_)), "an FP8 checkpoint under a bf16 spec is dequantised");
 }
 
 #[test]
