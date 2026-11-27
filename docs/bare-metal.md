@@ -193,16 +193,16 @@ Two things are worth doing on the way because they help every deployment, not on
 
 Filed as backlog issues with no goal; the owner promotes them. Each one names its check.
 
-| # | Slice | Needs a GPU | Check |
-|---|---|---|---|
-| 0 | Server and engine survive a host with no `libcuda` (bug) | no | a test that runs the server with no driver library on the path and calls `/metrics` and the CPU transcription path |
-| 1 | QEMU appliance with no GPU: Rust image builder (manifest TOML to cpio, zstd, UKI), Rust PID 1 init (mounts, modules, network from DHCP or `ip=`, config from file and `ib.*` command line keys, starts and restarts the server), serves the tiny Whisper fixture on CPU | no | a script boots the image in QEMU with KVM, curls `/v1/models`, posts the fixture WAV to `/v1/audio/transcriptions` and gets the fixture's greedy tokens, records boot to serving time; runs in CI |
-| 2 | Read-only root and the data partition: models, spec updates, session store and JIT cache on a virtio disk in QEMU (NVMe on hardware), A/B UKI slots with a boot counter and the `/health` good-mark | no | QEMU with two disks: an update to a broken image falls back to the old one on the next boot |
-| 3 | GPU payload: build open modules for the pinned kernel in CI, add GSP firmware, driver user space and NVRTC from the matching `.run` and toolkit, licence texts in the image; boot it on a real GPU box | yes, a spare machine or a GPU1 passthrough VM in a window the owner grants | `nvidia-smi` equivalent from `/metrics`, the tiny fixtures, then the 27B, with GSP boot time and model load time recorded |
-| 4 | Fleet boot: iPXE or UEFI HTTP boot script and a qcow2 for libvirt hosts (LNVPS marketplace style) with VFIO GPU passthrough | QEMU part no, passthrough yes | the same UKI boots by PXE in QEMU (no GPU) and as a qcow2 |
-| 5 | Cluster mode in the image: `mlx5_ib`, `ib_uverbs`, `rdma_rxe`, `nvidia-peermem`, `libibverbs` and providers | `rdma_rxe` part no, real RoCE yes | two QEMU guests on soft RoCE run `tests/rdma.rs` style frames between stages on the tiny fixture |
-| 6 | Driver host profile (option C): init and server in one binary, no shell, `isolcpus` for the decode thread, jitter measured | yes for the jitter numbers | step time p99 and ITL p99 on the 4B against the same box on Debian |
-| 7 | Prebuilt cubin set: `inference-bench warmup` style CI job that compiles the kir modules for the served specs for sm_80, sm_89, sm_90, sm_120, shipped in the image cache dir; NVRTC becomes optional | building no, proving the hit yes | a load with NVRTC absent from the image succeeds from the cubin set and gives the same logits |
+| # | Issue | Slice | Needs a GPU | Check |
+|---|---|---|---|---|
+| 0 | #1525 | Server and engine survive a host with no `libcuda` (bug) | no | a test that runs the server with no driver library on the path and calls `/metrics` and the CPU transcription path |
+| 1 | #1526 | QEMU appliance with no GPU: Rust image builder (manifest TOML to cpio, zstd, UKI), Rust PID 1 init (mounts, modules, network from DHCP or `ip=`, config from file and `ib.*` command line keys, starts and restarts the server), serves the tiny Whisper fixture on CPU | no | a script boots the image in QEMU with KVM, curls `/v1/models`, posts the fixture WAV to `/v1/audio/transcriptions` and gets the fixture's greedy tokens, records boot to serving time; runs in CI |
+| 2 | #1527 | Read-only root and the data partition: models, spec updates, session store and JIT cache on a virtio disk in QEMU (NVMe on hardware), A/B UKI slots with a boot counter and the `/health` good-mark | no | QEMU with two disks: an update to a broken image falls back to the old one on the next boot |
+| 3 | #1528 | GPU payload: build open modules for the pinned kernel in CI, add GSP firmware, driver user space and NVRTC from the matching `.run` and toolkit, licence texts in the image; boot it on a real GPU box | yes, a spare machine or a GPU1 passthrough VM in a window the owner grants | `nvidia-smi` equivalent from `/metrics`, the tiny fixtures, then the 27B, with GSP boot time and model load time recorded |
+| 4 | #1529 | Fleet boot: iPXE or UEFI HTTP boot script and a qcow2 for libvirt hosts (LNVPS marketplace style) with VFIO GPU passthrough | QEMU part no, passthrough yes | the same UKI boots by PXE in QEMU (no GPU) and as a qcow2 |
+| 5 | #1531 | Cluster mode in the image: `mlx5_ib`, `ib_uverbs`, `rdma_rxe`, `nvidia-peermem`, `libibverbs` and providers | `rdma_rxe` part no, real RoCE yes | two QEMU guests on soft RoCE run `tests/rdma.rs` style frames between stages on the tiny fixture |
+| 6 | #1532 | Driver host profile (option C): init and server in one binary, no shell, `isolcpus` for the decode thread, jitter measured | yes for the jitter numbers | step time p99 and ITL p99 on the 4B against the same box on Debian |
+| 7 | #1530 | Prebuilt cubin set: `inference-bench warmup` style CI job that compiles the kir modules for the served specs for sm_80, sm_89, sm_90, sm_120, shipped in the image cache dir; NVRTC becomes optional | building no, proving the hit yes | a load with NVRTC absent from the image succeeds from the cubin set and gives the same logits |
 
 Slice 1 depends on slice 0 (it transcribes, which panics today). Slices 2, 4 and 7 depend on 1. Slice 3 depends on 1. Slices 5 and 6 depend on 3.
 
