@@ -280,6 +280,11 @@ impl Service {
         Service::spawn(move || crate::progress::with_sink(sink, || open(&dir, device)))
     }
 
+    pub fn load_on_host(dir: &Path) -> Result<std::sync::Arc<Service>> {
+        let dir = dir.to_path_buf();
+        Service::spawn(move || open_host(&dir))
+    }
+
     pub fn transcribe(&self, pcm: Vec<f32>, rate: u32, request: Request) -> Result<Heard> {
         let pcm = resample(&pcm, rate, self.info.sample_rate);
         let (tx, rx) = channel();

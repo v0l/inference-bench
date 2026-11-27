@@ -51,6 +51,7 @@ struct Inner {
     duplex_frames_in: u64,
     duplex_frames_out: u64,
     duplex_late: u64,
+    transcriptions: BTreeMap<String, (u64, f64, f64)>,
 }
 
 #[derive(Default)]
@@ -124,6 +125,14 @@ impl Metrics {
 
     pub fn cancelled(&self) {
         self.inner.lock().unwrap().cancelled += 1;
+    }
+
+    pub fn transcription(&self, model: &str, audio_secs: f64, secs: f64) {
+        let mut m = self.inner.lock().unwrap();
+        let e = m.transcriptions.entry(model.to_string()).or_default();
+        e.0 += 1;
+        e.1 += audio_secs;
+        e.2 += secs;
     }
 
     pub fn image_job(&self, model: &str, images: u64, steps: u64, step_secs: f64, total_secs: f64) {
@@ -235,6 +244,18 @@ impl Metrics {
             let _ = writeln!(o, "# HELP inference_gpu_memory_used_bytes GPU memory in use on device 0.\n# TYPE inference_gpu_memory_used_bytes gauge\ninference_gpu_memory_used_bytes {used}");
         }
         o.push_str(&g.engine);
+        let _ = writeln!(o, "# HELP inference_transcriptions_total Transcriptions finished, by model.\n# TYPE inference_transcriptions_total counter");
+        for (model, (n, _, _)) in &m.transcriptions {
+            let _ = writeln!(o, "inference_transcriptions_total{{model=\"{model}\"}} {n}");
+        }
+        let _ = writeln!(o, "# HELP inference_transcription_audio_seconds_total Seconds of audio transcribed, by model.\n# TYPE inference_transcription_audio_seconds_total counter");
+        for (model, (_, audio, _)) in &m.transcriptions {
+            let _ = writeln!(o, "inference_transcription_audio_seconds_total{{model=\"{model}\"}} {audio}");
+        }
+        let _ = writeln!(o, "# HELP inference_transcription_seconds_total Seconds spent transcribing, by model.\n# TYPE inference_transcription_seconds_total counter");
+        for (model, (_, _, spent)) in &m.transcriptions {
+            let _ = writeln!(o, "inference_transcription_seconds_total{{model=\"{model}\"}} {spent}");
+        }
         let _ = writeln!(o, "# HELP inference_image_jobs_total Image generation jobs finished, by model.\n# TYPE inference_image_jobs_total counter");
         for (model, n) in &m.image_jobs {
             let _ = writeln!(o, "inference_image_jobs_total{{model=\"{model}\"}} {n}");

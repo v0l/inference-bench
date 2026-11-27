@@ -7,6 +7,7 @@ pub const IMAGES: u8 = 8;
 pub const VIDEOS: u8 = 16;
 pub const DUPLEX: u8 = 32;
 pub const VOICES: u8 = 64;
+pub const TRANSCRIBE: u8 = 128;
 const MEDIA: u8 = IMAGES | VIDEOS;
 const GENERATE: u8 = CHAT | COMPLETIONS;
 
@@ -42,7 +43,9 @@ const fn f(name: &'static str, on: u8, usage: Usage, ty: &'static str, note: &'s
 }
 
 pub const FIELDS: &[Field] = &[
-    f("model", CHAT | COMPLETIONS | BENCH | MEDIA | DUPLEX, Usage::Read, "string", "a configured model id or served name; defaults to the only model"),
+    f("model", CHAT | COMPLETIONS | BENCH | MEDIA | DUPLEX | TRANSCRIBE, Usage::Read, "string", "a configured model id or served name; defaults to the only model; on transcriptions whisper-1 or an unknown id picks the loaded speech to text model"),
+    f("file", TRANSCRIBE, Usage::Read, "file", "multipart: a WAV, PCM16 or float32, any rate (resampled to the model's), mono or stereo (downmixed), up to media.max_audio_bytes"),
+    f("language", TRANSCRIBE, Usage::Read, "string", "ISO code such as en; skips language detection on multilingual models, ignored by English only ones"),
     f("type", DUPLEX, Usage::Validated, "string", "start; then control messages say, mode, interrupt, stop. The server sends ready, text, said, late, queued, end and error events and binary PCM16 frames"),
     f("card", DUPLEX, Usage::Read, "string or object", "the character card as text, or its fields from the model family (persona, name, gender, backchannel, other_name, relationship, situation for Haru)"),
     f("voice", DUPLEX, Usage::Read, "string or object", "voice reference: base64 PCM16 mono at the model rate, {id} from /v1/duplex/voices, or {wav} base64"),
@@ -70,12 +73,12 @@ pub const FIELDS: &[Field] = &[
     f("background", IMAGES, Usage::Ignored, "string", "accepted and ignored"),
     f("moderation", IMAGES, Usage::Ignored, "string", "accepted and ignored"),
     f("messages", CHAT, Usage::Read, "array", "non-empty; text content only, images and video go through content parts when the model has vision"),
-    f("prompt", COMPLETIONS | MEDIA, Usage::Read, "string", "one prompt; batched prompts are refused"),
+    f("prompt", COMPLETIONS | MEDIA | TRANSCRIBE, Usage::Read, "string", "one prompt; batched prompts are refused; on transcriptions the previous text, fed as the decoder's previous context"),
     f("prompts", BENCH, Usage::Read, "array", "non-empty array of strings"),
     f("repeat", BENCH, Usage::Read, "integer", "1 to 100"),
     f("max_tokens", CHAT | COMPLETIONS | BENCH, Usage::Read, "integer", "at least 1"),
     f("max_completion_tokens", GENERATE, Usage::Read, "integer", "wins over max_tokens"),
-    f("temperature", GENERATE | DUPLEX, Usage::Read, "number", "defaults to 0; on duplex 0 to 2, defaults to the family's text temperature"),
+    f("temperature", GENERATE | DUPLEX | TRANSCRIBE, Usage::Read, "number", "defaults to 0; on duplex 0 to 2, defaults to the family's text temperature; on transcriptions 0 to 1, 0 is greedy"),
     f("top_p", GENERATE, Usage::Read, "number", ""),
     f("top_k", GENERATE, Usage::Read, "integer", "extension"),
     f("min_p", GENERATE, Usage::Read, "number", "extension"),
@@ -95,7 +98,7 @@ pub const FIELDS: &[Field] = &[
     f("n", GENERATE | IMAGES, Usage::Read, "integer", "1 to 16; above 1 needs a model loaded with more than one parallel request; on images 1 to the family's max_images"),
     f("logprobs", GENERATE, Usage::Read, "boolean or integer", "boolean on chat, integer on completions; needs the batched engine"),
     f("top_logprobs", CHAT, Usage::Read, "integer", "needs logprobs: true"),
-    f("response_format", GENERATE | IMAGES, Usage::Validated, "object or string", "chat and completions: json_object, json_schema, needs the batched engine; images: b64_json (default) or url, served from /v1/images/files for images.file_ttl_secs"),
+    f("response_format", GENERATE | IMAGES | TRANSCRIBE, Usage::Validated, "object or string", "chat and completions: json_object, json_schema, needs the batched engine; images: b64_json (default) or url, served from /v1/images/files for images.file_ttl_secs; transcriptions: json (default, {text}), text or verbose_json (language, duration, segments)"),
     f("frequency_penalty", GENERATE, Usage::ZeroOnly, "number", "only 0 or null is accepted"),
     f("presence_penalty", GENERATE, Usage::ZeroOnly, "number", "only 0 or null is accepted"),
     f("user", GENERATE | MEDIA, Usage::Ignored, "string", "accepted and ignored"),
@@ -121,6 +124,7 @@ fn endpoint_of(method: &str, path: &str) -> u8 {
         ("POST", "/v1/videos") => VIDEOS,
         ("GET", "/v1/duplex") => DUPLEX,
         ("POST", "/v1/duplex/voices") => VOICES,
+        ("POST", "/v1/audio/transcriptions") => TRANSCRIBE,
         _ => 0,
     }
 }
@@ -144,6 +148,10 @@ pub fn routes_with_fields(routes: &[crate::landing::ApiRoute]) -> Value {
                 let on = endpoint_of(r.method, r.path);
                 if on != 0 {
                     v["fields"] = fields_json(on);
+                }
+                if r.path == "/v1/audio/transcriptions" {
+                    v["content_type"] = json!("multipart/form-data");
+                    v["unknown_fields"] = json!("ignored");
                 }
                 if r.path == "/v1/realtime" {
                     v["protocol"] = json!("websocket");
@@ -176,7 +184,22 @@ mod tests {
                 names.insert(rest[..end].to_string());
             }
         }
+        names.extend(form_fields());
         names
+    }
+
+    fn form_fields() -> BTreeSet<String> {
+        let source = include_str!("audio.rs");
+        let body = &source[source.find("async fn read_form").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        body.lines().filter_map(|l| l.trim().strip_prefix('"')?.split_once("\" =>").map(|(n, _)| n.to_string())).collect()
+    }
+
+    #[test]
+    fn the_transcription_route_lists_exactly_the_form_fields_it_reads() {
+        let listed: BTreeSet<String> = FIELDS.iter().filter(|f| f.on & TRANSCRIBE != 0).map(|f| f.name.to_string()).collect();
+        assert_eq!(listed, form_fields());
+        assert_eq!(form_fields().len(), 6);
     }
 
     #[test]
@@ -196,7 +219,7 @@ mod tests {
     fn field_names_are_unique_and_every_generate_endpoint_has_fields() {
         let names: BTreeSet<&str> = FIELDS.iter().map(|f| f.name).collect();
         assert_eq!(names.len(), FIELDS.len());
-        for on in [CHAT, COMPLETIONS, BENCH, IMAGES, VIDEOS, DUPLEX, VOICES] {
+        for on in [CHAT, COMPLETIONS, BENCH, IMAGES, VIDEOS, DUPLEX, VOICES, TRANSCRIBE] {
             assert!(!fields_json(on).as_array().unwrap().is_empty());
         }
     }
