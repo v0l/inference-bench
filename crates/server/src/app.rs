@@ -211,10 +211,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         }
     }
     for (path, handler) in merged {
+        let handler = match path {
+            "/v1/audio/transcriptions" => handler.layer(axum::extract::DefaultBodyLimit::max(state.config.media.audio_body_limit())),
+            _ => handler.layer(axum::extract::DefaultBodyLimit::max(state.config.media.request_body_limit())),
+        };
         app = app.route(path, handler);
     }
     let mut app = app
-        .layer(axum::extract::DefaultBodyLimit::max(state.config.media.request_body_limit()))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .layer(middleware::from_fn_with_state(state.clone(), request_scope))
         .with_state(state.clone());

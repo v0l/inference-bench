@@ -191,6 +191,8 @@ fn every_openai_field_is_read_unknown_ones_are_ignored_and_audio_is_resampled_an
         assert_eq!(code, 400, "{body}");
         assert!(body.contains(word), "{body}");
     }
+    let (ct, body) = form(&[], &wav::wav_bytes(&vec![0.0; 1_600_000], 16_000));
+    assert_eq!(post(&rig, &ct, body, None, None).0, 200, "a 3.2 MB take fits the 64 MB default");
     let (ct, body) = form(&[], b"RIFF....WAVEjunk");
     assert_eq!(post(&rig, &ct, body, None, None).0, 400);
     assert_eq!(seen.loads.load(Ordering::SeqCst), 1, "one model, loaded once");

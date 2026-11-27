@@ -25,7 +25,11 @@ impl MediaLimits {
     pub fn request_body_limit(&self) -> usize {
         let images = self.max_images * self.max_image_bytes;
         let videos = self.max_videos * self.max_video_bytes;
-        ((images + videos) / 3 * 4 + (1 << 20)).max(self.max_audio_bytes + (1 << 20)).max(2 << 20)
+        ((images + videos) / 3 * 4 + (1 << 20)).max(2 << 20)
+    }
+
+    pub fn audio_body_limit(&self) -> usize {
+        self.max_audio_bytes + (1 << 20)
     }
 }
 
@@ -233,9 +237,10 @@ mod tests {
     fn the_audio_limit_defaults_to_64_mb_and_the_body_limit_covers_it() {
         let l = MediaLimits::default();
         assert_eq!(l.max_audio_bytes, 64 << 20);
-        assert!(l.request_body_limit() > l.max_audio_bytes);
+        assert!(l.audio_body_limit() > l.max_audio_bytes);
         let big = MediaLimits { max_images: 0, max_videos: 0, max_audio_bytes: 900 << 20, ..Default::default() };
-        assert!(big.request_body_limit() > 900 << 20);
+        assert!(big.audio_body_limit() > 900 << 20);
+        assert_eq!(big.request_body_limit(), 2 << 20, "the audio limit stays on its own route");
         let parsed: MediaLimits = toml::from_str("max_audio_bytes = 1000").unwrap();
         assert_eq!((parsed.max_audio_bytes, parsed.max_images), (1000, 8));
     }
