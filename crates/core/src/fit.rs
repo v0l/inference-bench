@@ -191,6 +191,13 @@ pub fn fitting_context(a: &ModelAnatomy, free: Option<u64>, seqs: usize) -> Opti
     Some(tokens.max(1))
 }
 
+pub fn fitting_context_each(a: &ModelAnatomy, free: Option<u64>, seqs: usize) -> Option<usize> {
+    let usable = usable(free?);
+    let room = usable.checked_sub(a.total_bytes + a.state_bytes_per_seq * seqs.max(1) as u64)?;
+    let tokens = (pool_tokens(a, room) / seqs.max(1)).min(a.max_context.max(1));
+    Some(tokens.max(1))
+}
+
 pub fn kv_kind_effective(choice: &specrt::options::EngineChoice) -> KvKind {
     match choice.value("runtime.kv_dtype").as_str() {
         Some("fp8") if choice.value("runtime.kv_f16_layers").as_u64() == Some(0) => KvKind::Fp8,
@@ -455,5 +462,9 @@ mod tests {
         assert!(big <= a.max_context.max(1));
         assert_eq!(fitting_context(&a, Some(1 << 20), 1), None);
         assert_eq!(fitting_context(&a, None, 1), None);
+        let one = fitting_context_each(&a, Some(96 << 30), 1).unwrap();
+        let four = fitting_context_each(&a, Some(96 << 30), 4).unwrap();
+        assert_eq!(one, big);
+        assert!(four * 4 <= fitting_context(&a, Some(96 << 30), 4).unwrap() && four <= one, "{four} {one}");
     }
 }

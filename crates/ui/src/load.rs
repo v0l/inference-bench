@@ -44,11 +44,13 @@ pub struct LoadDialog {
     pub solved: Option<Result<Solved, String>>,
     solve_key: String,
     native_max: usize,
-    auto_extension: bool,
 }
 
-const MAX_EXTENSION: usize = 16;
-const DEFAULT_EXTENSION: usize = 4;
+pub const MAX_EXTENSION: usize = 16;
+pub const DEFAULT_EXTENSION: usize = 4;
+pub const EXTENSION_FACTORS: [usize; 4] = [2, 4, 8, 16];
+pub const ROPE_LABEL: &str = "Extend context past the trained length (RoPE scaling, YaRN)";
+pub const LOCK_LABEL: &str = "lock to context and parallel requests";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProfilePick {
@@ -135,19 +137,25 @@ impl LoadDialog {
         let view = View::served(model);
         let free = app.free_gpu_bytes();
         let remembered_seqs = app.settings.model_seqs.get(&model.name).copied();
+        let saved = app.settings.engine_for(&model.name);
+        let stretch = match (&view, saved.value("runtime.rope_extension.factor").as_u64()) {
+            (Ok(v), Some(f)) if v.spec.rope.scaling.is_none() => (f as usize).clamp(1, MAX_EXTENSION),
+            (Ok(v), None) if v.spec.rope.scaling.is_none() && saved.value("runtime.rope_extension.type").as_str() == Some("yarn") => DEFAULT_EXTENSION,
+            _ => 1,
+        };
         let (ctx, max, seqs, kv_gb) = match &view {
             Ok(v) => {
                 let max = max_context(&v.anatomy);
                 let remembered = app.settings.model_ctx.get(&model.name).copied();
                 let seqs = initial_seqs(remembered_seqs, app.settings.default_seqs, &v.anatomy, free);
-                let ctx = initial_ctx(remembered, app.settings.default_ctx, max);
+                let ctx = initial_ctx(remembered, app.settings.default_ctx, max * stretch);
                 let kv_gb = app.settings.kv_gb_for(&model.name).unwrap_or_else(|| default_kv_gb(&v.anatomy, free, seqs, ctx));
                 (ctx, max, seqs, kv_gb)
             }
             Err(_) => (app.settings.ctx_for(&model.name), app.settings.ctx_for(&model.name), app.settings.seqs_for(&model.name), app.settings.kv_gb_for(&model.name).unwrap_or(0.0)),
         };
         let served_names = app.settings.served_names_for(&model.name).join(", ");
-        let mut choice = app.settings.engine_for(&model.name);
+        let mut choice = saved;
         if remembered_seqs.is_some() {
             choice.set("serve.max_num_seqs", json!(seqs));
         }
@@ -165,43 +173,59 @@ impl LoadDialog {
             }
             _ => (ctx, kv_gb),
         };
-        let pin_kv = app.settings.kv_gb_for(&model.name).is_some() || fitted.is_some();
-        let mut dialog = Self { model: model.clone(), view, ctx, max, seqs, kv_gb, served_names, remember: true, choice, advanced: false, open_sections: Default::default(), search: String::new(), details: false, texts: BTreeMap::new(), anatomy: None, pin_seqs: remembered_seqs.is_some(), pin_kv, solved: None, solve_key: String::new(), native_max: max, auto_extension: false };
+        let pin_kv = app.settings.kv_gb_for(&model.name).is_some() && seqs > 1;
+        let mut dialog = Self { model: model.clone(), view, ctx, max, seqs, kv_gb, served_names, remember: true, choice, advanced: false, open_sections: Default::default(), search: String::new(), details: false, texts: BTreeMap::new(), anatomy: None, pin_seqs: remembered_seqs.is_some(), pin_kv, solved: None, solve_key: String::new(), native_max: max };
         dialog.sync();
         dialog.resolve(&crate::hardware::load_devices(app));
         dialog
     }
 
+    fn key(&self, devices: &[specrt::placement::DeviceConfig]) -> String {
+        format!("{:?}|{}|{}|{}|{}|{}|{:?}|{:?}", self.choice.profile, self.ctx, self.seqs, self.kv_gb, self.pin_seqs, self.pin_kv, self.choice.overrides, devices.iter().map(|d| (d.name.clone(), d.memory_gib.to_bits())).collect::<Vec<_>>())
+    }
+
     pub fn resolve(&mut self, devices: &[specrt::placement::DeviceConfig]) {
-        let key = format!("{:?}|{}|{}|{}|{}|{}|{:?}|{:?}", self.choice.profile, self.ctx, self.seqs, self.kv_gb, self.pin_seqs, self.pin_kv, self.choice.overrides, devices.iter().map(|d| (d.name.clone(), d.memory_gib.to_bits())).collect::<Vec<_>>());
-        if key == self.solve_key {
+        if self.key(devices) == self.solve_key {
             return;
         }
-        self.solve_key = key;
-        self.solved = self.solve(devices);
-        if let Some(Ok(s)) = &self.solved {
-            if !self.pin_seqs {
-                self.seqs = s.slots;
-            }
-            if !self.pin_kv && s.slots > 1 {
-                self.kv_gb = s.kv_pool_bytes as f64 / GB;
+        if !self.pin_kv && !self.pin_seqs
+            && let Some(Ok(p)) = self.place(devices, BTreeMap::new())
+            && let Some(a) = self.anatomy()
+        {
+            let full = pool_tokens(a, p.kv_pool_bytes) / self.ctx.max(1);
+            let low = self.choice.profile == specrt::options::Profile::LowMemory;
+            self.seqs = p.slots.max(1).min(if low { p.slots } else { full }).max(1);
+            self.sync();
+            while self.seqs > 1 && !matches!(self.solve(devices), Some(Ok(ref s)) if s.shortfall.is_none()) {
+                self.seqs /= 2;
+                self.sync();
             }
         }
+        self.solved = self.solve(devices);
+        if let Some(Ok(s)) = &self.solved
+            && self.pin_kv && !self.pin_seqs {
+                self.seqs = s.slots;
+            }
+        self.solve_key = self.key(devices);
     }
 
     pub fn solve(&self, devices: &[specrt::placement::DeviceConfig]) -> Option<Result<Solved, String>> {
+        let mut pins = BTreeMap::new();
+        if self.pin_seqs || !self.pin_kv {
+            pins.insert(PIN_SLOTS.to_string(), json!(self.seqs));
+        }
+        pins.insert(PIN_POOL.to_string(), json!(self.kv_bytes()?));
+        self.place(devices, pins)
+    }
+
+    fn place(&self, devices: &[specrt::placement::DeviceConfig], extra: BTreeMap<String, Value>) -> Option<Result<Solved, String>> {
         if devices.is_empty() {
             return None;
         }
         let spec = self.kv_spec()?;
         self.anatomy()?;
         let mut pins = self.choice.overrides.clone();
-        if self.pin_seqs {
-            pins.insert(PIN_SLOTS.into(), json!(self.seqs));
-        }
-        if self.pin_kv && self.seqs > 1 {
-            pins.insert(PIN_POOL.into(), json!(self.kv_bytes()?));
-        }
+        pins.extend(extra);
         let target = Target { context: Some(self.ctx), memory: None, slots: None };
         let request = PlacementRequest { mode: self.choice.profile, target, pins, devices, spec: &spec };
         Some(specrt::solve::solve(&request).map_err(|e| inference_bench_core::cluster::friendly(&format!("{e:#}"))))
@@ -220,6 +244,66 @@ impl LoadDialog {
         self.choice.value("runtime.rope_extension.factor").as_u64().map_or(1, |f| f.max(1) as usize)
     }
 
+    pub fn can_extend(&self) -> bool {
+        self.view.as_ref().is_ok_and(|v| v.spec.rope.scaling.is_none())
+    }
+
+    pub fn rope_on(&self) -> bool {
+        self.can_extend() && self.extension_factor() > 1
+    }
+
+    pub fn native_max(&self) -> usize {
+        self.native_max
+    }
+
+    pub fn set_extension(&mut self, factor: Option<usize>) {
+        match factor.filter(|f| *f > 1) {
+            Some(f) => {
+                self.choice.set("runtime.rope_extension.type", json!("yarn"));
+                self.choice.set("runtime.rope_extension.factor", json!(f.min(MAX_EXTENSION)));
+            }
+            None => {
+                self.choice.reset("runtime.rope_extension.type");
+                self.choice.reset("runtime.rope_extension.factor");
+            }
+        }
+        self.sync();
+    }
+
+    pub fn locked(&self) -> bool {
+        !self.pin_kv
+    }
+
+    pub fn set_locked(&mut self, locked: bool) {
+        if locked == self.locked() {
+            return;
+        }
+        if !locked && let Some(kv) = self.kv_bytes() {
+            self.kv_gb = kv as f64 / GB;
+        }
+        self.pin_kv = !locked;
+        self.sync();
+    }
+
+    pub fn pool_tokens(&self) -> Option<usize> {
+        Some(pool_tokens(self.anatomy()?, self.kv_bytes()?))
+    }
+
+    pub fn context_cap(&self) -> usize {
+        match (self.pin_kv, self.anatomy()) {
+            (true, Some(a)) => tokens_for_kv_gb(a.kv_bytes_per_token, self.kv_gb).min(self.max).max(1),
+            _ => self.max,
+        }
+    }
+
+    pub fn max_that_fits(&self, free: Option<u64>) -> Option<usize> {
+        let a = self.anatomy()?;
+        if self.pin_kv {
+            return Some(self.context_cap());
+        }
+        fitting_context_each(a, free, self.seqs).map(|n| n.min(self.max))
+    }
+
     pub fn kv_dtype(&self) -> specrt::spec::KvDtype {
         match self.choice.value("runtime.kv_dtype").as_str() {
             Some("fp8") => specrt::spec::KvDtype::Fp8,
@@ -231,6 +315,7 @@ impl LoadDialog {
         let mut spec = self.view.as_ref().ok()?.spec.clone();
         spec.runtime.kv_dtype = self.kv_dtype();
         spec.runtime.kv_f16_layers = self.choice.value("runtime.kv_f16_layers").as_u64().map(|n| n as usize);
+        spec.runtime.rope_extension = self.rope_on().then_some(specrt::spec::RopeExtension { kind: specrt::spec::RopeExtensionKind::Yarn, factor: self.extension_factor() as u32 });
         Some(spec)
     }
 
@@ -245,47 +330,44 @@ impl LoadDialog {
     pub fn sync(&mut self) {
         let Ok(v) = &self.view else { return };
         let mut a = v.anatomy.clone();
-        let spec = self.kv_spec().unwrap();
-        a.kv_bytes_per_token = (specrt::runtime::kv_block_bytes(&spec, 1) / specrt::codegen::PAGE) as u64;
         if self.native_max == 0 {
             self.native_max = a.max_context;
         }
-        a.max_context = self.native_max * MAX_EXTENSION;
-        self.max = max_context(&a);
-        self.ctx = self.ctx.min(self.max);
-        self.anatomy = Some(a);
-        self.follow_context();
-    }
-
-    fn follow_context(&mut self) {
-        let native = self.native_max.max(1);
-        let yarn = self.choice.value("runtime.rope_extension.type").as_str() == Some("yarn");
-        if yarn && self.choice.value("runtime.rope_extension.factor").as_u64().is_none() {
+        if self.choice.value("runtime.rope_extension.type").as_str() == Some("yarn") && self.choice.value("runtime.rope_extension.factor").as_u64().is_none() {
             self.choice.set("runtime.rope_extension.factor", json!(DEFAULT_EXTENSION));
         }
-        if self.ctx > native {
-            let needed = self.ctx.div_ceil(native).min(MAX_EXTENSION);
-            if !yarn {
-                self.choice.set("runtime.rope_extension.type", json!("yarn"));
-                self.auto_extension = true;
-            }
-            if needed > self.extension_factor() || !yarn || self.auto_extension {
-                self.choice.set("runtime.rope_extension.factor", json!(needed));
-            }
-        } else if self.auto_extension {
-            self.choice.reset("runtime.rope_extension.type");
-            self.choice.reset("runtime.rope_extension.factor");
-            self.auto_extension = false;
+        let factor = if self.rope_on() { self.extension_factor().min(MAX_EXTENSION) } else { 1 };
+        a.max_context = self.native_max * factor;
+        self.max = max_context(&a);
+        self.ctx = self.ctx.min(self.max);
+        self.seqs = self.seqs.max(1);
+        a.kv_bytes_per_token = self.per_token();
+        self.anatomy = Some(a);
+        if self.pin_kv {
+            self.fit_to_pool();
         }
     }
 
-    pub fn plan_context(&self) -> Option<usize> {
-        let a = self.anatomy()?;
-        Some(pool_tokens(a, self.kv_bytes()?).min(self.max).div_ceil(self.seqs.max(1)).max(1))
+    fn per_token(&self) -> u64 {
+        self.kv_spec().map_or(0, |s| (specrt::runtime::kv_block_bytes(&s, 1) / specrt::codegen::PAGE) as u64)
+    }
+
+    fn fit_to_pool(&mut self) {
+        let floor = MIN_CTX.min(self.max);
+        for _ in 0..2 {
+            let per = self.per_token().max(1);
+            self.kv_gb = self.kv_gb.max(kv_gb_for_tokens(per, floor));
+            self.ctx = self.ctx.min(tokens_for_kv_gb(per, self.kv_gb)).max(1);
+            let per = self.per_token();
+            if let Some(a) = self.anatomy.as_mut() {
+                a.kv_bytes_per_token = per;
+            }
+        }
     }
 
     pub fn kv_bytes(&self) -> Option<u64> {
-        self.anatomy().map(|a| pool_bytes(a, self.ctx, self.seqs, self.kv_gb))
+        let a = self.anatomy()?;
+        Some(if self.pin_kv { (self.kv_gb * GB) as u64 } else { a.kv_bytes_per_token * (self.ctx * self.seqs.max(1)) as u64 })
     }
 
     pub fn holds_one_request(&self) -> bool {
@@ -305,8 +387,12 @@ impl LoadDialog {
     }
 
     pub fn serve_options(&self) -> Option<specrt::serve::ServeOptions> {
-        let base = specrt::serve::ServeOptions { max_model_len: Some(self.ctx), max_num_seqs: self.seqs, kv_cache_bytes: self.kv_bytes().filter(|_| self.seqs > 1), ..Default::default() };
+        let base = specrt::serve::ServeOptions { max_model_len: Some(self.ctx), max_num_seqs: self.seqs, kv_cache_bytes: self.engine_pool(), ..Default::default() };
         self.choice.apply(base).ok()
+    }
+
+    fn engine_pool(&self) -> Option<u64> {
+        self.view.is_ok().then(|| self.kv_bytes()).flatten().filter(|_| self.pin_kv || self.seqs > 1)
     }
 
     pub fn memory_gb(&self, free: Option<u64>) -> Option<f64> {
@@ -314,7 +400,7 @@ impl LoadDialog {
     }
 
     pub fn estimate(&self, free: Option<u64>) -> Option<Estimate> {
-        self.anatomy().map(|a| estimate(a, pool_bytes(a, self.ctx, self.seqs, self.kv_gb), self.seqs, free))
+        Some(estimate(self.anatomy()?, self.kv_bytes()?, self.seqs, free))
     }
 }
 
@@ -487,8 +573,12 @@ fn with_default(d: &LoadDialog, f: &Field) -> String {
 }
 
 fn context_row(ui: &mut egui::Ui, d: &mut LoadDialog, f: &Field, env: &Env) {
-    let fits = if d.view.is_ok() { d.anatomy().and_then(|a| fitting_context(a, env.free, d.seqs)).map(|n| n.min(d.max)) } else { None };
-    let (lo, max, native, ok, ctx) = (MIN_CTX.min(d.max), d.max, d.native_max, d.view.is_ok(), d.ctx);
+    let fits = if d.view.is_ok() { d.max_that_fits(env.free) } else { None };
+    let cap = d.context_cap();
+    let (lo, max, native, ok, ctx) = (MIN_CTX.min(cap), cap, d.native_max, d.view.is_ok(), d.ctx);
+    let (can_extend, mut rope) = (d.can_extend(), d.rope_on());
+    let mut factor = if rope { d.extension_factor() } else { DEFAULT_EXTENSION };
+    let (rope_before, factor_before) = (rope, factor);
     let mut value = ctx;
     grid_row(ui, "context length", f.help, false, |ui| {
         if ok {
@@ -506,17 +596,35 @@ fn context_row(ui: &mut egui::Ui, d: &mut LoadDialog, f: &Field, env: &Env) {
                         value = n.max(lo);
                     }
                 }
-                let note = if max > native { format!("trained {}, up to {} with YaRN", tokens(native), tokens(max)) } else { format!("model maximum {}", tokens(max)) };
+                let note = if cap < d.max { format!("the pinned kv cache holds {} per request", tokens(cap)) } else if rope { format!("trained {}, up to {} with YaRN", tokens(native), tokens(max)) } else { format!("trained length {}", tokens(max)) };
                 Line::new().note(note).size(10.5).show(ui);
             });
-            if ctx > native {
-                hint(ui, "Going past the trained length turns on YaRN, which changes short-context numerics slightly.");
+            if can_extend {
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut rope, ROPE_LABEL);
+                });
+                if rope {
+                    let mut choices: Vec<usize> = EXTENSION_FACTORS.to_vec();
+                    if !choices.contains(&factor) {
+                        choices.push(factor);
+                        choices.sort_unstable();
+                    }
+                    let labels: Vec<String> = choices.iter().map(|x| format!("{x}x  {}", tokens(native * x))).collect();
+                    let options: Vec<(usize, &str, Option<usize>)> = choices.iter().zip(&labels).map(|(x, l)| (*x, l.as_str(), None)).collect();
+                    segments(ui, &mut factor, &options);
+                    hint(ui, "YaRN stretches the positions the model was trained on. Short prompts give slightly different answers than with it off.");
+                }
             }
         } else {
             Line::new().set(format!("{} tokens", ctx)).show(ui);
         }
     });
-    d.ctx = value;
+    d.ctx = value.min(cap);
+    if rope != rope_before {
+        d.set_extension(rope.then_some(factor));
+    } else if rope && factor != factor_before {
+        d.set_extension(Some(factor));
+    }
 }
 
 fn kv_type_row(ui: &mut egui::Ui, d: &mut LoadDialog, f: &Field) {
@@ -543,44 +651,51 @@ fn kv_type_row(ui: &mut egui::Ui, d: &mut LoadDialog, f: &Field) {
     });
     if reset {
         set_kv_kind(&mut d.choice, KvKind::Auto);
+        d.sync();
     } else if pick != current {
         set_kv_kind(&mut d.choice, pick);
+        d.sync();
     }
 }
 
 fn kv_size_row(ui: &mut egui::Ui, d: &mut LoadDialog, f: &Field, env: &Env) {
     let Some(a) = d.anatomy().cloned() else { return };
     let per = a.kv_bytes_per_token.max(1);
-    let pooled = d.seqs > 1;
-    let mut gb = if pooled { d.kv_gb } else { kv_gb_for_tokens(per, d.ctx) };
-    let mut toks = if pooled { tokens_for_kv_gb(per, d.kv_gb) } else { d.ctx };
+    let locked = d.locked();
+    let pool = d.kv_bytes().unwrap_or(0);
+    let pool_toks = d.pool_tokens().unwrap_or(0);
+    let mut gb = d.kv_gb;
+    let mut toks = tokens_for_kv_gb(per, d.kv_gb);
+    let floor = MIN_CTX.min(d.max);
     let top = max_kv_gb(&a, env.free, d.seqs, d.max).max(gb);
     let token_cap = d.max.max(1) * d.seqs.max(1);
-    let (mut gb_changed, mut tok_changed) = (false, false);
-    let help = if pooled { format!("Shared by {} parallel requests. Change either number and the other follows.", d.seqs) } else { "With one request the cache follows the context length, so the two move together.".to_string() };
+    let (mut gb_changed, mut tok_changed, mut flip) = (false, false, false);
+    let each = if d.seqs > 1 { format!("{} tokens for each of {} parallel requests", tokens(d.ctx), d.seqs) } else { format!("{} tokens for one request", tokens(d.ctx)) };
+    let help = if locked { format!("Follows the context length, the parallel requests and the kv cache type: {each}. Unlock to set the size yourself.") } else { format!("Set by hand and shared by {} parallel request(s). The context length is capped so one request always fits.", d.seqs) };
     let changed = !is_default(d, f);
     let reset = grid_row(ui, "kv cache size", &help, changed, |ui| {
         ui.horizontal_wrapped(|ui| {
-            gb_changed = ui.add(egui::DragValue::new(&mut gb).speed(0.1).range(0.1..=top.max(0.2)).suffix(" GB").fixed_decimals(2)).changed();
-            tok_changed = ui.add(egui::DragValue::new(&mut toks).speed(256.0).range(1..=token_cap).suffix(" tokens")).changed();
+            if locked {
+                let r = Line::new().value(human_size(pool)).gap(8.0).value(format!("{} tokens", tokens(pool_toks))).size(11.0).show(ui);
+                r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "kv cache follows the context"));
+            } else {
+                gb_changed = ui.add(egui::DragValue::new(&mut gb).speed(0.1).range(kv_gb_for_tokens(per, floor)..=top.max(0.2)).suffix(" GB").fixed_decimals(2)).changed();
+                tok_changed = ui.add(egui::DragValue::new(&mut toks).speed(256.0).range(floor..=token_cap).suffix(" tokens")).changed();
+                Line::new().legend("each request up to").value(format!("{} tokens", tokens(d.context_cap()))).size(11.0).show(ui);
+            }
         });
+        flip = toggle(ui, LOCK_LABEL, locked).clicked();
     });
-    if reset {
-        d.pin_kv = false;
+    if reset || (flip && !locked) {
+        d.set_locked(true);
+    } else if flip {
+        d.set_locked(false);
     } else if gb_changed {
-        if pooled {
-            d.kv_gb = gb;
-            d.pin_kv = true;
-        } else {
-            d.ctx = tokens_for_kv_gb(per, gb).clamp(MIN_CTX.min(d.max), d.max);
-        }
+        d.kv_gb = gb;
+        d.sync();
     } else if tok_changed {
-        if pooled {
-            d.kv_gb = kv_gb_for_tokens(per, toks);
-            d.pin_kv = true;
-        } else {
-            d.ctx = toks.clamp(MIN_CTX.min(d.max), d.max);
-        }
+        d.kv_gb = kv_gb_for_tokens(per, toks);
+        d.sync();
     }
 }
 
@@ -799,10 +914,10 @@ fn result_card(ui: &mut egui::Ui, d: &LoadDialog, env: &Env, spread: &Option<Res
             return;
         };
         let a = d.anatomy().unwrap();
-        let fits = fitting_context(a, env.free, d.seqs).map(|n| n.min(d.max));
+        let fits = d.max_that_fits(env.free);
         let offload = d.choice.value("runtime.offload.vram_budget").as_u64().unwrap_or(0);
         let total_tint = if e.fits() == Some(false) { FAULT } else { VALUE };
-        let kv_tint = if d.holds_one_request() { VALUE } else { FAULT };
+        let kv_tint = VALUE;
         let tiles = [
             ("gpu memory", human_size(e.total()), total_tint),
             ("context", format!("{} tokens", tokens(d.ctx)), VALUE),
@@ -828,9 +943,6 @@ fn result_card(ui: &mut egui::Ui, d: &LoadDialog, env: &Env, spread: &Option<Res
             }
         } else {
             note(ui, "No GPU reading yet, so the estimate cannot be checked against free memory.", LEGEND);
-        }
-        if !d.holds_one_request() {
-            status(ui, false, &format!("the KV cache cannot hold one request of {} tokens: raise it or lower the context length. You can still try to load it.", tokens(d.ctx)));
         }
         if let Some((ok, text)) = d.kv_note() {
             status(ui, ok, &text);
@@ -1005,7 +1117,7 @@ fn launch(app: &mut App, dialog: &LoadDialog, alongside: bool, env: &Env) {
         } else {
             app.settings.model_seqs.remove(&model.name);
         }
-        if dialog.pin_kv && dialog.seqs > 1 && dialog.view.is_ok() {
+        if dialog.pin_kv && dialog.view.is_ok() {
             app.settings.model_kv_gb.insert(model.name.clone(), dialog.kv_gb);
         } else {
             app.settings.model_kv_gb.remove(&model.name);
@@ -1040,7 +1152,7 @@ fn launch(app: &mut App, dialog: &LoadDialog, alongside: bool, env: &Env) {
         None if load_devices.is_empty() && !inv.cards.is_empty() => Err("not loaded: no gpu selected. Tick a gpu under GPU selection on this page".to_string()),
         None if inv.local().any(|c| c.ordinal == Some(0) && !c.selected) => Err("not loaded: there is no placement plan for this model, and without one it would load on GPU 0, which is switched off".to_string()),
         None => {
-            let kv = dialog.view.is_ok().then(|| dialog.kv_bytes()).flatten().filter(|_| dialog.seqs > 1);
+            let kv = dialog.engine_pool();
             app.load_model_placed(&model, dialog.ctx, dialog.seqs, kv, names, dialog.choice.clone(), alongside);
             Ok(())
         }

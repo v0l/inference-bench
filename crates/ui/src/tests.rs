@@ -2521,6 +2521,163 @@ fn a_context_extension_lifts_the_slider_to_a_million_tokens_and_prices_the_kv_ca
     assert_eq!(dialog.ctx, 262144 * 4);
 }
 
+const ROPE_BOX: &str = "Extend context past the trained length (RoPE scaling, YaRN)";
+
+fn dialog_27b(name: &str, settings: impl FnOnce(&mut inference_bench_core::settings::Settings, &str)) -> Harness<'static, App> {
+    let mut h = harness_sized(name, Tab::Models, 2600.0);
+    with_gpu(&mut h, 0, 96 << 30);
+    let d = dir(&format!("{name}-27b"));
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::copy(fixtures().join("qwen3.8-27b.config.json"), d.join("config.json")).unwrap();
+    let mut m = model("Qwen3.8-27B", true, "dense decoder");
+    (m.path, m.root) = (d.clone(), d);
+    m.context_length = None;
+    settings(&mut h.state_mut().settings, &m.name);
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().open_load_dialog(&m);
+    h.run();
+    h
+}
+
+fn rope_fields(d: &crate::load::LoadDialog) -> (Option<String>, Option<u64>) {
+    (d.choice.value("runtime.rope_extension.type").as_str().map(str::to_string), d.choice.value("runtime.rope_extension.factor").as_u64())
+}
+
+#[test]
+fn with_rope_scaling_off_the_context_stops_at_the_trained_length_and_never_turns_yarn_on() {
+    let mut h = dialog_27b("rope-off", |_, _| {});
+    let d = h.state().load.as_ref().unwrap();
+    assert_eq!(d.max, 262144);
+    assert_eq!(rope_fields(d), (None, None));
+    h.get_by_label(ROPE_BOX);
+    let d = h.state_mut().load.as_mut().unwrap();
+    d.ctx = 262144 * 4;
+    d.sync();
+    assert_eq!(d.ctx, 262144);
+    h.run();
+    let d = h.state().load.as_ref().unwrap();
+    assert_eq!(d.ctx, 262144);
+    assert_eq!(rope_fields(d), (None, None));
+    assert!(d.serve_options().unwrap().runtime.unwrap().rope_extension.is_none());
+}
+
+#[test]
+fn ticking_rope_scaling_allows_native_times_factor_and_unticking_clamps_and_clears() {
+    let mut h = dialog_27b("rope-tick", |_, _| {});
+    h.get_by_label(ROPE_BOX).click();
+    h.run();
+    let d = h.state_mut().load.as_mut().unwrap();
+    assert_eq!(rope_fields(d), (Some("yarn".into()), Some(4)));
+    assert_eq!(d.max, 262144 * 4);
+    d.ctx = 1_048_576;
+    d.sync();
+    assert_eq!(d.ctx, 1_048_576);
+    assert_eq!(d.serve_options().unwrap().runtime.unwrap().rope_extension.unwrap().factor, 4);
+    d.choice.set("runtime.rope_extension.factor", serde_json::json!(2));
+    d.sync();
+    assert_eq!(d.max, 262144 * 2);
+    assert_eq!(d.ctx, 262144 * 2);
+    h.run();
+    h.get_by_label(ROPE_BOX).click();
+    h.run();
+    let d = h.state().load.as_ref().unwrap();
+    assert_eq!(rope_fields(d), (None, None));
+    assert_eq!(d.max, 262144);
+    assert_eq!(d.ctx, 262144);
+}
+
+#[test]
+fn a_model_saved_with_yarn_reads_back_with_the_box_ticked() {
+    let h = dialog_27b("rope-saved", |s, name| {
+        let mut c = s.engine_for(name);
+        c.set("runtime.rope_extension.type", serde_json::json!("yarn"));
+        c.set("runtime.rope_extension.factor", serde_json::json!(4));
+        s.model_engine.insert(name.into(), c);
+        s.model_ctx.insert(name.into(), 1_048_576);
+        s.model_seqs.insert(name.into(), 1);
+    });
+    let d = h.state().load.as_ref().unwrap();
+    assert_eq!(rope_fields(d), (Some("yarn".into()), Some(4)));
+    assert_eq!(d.max, 262144 * 4);
+    assert_eq!(d.ctx, 1_048_576);
+    let boxed = h.get_by_label(ROPE_BOX);
+    assert_eq!(boxed.accesskit_node().toggled(), Some(egui::accesskit::Toggled::True));
+}
+
+#[test]
+fn the_locked_kv_cache_is_context_times_requests_at_the_kv_type_cost() {
+    let mut h = dialog_27b("kv-locked", |_, _| {});
+    let d = h.state_mut().load.as_mut().unwrap();
+    assert!(!d.pin_kv, "locked by default");
+    d.ctx = 8192;
+    d.seqs = 4;
+    d.pin_seqs = true;
+    d.sync();
+    let per = d.anatomy().unwrap().kv_bytes_per_token;
+    assert_eq!(d.kv_bytes().unwrap(), per * 8192 * 4);
+    h.run();
+    let d = h.state_mut().load.as_mut().unwrap();
+    assert_eq!(d.kv_bytes().unwrap(), per * 8192 * 4, "the solver does not change a locked pool");
+    crate::load::set_kv_kind(&mut d.choice, crate::load::KvKind::Fp8);
+    d.sync();
+    let fp8 = d.anatomy().unwrap().kv_bytes_per_token;
+    assert!(fp8 < per);
+    assert_eq!(d.kv_bytes().unwrap(), fp8 * 8192 * 4);
+    d.seqs = 2;
+    d.sync();
+    assert_eq!(d.kv_bytes().unwrap(), fp8 * 8192 * 2);
+    h.run();
+    h.get_by_label("kv cache follows the context");
+    let o = h.state().load.as_ref().unwrap().serve_options().unwrap();
+    assert_eq!((o.max_model_len, o.max_num_seqs, o.kv_cache_bytes), (Some(8192), 2, Some(fp8 * 8192 * 2)));
+}
+
+#[test]
+fn an_unlocked_kv_cache_caps_the_context_so_one_request_fits() {
+    let mut h = dialog_27b("kv-unlocked", |_, _| {});
+    let d = h.state_mut().load.as_mut().unwrap();
+    let per = d.anatomy().unwrap().kv_bytes_per_token;
+    d.seqs = 4;
+    d.pin_seqs = true;
+    d.pin_kv = true;
+    d.kv_gb = (per * 4096) as f64 / (1u64 << 30) as f64;
+    d.ctx = 32768;
+    d.sync();
+    assert!(d.ctx <= 4096, "{}", d.ctx);
+    h.run();
+    let d = h.state().load.as_ref().unwrap();
+    assert!(crate::load::pool_tokens(d.anatomy().unwrap(), d.kv_bytes().unwrap()) >= d.ctx);
+    assert!(h.query_by_label_contains("cannot hold one request").is_none());
+}
+
+#[test]
+fn no_mix_of_context_requests_pool_and_kv_type_leaves_one_request_without_room() {
+    let mut h = dialog_27b("kv-never-short", |_, _| {});
+    for pinned in [false, true] {
+        for seqs in [1, 3, 8] {
+            for gb in [0.05, 1.0, 6.0] {
+                for kind in [crate::load::KvKind::F16, crate::load::KvKind::Fp8] {
+                    for ctx in [512, 100_000, 262144] {
+                        let d = h.state_mut().load.as_mut().unwrap();
+                        crate::load::set_kv_kind(&mut d.choice, kind);
+                        d.pin_kv = pinned;
+                        d.pin_seqs = true;
+                        d.seqs = seqs;
+                        d.kv_gb = gb;
+                        d.ctx = ctx;
+                        d.sync();
+                        h.run();
+                        let d = h.state().load.as_ref().unwrap();
+                        let pool = crate::load::pool_tokens(d.anatomy().unwrap(), d.kv_bytes().unwrap());
+                        assert!(pool >= d.ctx, "pinned {pinned} seqs {seqs} gb {gb} {kind:?} ctx {ctx}: pool {pool} < {}", d.ctx);
+                        assert!(h.query_by_label_contains("cannot hold one request").is_none());
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn fixture_spec_model() -> LocalModel {
     let mut m = model("Qwen27", true, "dense decoder");
     m.format = Format::Spec;
