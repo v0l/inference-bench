@@ -69,10 +69,10 @@ const WHISPER: &[Need] = &[
 ];
 
 const TTS: &[Need] = &[
-    Need { piece: "Mimi decoder SEANet: causal conv k7 and k3 with ELU, constant pad, dilated residual blocks", state: "new graph entry over the codec convs; ELU is a new expression", evidence: Some(("specrt/src/codec/graph.rs", "\"conv\" =>")), slice: "e" },
-    Need { piece: "Mimi transposed conv upsampling (ratios 4, 5, 6) with an overlap tail", state: "exists as codec conv_up", evidence: Some(("specrt/src/codec/graph.rs", "\"conv_up\" =>")), slice: "e" },
-    Need { piece: "Mimi depthwise transposed conv 12.5 Hz to 200 Hz upsample (groups = channels, no bias)", state: "new: conv_up is dense only", evidence: None, slice: "e" },
-    Need { piece: "Mimi decoder transformer at 200 Hz: 2 layers, LayerNorm, layer scale, rope pairs, sliding context 250", state: "new graph (codec stack has no attention)", evidence: None, slice: "e" },
+    Need { piece: "Mimi decoder SEANet: causal conv k7 and k3 with ELU, constant pad, residual blocks k3 and k1", state: "exists: graphs/codec.toml mimi-decoder, ELU as a kir::expr macro folded into the conv input (Prologue::Act)", evidence: Some(("kir/src/expr.rs", "(\"elu\", \"select(x > 0.0, x, exp(x) - 1.0)\")")), slice: "e" },
+    Need { piece: "Mimi transposed conv upsampling (ratios 6, 5, 4) with an overlap tail", state: "exists as codec conv_up", evidence: Some(("specrt/src/codec/graph.rs", "\"conv_up\" =>")), slice: "e" },
+    Need { piece: "Mimi depthwise transposed conv 12.5 Hz to 200 Hz upsample (groups = channels, no bias)", state: "exists: conv_up groups = channels, the line_dwup kernel", evidence: Some(("specrt/src/codec/host.rs", "pub fn lower_dw_up(")), slice: "e" },
+    Need { piece: "Mimi decoder transformer at 200 Hz: 2 layers, LayerNorm, layer scale, rope pairs, sliding context 250", state: "exists: codec attention node over a per session ring KV of context steps, layer_norm node", evidence: Some(("specrt/src/codec/graph.rs", "\"attention\" =>")), slice: "e" },
     Need { piece: "flow LM backbone: 6 layer LayerNorm transformer, packed qkv, rope pairs, GELU MLP, no bias", state: "new family file and decoder graph entries (LayerNorm kind, GELU dense MLP)", evidence: Some(("specrt/src/spec.rs", "pub enum NormKind")), slice: "f" },
     Need { piece: "LSD flow head: adaLN res blocks with LayerNorm, two timestep embedders averaged, one step", state: "close to graphs/meanflow.toml: LayerNorm modulate, bias, rms-var timestep norm are new", evidence: Some(("specrt/src/denoiser.rs", "\"modulate\" =>")), slice: "f" },
     Need { piece: "EOS head with threshold and frames after EOS", state: "new sampler rule", evidence: None, slice: "f" },
@@ -116,7 +116,7 @@ fn the_engine_refuses_whisper_as_text_chat_and_says_which_ops_are_missing() {
     for m in &missing {
         println!("  {m}");
     }
-    assert_eq!(missing.len(), 4, "{missing:#?}");
+    assert_eq!(missing.len(), 2, "{missing:#?}");
     for slice in ["a", "b", "c", "e", "f"] {
         assert!(WHISPER.iter().chain(TTS).any(|n| n.slice == slice), "slice {slice} has no gap");
     }
@@ -333,6 +333,117 @@ fn the_speech_fixture_stays_under_2_mb() {
     let total = size(&dir());
     println!("tests/fixtures/speech: {total} bytes");
     assert!(total < 2 * 1024 * 1024, "{total}");
+}
+
+fn mimi() -> PathBuf {
+    dir().join("tiny-mimi")
+}
+
+fn mimi_ref(key: &str) -> (Vec<f32>, Vec<usize>) {
+    let meta = json(&mimi().join("reference.json"));
+    let entry = &meta["files"][key];
+    let shape: Vec<usize> = entry["shape"].as_array().unwrap_or_else(|| panic!("{key}")).iter().map(|d| d.as_u64().unwrap() as usize).collect();
+    let bytes = std::fs::read(mimi().join("reference").join(entry["file"].as_str().unwrap())).unwrap();
+    let values: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+    assert_eq!(values.len(), shape.iter().product::<usize>(), "{key}");
+    (values, shape)
+}
+
+fn mimi_decoder_with(config: Value) -> specrt::codec::HostCodec {
+    let plan = specrt::codec::graph::plan(&config).unwrap();
+    let ck = specrt::weights::Checkpoint::open(&mimi()).unwrap();
+    plan.check_tensors(&|n| ck.shape_of(n)).unwrap();
+    specrt::codec::HostCodec::load(plan, &ck).unwrap()
+}
+
+fn mimi_host() -> specrt::codec::HostCodec {
+    specrt::codec::HostCodec::open(&mimi()).unwrap()
+}
+
+#[test]
+fn the_mimi_decoder_graph_plans_every_codec_tensor_of_the_real_phonon_checkpoint() {
+    let hub = json(&dir().join("phonon-31m-en.hub-92741c5.config.json"));
+    let plan = specrt::codec::graph::plan(&hub).unwrap();
+    assert!(!plan.has_encoder(), "the TTS codec is a decoder only");
+    let h = header("phonon-31m-en.header.json");
+    let codec: BTreeMap<String, Vec<usize>> = h.iter().filter(|(k, _)| k.starts_with("mimi.")).map(|(k, (_, s))| (k.clone(), s.clone())).collect();
+    let planned: BTreeMap<String, Vec<usize>> = plan.decoder.tensors().into_iter().collect();
+    assert_eq!(planned, codec, "the graph reads every mimi tensor of the checkpoint and nothing else");
+    assert_eq!(plan.decoder.params(), 3_974_945 + 6_297_600 + 32_768);
+    assert_eq!((plan.frame_samples, plan.latent_dim), (1920, 32));
+    let steps = plan.decoder.steps(1);
+    assert_eq!(steps.last(), Some(&1920));
+    assert!(steps.contains(&16), "the transformer runs at 200 Hz, 16 steps per 12.5 Hz frame");
+    let ring: usize = plan.decoder.ops.iter().filter(|o| matches!(o, specrt::codec::CodecOp::Attention { .. })).map(|o| o.state_floats()).sum();
+    assert_eq!(ring, 2 * (2 * 250 * 512 + 1), "two layers, K and V rings of transformer_context = 250 steps and a position");
+    let p = specrt::codec::compile::plan(&plan.decoder, 1, 4).unwrap();
+    let report = specrt::codec::compile::report(&plan.decoder, &p, 4);
+    println!("{report}");
+    assert!(report.contains("ring attention") && report.contains("dwconv_up mimi.upsample.convtr.convtr"), "{report}");
+    assert!(p.kernels(&kir::Target::sm_120()).unwrap().iter().any(|k| matches!(k.prologue, kir::conv::Prologue::Act("elu"))), "ELU is a conv input prologue, not a launch");
+    assert!(!p.launches.iter().any(|l| l.label(&plan.decoder).starts_with("add")), "the residual add folds into the k1 conv");
+}
+
+#[test]
+fn the_host_mimi_decoder_matches_transformers_whole_and_frame_by_frame() {
+    let codec = mimi_host();
+    let (latents, shape) = mimi_ref("latents");
+    let (want, _) = mimi_ref("audio");
+    let frames = shape[0];
+    assert_eq!(codec.plan.frame_samples * frames, want.len());
+    let whole = codec.decode(&latents).unwrap();
+    let e = max_rel(&whole, &want);
+    println!("host mimi decode: max rel {e:.2e} against transformers over {} samples", want.len());
+    assert!(e < 1e-4, "{e}");
+    let mut state = codec.decoder.new_state();
+    assert_eq!(state.floats(), codec.plan.decoder.state_floats());
+    let streamed: Vec<f32> = latents.chunks(codec.plan.latent_dim).flat_map(|z| codec.decoder.run(z, &mut state).unwrap()).collect();
+    let f = max_rel(&streamed, &whole);
+    println!("host mimi decode: frame by frame against whole clip max rel {f:.2e}");
+    assert!(f < 1e-5, "{f}");
+    let mut state = codec.decoder.new_state();
+    let pairs: Vec<f32> = latents.chunks(2 * codec.plan.latent_dim).flat_map(|z| codec.decoder.run(z, &mut state).unwrap()).collect();
+    assert!(max_rel(&pairs, &whole) < 1e-5);
+}
+
+#[test]
+fn a_ring_shorter_than_the_reference_window_changes_the_audio() {
+    let mut config = json(&mimi().join("config.json"));
+    let context = config["mimi"]["transformer_context"].as_u64().unwrap();
+    assert!(context < 6 * 16, "the fixture's 96 steps at 200 Hz pass the ring of {context}, so the window is exercised");
+    config["mimi"]["transformer_context"] = (context - 4).into();
+    let short = mimi_decoder_with(config);
+    let (latents, _) = mimi_ref("latents");
+    let (want, _) = mimi_ref("audio");
+    let e = max_rel(&short.decode(&latents).unwrap(), &want);
+    println!("ring of {} instead of {context}: max rel {e:.2e}", context - 4);
+    assert!(e > 1e-3, "a wrong window must not pass the 1e-4 bar: {e}");
+    let mut state = short.decoder.new_state();
+    let streamed: Vec<f32> = latents.chunks(short.plan.latent_dim).flat_map(|z| short.decoder.run(z, &mut state).unwrap()).collect();
+    assert!(max_rel(&streamed, &short.decode(&latents).unwrap()) < 1e-5, "the ring streams like the whole clip at any window");
+}
+
+#[test]
+fn the_elu_on_the_conv_inputs_is_what_makes_the_audio() {
+    let codec = mimi_host();
+    let (latents, _) = mimi_ref("latents");
+    let (want, _) = mimi_ref("audio");
+    let mut plain = specrt::codec::HostCodec { plan: codec.plan.clone(), encoder: codec.encoder, decoder: codec.decoder };
+    let mut dropped = 0;
+    for p in &mut plain.decoder.params {
+        if let specrt::codec::host::Param::Conv(c) = p
+            && c.act.is_some()
+        {
+            c.act = None;
+            dropped += 1;
+        }
+    }
+    assert_eq!(dropped, 3 * 3 + 1, "ELU before each up conv, both residual convs of each stage, and the final conv");
+    let e = max_rel(&plain.decode(&latents).unwrap(), &want);
+    println!("without ELU: max rel {e:.2e}");
+    assert!(e > 1e-2, "{e}");
+    let refuse = kir::conv::ConvKernel::new(&kir::Target::sm_120(), kir::conv::ConvShape::line(8, 8, 3, 1, 1), kir::conv::Prologue::Act("sigmoid"), kir::conv::Epilogue { residual: false, stats: None, gelu: false });
+    assert!(format!("{}", refuse.unwrap_err()).contains("maps 0 to 0"), "an input activation that moves zero would break the zero pad and tail");
 }
 
 fn max_abs(a: &[f32], b: &[f32]) -> f32 {
@@ -553,7 +664,7 @@ fn the_padded_line_conv_is_its_own_kernel_and_refuses_a_wide_pad() {
     let b = kir::conv::ConvKernel::new(&t, padded, kir::conv::Prologue::None, e).unwrap();
     assert_ne!(a.name(), b.name());
     let src = kir::cuda::emit_line(&[a, b]).unwrap();
-    assert!(src.contains("true, -1>(x, st") && src.contains("true, 1>(x, st"), "causal convs keep PAD -1, the stem gets PAD 1");
+    assert!(src.contains("true, -1, 0>(x, st") && src.contains("true, 1, 0>(x, st"), "causal convs keep PAD -1, the stem gets PAD 1, neither has an input activation");
     assert!(kir::conv::ConvKernel::new(&t, kir::conv::ConvShape::padded(64, 64, 3, 1, 3), kir::conv::Prologue::None, e).is_err());
 }
 
@@ -918,6 +1029,69 @@ fn the_gpu_transcriber_matches_transformers_and_the_host_on_every_tiny_run() {
     let mut forced = |w: usize, a: usize, step: usize, _: &[f32], t: f64| (t != 0.0).then(|| ids(&windows[w]["attempts"][a]["tokens"])[step]);
     check_run("gpu fallback", &g.transcribe_mel(&frames_major_mel("mel.long"), &run_options(run), &mut forced).unwrap(), run);
     println!("gpu transcriber: greedy, timestamps, long and fallback runs equal transformers, {} weight bytes", g.engine.weight_bytes);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn the_gpu_mimi_decoder_matches_transformers_frame_by_frame_and_batched() {
+    use specrt::codec::cuda::CudaCodec;
+    let host = mimi_host();
+    let ctx = cudarc::driver::CudaContext::new(0).unwrap();
+    let cache = std::env::var_os("SPECRT_CACHE").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("specrt-codec-jit"));
+    let jit = specrt::jit::Jit::new(ctx.clone(), cache).unwrap();
+    let (latents, shape) = mimi_ref("latents");
+    let (want, _) = mimi_ref("audio");
+    let frames = shape[0];
+    let gpu = CudaCodec::load(&ctx, &jit, &host, &[(1, 1), (1, 2), (frames, 1)]).unwrap();
+    let mut s = gpu.sessions(&gpu.decoder, 1).unwrap();
+    assert_eq!(s.floats_per_session(), host.plan.decoder.state_floats());
+    let whole = gpu.run(&gpu.decoder, &latents, &mut s).unwrap();
+    let e = max_rel(&whole, &want);
+    let host_whole = host.decode(&latents).unwrap();
+    let h = max_rel(&whole, &host_whole);
+    println!("gpu mimi decode: max rel {e:.2e} against transformers, {h:.2e} against the host");
+    assert!(e < 1e-4 && h < 1e-4, "{e} {h}");
+    let d = host.plan.latent_dim;
+    let mut s = gpu.sessions(&gpu.decoder, 1).unwrap();
+    let streamed: Vec<f32> = latents.chunks(d).flat_map(|z| gpu.run(&gpu.decoder, z, &mut s).unwrap()).collect();
+    let f = max_rel(&streamed, &whole);
+    println!("gpu mimi decode: frame by frame against whole clip max rel {f:.2e}");
+    assert!(f < 1e-5, "{f}");
+    let reversed: Vec<Vec<f32>> = latents.chunks(d).rev().map(<[f32]>::to_vec).collect();
+    let mut pair = gpu.sessions(&gpu.decoder, 2).unwrap();
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    let n = host.plan.frame_samples;
+    for (i, z) in latents.chunks(d).enumerate() {
+        let both = gpu.run(&gpu.decoder, &[z.to_vec(), reversed[i].clone()].concat(), &mut pair).unwrap();
+        a.extend_from_slice(&both[..n]);
+        b.extend_from_slice(&both[n..]);
+    }
+    let mut solo = gpu.sessions(&gpu.decoder, 1).unwrap();
+    let alone: Vec<f32> = reversed.iter().flat_map(|z| gpu.run(&gpu.decoder, z, &mut solo).unwrap()).collect();
+    let (ea, eb) = (max_rel(&a, &streamed), max_rel(&b, &alone));
+    println!("gpu mimi decode: two sessions batched against each alone {ea:.2e} {eb:.2e}");
+    assert!(ea < 1e-5 && eb < 1e-5, "{ea} {eb}");
+}
+
+#[test]
+#[ignore = "needs nvrtc, no GPU: compiles every Mimi decoder kernel of the real Phonon config for sm_120"]
+fn every_mimi_kernel_of_the_real_config_compiles_with_nvrtc() {
+    let plan = specrt::codec::graph::plan(&json(&dir().join("phonon-31m-en.hub-92741c5.config.json"))).unwrap();
+    let target = kir::Target::sm_120();
+    let mut all = Vec::new();
+    for (steps, batch) in [(1, 1), (1, 8), (16, 1)] {
+        all.extend(specrt::codec::compile::plan(&plan.decoder, steps, batch).unwrap().kernels(&target).unwrap());
+    }
+    all.sort_by_key(|k| k.name());
+    all.dedup_by_key(|k| k.name());
+    let m = specrt::codec::cuda::module(&all).unwrap();
+    let opts = cudarc::nvrtc::CompileOptions { arch: Some("compute_120"), options: vec!["--std=c++17".into()], ..Default::default() };
+    let ptx = cudarc::nvrtc::compile_ptx_with_opts(m.source.as_str(), opts).unwrap().to_src();
+    for name in &m.kernels {
+        assert!(ptx.contains(&format!(".entry {name}(")), "{name} missing from the PTX");
+    }
+    assert!(m.source.as_str().contains("if (ACT == 4) return (v > 0.0f ? v : expf(v) - 1.0f);"), "ELU is lowered from the kir macro");
+    println!("{} kernels, {} conv variants", m.kernels.len(), all.len());
 }
 
 #[test]

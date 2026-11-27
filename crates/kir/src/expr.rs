@@ -79,13 +79,22 @@ const UNARY: [(&str, &str, &str); 10] = [
     ("abs", "fabsf", "abs"),
 ];
 
-const MACROS: [(&str, &str); 5] = [
+const MACROS: [(&str, &str); 6] = [
     ("gelu", "0.5 * x * (1.0 + erf(x * 0.7071067811865476))"),
     ("sigmoid", "1.0 / (1.0 + exp(-x))"),
     ("silu", "x / (1.0 + exp(-x))"),
     ("gelu_tanh", "0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))"),
     ("softplus", "select(x > 20.0, x, log(1.0 + exp(x)))"),
+    ("elu", "select(x > 0.0, x, exp(x) - 1.0)"),
 ];
+
+pub fn unary_macro(name: &str) -> Option<&'static str> {
+    MACROS.iter().find(|(n, _)| *n == name).map(|(n, _)| *n)
+}
+
+pub fn apply_macro(name: &str, arg: Expr) -> Result<Expr, String> {
+    Expr::parse(&format!("{name}(v)"))?.subst(&|n| (n == "v").then(|| arg.clone()))
+}
 
 const BINARY: [(&str, &str, &str); 2] = [("min", "fminf", "min"), ("max", "fmaxf", "max")];
 

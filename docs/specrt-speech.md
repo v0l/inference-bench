@@ -187,6 +187,24 @@ One frame: input linear of the previous latent (BOS first) plus the summed defau
 
 What is reusable from Haru: the causal conv and transposed conv lowering, the streaming tail state, the codec batching over sessions, the flow head machinery and its hoisting, the input node prefill, the frame loop shape of `specrt::duplex`. What differs: Mimi's 200 Hz inner transformer with a 250 step window, ELU instead of ConvNeXt blocks, LayerNorm everywhere, and the 12.5 Hz frame (80 ms) against Haru's 7.5 Hz (133 ms).
 
+### 3.2.1 The Mimi decoder, landed (#1482)
+
+`graphs/codec.toml` `[[codec]] mimi-decoder` (`model_types = ["gradium_phonon_tts"]`, `section = "mimi"`, no encoder) is the TTS codec as graph TOML over the codec ops, with no Rust naming it:
+
+- `quantizer.output_proj` as a k1 conv with `bias = "false"`, then `conv_up` with `groups = "dimension"` (depthwise, k 32, stride 16, no bias). A depthwise `conv_up` lowers to the same 2 tap form per channel (`host::lower_dw_up`, the `line_dwup` kernel) with the previous input column as its state.
+- Two transformer layers at 200 Hz: `layer_norm` nodes (weight and bias, the `line_layernorm` kernel), an `attention` node (`layout = "blocks"`, Mimi's in_proj as q, k and v blocks per position, `rope = "pairs"`, rope on dimensions 2i and 2i+1 as the checkpoint stores it), and the layer scales as `scale_add`. The attention node lowers to a qkv line GEMM, `line_rope`, `line_ring_attention`, `line_ring_store`, `line_advance` and the out GEMM with the layer scale residual in its epilogue. Its state per session is `[position, K ring, V ring]` of `transformer_context` steps (250: 256,001 values a layer), so a step attends to its last 250 keys, the ones still in this call first and the ring for the rest.
+- SEANet: conv k7, then per ratio (6, 5, 4) ELU and `conv_up`, one residual block (ELU, conv k3, ELU, conv k1, `add` into x), and ELU then the final conv k3. ELU is the `kir::expr` macro `elu` (`select(x > 0, x, exp(x) - 1)`), lowered into the conv input load as `Prologue::Act` (the line kernels' `line_act`), so it costs no launch; a prologue activation must map 0 to 0, since the zero pad and the stored tail skip it. The `add` folds into the k1 conv's residual epilogue. Phonon's `dilation_base 2` with one residual layer gives dilation 1; a `dilation` other than 1 is refused by name.
+
+The real Phonon config plans exactly the 44 `mimi.*` tensors of the checkpoint (10,305,313 parameters). A frame is 1920 samples; `inference-bench kernels --spec phonon-31m-en.hub-92741c5.config.json --plan --graph codec --tokens 4` prints 42 launches a frame at 4 sessions, 66.4 MB read (41.3 MB of f32 weights), 2.17 GFLOP, 517,506 state values per session. Streaming is per session and batched over sessions as for the Haru codec (`codec::cuda::Sessions`).
+
+Fixture: `tests/fixtures/speech/tiny-mimi/` (212 KB, `scripts/tiny_mimi.py`, CPU, seeded, regenerates byte identical): the checkpoint's own `mimi.*` names and tensor kinds at d 32, 2 heads, ratios 6, 5, 4, `transformer_context` 20, so the 96 steps of the 6 frame clip pass the ring. The reference is transformers 5.23 `PocketTTSAudioTokenizerModel.decode` (the `transformers.models.mimi` decoder with `latent_proj`), eager attention, with the q and k rows permuted from rope pairs to rotate half as transformers' own conversion does. Results: host 2.2e-6 relative, GPU1 2.9e-6 (1.4e-6 against the host), frame by frame equal to the whole clip (0.0 on both), two sessions batched equal to each alone (0.0). A ring 4 steps short gives 0.62 relative and dropping the ELUs 16, so both are seen by the 1e-4 bar.
+
+```
+cargo test -p inference-bench-specrt --test speech mimi
+B=$(cargo test -p inference-bench-specrt --test speech --no-run 2>&1 | grep -o '/[^ ]*speech-[0-9a-f]*')
+~/.agents/bin/gpu-run 1 --min-free 2000 -- $B --ignored mimi --test-threads=1
+```
+
 ### 3.3 Alternatives, from the cards
 
 | Model | Licence | Size | Quality, from the card | Fit |

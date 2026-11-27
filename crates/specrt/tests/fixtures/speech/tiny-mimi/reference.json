@@ -1,0 +1,35 @@
+{
+  "files": {
+    "audio": {
+      "file": "audio.bin",
+      "shape": [
+        11520
+      ]
+    },
+    "latents": {
+      "file": "latents.bin",
+      "shape": [
+        6,
+        8
+      ]
+    },
+    "transformer": {
+      "file": "transformer.bin",
+      "shape": [
+        96,
+        32
+      ]
+    },
+    "upsample": {
+      "file": "upsample.bin",
+      "shape": [
+        96,
+        32
+      ]
+    }
+  },
+  "frame_samples": 1920,
+  "frames": 6,
+  "seed": 0,
+  "source": "transformers.models.pocket_tts_audio_tokenizer PocketTTSAudioTokenizerModel.decode (the Mimi decoder with latent_proj), f32, CPU, eager attention"
+}

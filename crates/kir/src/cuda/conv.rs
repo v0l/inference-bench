@@ -309,7 +309,7 @@ fn flag(b: bool) -> &'static str {
 fn wrapper(k: &ConvKernel) -> String {
     let s = &k.shape;
     let (gin, silu) = match k.prologue {
-        Prologue::None => (0, false),
+        Prologue::None | Prologue::Act(_) => (0, false),
         Prologue::GroupApply { groups, silu } => (groups, silu),
     };
     let gout = k.epilogue.stats.unwrap_or(0);
@@ -336,15 +336,15 @@ fn wrapper(k: &ConvKernel) -> String {
 
 const LINE: &str = r#"__device__ __forceinline__ float line_gelu(float v) { return 0.5f * v * (1.0f + erff(v * 0.70710678118654752f)); }
 
-template <int KT, int STRIDE, int CIN, int PAD>
+template <int KT, int STRIDE, int CIN, int PAD, int ACT>
 __device__ __forceinline__ float line_input(const float* __restrict__ x, const float* __restrict__ st, int T, int b, int o, int tap, int c) {
     if (c >= CIN) return 0.0f;
     constexpr int CTX = PAD >= 0 ? PAD : KT - STRIDE;
     int p = o * STRIDE + tap - CTX;
     if (p >= T) return 0.0f;
-    if (p >= 0) return x[((size_t)b * T + p) * CIN + c];
+    if (p >= 0) return line_act<ACT>(x[((size_t)b * T + p) * CIN + c]);
     if (PAD >= 0) return 0.0f;
-    return st[((size_t)b * (CTX > 0 ? CTX : 1) + (CTX + p)) * CIN + c];
+    return line_act<ACT>(st[((size_t)b * (CTX > 0 ? CTX : 1) + (CTX + p)) * CIN + c]);
 }
 
 template <int COUT, int PHASES, bool RES, bool GELU>
@@ -357,7 +357,7 @@ __device__ __forceinline__ void line_store(float v, const float* __restrict__ sc
     else y[at] = v;
 }
 
-template <int BM, int BN, int BK, int TM, int TN, int STAGES, int KT, int STRIDE, int CIN, int COUT, int PHASES, bool RES, bool GELU, int PAD>
+template <int BM, int BN, int BK, int TM, int TN, int STAGES, int KT, int STRIDE, int CIN, int COUT, int PHASES, bool RES, bool GELU, int PAD, int ACT>
 __device__ __forceinline__ void line_conv_tile(const float* __restrict__ x, const float* __restrict__ st, const float* __restrict__ w, const float* __restrict__ bias,
                                                const float* __restrict__ scale, float* __restrict__ y, int B, int T, int TO) {
     extern __shared__ __align__(16) unsigned char line_smem[];
@@ -376,7 +376,7 @@ __device__ __forceinline__ void line_conv_tile(const float* __restrict__ x, cons
         for (int e = tid; e < BM * BK; e += blockDim.x) {
             int p = e / BK, kk = e % BK;
             int m = m0 + p;
-            A[kk * BM + p] = m < rows ? line_input<KT, STRIDE, CIN, PAD>(x, st, T, m / TO, m % TO, tap, c0 + kk) : 0.0f;
+            A[kk * BM + p] = m < rows ? line_input<KT, STRIDE, CIN, PAD, ACT>(x, st, T, m / TO, m % TO, tap, c0 + kk) : 0.0f;
         }
         for (int e = tid; e < BN * BK; e += blockDim.x) {
             int j = e / BK, kk = e % BK;
@@ -427,7 +427,7 @@ __device__ __forceinline__ void line_conv_tile(const float* __restrict__ x, cons
     }
 }
 
-template <int KT, int STRIDE, int CIN, int COUT, int PHASES, bool RES, bool GELU, int PAD>
+template <int KT, int STRIDE, int CIN, int COUT, int PHASES, bool RES, bool GELU, int PAD, int ACT>
 __device__ __forceinline__ void line_conv_direct(const float* __restrict__ x, const float* __restrict__ st, const float* __restrict__ w, const float* __restrict__ bias,
                                                  const float* __restrict__ scale, float* __restrict__ y, int B, int T, int TO) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -438,12 +438,12 @@ __device__ __forceinline__ void line_conv_direct(const float* __restrict__ x, co
     float acc = bias[n];
     for (int tap = 0; tap < KT; tap++) {
         const float* wr = w + ((size_t)n * KT + tap) * CIN;
-        for (int c = 0; c < CIN; c++) acc = fmaf(line_input<KT, STRIDE, CIN, PAD>(x, st, T, b, o, tap, c), wr[c], acc);
+        for (int c = 0; c < CIN; c++) acc = fmaf(line_input<KT, STRIDE, CIN, PAD, ACT>(x, st, T, b, o, tap, c), wr[c], acc);
     }
     line_store<COUT, PHASES, RES, GELU>(acc, scale, y, TO, b, o, n);
 }
 
-template <int KT, int STRIDE, int CIN, int COUT, int PHASES, int CHUNK, bool RES, bool GELU, int PAD>
+template <int KT, int STRIDE, int CIN, int COUT, int PHASES, int CHUNK, bool RES, bool GELU, int PAD, int ACT>
 __device__ __forceinline__ void line_conv_rows(const float* __restrict__ x, const float* __restrict__ st, const float* __restrict__ w, const float* __restrict__ bias,
                                                const float* __restrict__ scale, float* __restrict__ y, int B, int T, int TO) {
     __shared__ float part[CHUNK][32];
@@ -462,7 +462,7 @@ __device__ __forceinline__ void line_conv_rows(const float* __restrict__ x, cons
 #pragma unroll
             for (int j = 0; j < CHUNK; j++) {
                 int m = r0 + j;
-                if (m < rows) acc[j] = fmaf(line_input<KT, STRIDE, CIN, PAD>(x, st, T, m / TO, m % TO, tap, c), wv, acc[j]);
+                if (m < rows) acc[j] = fmaf(line_input<KT, STRIDE, CIN, PAD, ACT>(x, st, T, m / TO, m % TO, tap, c), wv, acc[j]);
             }
         }
 #pragma unroll
@@ -527,6 +527,145 @@ extern "C" __global__ void line_shift(const float* x, const float* st, float* ne
 }
 "#;
 
+const LINE_SEQ: &str = r#"extern "C" __global__ void line_layernorm(const float* x, float* y, const float* gamma, const float* beta, int P, int C, float eps) {
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    size_t p = (size_t)blockIdx.x * (blockDim.x / 32) + warp;
+    if (p >= (size_t)P) return;
+    const float* row = x + p * C;
+    float s = 0.0f;
+    for (int c = lane; c < C; c += 32) s += row[c];
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffff, s, o);
+    float mean = s / (float)C;
+    float q = 0.0f;
+    for (int c = lane; c < C; c += 32) {
+        float d = row[c] - mean;
+        q += d * d;
+    }
+    for (int o = 16; o > 0; o >>= 1) q += __shfl_xor_sync(0xffffffff, q, o);
+    float r = rsqrtf(q / (float)C + eps);
+    for (int c = lane; c < C; c += 32) y[p * C + c] = (row[c] - mean) * r * gamma[c] + beta[c];
+}
+
+extern "C" __global__ void line_dwup(const float* x, const float* st, const float* w, const float* bias, float* y, int B, int T, int C, int S) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)B * T * S * C) return;
+    int c = idx % C;
+    size_t m = idx / C;
+    int r = m % S;
+    size_t bt = m / S;
+    int t = bt % T, b = bt / T;
+    float cur = x[bt * C + c];
+    float prev = t > 0 ? x[(bt - 1) * C + c] : st[(size_t)b * C + c];
+    size_t n = (size_t)r * C + c;
+    y[idx] = bias[n] + fmaf(prev, w[2 * n], cur * w[2 * n + 1]);
+}
+
+extern "C" __global__ void line_rope(float* qkv, const float* ring, int B, int T, int H, int D, int S, float theta) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int half = D / 2;
+    if (idx >= (size_t)B * T * 2 * H * half) return;
+    int i = idx % half;
+    size_t m = idx / half;
+    int h = m % H;
+    m /= H;
+    int part = m % 2;
+    size_t bt = m / 2;
+    int t = bt % T, b = bt / T;
+    float inv = 1.0f / powf(theta, (float)(2 * i) / (float)D);
+    float f = ((float)((int)ring[(size_t)b * S] + t)) * inv;
+    float c = (float)cos((double)f), s = (float)sin((double)f);
+    float* v = qkv + bt * 3 * H * D + (size_t)part * H * D + (size_t)h * D + 2 * i;
+    float a = v[0], e = v[1];
+    v[0] = a * c - e * s;
+    v[1] = e * c + a * s;
+}
+
+extern "C" __global__ void line_ring_attention(const float* qkv, const float* ring, float* out, int B, int T, int H, int D, int W, float scale) {
+    extern __shared__ float ring_smem[];
+    float* sc = ring_smem;
+    float* qs = sc + W;
+    float* red = qs + D;
+    int h = blockIdx.x % H;
+    size_t bt = blockIdx.x / H;
+    int t = bt % T, b = bt / T;
+    int DM = H * D;
+    const float* rs = ring + (size_t)b * (1 + 2 * (size_t)W * DM);
+    const float* rk = rs + 1;
+    const float* rv = rk + (size_t)W * DM;
+    int p0 = (int)rs[0];
+    int a = p0 + t;
+    int n = a + 1 < W ? a + 1 : W;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) qs[d] = qkv[bt * 3 * DM + (size_t)h * D + d];
+    __syncthreads();
+    float mx = -3.402823466e38f;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        int k = a - n + 1 + j;
+        const float* kr = k >= p0 ? qkv + ((size_t)b * T + (k - p0)) * 3 * DM + DM : rk + (size_t)(k % W) * DM;
+        float acc = 0.0f;
+        for (int d = 0; d < D; d++) acc = fmaf(qs[d], kr[(size_t)h * D + d], acc);
+        acc *= scale;
+        sc[j] = acc;
+        mx = fmaxf(mx, acc);
+    }
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = mx;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = red[0];
+        for (int i = 1; i < (int)(blockDim.x >> 5); i++) m = fmaxf(m, red[i]);
+        red[32] = m;
+    }
+    __syncthreads();
+    mx = red[32];
+    float sum = 0.0f;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        float e = expf(sc[j] - mx);
+        sc[j] = e;
+        sum += e;
+    }
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, o);
+    __syncthreads();
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.0f;
+        for (int i = 0; i < (int)(blockDim.x >> 5); i++) s += red[i];
+        red[33] = s;
+    }
+    __syncthreads();
+    float inv = 1.0f / red[33];
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int j = 0; j < n; j++) {
+            int k = a - n + 1 + j;
+            const float* vr = k >= p0 ? qkv + ((size_t)b * T + (k - p0)) * 3 * DM + 2 * DM : rv + (size_t)(k % W) * DM;
+            acc = fmaf(sc[j], vr[(size_t)h * D + d], acc);
+        }
+        out[bt * DM + (size_t)h * D + d] = acc * inv;
+    }
+}
+
+extern "C" __global__ void line_ring_store(const float* qkv, float* ring, int B, int T, int DM, int W) {
+    int n = T < W ? T : W;
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)B * n * DM) return;
+    int e = idx % DM;
+    size_t m = idx / DM;
+    int i = m % n, b = m / n;
+    int t = T - n + i;
+    float* rs = ring + (size_t)b * (1 + 2 * (size_t)W * DM);
+    int slot = ((int)rs[0] + t) % W;
+    const float* row = qkv + ((size_t)b * T + t) * 3 * DM;
+    rs[1 + (size_t)slot * DM + e] = row[DM + e];
+    rs[1 + (size_t)W * DM + (size_t)slot * DM + e] = row[2 * DM + e];
+}
+
+extern "C" __global__ void line_advance(float* ring, int B, int T, int S) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b < B) ring[(size_t)b * S] += (float)T;
+}
+"#;
+
 const LINE_ARGS: &str = "const float* x, const float* st, const float* w, const float* bias, const float* scale, float* y, int B, int T, int TO";
 const LINE_PASS: &str = "x, st, w, bias, scale, y, B, T, TO";
 
@@ -534,20 +673,33 @@ fn line_wrapper(k: &ConvKernel) -> String {
     let s = &k.shape;
     let (res, gelu) = (flag(k.epilogue.residual), flag(k.epilogue.gelu));
     let pad = s.pad.map_or(-1, |p| p as i64);
+    let act = crate::conv::line_act_id(k.prologue);
     let call = match k.family {
         Family::Tile => {
             let t = &k.tile;
-            format!("line_conv_tile<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {res}, {gelu}, {pad}>", t.bm, t.bn, t.bk, t.tm, t.tn, t.stages, s.kt, s.stride, s.cin, s.cout, s.phases)
+            format!("line_conv_tile<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {res}, {gelu}, {pad}, {act}>", t.bm, t.bn, t.bk, t.tm, t.tn, t.stages, s.kt, s.stride, s.cin, s.cout, s.phases)
         }
-        Family::Direct => format!("line_conv_direct<{}, {}, {}, {}, {}, {res}, {gelu}, {pad}>", s.kt, s.stride, s.cin, s.cout, s.phases),
-        Family::Rows => format!("line_conv_rows<{}, {}, {}, {}, {}, {}, {res}, {gelu}, {pad}>", s.kt, s.stride, s.cin, s.cout, s.phases, crate::conv::ROWS_CHUNK),
+        Family::Direct => format!("line_conv_direct<{}, {}, {}, {}, {}, {res}, {gelu}, {pad}, {act}>", s.kt, s.stride, s.cin, s.cout, s.phases),
+        Family::Rows => format!("line_conv_rows<{}, {}, {}, {}, {}, {}, {res}, {gelu}, {pad}, {act}>", s.kt, s.stride, s.cin, s.cout, s.phases, crate::conv::ROWS_CHUNK),
     };
     format!("extern \"C\" __global__ void __launch_bounds__({THREADS}) {}({LINE_ARGS}) {{\n    {call}({LINE_PASS});\n}}\n\n", k.name())
 }
 
+fn line_acts() -> Result<String, ConvError> {
+    let mut out = String::from("template <int ACT>\n__device__ __forceinline__ float line_act(float v) {\n");
+    for (i, name) in crate::conv::LINE_ACTS.iter().enumerate() {
+        let e = crate::expr::apply_macro(name, crate::expr::Expr::Raw("v".into())).and_then(|e| e.lower(crate::layout::Dialect::Cuda, &[])).map_err(ConvError)?;
+        out += &format!("    if (ACT == {}) return {e};\n", i + 1);
+    }
+    out += "    return v;\n}\n\n";
+    Ok(out)
+}
+
 pub fn emit_line(kernels: &[ConvKernel]) -> Result<crate::KirSource, ConvError> {
     let mut out = format!("constexpr int THREAD_ROWS = {THREAD_ROWS};\nconstexpr int THREAD_COLS = {THREAD_COLS};\n\n");
+    out += &line_acts()?;
     out += LINE;
+    out += LINE_SEQ;
     let mut seen = Vec::new();
     for k in kernels {
         k.validate()?;

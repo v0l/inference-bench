@@ -114,6 +114,20 @@ pub fn tile(t: &Target, s: &ConvShape) -> ConvTile {
 pub enum Prologue {
     None,
     GroupApply { groups: usize, silu: bool },
+    Act(&'static str),
+}
+
+pub const LINE_ACTS: &[&str] = &["gelu", "silu", "gelu_tanh", "elu"];
+
+pub fn line_act_id(p: Prologue) -> usize {
+    match p {
+        Prologue::Act(name) => LINE_ACTS.iter().position(|a| *a == name).map_or(0, |i| i + 1),
+        _ => 0,
+    }
+}
+
+pub fn act_keeps_zero(name: &str) -> bool {
+    crate::expr::Expr::parse(&format!("{name}(x)")).ok().and_then(|e| e.eval(&|n| (n == "x").then_some(0.0))) == Some(0.0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -152,7 +166,11 @@ impl ConvKernel {
     }
 
     pub fn rows(t: &Target, shape: ConvShape, epilogue: Epilogue) -> Result<ConvKernel, ConvError> {
-        let k = ConvKernel { target: *t, shape, family: Family::Rows, tile: tile(t, &shape), prologue: Prologue::None, epilogue };
+        Self::rows_with(t, shape, Prologue::None, epilogue)
+    }
+
+    pub fn rows_with(t: &Target, shape: ConvShape, prologue: Prologue, epilogue: Epilogue) -> Result<ConvKernel, ConvError> {
+        let k = ConvKernel { target: *t, shape, family: Family::Rows, tile: tile(t, &shape), prologue, epilogue };
         k.validate()?;
         Ok(k)
     }
@@ -169,7 +187,12 @@ impl ConvKernel {
         if s.interleave && (!s.cout.is_multiple_of(2) || s.upsample || s.phases != 1) {
             return bad("an interleaved output splits an even channel count and does not upsample".into());
         }
-        if s.line && (s.k != 1 || s.upsample || s.interleave || s.stride == 0 || s.stride > s.kt || s.phases == 0 || !s.cout.is_multiple_of(s.phases) || self.prologue != Prologue::None || self.epilogue.stats.is_some()) {
+        if let Prologue::Act(name) = self.prologue
+            && (!s.line || line_act_id(self.prologue) == 0 || crate::expr::unary_macro(name).is_none() || !act_keeps_zero(name))
+        {
+            return bad(format!("an input activation {name:?} is a line conv prologue over one of {LINE_ACTS:?} that maps 0 to 0, so the zero pad and tail need no activation"));
+        }
+        if s.line && (s.k != 1 || s.upsample || s.interleave || s.stride == 0 || s.stride > s.kt || s.phases == 0 || !s.cout.is_multiple_of(s.phases) || matches!(self.prologue, Prologue::GroupApply { .. }) || self.epilogue.stats.is_some()) {
             return bad(format!("a causal line conv over {} taps with stride {} and {} phases needs a 1x1 spatial kernel, whole phases and no group norm", s.kt, s.stride, s.phases));
         }
         if !s.line && (s.stride != 1 || s.phases != 1 || self.epilogue.gelu || s.pad.is_some()) {
@@ -223,7 +246,7 @@ impl ConvKernel {
 
     pub fn groups_in(&self) -> usize {
         match self.prologue {
-            Prologue::None => 1,
+            Prologue::None | Prologue::Act(_) => 1,
             Prologue::GroupApply { groups, .. } => groups,
         }
     }
@@ -289,4 +312,14 @@ pub fn attention_fits(t: &Target, keys: usize) -> bool {
 
 pub const ROW_KERNELS: &[&str] = &["vae_zero", "vae_group_stats", "vae_group_apply", "vae_rms", "vae_upsample", "vae_add", "vae_clamp", "vae_attention"];
 
-pub const LINE_ROW_KERNELS: &[&str] = &["line_rms", "line_dwconv", "line_shift"];
+pub const LINE_ROW_KERNELS: &[&str] = &["line_rms", "line_dwconv", "line_shift", "line_layernorm", "line_dwup", "line_rope", "line_ring_attention", "line_ring_store", "line_advance"];
+
+pub const RING_THREADS: u32 = 128;
+
+pub fn ring_attention_smem(context: usize, head_dim: usize) -> u32 {
+    ((context + head_dim + 64) * 4) as u32
+}
+
+pub fn ring_fits(t: &Target, context: usize, head_dim: usize) -> bool {
+    ring_attention_smem(context, head_dim) <= t.smem_limit && head_dim.is_multiple_of(2) && context > 0
+}
