@@ -11,6 +11,7 @@ use inference_bench_core::specs;
 use inference_bench_core::store;
 #[cfg(unix)]
 mod duplex;
+#[cfg(unix)]
 mod hostcmd;
 mod launch;
 
@@ -173,6 +174,7 @@ enum Cmd {
     Launch(launch::LaunchArgs),
     #[command(about = "Point Claude Code, Codex, OpenCode, pi or agentbench at a running server; --check tries a prompt and a tool call")]
     Connect(ConnectArgs),
+    #[cfg(unix)]
     #[command(about = "Stream a WAV through a duplex speech model in real time and write the reply WAV with per frame latency")]
     Duplex(duplex::DuplexArgs),
     #[command(about = "Run a model on the native engine and report its speed")]
@@ -767,6 +769,7 @@ fn main() -> Result<()> {
     match &cli.cmd {
         Cmd::Serve(_) => unreachable!(),
         Cmd::Launch(args) => launch::run(args, &data)?,
+        #[cfg(unix)]
         Cmd::Duplex(args) => duplex::run(args)?,
         Cmd::Connect(args) => connect_command(&data, args)?,
         Cmd::Run { engine, prompt } => {

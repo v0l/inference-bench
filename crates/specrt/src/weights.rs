@@ -545,12 +545,16 @@ impl Checkpoint {
             let sh = &self.shards[*i];
             let Ok(info) = sh.meta.info(stored).context("tensor info") else { continue };
             let (from, to) = info.data_offsets;
-            let start = (sh.data_start + from).div_ceil(page) * page;
-            let end = (sh.data_start + to) / page * page;
             #[cfg(unix)]
-            if end > start {
-                let _ = unsafe { sh.map.unchecked_advise_range(UncheckedAdvice::DontNeed, start, end - start) };
+            {
+                let start = (sh.data_start + from).div_ceil(page) * page;
+                let end = (sh.data_start + to) / page * page;
+                if end > start {
+                    let _ = unsafe { sh.map.unchecked_advise_range(UncheckedAdvice::DontNeed, start, end - start) };
+                }
             }
+            #[cfg(not(unix))]
+            let _ = (sh, from, to, page);
         }
     }
 
