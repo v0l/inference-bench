@@ -384,6 +384,44 @@ What the deletion removes:
 
 What stays in agentbench: `agent-voice::voice` (audio helpers, WAV, resampling, the OpenAI style client, the model and voice lists the pickers show) and the Android app code, unchanged.
 
+### 5.1 Landed (#1486)
+
+agentbench branch `issue-1486-speech-through-engine`. Step 2 is its commit `85983b4`, kept as the branch `issue-1486-candle-fallback` (candle behind `[speech] backend = "candle"`); step 3 (`5c62428` and after) deletes everything in the table above. `speech.backend = "candle"` is now refused with a message saying to remove the line.
+
+- `agent_voice::engine` is the child manager from agentbench #1473, moved out of the app and made general: any list of `duplex`, `transcription` and `speech` models, a memory need per plan, and a CPU fallback (`Host::Fallback`) when no card has room. The hands free child and the speech child are both instances of it.
+- The agentbench server (`crates/server/src/engine.rs`, `audio.rs`) starts its own child on the first speech request, listing every Whisper in `models/` and Phonon in `models/phonon`, none preloaded, with `[images] jobs_per_gpu = 4` so a reading and a transcription do not queue behind each other. `[speech]` in `agentbench.toml`: `gpu`, `cpu`, `program`, `idle_secs` (600). It fetches the Whisper `generation_config.json` and `preprocessor_config.json` the engine reads, and Phonon at the hub revision `92741c5b` (an old runtime config is kept as `config.json.old`).
+- Transcription: the take is resampled to 16 kHz once and posted as f32 samples, `verbose_json`; the `no_speech_prob` and `avg_logprob` the hands free noise filter reads are made from the segments the way candle made them (lowest window, token weighted mean). Speech: the body is passed on with `model`, `voice`, `response_format` and an optional `seed`, and the engine's headers and PCM stream come back untouched.
+- The desktop window's "this device" voice input posts to the agentbench server on this machine (`Settings::resolved_with`), so it is offered in every desktop build; the phone and the web build are unchanged.
+
+Parity, on this machine through agentbench's own routes (`scripts/agentbench_speech.py`), engine child on GPU1, candle through agentbench with `backend = "candle"` on GPU1:
+
+| set | run | WER % | identical | note |
+|---|---|---|---|---|
+| c2, whisper-base.en, 205 clips | agentbench to engine | 6.08 (short 6.39, long 3.61) | 205/205 to transformers | equal to 2.7's engine row |
+| c2, whisper-base.en | agentbench candle | 14.39 (short 8.48, long 61.45) | 120/205 | equal to 2.7's candle row |
+| c2, whisper-large-v3-turbo | agentbench to engine | 2.26 (short 2.39, long 1.20) | 205/205 to transformers | equal to 2.7 |
+| c2, whisper-large-v3-turbo | agentbench candle | 2.39 | 128/205 | equal to 2.7 |
+| f2, 80 Phonon clips, seed 1484, streamed `pcm` | agentbench to engine | 1.70 (Harper 1.61, Hadley 1.79) | 80/80 byte equal to the #1484 engine WAVs | |
+| f2 | agentbench candle | 1.70 (Harper 1.79, Hadley 1.61) | | durations engine over candle 0.955 to 1.063, none outside 10% |
+
+The accuracy bar holds: through agentbench the engine gives the transformers transcripts on both Whisper models (better than candle, which loses the long clips on base.en) and the same Phonon audio and word error rate as section 3.6.
+
+The real app, in a private headless sway with ALSA pointed at a file microphone (`ask.wav` in pink noise) and a file speaker: SPEAK put "What is running right now?" in the draft at 1280x800 and at 392x844; SEND gave the reply, and read aloud played 3.9 s that the engine's turbo hears as "I started two workers just now. They are still running.", the reply word for word. `nvidia-smi --query-compute-apps` showed the child `inference-bench-server` on GPU1 only (4.6 GB), and stopping the agentbench server took it down. Settings, speech: "this device" offered, "runs on" reads read aloud on GPU, voice input on GPU.
+
+![dictated](img/speech-1486/05-heard.png) ![reply](img/speech-1486/06-sent.png) ![phone](img/speech-1486/09-phone-dictated.png) ![settings phone](img/speech-1486/12-speech-phone.png) ![settings](img/speech-1486/13-speech-desktop.png)
+
+Rerun (agentbench release build in `$A`, engine in `$E`, a home whose `agentbench.toml` has `[speech] gpu = 1` and `program = "$E"`):
+
+```
+~/.agents/bin/gpu-run 1 --min-free 8000 -- env AGENTBENCH_HOME=$H $A/agentbench-server serve &
+T=$($A/agentbench-server --home $H token); S=crates/specrt/scripts; D=/mnt/data/tmp/speech-1486
+for m in whisper-base.en whisper-large-v3-turbo; do python3 $S/agentbench_speech.py hear http://127.0.0.1:7461 $T $m /mnt/data/tmp/speech-1480/clips/manifest.jsonl $D/agentbench-engine-$m.jsonl; done
+python3 $S/agentbench_speech.py say http://127.0.0.1:7461 $T /mnt/data/tmp/speech-1484/sentences.jsonl $D/f2 --stream
+python3 $S/agentbench_speech.py same /mnt/data/tmp/speech-1484/sentences.jsonl $D/f2/wav /mnt/data/tmp/speech-1484/engine/wav
+```
+
+The agentbench tests: `crates/server/tests/speech_engine.rs` serves the routes against a fake engine child (the app's multipart body, the default model, extra form fields, 401 never starting the child, the streamed bytes and headers, WAV and seed, lists, status, an engine error); `crates/app/tests/voice.rs` and `duplex.rs` run the real Whisper and Phonon through the child with `AGENTBENCH_REAL_ENGINE` and `AGENTBENCH_SPEECH_GPU=1` (27 passed on GPU1), and `a_spoken_take_reaches_the_supervisor_and_its_reply_is_spoken_back` checks the engine log for both routes.
+
 ## 6. Fixture and test
 
 `crates/specrt/tests/fixtures/speech/` (1.99 MB of the 2 MB cap the test sets, with `tiny-mimi` and `tiny-phonon`; the Haru fixture is under 3 MB and the diffusion ones under 20 MB, there is no shared cap across fixtures beyond each test's own):
@@ -430,4 +468,4 @@ Each follows `docs/specrt-kir-compiler.md`: new ops are typed signature entries 
 | f | TTS model graph and sampling: Phonon flow LM, LSD head, EOS, voices, chunking, tiny fixture | e |
 | f2 | Real Phonon: download, step match against transformers and the quality run on GPU1 | f |
 | g | `/v1/audio/speech` with streaming PCM, `/v1/audio/voices`, `/v1/models` type `speech` | f |
-| h | agentbench: speech through the engine child, candle kept as fallback, then removed | d, g, c2, f2, agentbench #1473 |
+| h | agentbench: speech through the engine child, candle kept as fallback, then removed (landed, 5.1) | d, g, c2, f2, agentbench #1473 |

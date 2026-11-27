@@ -81,7 +81,7 @@ def score(args):
     for spec in args.runs:
         name, rows, heard = spec.split("=", 1)[0], *spec.split("=", 1)[1].split(",")
         audio = {r["id"]: r for r in whisper_wer.load_manifest(rows)}
-        text = {r["id"]: tok.decode(r["tokens"], skip_special_tokens=True) for r in whisper_wer.load_manifest(heard)}
+        text = {r["id"]: r["text"] if "text" in r else tok.decode(r["tokens"], skip_special_tokens=True) for r in whisper_wer.load_manifest(heard)}
         runs[name] = (audio, text)
     table = []
     for name, (audio, text) in runs.items():
