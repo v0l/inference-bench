@@ -1426,3 +1426,77 @@ fn the_phonon_family_spec_is_a_tts_decoder_refused_as_text_chat() {
         assert_eq!(specrt::plan::Weight::LmHead.tensors(&spec), ["eos_head.weight", "eos_head.bias"]);
     }
 }
+
+fn real_phonon() -> Option<(PathBuf, PathBuf)> {
+    Some((PathBuf::from(std::env::var_os("PHONON_DIR")?), PathBuf::from(std::env::var_os("PHONON_REF")?)))
+}
+
+fn real_ref(dir: &Path, key: &str) -> (Vec<f32>, Vec<usize>) {
+    let meta = json(&dir.join("reference.json"));
+    let entry = &meta["files"][key];
+    let shape: Vec<usize> = entry["shape"].as_array().unwrap_or_else(|| panic!("{key}")).iter().map(|d| d.as_u64().unwrap() as usize).collect();
+    let values: Vec<f32> = std::fs::read(dir.join(entry["file"].as_str().unwrap())).unwrap().as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+    assert_eq!(values.len(), shape.iter().product::<usize>(), "{key}");
+    (values, shape)
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU, PHONON_DIR (gradium/phonon-31m-en) and PHONON_REF (scripts/phonon_reference.py)"]
+fn every_real_phonon_step_matches_transformers_when_fed_its_latent_and_noise() {
+    use specrt::codec::cuda::CudaCodec;
+    use specrt::flow_head::FlowHead;
+    use specrt::flow_head_cuda::CudaHead;
+    let Some((model, rdir)) = real_phonon() else { panic!("set PHONON_DIR and PHONON_REF") };
+    let meta = json(&rdir.join("reference.json"));
+    let t = specrt::speech::tts::HostTts::open(&model).unwrap();
+    let w = t.spec.inputs.as_ref().unwrap().width_of(&t.tts.voice).unwrap();
+    let voice = specrt::speech::tts::Voice::open(Path::new(meta["voice"].as_str().unwrap()), &t.tts, w).unwrap();
+    let tokens = ids(&meta["tokens"]);
+    let (prompt, _) = t.prompt(Some(&voice), &tokens).unwrap();
+    assert_eq!(prompt, ids(&meta["prompt"]));
+    let (conditions, _) = real_ref(&rdir, "conditions");
+    let raw = specrt::weights::Checkpoint::open(&model).unwrap();
+    let c = max_rel(&specrt::speech::tts::conditions(&t.tts, &raw, t.spec.dims.hidden).unwrap(), &conditions);
+    let (hidden, hshape) = real_ref(&rdir, "frames.hidden");
+    let (eos, _) = real_ref(&rdir, "frames.eos");
+    let (latents, _) = real_ref(&rdir, "frames.latent");
+    let (codec_want, _) = real_ref(&rdir, "frames.codec_latent");
+    let (noise, _) = real_ref(&rdir, "noise");
+    let (audio_want, _) = real_ref(&rdir, "audio");
+    let (frames, h, d) = (hshape[0], hshape[1], t.latent_dim());
+    let ctx = cudarc::driver::CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+    let cache = std::env::var_os("SPECRT_CACHE").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("specrt-phonon-jit"));
+    let jit = specrt::jit::Jit::new(ctx.clone(), cache).unwrap();
+    let gpu_head = CudaHead::load(&stream, &jit, FlowHead::from_dir(&model, None).unwrap(), &model, true).unwrap();
+    let mut gs = gpu_head.session(&[1.0]).unwrap();
+    let host_codec = specrt::codec::HostCodec::open(&model).unwrap();
+    let gpu_codec = CudaCodec::load(&ctx, &jit, &host_codec, &[(1, 1)]).unwrap();
+    let mut cs = gpu_codec.sessions(&gpu_codec.decoder, 1).unwrap();
+    let eos_scale = eos.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let (mut s, mut hid, mut logit) = t.start(Some(&voice), &tokens).unwrap();
+    let (mut wh, mut we, mut wz, mut wg, mut wc) = (0f32, 0f32, 0f32, 0f32, 0f32);
+    let (mut codec_host, mut audio_gpu) = (Vec::new(), Vec::new());
+    for f in 0..frames {
+        let (rh, rz, rn) = (&hidden[f * h..(f + 1) * h], &latents[f * d..(f + 1) * d], &noise[f * d..(f + 1) * d]);
+        wh = wh.max(max_rel(&hid, rh));
+        we = we.max((logit - eos[f]).abs() / eos_scale);
+        let frame = t.sample(&mut s, &hid, logit, rn).unwrap();
+        wz = wz.max(max_rel(&frame.latent, rz));
+        let gz = gpu_head.frame(&mut gs, &hid, rn).unwrap();
+        wg = wg.max(max_rel(&gz, rz));
+        let gc = gpu_head.read(&gs, "codec").unwrap();
+        wc = wc.max(max_rel(&gc, &codec_want[f * d..(f + 1) * d]));
+        codec_host.extend_from_slice(&frame.codec);
+        audio_gpu.extend(gpu_codec.run(&gpu_codec.decoder, &gc, &mut cs).unwrap());
+        (hid, logit) = t.advance(&mut s, rz).unwrap();
+    }
+    let ec = max_rel(&codec_host, &codec_want);
+    let audio_ref_codec = host_codec.decode(&codec_want).unwrap();
+    let (ea, ega, ehc) = (max_rel(&audio_ref_codec, &audio_want), max_rel(&audio_gpu, &audio_want), max_rel(&audio_gpu, &audio_ref_codec));
+    println!("real phonon, {frames} frames fed the reference latent and noise: conditions {c:.2e}, hidden {wh:.2e}, eos logit {we:.2e}, host latent {wz:.2e}, gpu latent {wg:.2e}, host codec latent {ec:.2e}, gpu codec latent {wc:.2e}");
+    println!("real phonon audio over {} samples: host mimi on the reference latents {ea:.2e}, gpu head and gpu mimi frame by frame {ega:.2e} (against the host mimi {ehc:.2e})", audio_want.len());
+    assert!(c < 1e-5 && wh < 1e-3 && we < 1e-3, "{c} {wh} {we}");
+    assert!(wz < 1e-3 && wg < 1e-3 && ec < 1e-3 && wc < 1e-3, "{wz} {wg} {ec} {wc}");
+    assert!(ea < 1e-3 && ega < 1e-3, "{ea} {ega}");
+}

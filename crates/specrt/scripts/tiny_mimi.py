@@ -47,8 +47,7 @@ CONFIG = dict(
 )
 
 
-def reference_config():
-    m = MIMI
+def reference_config(m=MIMI):
     return PocketTTSAudioTokenizerConfig(
         sampling_rate=m["sample_rate"],
         hidden_size=m["dimension"],
@@ -126,8 +125,7 @@ def pairs_to_halves(rows, heads):
     return rows.view(heads, half, 2, cols).transpose(1, 2).reshape(n, cols)
 
 
-def reference_state(w):
-    m = MIMI
+def reference_state(w, m=MIMI):
     d, heads = m["dimension"], m["transformer_num_heads"]
     s = {"latent_proj.weight": w["mimi.quantizer.output_proj.weight"], "decoder.upsample.conv.weight": w["mimi.upsample.convtr.convtr.weight"]}
     for l in range(m["transformer_num_layers"]):

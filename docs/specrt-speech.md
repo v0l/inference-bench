@@ -266,7 +266,51 @@ Port **Phonon** (slices e and f), in the engine, as spec data.
 
 - Tiny fixture (slice e and f make it from `transformers.models.gradium_phonon_tts` and `transformers.models.mimi` on the CPU, random weights, the real tensor kinds): flow LM hidden states and EOS logits within 1e-3 relative, the flow head latent within 1e-4 for recorded noise, Mimi decode within 1e-4, frame by frame equal to whole clip within 1e-5, as the Haru codec tests do.
 - Real checkpoint: fed the reference's previous latent and noise each step (the `every_step_matches_ptts_when_fed_the_same_input` test in agentbench does this for candle against `ptts`), latents and audio within 1e-3 relative of the transformers reference for 50 frames.
-- Speech quality: a fixed sentence set (the 30 sentences of `fixtures/haru/say_sentences.txt` plus 20 from LibriSpeech test-clean transcripts) spoken in Harper and Hadley by the engine and by the candle path, each transcribed by `whisper-large-v3-turbo` through the engine: WER of the engine's audio within 0.5 points of the candle path's, and no sentence cut short (duration within 10% of the candle one).
+- Speech quality: a fixed sentence set (the 20 sentences of `fixtures/haru/say_sentences.txt`, which holds 20, not the 30 first planned, plus 20 from LibriSpeech test-clean transcripts) spoken in Harper and Hadley by the engine and by the candle path, each transcribed by `whisper-large-v3-turbo` through the engine: WER of the engine's audio within 0.5 points of the candle path's, and no sentence cut short (duration within 10% of the candle one). Met (#1484, section 3.6): gap 0.00, durations within 4.5% shorter to 6.3% longer.
+
+### 3.6 Real Phonon (#1484)
+
+Checkpoint: `gradium/phonon-31m-en` `model.safetensors` (sha256 `8a04cf83...`, the same blob at `8c64b55e` and `92741c5b`) and `tokenizer.json` from `~/.local/share/agentbench/models/phonon`, with the hub config of `92741c5b` (`tests/fixtures/speech/phonon-31m-en.hub-92741c5.config.json`; the pinned `8c64b55e` config is the original runtime format with no `model_type`, which neither transformers nor the family match reads). Voices from `gradium/phonon-voices`: Harper `4SZHfMpw-p46Ywgs`, Hadley `bXwrkHhURL1VFJdG`.
+
+Step match (`every_real_phonon_step_matches_transformers_when_fed_its_latent_and_noise`, GPU1): `scripts/phonon_reference.py` runs transformers 5.23 on the CPU in f32 (eager) for a 38 token sentence after the voice, 50 frames, each step fed the reference's previous latent and seeded noise at temperature 0.3, and decodes the codec latents with `PocketTTSAudioTokenizerModel`. The engine runs the flow LM on the host decoder, the LSD head and the Mimi decoder through kir kernels on GPU1 (head fused, codec frame by frame), each step fed the same latent and noise.
+
+| Check, 50 frames (bar 1e-3) | Harper | Hadley |
+|---|---|---|
+| summed conditions | 0.0 | 0.0 |
+| flow LM hidden state | 2.6e-6 | 2.5e-6 |
+| EOS logit | 5.2e-7 | 3.1e-7 |
+| latent, host head | 2.5e-5 | 6.5e-6 |
+| latent, GPU1 head | 2.2e-5 | 8.7e-6 |
+| codec latent, GPU1 head | 2.0e-5 | 7.7e-6 |
+| audio, host Mimi on the reference latents (96,000 samples) | 2.2e-6 | 3.3e-6 |
+| audio, GPU1 head and GPU1 Mimi frame by frame | 8.6e-5 | 1.4e-4 |
+
+Quality run: 40 sentences (the 20 of `say_sentences.txt` and 20 LibriSpeech test-clean transcripts of 8 to 30 words, evenly spaced over the 200 short clips of 2.7, sentence cased with a full stop) in Harper and Hadley, 80 clips a run. The engine (`src/bin/phonon.rs`: text normalisation, sentence chunks, host flow LM, GPU1 LSD head and Mimi, `flow_head::frame_noise` with seed 1484) and agentbench's candle path (`agent-voice` example `phonon_say` with `DEVICE=cuda` on GPU1, its own `StdRng` noise, seed 4242424242424242), each resampled to 16 kHz by ffmpeg and transcribed greedy by the engine's `whisper-large-v3-turbo` (2.7), scored with `EnglishTextNormalizer`. The noise streams differ, so the audio is not sample identical, only alike.
+
+| run | WER all % | Harper | Hadley | say set | LibriSpeech set | exact transcripts | audio |
+|---|---|---|---|---|---|---|---|
+| engine, GPU1 | 1.70 | 1.61 | 1.79 | 0.47 | 2.44 | 63/80 | 361.0 s |
+| candle `phonon_say`, GPU1 | 1.70 | 1.79 | 1.61 | 0.47 | 2.44 | 64/80 | 355.4 s |
+
+Gap 0.00 (bar 0.5). Duration engine over candle per clip: 0.955 to 1.063, none outside 10%. Every error on both paths is a name Whisper spells its own way (Fitzooth, Phronsie, Gamewell, Warrenton) or "nine thirty" heard as "9.30", plus one "asked" heard as "Ask" in the engine's Hadley clip and one "ascertain" heard as "assert" in candle's Harper clip. The engine takes 452.7 s for the 361 s of audio, since its flow LM still runs on the host decoder (the CUDA flow LM is slice g); candle takes 151.7 s including a model load per clip.
+
+Rerun (paths as used; the model folder is the checkpoint with the hub config):
+
+```
+D=/mnt/data/tmp/speech-1484; P=~/.local/share/agentbench/models/phonon; S=crates/specrt/scripts; PY=~/.venv-vllm/bin/python
+mkdir -p $D/phonon && cp crates/specrt/tests/fixtures/speech/phonon-31m-en.hub-92741c5.config.json $D/phonon/config.json && ln -s $P/model.safetensors $P/tokenizer.json $D/phonon/
+systemd-run --user --wait --collect -P -q -p MemoryMax=16G -p MemorySwapMax=0 -E CUDA_VISIBLE_DEVICES= --working-directory=$PWD/$S $PY phonon_reference.py $P $P/voices/4SZHfMpw-p46Ywgs.safetensors $D/ref-harper
+B=$(cargo test -p inference-bench-specrt --test speech --no-run 2>&1 | grep -o '/[^ ]*speech-[0-9a-f]*')
+~/.agents/bin/gpu-run 1 --min-free 2000 -- env PHONON_DIR=$D/phonon PHONON_REF=$D/ref-harper $B --ignored every_real_phonon --nocapture
+cargo build --release -p inference-bench-specrt --bin phonon --bin whisper
+$PY $S/phonon_quality.py sentences /mnt/data/tmp/speech-1480/clips/manifest.jsonl $P/voices $D/sentences.jsonl
+~/.agents/bin/gpu-run 1 --min-free 2000 -- $CARGO_TARGET_DIR/release/phonon $D/phonon $D/sentences.jsonl $D/engine 1484
+(cd ~/git/agentbench && cargo build --release -p agent-voice --features speech-cuda --example phonon_say)
+$PY $S/phonon_quality.py candle <target>/release/examples/phonon_say $D/phonon $D/sentences.jsonl $D/candle --prefix "$HOME/.agents/bin/gpu-run 1 --min-free 2000 --"
+W=$(ls -d ~/.cache/huggingface/hub/models--openai--whisper-large-v3-turbo/snapshots/*)
+for r in engine candle; do $PY $S/phonon_quality.py to16k $D/$r/$r.jsonl $D/$r; ~/.agents/bin/gpu-run 1 --min-free 8000 -- systemd-run --user --wait --collect -P -q -p MemoryMax=16G -p MemorySwapMax=0 -E CUDA_VISIBLE_DEVICES=1 -E CUDA_DEVICE_ORDER=PCI_BUS_ID $CARGO_TARGET_DIR/release/whisper $W $D/$r/manifest16.jsonl $D/$r/whisper.jsonl; done
+$PY $S/phonon_quality.py score $W $D/sentences.jsonl engine=$D/engine/engine.jsonl,$D/engine/whisper.jsonl candle=$D/candle/candle.jsonl,$D/candle/whisper.jsonl
+```
 
 ## 4. Serving: compatibility with agentbench's routes
 
