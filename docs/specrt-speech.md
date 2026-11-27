@@ -228,6 +228,19 @@ What agentbench's clients send and read today, which the new routes must accept 
 
 Admission and queueing follow the media job pattern (`specrt::media`, #1285): a speech job holds a slot, a full queue answers 429 with `Retry-After`, and `/v1/capabilities` lists the fields above per route. Body limit: a 30 minute WAV at 16 kHz PCM16 is 57.6 MB, so the transcription route needs its own `[media] max_audio_bytes` (default 64 MB) in the server config rather than the chat limit.
 
+### 4.1 Transcription, landed (#1481)
+
+`POST /v1/audio/transcriptions`, `GET /v1/audio/models` and `GET /v1/audio/status` are in `api_routes()` (`crates/server/src/audio.rs`), behind the same auth, `x-request-id`, access log line and `inference_requests_total{endpoint="audio_transcriptions"}` as chat. `ModelKind::Transcription` labels a Whisper folder `type: "transcription"` in `/v1/models`, from disk before it loads and from the engine after. The engine side is `speech::service`: `resolve_dir` and `is_speech_config` are the support check (`Spec::from_hf_config_speech` plus a `[speech.decode]` section, no model names), `Service` runs one `Transcriber` on its own thread (the kir GPU engine, the host engine when no CUDA device opens), resamples to the plan's rate, decodes text with the checkpoint's `tokenizer.json`, and decodes long form with timestamps past one window. A request `prompt` becomes the first window's `<|startofprev|>` context (`Options::prompt`). The library reports Whisper as runnable from the same check ("speech to text, whisper family, served on /v1/audio/transcriptions"). Jobs take the media gate's slots and queue (`[images] jobs_per_gpu`, `queue_depth`): a full queue is a 429 with `Retry-After`. `[media] max_audio_bytes` is the route's own body limit (413 above it); `/v1/capabilities` lists the six form fields and the limit.
+
+Tests: `crates/server/tests/audio.rs` (CPU) posts the exact multipart bodies of agentbench's `voice/native.rs` (reqwest: `file`, `model`, `response_format=json`) and `agent-voice` `Client::transcribe` (hand built, `model=whisper-1`, `response_format`, then `file`) and gets `{"text"}`, checks 401 without the key, the request id, access log and metrics lines, every field and unknown ones, 48 kHz stereo downmixed and resampled, 413, 429 with `Retry-After`, and the agentbench shapes of `/v1/audio/models` and `/v1/audio/status`; `the_tiny_whisper_fixture_served_end_to_end_on_the_host_engine_gives_the_greedy_tokens` posts the fixture's 1 s chirp as a float WAV and gets the 12 greedy tokens. `crates/server/tests/audio_gpu.rs` (GPU1) sends the #1480 clips through the route: whisper-base.en 205/205 transcripts identical to the engine run of 2.7 (all 200 short clips and the 5 long ones, 18 s), whisper-large-v3-turbo 25/25 (20 short, the 5 long).
+
+```
+B=$(cargo test --release -p inference-bench-server --test audio_gpu --no-run 2>&1 | grep -o '/[^ ]*audio_gpu-[0-9a-f]*')
+~/.agents/bin/gpu-run 1 --min-free 8000 -- systemd-run --user --wait --collect -P -q -p MemoryMax=16G -p MemorySwapMax=0 -E CUDA_VISIBLE_DEVICES=1 -E CUDA_DEVICE_ORDER=PCI_BUS_ID -E HOME=$HOME -E SPEECH_COUNT=200 --working-directory=$PWD/crates/server $B --ignored --nocapture
+```
+
+`SPEECH_REPO=openai/whisper-large-v3-turbo SPEECH_ENGINE=/mnt/data/tmp/speech-1480/engine-whisper-large-v3-turbo.jsonl` runs the turbo.
+
 ## 5. Migration of agentbench
 
 The managed engine child from agentbench #1473 serves duplex (Haru), transcription (Whisper) and speech (Phonon) from one process. agentbench's own `/v1/audio/*` routes become a proxy to the child when it is running, so the desktop app, the Android app and the web build change nothing: they already talk to the server endpoints, never to candle directly (Android builds `--features local-speech`, but `build.rs` turns `local_speech` off on Android, so the phone already only records and posts).

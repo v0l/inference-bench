@@ -160,7 +160,7 @@ impl LocalModel {
             ("specrt", Format::Spec) => self.path.display().to_string(),
             ("specrt" | "llama.cpp", Format::Gguf) => self.path.display().to_string(),
             ("specrt", _) if self.repo.is_empty() && specrt::media::is_pipeline(&self.path) => self.path.display().to_string(),
-            ("specrt", Format::Safetensors) if self.repo.is_empty() && is_duplex(self) => self.path.display().to_string(),
+            ("specrt", Format::Safetensors) if self.repo.is_empty() && (is_duplex(self) || is_transcription(self)) => self.path.display().to_string(),
             ("specrt" | "vllm", _) if !self.repo.is_empty() => self.repo.clone(),
             _ => self.name.clone(),
         }
@@ -246,9 +246,16 @@ pub fn specrt_support(config: &Value) -> Support {
         },
         Err(e) => match specrt::spec::Spec::from_hf_config_duplex(&text) {
             Ok(spec) => Support::yes("specrt", &format!("full duplex speech, {} family, served on /v1/duplex on CUDA", spec.name)),
-            Err(_) => Support::no("specrt", e.root_cause().to_string()),
+            Err(_) => match specrt::spec::Spec::from_hf_config_speech(&text) {
+                Ok(spec) if spec.speech_decode.is_some() => Support::yes("specrt", &format!("speech to text, {} family, served on /v1/audio/transcriptions on CUDA or the CPU", spec.name)),
+                _ => Support::no("specrt", e.root_cause().to_string()),
+            },
         },
     }
+}
+
+pub fn is_transcription(model: &LocalModel) -> bool {
+    model.format == Format::Safetensors && std::fs::read_to_string(model.path.join("config.json")).is_ok_and(|t| specrt::speech::service::is_speech_config(&t))
 }
 
 pub fn is_duplex(model: &LocalModel) -> bool {
@@ -1039,7 +1046,10 @@ mod tests {
         let fixtures = engine_config_fixtures();
         assert!(fixtures.len() >= 12, "{} fixtures", fixtures.len());
         for (name, config) in &fixtures {
-            let engine = specrt::spec::Spec::from_hf_config(&config.to_string()).or_else(|_| specrt::spec::Spec::from_hf_config_duplex(&config.to_string()));
+            let engine = specrt::spec::Spec::from_hf_config(&config.to_string()).or_else(|_| specrt::spec::Spec::from_hf_config_duplex(&config.to_string())).or_else(|e| match specrt::speech::service::is_speech_config(&config.to_string()) {
+                true => specrt::spec::Spec::from_hf_config_speech(&config.to_string()),
+                false => Err(e),
+            });
             let s = specrt_support(config);
             assert_eq!(s.supported, engine.is_ok(), "{name}: library says {:?}, engine says {:?}", s, engine.err());
             assert_eq!(s.supported, !engine_refuses.contains(&name.as_str()), "{name}: {}", s.reason);
@@ -1072,6 +1082,21 @@ mod tests {
         config["quantization_config"] = serde_json::json!({"quant_method": "gptq", "bits": 4});
         let s = specrt_support(&config);
         assert!(!s.supported && s.reason.contains("quantization") && s.reason.contains("gptq"), "{}", s.reason);
+    }
+
+    #[test]
+    fn whisper_is_supported_as_a_transcription_model_from_the_engine_spec() {
+        let speech = Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures/speech");
+        for name in ["whisper-tiny.en.config.json", "whisper-base.config.json", "whisper-large-v3-turbo.config.json"] {
+            let config: Value = serde_json::from_str(&std::fs::read_to_string(speech.join(name)).unwrap()).unwrap();
+            let s = specrt_support(&config);
+            assert_eq!(s.supported, specrt::spec::Spec::from_hf_config_speech(&config.to_string()).is_ok(), "{name}");
+            assert!(s.supported && s.reason.contains("/v1/audio/transcriptions"), "{name}: {}", s.reason);
+            assert!(specrt::spec::Spec::from_hf_config(&config.to_string()).is_err(), "{name}: text chat stays refused");
+        }
+        let tiny = local_model_at(&speech.join("tiny-whisper")).unwrap();
+        assert!(is_transcription(&tiny) && tiny.support_for("specrt").unwrap().supported);
+        assert_eq!(tiny.model_id("specrt"), tiny.path.display().to_string(), "a local speech folder loads by its path");
     }
 
     #[test]

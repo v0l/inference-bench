@@ -22,6 +22,7 @@ pub fn specrt_serving_factory() -> ServingFactory {
 
 type StatsSource = Arc<Mutex<Vec<(String, Box<dyn Target>)>>>;
 type DuplexList = Arc<Mutex<Vec<(String, Arc<specrt::duplex::service::Service>)>>>;
+type TranscriberList = Arc<Mutex<Vec<(String, Arc<specrt::speech::service::Service>)>>>;
 type LoadedList = Arc<Mutex<Vec<Loaded>>>;
 type LiveList = Arc<Mutex<Vec<Live>>>;
 
@@ -121,6 +122,7 @@ pub struct Engine {
     stop_sampler: Arc<AtomicBool>,
     max_loaded: Arc<AtomicUsize>,
     duplexes: DuplexList,
+    transcribers: TranscriberList,
     duplex_options: Arc<Mutex<specrt::duplex::service::ServiceOptions>>,
     duplex_loader: Arc<Mutex<crate::native::DuplexLoader>>,
 }
@@ -135,9 +137,18 @@ pub struct Handle {
     stats: StatsSource,
     watching: Arc<AtomicBool>,
     duplexes: DuplexList,
+    transcribers: TranscriberList,
 }
 
 impl Handle {
+    pub fn transcriber_of(&self, model: Option<&str>) -> Option<Arc<specrt::speech::service::Service>> {
+        let id = match model {
+            Some(name) => self.loaded_named(name)?.model_id,
+            None => self.loaded()?.model_id,
+        };
+        self.transcribers.lock().unwrap().iter().find(|(m, _)| *m == id).map(|(_, s)| s.clone())
+    }
+
     pub fn duplex_of(&self, model: Option<&str>) -> Option<Arc<specrt::duplex::service::Service>> {
         let id = match model {
             Some(name) => self.loaded_named(name)?.model_id,
@@ -331,13 +342,14 @@ impl Engine {
         let idle = Live::new("");
         let stats: StatsSource = Arc::default();
         let duplexes: DuplexList = Arc::default();
+        let transcribers: TranscriberList = Arc::default();
         let duplex_options = Arc::new(Mutex::new(specrt::duplex::service::ServiceOptions::default()));
         let duplex_loader = Arc::new(Mutex::new(crate::native::specrt_duplex_loader()));
         let max_loaded = Arc::new(AtomicUsize::new(DEFAULT_MAX_LOADED));
         let watching = Arc::new(AtomicBool::new(false));
         let stop_sampler = Arc::new(AtomicBool::new(false));
-        let shared = Shared { loaded: loaded.clone(), suspended: suspended.clone(), lives: lives.clone(), stats: stats.clone(), max_loaded: max_loaded.clone(), duplexes: duplexes.clone(), duplex_options: duplex_options.clone(), duplex_loader: duplex_loader.clone() };
-        let this = Self { commands, events, loaded, suspended, lives, idle, stats, watching, stop_sampler, max_loaded, duplexes, duplex_options, duplex_loader };
+        let shared = Shared { loaded: loaded.clone(), suspended: suspended.clone(), lives: lives.clone(), stats: stats.clone(), max_loaded: max_loaded.clone(), duplexes: duplexes.clone(), transcribers: transcribers.clone(), duplex_options: duplex_options.clone(), duplex_loader: duplex_loader.clone() };
+        let this = Self { commands, events, loaded, suspended, lives, idle, stats, watching, stop_sampler, max_loaded, duplexes, transcribers, duplex_options, duplex_loader };
         let handle = this.handle();
         let (stop, wake_sampler) = (this.stop_sampler.clone(), wake.clone());
         std::thread::spawn(move || run(inbox, events_tx, shared, wake, factory, serving, gpu));
@@ -355,6 +367,7 @@ impl Engine {
             stats: self.stats.clone(),
             watching: self.watching.clone(),
             duplexes: self.duplexes.clone(),
+            transcribers: self.transcribers.clone(),
         }
     }
 
@@ -421,6 +434,7 @@ struct Shared {
     stats: StatsSource,
     max_loaded: Arc<AtomicUsize>,
     duplexes: DuplexList,
+    transcribers: TranscriberList,
     duplex_options: Arc<Mutex<specrt::duplex::service::ServiceOptions>>,
     duplex_loader: Arc<Mutex<crate::native::DuplexLoader>>,
 }
@@ -521,7 +535,7 @@ fn open(
     duplex: &specrt::duplex::service::ServiceOptions,
     duplex_loader: &crate::native::DuplexLoader,
 ) -> Result<Opened, BackendError> {
-    if specrt::duplex::service::resolve_dir(model_id).is_some() {
+    if specrt::duplex::service::resolve_dir(model_id).is_some() || specrt::speech::service::resolve_dir(model_id).is_some() {
         let device = engine.overrides.get(specrt::media::DEVICE_KEY).and_then(|v| v.as_u64()).map(|d| d as usize);
         let mut opts = duplex.clone();
         if let Some(c) = max_ctx {
@@ -531,7 +545,8 @@ fn open(
         native.set_duplex(opts.clone());
         native.set_progress(Some(progress.clone()));
         native.load(model_id)?;
-        return Ok(Opened { backend: Backend::Single(native), vision: false, thinking: Default::default(), tools: Default::default(), seqs: opts.slots, note: None, speculation: None, share: None });
+        let seqs = if native.transcriber().is_some() { 1 } else { opts.slots };
+        return Ok(Opened { backend: Backend::Single(native), vision: false, thinking: Default::default(), tools: Default::default(), seqs, note: None, speculation: None, share: None });
     }
     if specrt::media::resolve_dir(model_id).is_some() {
         let device = engine.overrides.get(specrt::media::DEVICE_KEY).and_then(|v| v.as_u64()).map(|d| d as usize);
@@ -605,6 +620,7 @@ fn drop_stats(shared: &Shared, model_id: &str) {
     shared.stats.lock().unwrap().retain(|(id, _)| id != model_id);
     shared.lives.lock().unwrap().retain(|l| l.model_id != model_id);
     shared.duplexes.lock().unwrap().retain(|(id, _)| id != model_id);
+    shared.transcribers.lock().unwrap().retain(|(id, _)| id != model_id);
 }
 
 fn run(
@@ -765,7 +781,7 @@ fn run(
                             tools: o.tools,
                             vram_bytes,
                             landed,
-                            kind: match &o.backend { Backend::Single(n) if n.duplex().is_some() => specrt::media::ModelKind::Duplex, b => b.media().map(|m| m.kind).unwrap_or_default() },
+                            kind: match &o.backend { Backend::Single(n) if n.duplex().is_some() => specrt::media::ModelKind::Duplex, Backend::Single(n) if n.transcriber().is_some() => specrt::media::ModelKind::Transcription, b => b.media().map(|m| m.kind).unwrap_or_default() },
                             media: o.backend.media(),
                         };
                         if let Some(share) = o.share {
@@ -775,6 +791,11 @@ fn run(
                             && let Some(d) = n.duplex()
                         {
                             shared.duplexes.lock().unwrap().push((model_id.clone(), d));
+                        }
+                        if let Backend::Single(n) = &o.backend
+                            && let Some(t) = n.transcriber()
+                        {
+                            shared.transcribers.lock().unwrap().push((model_id.clone(), t));
                         }
                         shared.lives.lock().unwrap().push(Live::new(&model_id));
                         slots.push(Slot { info: info.clone(), backend: o.backend, reload });

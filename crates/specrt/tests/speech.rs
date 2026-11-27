@@ -637,6 +637,7 @@ fn run_options(run: &Value) -> specrt::speech::decode::Options {
         condition_on_prev: o["condition_on_prev_tokens"].as_bool().unwrap_or(false),
         max_new_tokens: None,
         seed: 0,
+        prompt: Vec::new(),
     }
 }
 

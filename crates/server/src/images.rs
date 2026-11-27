@@ -56,6 +56,10 @@ impl Gate {
     pub fn admitted(&self) -> usize {
         self.admitted.load(Ordering::SeqCst)
     }
+
+    pub(crate) async fn permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.running.clone().acquire_owned().await.ok()
+    }
 }
 
 pub(crate) struct Ticket {

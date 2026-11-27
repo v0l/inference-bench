@@ -40,11 +40,12 @@ pub struct Options {
     pub condition_on_prev: bool,
     pub max_new_tokens: Option<usize>,
     pub seed: u64,
+    pub prompt: Vec<u32>,
 }
 
 impl Options {
     pub fn greedy() -> Options {
-        Options { language: None, task: None, timestamps: false, temperatures: vec![0.0], compression_ratio_threshold: None, logprob_threshold: None, no_speech_threshold: None, condition_on_prev: false, max_new_tokens: None, seed: 0 }
+        Options { language: None, task: None, timestamps: false, temperatures: vec![0.0], compression_ratio_threshold: None, logprob_threshold: None, no_speech_threshold: None, condition_on_prev: false, max_new_tokens: None, seed: 0, prompt: Vec::new() }
     }
 
     pub fn from_rules(r: &Rules) -> Options {

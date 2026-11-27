@@ -395,7 +395,7 @@ impl ServerConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        anyhow::ensure!(self.media.max_image_bytes > 0 && self.media.max_video_bytes > 0, "media byte limits must be positive");
+        anyhow::ensure!(self.media.max_image_bytes > 0 && self.media.max_video_bytes > 0 && self.media.max_audio_bytes > 0, "media byte limits must be positive");
         anyhow::ensure!(self.max_concurrent >= 1, "max_concurrent must be at least 1");
         anyhow::ensure!(self.duplex.sessions_per_gpu >= 1, "duplex.sessions_per_gpu must be at least 1");
         anyhow::ensure!(self.duplex.max_ctx >= 64, "duplex.max_ctx must be at least 64");

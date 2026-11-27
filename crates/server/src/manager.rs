@@ -87,6 +87,11 @@ pub trait ModelSource: Send + Sync + 'static {
         let _ = id;
         None
     }
+
+    fn transcriber(&self, id: &str) -> Option<Arc<inference_bench_core::specrt_speech::service::Service>> {
+        let _ = id;
+        None
+    }
 }
 
 pub type TotalProbe = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
@@ -112,6 +117,7 @@ pub struct LoadedModel {
     pub tools: inference_bench_core::specrt_chat::ToolFormat,
     pub kind: inference_bench_core::specrt_media::ModelKind,
     pub duplex: Option<Arc<inference_bench_core::specrt_duplex::service::Service>>,
+    pub transcriber: Option<Arc<inference_bench_core::specrt_speech::service::Service>>,
 }
 
 pub struct InUse {
@@ -431,6 +437,9 @@ impl Manager {
         if inference_bench_core::specrt_duplex::service::resolve_dir(&self.config.specs.resolve(m.upstream_name())).is_some() {
             return media::ModelKind::Duplex;
         }
+        if inference_bench_core::specrt_speech::service::resolve_dir(&self.config.specs.resolve(m.upstream_name())).is_some() {
+            return media::ModelKind::Transcription;
+        }
         media::resolve_dir(m.upstream_name()).and_then(|d| media::info(&d).ok()).map(|i| i.kind).unwrap_or_default()
     }
 
@@ -453,6 +462,41 @@ impl Manager {
         };
         let held = InUse { model: Some(model.clone()) };
         let service = model.duplex.clone().ok_or_else(|| ApiError::bad_request(format!("model {} is a {} model; /v1/duplex needs a duplex speech model", cfg.id, model.kind.label())))?;
+        Ok((cfg.id, service, held))
+    }
+
+    pub fn loaded_transcribers(&self) -> Vec<(String, Arc<inference_bench_core::specrt_speech::service::Service>)> {
+        if let Some(source) = &self.source {
+            return source.loaded().into_iter().filter_map(|m| source.transcriber(&m.id).map(|s| (m.id, s))).collect();
+        }
+        let mut out: Vec<_> = self.loaded.lock().unwrap().values().filter_map(|m| m.transcriber.clone().map(|s| (m.id.clone(), s))).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    pub fn transcription_ids(&self) -> Vec<String> {
+        self.status().into_iter().filter(|m| m.kind == inference_bench_core::specrt_media::ModelKind::Transcription).map(|m| m.id).collect()
+    }
+
+    pub async fn transcriber(&self, id: &str) -> Result<(String, Arc<inference_bench_core::specrt_speech::service::Service>, InUse), ApiError> {
+        let cfg = self.resolve(id)?;
+        if let Some(source) = self.source.clone() {
+            self.resume_source(&cfg.id).await?;
+            let service = source.transcriber(&cfg.id).ok_or_else(|| ApiError::bad_request(format!("model {} is not a speech to text model; /v1/audio/transcriptions needs one", cfg.id)))?;
+            return Ok((cfg.id, service, InUse { model: None }));
+        }
+        if let Some(reason) = self.settle_failure(&cfg.id) {
+            if !self.config.reload_failed_models {
+                return Err(ApiError::unavailable(format!("model {} failed: {reason}", cfg.id)));
+            }
+            self.failed.lock().unwrap().remove(&cfg.id);
+        }
+        let model = match self.get(&cfg.id) {
+            Some(m) => m,
+            None => self.load(&cfg).await?,
+        };
+        let held = InUse { model: Some(model.clone()) };
+        let service = model.transcriber.clone().ok_or_else(|| ApiError::bad_request(format!("model {} is a {} model; /v1/audio/transcriptions needs a speech to text model", cfg.id, model.kind.label())))?;
         Ok((cfg.id, service, held))
     }
 
@@ -606,11 +650,11 @@ impl Manager {
             self.make_room(cfg)?;
         }
         let max_ctx = self.config.max_ctx_for(cfg);
-        let is_duplex = inference_bench_core::specrt_duplex::service::resolve_dir(&match &self.source {
+        let upstream = match &self.source {
             Some(_) => cfg.id.clone(),
             None => self.config.specs.resolve(cfg.upstream_name()),
-        })
-        .is_some();
+        };
+        let is_duplex = inference_bench_core::specrt_duplex::service::resolve_dir(&upstream).is_some() || inference_bench_core::specrt_speech::service::resolve_dir(&upstream).is_some();
         let serving = if is_duplex { None } else { self.config.serve_options(cfg) };
         let duplex_options = self.config.duplex.service_options();
         let runtime = self.config.runtime.clone();
@@ -687,6 +731,7 @@ impl Manager {
         let tools = backends.first().map(|b| b.capabilities().tools).unwrap_or_default();
         let kind = backends.first().map(|b| b.capabilities().kind).unwrap_or_default();
         let duplex = backends.first().and_then(|b| b.duplex());
+        let transcriber = backends.first().and_then(|b| b.transcriber());
         match (tools, &self.config.tool_parser) {
             (inference_bench_core::specrt_chat::ToolFormat::Unparsed, None) => tracing::warn!(model = %cfg.id, "the chat template has a tool format this server cannot parse: tool calls will come back as raw text"),
             (format, None) => tracing::info!(model = %cfg.id, tool_parser = ?format.parser(), "tool parser inferred from the chat template"),
@@ -717,6 +762,7 @@ impl Manager {
             tools,
             kind,
             duplex,
+            transcriber,
         });
         self.loaded.lock().unwrap().insert(cfg.id.clone(), model.clone());
         Ok(model)

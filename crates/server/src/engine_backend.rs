@@ -36,6 +36,10 @@ impl ModelSource for Handle {
     fn duplex(&self, id: &str) -> Option<std::sync::Arc<inference_bench_core::specrt_duplex::service::Service>> {
         Handle::duplex_of(self, Some(id))
     }
+
+    fn transcriber(&self, id: &str) -> Option<std::sync::Arc<inference_bench_core::specrt_speech::service::Service>> {
+        Handle::transcriber_of(self, Some(id))
+    }
 }
 
 pub struct EngineBackend {

@@ -37,6 +37,7 @@ pub use specrt::logprobs as specrt_logprobs;
 pub use specrt::grammar as specrt_grammar;
 pub use specrt::media as specrt_media;
 pub use specrt::duplex as specrt_duplex;
+pub use specrt::speech as specrt_speech;
 pub use specrt::mp4 as specrt_mp4;
 pub use specrt::placement as specrt_placement;
 pub use specrt::solve as specrt_solve;
