@@ -18,13 +18,14 @@ pub struct MediaLimits {
     pub max_video_secs: Option<f64>,
     pub max_patches: Option<usize>,
     pub max_video_frames: Option<usize>,
+    pub max_audio_bytes: usize,
 }
 
 impl MediaLimits {
     pub fn request_body_limit(&self) -> usize {
         let images = self.max_images * self.max_image_bytes;
         let videos = self.max_videos * self.max_video_bytes;
-        ((images + videos) / 3 * 4 + (1 << 20)).max(2 << 20)
+        ((images + videos) / 3 * 4 + (1 << 20)).max(self.max_audio_bytes + (1 << 20)).max(2 << 20)
     }
 }
 
@@ -41,6 +42,7 @@ impl Default for MediaLimits {
             max_video_secs: None,
             max_patches: Some(16384),
             max_video_frames: Some(128),
+            max_audio_bytes: 64 << 20,
         }
     }
 }
@@ -225,6 +227,17 @@ mod tests {
 
     fn msg(parts: Value) -> Vec<Value> {
         vec![json!({"role": "user", "content": parts})]
+    }
+
+    #[test]
+    fn the_audio_limit_defaults_to_64_mb_and_the_body_limit_covers_it() {
+        let l = MediaLimits::default();
+        assert_eq!(l.max_audio_bytes, 64 << 20);
+        assert!(l.request_body_limit() > l.max_audio_bytes);
+        let big = MediaLimits { max_images: 0, max_videos: 0, max_audio_bytes: 900 << 20, ..Default::default() };
+        assert!(big.request_body_limit() > 900 << 20);
+        let parsed: MediaLimits = toml::from_str("max_audio_bytes = 1000").unwrap();
+        assert_eq!((parsed.max_audio_bytes, parsed.max_images), (1000, 8));
     }
 
     #[test]
