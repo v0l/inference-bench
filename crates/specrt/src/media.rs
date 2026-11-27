@@ -19,6 +19,7 @@ pub enum ModelKind {
     Image,
     Video,
     Duplex,
+    Transcription,
 }
 
 impl ModelKind {
@@ -28,6 +29,7 @@ impl ModelKind {
             ModelKind::Image => "image",
             ModelKind::Video => "video",
             ModelKind::Duplex => "duplex",
+            ModelKind::Transcription => "transcription",
         }
     }
 
@@ -37,6 +39,7 @@ impl ModelKind {
             "image" => Some(ModelKind::Image),
             "video" => Some(ModelKind::Video),
             "duplex" => Some(ModelKind::Duplex),
+            "transcription" => Some(ModelKind::Transcription),
             _ => None,
         }
     }
@@ -572,6 +575,16 @@ impl ImageModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_kind_label_parses_back_and_the_old_ones_keep_their_names() {
+        let kinds = [ModelKind::Text, ModelKind::Image, ModelKind::Video, ModelKind::Duplex, ModelKind::Transcription];
+        assert_eq!(kinds.map(|k| k.label()), ["text", "image", "video", "duplex", "transcription"]);
+        for k in kinds {
+            assert_eq!(ModelKind::parse(k.label()), Some(k));
+            assert_eq!(serde_json::to_value(k).unwrap(), serde_json::json!(k.label()));
+        }
+    }
 
     fn tiny() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-flux2-klein")
