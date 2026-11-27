@@ -167,11 +167,180 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
 pub async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let gpu = tokio::task::spawn_blocking(crate::gpu::smi_total_bytes).await.ok().flatten().is_some();
     let reading_on = state.manager.loaded_transcribers().first().map(|(_, s)| s.info.device.clone());
+    let speaking_on = state.manager.loaded_speakers().first().map(|(_, s)| s.info.device.clone());
     Json(json!({
         "device": if gpu { "GPU" } else { "CPU" },
         "reading_on": reading_on,
-        "speaking_on": Value::Null,
+        "speaking_on": speaking_on,
     }))
+}
+
+pub const INPUT_MAX: usize = 20_000;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpeechRequest {
+    pub input: String,
+    pub voice: String,
+    pub model: String,
+    pub stream: bool,
+    pub seed: Option<u64>,
+}
+
+pub fn parse_speech(body: &Value) -> Result<SpeechRequest, ApiError> {
+    let text = |v: &Value, name: &'static str| -> Result<String, ApiError> {
+        match v {
+            Value::Null => Ok(String::new()),
+            Value::String(s) => Ok(s.clone()),
+            _ => Err(ApiError::bad_request(format!("{name} must be a string")).with_code("invalid_type", name)),
+        }
+    };
+    let input = text(&body["input"], "input")?.trim().to_string();
+    if input.is_empty() {
+        return Err(ApiError::bad_request("input is empty: there is nothing to say").with_code("invalid_value", "input"));
+    }
+    let chars = input.chars().count();
+    if chars > INPUT_MAX {
+        return Err(ApiError::bad_request(format!("input is {chars} characters, too long to say in one go: {INPUT_MAX} at most")).with_code("invalid_value", "input"));
+    }
+    let seed = match &body["seed"] {
+        Value::Null => None,
+        v => Some(v.as_u64().ok_or_else(|| ApiError::bad_request("seed must be a non-negative integer").with_code("invalid_value", "seed"))?),
+    };
+    Ok(SpeechRequest {
+        input,
+        voice: text(&body["voice"], "voice").unwrap_or_default().trim().to_string(),
+        model: text(&body["model"], "model")?.trim().to_string(),
+        stream: text(&body["response_format"], "response_format")?.trim().eq_ignore_ascii_case("pcm"),
+        seed,
+    })
+}
+
+pub fn pick_speaker(state: &AppState, asked: &str) -> Result<String, ApiError> {
+    let ids = state.manager.speech_ids();
+    if !asked.is_empty()
+        && let Ok(cfg) = state.manager.resolve(asked)
+        && ids.contains(&cfg.id)
+    {
+        return Ok(cfg.id);
+    }
+    let loaded = state.manager.loaded_speakers();
+    loaded
+        .first()
+        .map(|(id, _)| id.clone())
+        .or_else(|| ids.first().cloned())
+        .ok_or_else(|| ApiError::not_found("no text to speech model is configured; add a Phonon model folder to the server config").with_code("model_not_found", "model"))
+}
+
+type Frames = tokio::sync::mpsc::Receiver<Result<Vec<f32>, String>>;
+
+fn pcm_body(first: Vec<f32>, rest: Frames) -> axum::body::Body {
+    use futures_util::StreamExt;
+    let head = futures_util::stream::once(async move { Ok::<_, std::io::Error>(axum::body::Bytes::from(wav::f32_to_pcm16(&first))) });
+    let tail = futures_util::stream::unfold(rest, |mut rx| async move {
+        match rx.recv().await {
+            Some(Ok(pcm)) => Some((Ok::<_, std::io::Error>(axum::body::Bytes::from(wav::f32_to_pcm16(&pcm))), rx)),
+            Some(Err(e)) => {
+                tracing::warn!("speech stopped part way: {e}");
+                None
+            }
+            None => None,
+        }
+    });
+    axum::body::Body::from_stream(head.chain(tail).fuse())
+}
+
+fn random_seed() -> u64 {
+    uuid::Uuid::new_v4().as_u64_pair().0
+}
+
+pub async fn speech(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Result<Response, ApiError> {
+    use inference_bench_core::specrt_speech::tts::service::{Emit, Job};
+    let req = parse_speech(&body)?;
+    let id = pick_speaker(&state, &req.model)?;
+    tracing::Span::current().record("model", id.as_str());
+    let ticket = crate::images::admit(&state)?;
+    let permit = state.images.permit().await.ok_or_else(|| ApiError::unavailable("the media queue closed"))?;
+    let (id, service, held) = state.manager.speaker(&id).await?;
+    let picked = tokio::task::spawn_blocking({
+        let (service, asked) = (service.clone(), req.voice.clone());
+        move || service.pick(&asked)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("voice lookup failed: {e}")))?
+    .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+    let voice_name = picked.as_ref().map(|(v, _)| v.name.clone());
+    if picked.is_none() {
+        tracing::warn!(model = %id, "the model has no voice catalogue, speaking with no voice prompt");
+    }
+    let job = Job { text: req.input.clone(), voice: picked.map(|(_, p)| p), seed: req.seed.unwrap_or_else(random_seed) };
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Vec<f32>, String>>(32);
+    let frames = tx.clone();
+    let emit: Emit = Box::new(move |f| frames.blocking_send(Ok(f.to_vec())).is_ok());
+    let rate = service.info.sample_rate;
+    let done = service.start(job, emit).map_err(|e| ApiError::internal(format!("{e:#}")))?;
+    let started = std::time::Instant::now();
+    let span = tracing::Span::current();
+    let (metrics, model) = (state.metrics.clone(), id.clone());
+    tokio::task::spawn_blocking(move || {
+        let out = done.recv().unwrap_or_else(|_| Err(anyhow::anyhow!("the speech engine has stopped")));
+        span.in_scope(|| match out {
+            Ok(spoken) => {
+                let (audio, secs) = (spoken.samples as f64 / f64::from(rate), started.elapsed().as_secs_f64());
+                metrics.speech(&model, audio, secs);
+                tracing::info!(model = %model, voice = ?voice_name, audio_secs = audio, secs, frames = spoken.frames, chunks = spoken.chunks, stopped = spoken.stopped, "spoke");
+            }
+            Err(e) => {
+                let _ = tx.blocking_send(Err(format!("{e:#}")));
+            }
+        });
+        drop((held, permit, ticket));
+    });
+    if req.stream {
+        let first = match rx.recv().await {
+            Some(Ok(f)) => f,
+            Some(Err(e)) => return Err(ApiError::internal(e)),
+            None => Vec::new(),
+        };
+        let headers = [
+            (header::CONTENT_TYPE, "audio/L16".to_string()),
+            (header::HeaderName::from_static("x-sample-rate"), rate.to_string()),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ];
+        return Ok((headers, pcm_body(first, rx)).into_response());
+    }
+    let mut pcm = Vec::new();
+    while let Some(f) = rx.recv().await {
+        pcm.extend(f.map_err(ApiError::internal)?);
+    }
+    Ok(([(header::CONTENT_TYPE, "audio/wav")], wav::wav_bytes(&pcm, rate)).into_response())
+}
+
+fn speaker_dir(state: &AppState, id: &str) -> Option<std::path::PathBuf> {
+    let cfg = state.config.model(id)?;
+    inference_bench_core::specrt_speech::tts::service::resolve_dir(&state.config.specs.resolve(cfg.upstream_name()))
+}
+
+pub async fn voices(State(state): State<Arc<AppState>>) -> Json<Value> {
+    use inference_bench_core::specrt_speech::tts::voices::{Catalogue, HUB};
+    let listed = tokio::task::spawn_blocking(move || {
+        if let Some((_, s)) = state.manager.loaded_speakers().first() {
+            return s.voices();
+        }
+        for id in state.manager.speech_ids() {
+            let Some(mut c) = speaker_dir(&state, &id).and_then(|d| Catalogue::open(&d).ok()) else { continue };
+            if c.voices.is_empty()
+                && let Err(e) = c.fetch_catalogue(HUB)
+            {
+                tracing::warn!("could not fetch the voice catalogue: {e:#}");
+            }
+            return c.voices.iter().map(|v| (v.clone(), c.installed(v))).collect();
+        }
+        Vec::new()
+    })
+    .await
+    .unwrap_or_default();
+    let list: Vec<Value> = listed.into_iter().map(|(v, installed)| json!({"id": v.name, "label": v.label(), "installed": installed})).collect();
+    Json(json!({"voices": list}))
 }
 
 #[cfg(test)]

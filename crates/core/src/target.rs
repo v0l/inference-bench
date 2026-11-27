@@ -137,6 +137,10 @@ pub trait Target: Send {
         None
     }
 
+    fn speaker(&self) -> Option<std::sync::Arc<specrt::speech::tts::service::Service>> {
+        None
+    }
+
     fn generate_media(&mut self, _job: &specrt::media::MediaJob, _on_event: &mut dyn FnMut(specrt::media::MediaEvent) -> bool) -> Result<specrt::media::MediaOutput, BackendError> {
         Err(BackendError::new(crate::result::ErrorKind::InvalidRequest, format!("{} generates text only; image and video jobs need an image or video model", self.name())))
     }

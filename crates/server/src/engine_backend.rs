@@ -40,6 +40,10 @@ impl ModelSource for Handle {
     fn transcriber(&self, id: &str) -> Option<std::sync::Arc<inference_bench_core::specrt_speech::service::Service>> {
         Handle::transcriber_of(self, Some(id))
     }
+
+    fn speaker(&self, id: &str) -> Option<std::sync::Arc<inference_bench_core::specrt_speech::tts::service::Service>> {
+        Handle::speaker_of(self, Some(id))
+    }
 }
 
 pub struct EngineBackend {

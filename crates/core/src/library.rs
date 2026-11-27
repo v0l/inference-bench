@@ -160,7 +160,7 @@ impl LocalModel {
             ("specrt", Format::Spec) => self.path.display().to_string(),
             ("specrt" | "llama.cpp", Format::Gguf) => self.path.display().to_string(),
             ("specrt", _) if self.repo.is_empty() && specrt::media::is_pipeline(&self.path) => self.path.display().to_string(),
-            ("specrt", Format::Safetensors) if self.repo.is_empty() && (is_duplex(self) || is_transcription(self)) => self.path.display().to_string(),
+            ("specrt", Format::Safetensors) if self.repo.is_empty() && (is_duplex(self) || is_transcription(self) || is_speaker(self)) => self.path.display().to_string(),
             ("specrt" | "vllm", _) if !self.repo.is_empty() => self.repo.clone(),
             _ => self.name.clone(),
         }
@@ -249,7 +249,7 @@ pub fn specrt_support(config: &Value) -> Support {
             Err(_) => match specrt::spec::Spec::from_hf_config_speech(&text) {
                 Ok(spec) if spec.speech_decode.is_some() => Support::yes("specrt", &format!("speech to text, {} family, served on /v1/audio/transcriptions on CUDA or the CPU", spec.name)),
                 _ => match specrt::spec::Spec::from_hf_config_tts(&text) {
-                    Ok(spec) => Support::yes("specrt", &format!("text to speech, {} family, runs on the CPU, no speech route yet", spec.name)),
+                    Ok(spec) => Support::yes("specrt", &format!("text to speech, {} family, served on /v1/audio/speech on CUDA or the CPU", spec.name)),
                     Err(_) => Support::no("specrt", e.root_cause().to_string()),
                 },
             },
@@ -259,6 +259,10 @@ pub fn specrt_support(config: &Value) -> Support {
 
 pub fn is_transcription(model: &LocalModel) -> bool {
     model.format == Format::Safetensors && std::fs::read_to_string(model.path.join("config.json")).is_ok_and(|t| specrt::speech::service::is_speech_config(&t))
+}
+
+pub fn is_speaker(model: &LocalModel) -> bool {
+    model.format == Format::Safetensors && std::fs::read_to_string(model.path.join("config.json")).is_ok_and(|t| specrt::speech::tts::is_tts_config(&t))
 }
 
 pub fn is_duplex(model: &LocalModel) -> bool {
@@ -1112,7 +1116,7 @@ mod tests {
             let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             let s = specrt_support(&config);
             assert_eq!(s.supported, specrt::spec::Spec::from_hf_config_tts(&config.to_string()).is_ok(), "{}", path.display());
-            assert!(s.supported && s.reason.contains("text to speech"), "{}: {}", path.display(), s.reason);
+            assert!(s.supported && s.reason.contains("text to speech") && s.reason.contains("/v1/audio/speech"), "{}: {}", path.display(), s.reason);
             assert!(specrt::spec::Spec::from_hf_config(&config.to_string()).is_err(), "text chat stays refused");
             assert!(!specrt_wgpu_support(&config).supported);
         }

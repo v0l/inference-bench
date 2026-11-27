@@ -153,6 +153,12 @@ pub fn specrt_speech_loader() -> SpeechLoader {
     Arc::new(|dir, device| specrt::speech::service::Service::load(dir, device))
 }
 
+pub type SpeakerLoader = Arc<dyn Fn(&std::path::Path, usize) -> anyhow::Result<Arc<specrt::speech::tts::service::Service>> + Send + Sync>;
+
+pub fn specrt_speaker_loader() -> SpeakerLoader {
+    Arc::new(|dir, device| specrt::speech::tts::service::Service::load(dir, device))
+}
+
 pub fn specrt_factory() -> Factory {
     specrt_factory_with(None)
 }
@@ -198,6 +204,8 @@ pub struct Native {
     duplex_loader: DuplexLoader,
     speech: Option<Arc<specrt::speech::service::Service>>,
     speech_loader: SpeechLoader,
+    speaker: Option<Arc<specrt::speech::tts::service::Service>>,
+    speaker_loader: SpeakerLoader,
 }
 
 impl Native {
@@ -210,7 +218,12 @@ impl Native {
     }
 
     pub fn with_factory(max_ctx: Option<usize>, factory: Factory) -> Self {
-        Self { max_ctx, factory, worker: None, vision: false, thinking: Default::default(), tools: Default::default(), progress: None, media: None, device: None, duplex: None, duplex_options: Default::default(), duplex_loader: specrt_duplex_loader(), speech: None, speech_loader: specrt_speech_loader() }
+        Self { max_ctx, factory, worker: None, vision: false, thinking: Default::default(), tools: Default::default(), progress: None, media: None, device: None, duplex: None, duplex_options: Default::default(), duplex_loader: specrt_duplex_loader(), speech: None, speech_loader: specrt_speech_loader(), speaker: None, speaker_loader: specrt_speaker_loader() }
+    }
+
+    pub fn with_speaker_loader(mut self, loader: SpeakerLoader) -> Self {
+        self.speaker_loader = loader;
+        self
     }
 
     pub fn with_speech_loader(mut self, loader: SpeechLoader) -> Self {
@@ -265,6 +278,10 @@ fn not_duplex_text() -> BackendError {
 
 fn not_speech_text() -> BackendError {
     BackendError::new(ErrorKind::InvalidRequest, "this is a speech to text model: post audio to /v1/audio/transcriptions, not a text route")
+}
+
+fn not_speaker_text() -> BackendError {
+    BackendError::new(ErrorKind::InvalidRequest, "this is a text to speech model: post text to /v1/audio/speech, not a text route")
 }
 
 fn panic_text(payload: &(dyn Any + Send)) -> String {
@@ -375,6 +392,9 @@ impl Target for Native {
         if self.speech.is_some() {
             return Capabilities { kind: specrt::media::ModelKind::Transcription, ..Capabilities::default() };
         }
+        if self.speaker.is_some() {
+            return Capabilities { streaming: true, kind: specrt::media::ModelKind::Speech, ..Capabilities::default() };
+        }
         Capabilities { streaming: true, logits: true, memory: true, vision: self.vision, thinking: self.thinking, tools: self.tools, kind: self.media.as_ref().map(|m| m.kind).unwrap_or_default(), ..Capabilities::default() }
     }
 
@@ -384,6 +404,10 @@ impl Target for Native {
 
     fn transcriber(&self) -> Option<Arc<specrt::speech::service::Service>> {
         self.speech.clone()
+    }
+
+    fn speaker(&self) -> Option<Arc<specrt::speech::tts::service::Service>> {
+        self.speaker.clone()
     }
 
     fn set_duplex(&mut self, options: specrt::duplex::service::ServiceOptions) {
@@ -426,6 +450,21 @@ impl Target for Native {
         self.worker = None;
         self.duplex = None;
         self.speech = None;
+        self.speaker = None;
+        if let Some(dir) = specrt::speech::tts::service::resolve_dir(model) {
+            let device = self.device.unwrap_or(0);
+            let progress = self.progress.clone();
+            let loader = self.speaker_loader.clone();
+            let loaded = catch_unwind(AssertUnwindSafe(|| specrt::progress::with_sink(progress, || loader(&dir, device))));
+            return match loaded {
+                Ok(Ok(s)) => {
+                    self.speaker = Some(s);
+                    Ok(())
+                }
+                Ok(Err(e)) => Err(engine_error(&e)),
+                Err(p) => Err(BackendError::failed(format!("the speech engine panicked while loading: {}", panic_text(p.as_ref())))),
+            };
+        }
         if let Some(dir) = specrt::speech::service::resolve_dir(model) {
             let device = self.device.unwrap_or(0);
             let progress = self.progress.clone();
@@ -489,6 +528,9 @@ impl Target for Native {
         if self.speech.is_some() {
             return Err(not_speech_text());
         }
+        if self.speaker.is_some() {
+            return Err(not_speaker_text());
+        }
         let (prompt, max_tokens) = (request.prompt.clone(), request.max_tokens);
         let g = self.call(move |m| {
             m.generate(&prompt, max_tokens, Sampling::GREEDY).map(generation).map_err(|e| engine_error(&e))
@@ -503,6 +545,9 @@ impl Target for Native {
         }
         if self.speech.is_some() {
             return Err(not_speech_text());
+        }
+        if self.speaker.is_some() {
+            return Err(not_speaker_text());
         }
         let messages = request.messages_json();
         let media = request.media.clone();
