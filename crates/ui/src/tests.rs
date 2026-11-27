@@ -3119,6 +3119,9 @@ fn request(ttft: f64, prompt: u64, cached: u64, completion: u64, prefill: f64, d
         at: chrono::Utc::now(),
         ttft_secs: ttft,
         queue_secs: 0.0,
+        admission_secs: 0.0,
+        prefill_wait_secs: 0.0,
+        held_by: None,
         prefill_secs: 0.0,
         prompt_tokens: prompt,
         cached_tokens: cached,
@@ -3132,18 +3135,22 @@ fn request(ttft: f64, prompt: u64, cached: u64, completion: u64, prefill: f64, d
 fn the_per_request_table_shows_clean_units_and_cache_columns() {
     let wide = crate::serving::request_columns(false, 1280.0);
     let plain = request(0.842, 625, 0, 1574, 742.3, 35.44);
-    assert_eq!(crate::serving::request_cells(&plain, &wide), ["842 ms", "0 ms", "625", "625", "1.57k", "742 tok/s", "35.4 tok/s"]);
+    assert_eq!(crate::serving::request_cells(&plain, &wide), ["842 ms", "0 ms", "-", "0 ms", "0 ms", "625", "625", "1.57k", "742 tok/s", "35.4 tok/s"]);
     let wide = crate::serving::request_columns(true, 1280.0);
     let warm = request(1.308, 1450, 1000, 40, 2310.4, 35.44);
-    assert_eq!(crate::serving::request_cells(&warm, &wide), ["1.31 s", "0 ms", "1.45k", "69%", "1.00k", "450", "40", "2,310 tok/s", "35.4 tok/s"]);
+    assert_eq!(crate::serving::request_cells(&warm, &wide), ["1.31 s", "0 ms", "-", "0 ms", "0 ms", "1.45k", "69%", "1.00k", "450", "40", "2,310 tok/s", "35.4 tok/s"]);
     let full = request(0.19, 512, 507, 8, 0.0, 20.0);
-    assert_eq!(crate::serving::request_cells(&full, &wide)[5..], ["5", "8", "-", "20.0 tok/s"]);
+    assert_eq!(crate::serving::request_cells(&full, &wide)[8..], ["5", "8", "-", "20.0 tok/s"]);
     let mut waited = request(3.71, 5000, 0, 8, 5376.0, 20.0);
     waited.queue_secs = 3.5;
-    assert_eq!(crate::serving::request_cells(&waited, &wide)[..2], ["3.71 s", "3,500 ms"]);
+    waited.admission_secs = 3.1;
+    waited.prefill_wait_secs = 0.4;
+    waited.held_by = Some("long_cap".into());
+    assert_eq!(crate::serving::request_cells(&waited, &wide)[..5], ["3.71 s", "3,500 ms", "long cap", "3.10 s", "400 ms"]);
     let cols = |c: bool, w: f32| crate::serving::request_columns(c, w).iter().map(|c| c.0).collect::<Vec<_>>();
-    assert_eq!(cols(false, 800.0), ["time", "ttft", "queue", "prompt", "new", "prefill", "decode"]);
-    assert_eq!(cols(true, 1280.0), ["time", "ttft", "queue", "prompt", "cache hit", "cache read", "new", "completion", "prefill", "decode"]);
+    assert_eq!(cols(false, 800.0), ["time", "ttft", "queue", "held by", "prompt", "new", "prefill", "decode"]);
+    assert_eq!(cols(true, 1280.0), ["time", "ttft", "queue", "held by", "admit", "wait", "prompt", "cache hit", "cache read", "new", "completion", "prefill", "decode"]);
+    assert_eq!(cols(true, 358.0), ["time", "ttft", "held", "new", "prefill"]);
 }
 
 #[test]
@@ -3160,7 +3167,9 @@ fn the_per_request_columns_fit_every_width_down_to_a_phone() {
     let names = |w: f32| crate::serving::request_columns(true, w).iter().map(|c| c.0).collect::<Vec<_>>();
     assert!(names(1280.0).contains(&"queue"));
     assert!(!names(340.0).contains(&"queue"));
-    assert!(names(392.0).contains(&"decode") && !names(280.0).contains(&"decode"));
+    assert!(names(392.0).contains(&"held") && !names(280.0).contains(&"held"));
+    assert!(names(440.0).contains(&"decode") && !names(392.0).contains(&"decode"));
+    assert!(["held", "admit", "wait", "decode"].iter().all(|c| names(700.0).contains(c)));
 }
 
 #[test]
@@ -3180,6 +3189,46 @@ fn the_per_request_table_renders_with_and_without_cache_columns() {
     h.run();
 }
 
+fn waited(mut r: inference_bench_core::live::RequestRecord, admission: f64, wait: f64, held_by: &str) -> inference_bench_core::live::RequestRecord {
+    r.admission_secs = admission;
+    r.prefill_wait_secs = wait;
+    r.queue_secs = admission + wait;
+    r.held_by = Some(held_by.into());
+    r
+}
+
+#[test]
+fn the_server_tab_per_request_table_fits_desktop_and_phone_with_the_wait_columns() {
+    let _guard = PAINTED_TEXT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let recent = vec![
+        request(0.842, 625, 0, 1574, 742.3, 35.4),
+        waited(request(8.7, 14_500, 0, 912, 6431.0, 33.1), 7.4, 0.5, "long_cap"),
+        waited(request(2.1, 3000, 1000, 40, 2310.4, 31.9), 1.6, 0.2, "kv"),
+    ];
+    for (size, want) in [(egui::vec2(1280.0, 800.0), vec!["held by", "admit", "wait", "long cap", "7.40 s", "500 ms"]), (egui::vec2(390.0, 844.0), vec!["held", "long cap", "kv"])] {
+        let recent = recent.clone();
+        let mut h = Harness::builder().with_size(size).with_accessibility_check(false).allow_missing_glyphs().build_ui(move |ui| {
+            egui_bench::install(ui.ctx());
+            crate::serving::per_request(ui, &recent);
+        });
+        capture_painted_text(&h.ctx);
+        h.run();
+        h.step();
+        let found = PAINTED_TEXT.lock().unwrap().clone();
+        for w in &want {
+            assert!(found.iter().any(|(t, _)| t.eq_ignore_ascii_case(w)), "{w} not painted at {size:?}: {:?}", found.iter().map(|f| &f.0).collect::<Vec<_>>());
+        }
+        for (text, r) in &found {
+            assert!(r.max.x <= size.x + 0.5, "{text:?} ends at {} past {} at {size:?}", r.max.x, size.x);
+        }
+        let cells: Vec<&(String, egui::Rect)> = found.iter().filter(|(t, _)| ["long cap", "HELD", "HELD BY"].contains(&t.as_str())).collect();
+        for (text, r) in cells {
+            let overlapping = found.iter().filter(|(t, o)| t != text && o.intersects(r.shrink(1.0))).map(|f| f.0.clone()).collect::<Vec<_>>();
+            assert!(overlapping.is_empty(), "{text:?} overlaps {overlapping:?} at {size:?}");
+        }
+    }
+}
+
 #[test]
 #[ignore = "renders with wgpu; run with SHOTS=docs/gui"]
 fn screenshot_of_the_per_request_table() {
@@ -3187,11 +3236,20 @@ fn screenshot_of_the_per_request_table() {
     std::fs::create_dir_all(&out).unwrap();
     let recent = vec![
         request(0.842, 625, 0, 1574, 742.3, 35.4),
-        request(2.254, 14_500, 0, 912, 6431.0, 33.1),
-        request(12.43, 145_000, 120_000, 300, 2310.4, 31.9),
+        waited(request(8.7, 14_500, 0, 912, 6431.0, 33.1), 7.4, 0.5, "long_cap"),
+        waited(request(12.43, 145_000, 120_000, 300, 2310.4, 31.9), 2.2, 1.1, "kv"),
         request(0.05, 512, 512, 8, 0.0, 41.2),
-        request(65.0, 1_200_000, 1_000_000, 4096, 3100.0, 28.0),
+        waited(request(65.0, 1_200_000, 1_000_000, 4096, 3100.0, 28.0), 20.5, 3.0, "slots"),
     ];
+    for (name, size) in [("server-per-request-1280x800", egui::vec2(1280.0, 800.0)), ("server-per-request-390x844", egui::vec2(390.0, 844.0))] {
+        let recent = recent.clone();
+        let mut h = Harness::builder().with_size(size).with_accessibility_check(false).allow_missing_glyphs().build_ui(move |ui| {
+            egui_bench::install(ui.ctx());
+            crate::serving::per_request(ui, &recent);
+        });
+        h.run();
+        h.render().unwrap().save(out.join(format!("{name}.png"))).unwrap();
+    }
     let mut h = Harness::builder().with_size(egui::vec2(1000.0, 220.0)).with_accessibility_check(false).allow_missing_glyphs().build_ui(|ui| {
         egui_bench::install(ui.ctx());
         crate::serving::per_request(ui, &recent);

@@ -76,6 +76,9 @@ pub struct RequestRecord {
     pub at: DateTime<Utc>,
     pub ttft_secs: f64,
     pub queue_secs: f64,
+    pub admission_secs: f64,
+    pub prefill_wait_secs: f64,
+    pub held_by: Option<String>,
     pub prefill_secs: f64,
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
@@ -191,7 +194,20 @@ impl Tracked {
         let ttft_secs = self.first.map_or(g.ttft_secs, |f| f.duration_since(self.started).as_secs_f64());
         let cached_tokens = g.cached_tokens.min(g.prompt_tokens);
         let prefill_tok_s = prefill_rate(g.prompt_tokens - cached_tokens, g.prefill_secs);
-        m.recent.push(RequestRecord { at: Utc::now(), ttft_secs, queue_secs: g.queue_secs, prefill_secs: g.prefill_secs, prompt_tokens: g.prompt_tokens, cached_tokens, completion_tokens: g.completion_tokens, prefill_tok_s, decode_tok_s });
+        m.recent.push(RequestRecord {
+            at: Utc::now(),
+            ttft_secs,
+            queue_secs: g.queue_secs,
+            admission_secs: g.admission_secs,
+            prefill_wait_secs: g.prefill_wait_secs,
+            held_by: g.held_by.clone(),
+            prefill_secs: g.prefill_secs,
+            prompt_tokens: g.prompt_tokens,
+            cached_tokens,
+            completion_tokens: g.completion_tokens,
+            prefill_tok_s,
+            decode_tok_s,
+        });
     }
 }
 
@@ -501,6 +517,17 @@ mod tests {
         t.finish(&Generation { prompt_tokens: 1000, completion_tokens: 2, ttft_secs: 3.71, prefill_secs: 0.2, queue_secs: 3.5, ..Generation::default() });
         let rec = meter.recent();
         assert_eq!((rec[0].queue_secs, rec[0].prefill_tok_s), (3.5, 5000.0));
+    }
+
+    #[test]
+    fn a_request_record_keeps_the_admission_wait_prefill_wait_and_reason() {
+        let meter = Arc::new(Meter::default());
+        let t = meter.begin(meter.submitted());
+        t.finish(&Generation { prompt_tokens: 1000, completion_tokens: 2, ttft_secs: 8.7, prefill_secs: 0.8, queue_secs: 7.9, admission_secs: 7.4, prefill_wait_secs: 0.5, held_by: Some("kv".into()), ..Generation::default() });
+        let rec = meter.recent();
+        assert_eq!((rec[0].admission_secs, rec[0].prefill_wait_secs, rec[0].held_by.as_deref()), (7.4, 0.5, Some("kv")));
+        let old: Generation = serde_json::from_str(r#"{"text":"","prompt_tokens":1,"completion_tokens":1,"ttft_secs":0.1,"prefill_secs":0.1,"decode_secs":0.1,"peak_memory_bytes":null}"#).unwrap();
+        assert_eq!((old.admission_secs, old.prefill_wait_secs, old.held_by), (0.0, 0.0, None));
     }
 
     #[test]

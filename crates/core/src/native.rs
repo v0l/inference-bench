@@ -328,6 +328,9 @@ fn generation(r: Reply) -> Generation {
         ttft_secs: r.prefill_secs,
         prefill_secs: r.prefill_secs,
         queue_secs: 0.0,
+        admission_secs: 0.0,
+        prefill_wait_secs: 0.0,
+        held_by: None,
         decode_secs: r.decode_secs,
         peak_memory_bytes: Some(r.peak_device_bytes),
     }

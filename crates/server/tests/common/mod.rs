@@ -133,6 +133,9 @@ impl Fake {
             ttft_secs: ttft,
             prefill_secs: ttft,
             queue_secs: 0.0,
+            admission_secs: 0.0,
+            prefill_wait_secs: 0.0,
+            held_by: None,
             decode_secs: started.elapsed().as_secs_f64() - ttft,
             peak_memory_bytes: None,
         })

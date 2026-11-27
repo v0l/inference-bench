@@ -92,6 +92,12 @@ pub struct Generation {
     pub prefill_secs: f64,
     #[serde(default)]
     pub queue_secs: f64,
+    #[serde(default)]
+    pub admission_secs: f64,
+    #[serde(default)]
+    pub prefill_wait_secs: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_by: Option<String>,
     pub decode_secs: f64,
     pub peak_memory_bytes: Option<u64>,
 }

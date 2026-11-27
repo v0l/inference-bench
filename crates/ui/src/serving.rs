@@ -159,6 +159,9 @@ fn request_cell(r: &RequestRecord, name: &str) -> String {
     match name {
         "ttft" => crate::fmt::duration(r.ttft_secs),
         "queue" => crate::fmt::millis(r.queue_secs),
+        "admit" => crate::fmt::duration(r.admission_secs),
+        "wait" => crate::fmt::duration(r.prefill_wait_secs),
+        "held by" | "held" => held_label(r.held_by.as_deref()).into(),
         "prompt" => crate::fmt::count(r.prompt_tokens),
         "cache hit" if r.prompt_tokens > 0 => crate::fmt::percent(r.cached_tokens as f64 / r.prompt_tokens as f64),
         "cache read" => crate::fmt::count(r.cached_tokens),
@@ -170,18 +173,46 @@ fn request_cell(r: &RequestRecord, name: &str) -> String {
     }
 }
 
+pub fn held_label(reason: Option<&str>) -> &str {
+    match reason {
+        None => "-",
+        Some("long_cap") => "long cap",
+        Some(r) => r,
+    }
+}
+
 pub const WIDE_TABLE: f32 = 1000.0;
 pub const MEDIUM_TABLE: f32 = 780.0;
 
-pub const NARROW_TABLE: f32 = 370.0;
-
 pub fn request_columns(with_cache: bool, width: f32) -> Vec<(&'static str, f32)> {
-    if width < NARROW_TABLE {
-        return vec![("time", 66.0), ("ttft", 56.0), ("new", 52.0), ("prefill", 92.0)];
+    if width >= MEDIUM_TABLE {
+        return fill(wide_columns(with_cache, width), &[("held by", 80.0), ("admit", 80.0), ("wait", 80.0)], width, "queue");
     }
-    if width < MEDIUM_TABLE {
-        return vec![("time", 66.0), ("ttft", 56.0), ("new", 52.0), ("prefill", 92.0), ("decode", 92.0)];
+    let base = vec![("time", 66.0), ("ttft", 56.0), ("new", 52.0), ("prefill", 92.0)];
+    let mut cols = fill(base, &[("held", 66.0), ("decode", 92.0), ("admit", 60.0), ("wait", 60.0)], width, "ttft");
+    if let Some(i) = cols.iter().position(|c| c.0 == "decode") {
+        let d = cols.remove(i);
+        cols.push(d);
     }
+    cols
+}
+
+fn fill(mut cols: Vec<(&'static str, f32)>, extras: &[(&'static str, f32)], width: f32, after: &str) -> Vec<(&'static str, f32)> {
+    let at = cols.iter().position(|c| c.0 == after).map_or(1, |i| i + 1);
+    let mut used: f32 = cols.iter().map(|c| c.1).sum();
+    let mut added = 0;
+    for &extra in extras {
+        if used + extra.1 + 6.0 > width {
+            break;
+        }
+        used += extra.1;
+        cols.insert(at + added, extra);
+        added += 1;
+    }
+    cols
+}
+
+fn wide_columns(with_cache: bool, width: f32) -> Vec<(&'static str, f32)> {
     let mut cols = vec![("time", 80.0), ("ttft", 90.0), ("queue", 90.0), ("prompt", 80.0)];
     if with_cache {
         cols.push(("cache hit", 90.0));
@@ -209,7 +240,7 @@ pub fn per_request(ui: &mut egui::Ui, recent: &[RequestRecord]) {
             let r = &recent[recent.len() - 1 - i];
             cell(p, rect, at(0), cols[0].1, &r.at.with_timezone(&chrono::Local).format("%H:%M:%S").to_string(), LEGEND);
             for (k, text) in request_cells(r, &cols).iter().enumerate() {
-                let tint = if matches!(cols[k + 1].0, "ttft" | "queue" | "prefill" | "decode") { TRACE } else { VALUE };
+                let tint = if matches!(cols[k + 1].0, "ttft" | "queue" | "admit" | "wait" | "prefill" | "decode") { TRACE } else { VALUE };
                 right(p, rect, at(k + 1), cols[k + 1].1, text, tint);
             }
         });

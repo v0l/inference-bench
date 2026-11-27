@@ -3,6 +3,7 @@ use crate::native::engine_error;
 use crate::result::{BackendError, Generation};
 use crate::target::{Capabilities, Request, Target};
 use specrt::runtime::Sampling;
+use specrt::sched::Blocked;
 use specrt::serve::{Histogram, ServeOptions, Serving, Stats};
 use std::fmt::Write;
 use std::sync::Arc;
@@ -57,6 +58,9 @@ impl ServingTarget {
             ttft_secs: c.ttft_secs,
             prefill_secs: c.prefill_secs,
             queue_secs: c.queue_secs,
+            admission_secs: c.admission_secs,
+            prefill_wait_secs: c.prefill_wait_secs,
+            held_by: c.held_by.map(|b| b.label().to_string()),
             decode_secs: c.decode_secs,
             peak_memory_bytes: None,
         })
@@ -155,10 +159,33 @@ impl Target for ServingTarget {
 
 fn histogram(o: &mut String, name: &str, help: &str, h: &Histogram) {
     let _ = writeln!(o, "# HELP {name} {help}\n# TYPE {name} histogram");
+    histogram_lines(o, name, "", h);
+}
+
+fn histogram_lines(o: &mut String, name: &str, labels: &str, h: &Histogram) {
     for (b, c) in h.bounds.iter().zip(&h.counts) {
-        let _ = writeln!(o, "{name}_bucket{{le=\"{b}\"}} {c}");
+        let _ = writeln!(o, "{name}_bucket{{{labels}le=\"{b}\"}} {c}");
     }
-    let _ = writeln!(o, "{name}_bucket{{le=\"+Inf\"}} {}\n{name}_sum {}\n{name}_count {}", h.total, h.sum, h.total);
+    let _ = writeln!(o, "{name}_bucket{{{labels}le=\"+Inf\"}} {}", h.total);
+    let tail = if labels.is_empty() { String::new() } else { format!("{{{}}}", labels.trim_end_matches(',')) };
+    let _ = writeln!(o, "{name}_sum{tail} {}\n{name}_count{tail} {}", h.sum, h.total);
+}
+
+fn admission(o: &mut String, s: &Stats) {
+    let name = "inference_admission_blocked_steps_total";
+    let _ = writeln!(o, "# HELP {name} Scheduler steps whose admission stopped for this reason while sequences waited.\n# TYPE {name} counter");
+    for b in Blocked::ALL {
+        let _ = writeln!(o, "{name}{{reason=\"{}\"}} {}", b.label(), s.admission_blocked_steps[b as usize]);
+    }
+    let name = "inference_admission_wait_seconds";
+    let _ = writeln!(o, "# HELP {name} Time from arrival to admission, by the reason that held the sequence longest.\n# TYPE {name} histogram");
+    for b in Blocked::ALL.map(Some).into_iter().chain([None]) {
+        histogram_lines(o, name, &format!("reason=\"{}\",", Blocked::label_of(b)), s.admission_wait(b));
+    }
+    histogram(o, "inference_prefill_wait_seconds", "Time from admission to the first prefill step.", &s.prefill_wait_secs);
+    histogram(o, "inference_prefill_seconds", "Time from the first prefill step to the first token.", &s.prefill_secs);
+    histogram(o, "inference_prompt_tokens", "Prompt length of finished requests, in tokens.", &s.prompt_tokens);
+    histogram(o, "inference_cached_prompt_tokens", "Prompt tokens of finished requests served from the prefix cache.", &s.cached_prompt_tokens);
 }
 
 fn chain(o: &mut String, c: &specrt::sched::ChainMetrics) {
@@ -226,6 +253,8 @@ pub fn render(s: &Stats) -> String {
     };
     gauge(&mut o, "inference_running_seqs", "Sequences in the running batch.", s.running as f64);
     gauge(&mut o, "inference_waiting_seqs", "Sequences waiting for admission.", s.waiting as f64);
+    gauge(&mut o, "inference_free_slots", "Sequence slots free for admission.", s.free_slots as f64);
+    gauge(&mut o, "inference_long_prompts_in_flight", "Running sequences with more than 2048 prompt tokens left to prefill.", s.long_prompts_in_flight as f64);
     gauge(&mut o, "inference_kv_blocks_used", "KV cache blocks held by running sequences.", s.kv_blocks_used as f64);
     gauge(&mut o, "inference_kv_blocks_cached", "KV cache blocks held only by the prefix cache, evicted on demand.", s.kv_blocks_cached as f64);
     gauge(&mut o, "inference_kv_blocks_total", "KV cache blocks in the pool.", s.kv_blocks_total as f64);
@@ -284,6 +313,7 @@ pub fn render(s: &Stats) -> String {
     histogram(&mut o, "inference_batch_size", "Decode rows per step.", &s.decode_batch);
     histogram(&mut o, "inference_prefill_tokens_per_step", "Prompt tokens prefilled per step.", &s.prefill_tokens_per_step);
     histogram(&mut o, "inference_step_seconds", "Wall time of one scheduler step.", &s.step_secs);
+    admission(&mut o, s);
     o
 }
 
@@ -353,6 +383,47 @@ mod tests {
         ] {
             assert!(t.contains(want), "{want} missing from\n{t}");
         }
+    }
+
+    #[test]
+    fn admission_causes_render_per_reason_and_ttft_splits_into_three_histograms() {
+        let mut s = Stats { waiting: 4, free_slots: 0, long_prompts_in_flight: 1, admission_blocked_steps: [7, 3, 2, 5, 1, 4], ..Stats::default() };
+        s.admission_wait_secs[Blocked::Kv as usize].observe(6.0);
+        s.admission_wait_secs[Blocked::Kv as usize].observe(9.0);
+        s.admission_wait_secs[6].observe(0.0);
+        s.prefill_wait_secs.observe(0.75);
+        s.prefill_secs.observe(0.2);
+        s.prompt_tokens.observe(3000.0);
+        s.cached_prompt_tokens.observe(0.0);
+        let t = render(&s);
+        for want in [
+            "inference_waiting_seqs 4",
+            "inference_free_slots 0",
+            "inference_long_prompts_in_flight 1",
+            "# TYPE inference_admission_blocked_steps_total counter",
+            "inference_admission_blocked_steps_total{reason=\"slots\"} 7",
+            "inference_admission_blocked_steps_total{reason=\"budget\"} 3",
+            "inference_admission_blocked_steps_total{reason=\"long_cap\"} 2",
+            "inference_admission_blocked_steps_total{reason=\"kv\"} 5",
+            "inference_admission_blocked_steps_total{reason=\"state\"} 1",
+            "inference_admission_blocked_steps_total{reason=\"resume\"} 4",
+            "# TYPE inference_admission_wait_seconds histogram",
+            "inference_admission_wait_seconds_bucket{reason=\"kv\",le=\"5\"} 0",
+            "inference_admission_wait_seconds_bucket{reason=\"kv\",le=\"10\"} 2",
+            "inference_admission_wait_seconds_sum{reason=\"kv\"} 15",
+            "inference_admission_wait_seconds_count{reason=\"kv\"} 2",
+            "inference_admission_wait_seconds_count{reason=\"slots\"} 0",
+            "inference_admission_wait_seconds_count{reason=\"none\"} 1",
+            "inference_prefill_wait_seconds_sum 0.75",
+            "inference_prefill_seconds_count 1",
+            "inference_prompt_tokens_bucket{le=\"2048\"} 0",
+            "inference_prompt_tokens_bucket{le=\"4096\"} 1",
+            "inference_cached_prompt_tokens_bucket{le=\"0\"} 1",
+            "inference_queue_seconds_count 0",
+        ] {
+            assert!(t.contains(want), "{want} missing from\n{t}");
+        }
+        assert_eq!(t.matches("# TYPE inference_admission_wait_seconds histogram").count(), 1);
     }
 
     #[test]
