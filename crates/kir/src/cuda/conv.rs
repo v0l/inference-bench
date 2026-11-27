@@ -597,7 +597,7 @@ extern "C" __global__ void line_ring_attention(const float* qkv, const float* ri
     int n = a + 1 < W ? a + 1 : W;
     for (int d = threadIdx.x; d < D; d += blockDim.x) qs[d] = qkv[bt * 3 * DM + (size_t)h * D + d];
     __syncthreads();
-    float mx = -INFINITY;
+    float mx = -3.402823466e38f;
     for (int j = threadIdx.x; j < n; j += blockDim.x) {
         int k = a - n + 1 + j;
         const float* kr = k >= p0 ? qkv + ((size_t)b * T + (k - p0)) * 3 * DM + DM : rk + (size_t)(k % W) * DM;

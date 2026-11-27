@@ -1033,6 +1033,69 @@ fn the_gpu_transcriber_matches_transformers_and_the_host_on_every_tiny_run() {
 
 #[test]
 #[ignore = "needs a CUDA GPU"]
+fn the_gpu_mimi_decoder_matches_transformers_frame_by_frame_and_batched() {
+    use specrt::codec::cuda::CudaCodec;
+    let host = mimi_host();
+    let ctx = cudarc::driver::CudaContext::new(0).unwrap();
+    let cache = std::env::var_os("SPECRT_CACHE").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("specrt-codec-jit"));
+    let jit = specrt::jit::Jit::new(ctx.clone(), cache).unwrap();
+    let (latents, shape) = mimi_ref("latents");
+    let (want, _) = mimi_ref("audio");
+    let frames = shape[0];
+    let gpu = CudaCodec::load(&ctx, &jit, &host, &[(1, 1), (1, 2), (frames, 1)]).unwrap();
+    let mut s = gpu.sessions(&gpu.decoder, 1).unwrap();
+    assert_eq!(s.floats_per_session(), host.plan.decoder.state_floats());
+    let whole = gpu.run(&gpu.decoder, &latents, &mut s).unwrap();
+    let e = max_rel(&whole, &want);
+    let host_whole = host.decode(&latents).unwrap();
+    let h = max_rel(&whole, &host_whole);
+    println!("gpu mimi decode: max rel {e:.2e} against transformers, {h:.2e} against the host");
+    assert!(e < 1e-4 && h < 1e-4, "{e} {h}");
+    let d = host.plan.latent_dim;
+    let mut s = gpu.sessions(&gpu.decoder, 1).unwrap();
+    let streamed: Vec<f32> = latents.chunks(d).flat_map(|z| gpu.run(&gpu.decoder, z, &mut s).unwrap()).collect();
+    let f = max_rel(&streamed, &whole);
+    println!("gpu mimi decode: frame by frame against whole clip max rel {f:.2e}");
+    assert!(f < 1e-5, "{f}");
+    let reversed: Vec<Vec<f32>> = latents.chunks(d).rev().map(<[f32]>::to_vec).collect();
+    let mut pair = gpu.sessions(&gpu.decoder, 2).unwrap();
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    let n = host.plan.frame_samples;
+    for (i, z) in latents.chunks(d).enumerate() {
+        let both = gpu.run(&gpu.decoder, &[z.to_vec(), reversed[i].clone()].concat(), &mut pair).unwrap();
+        a.extend_from_slice(&both[..n]);
+        b.extend_from_slice(&both[n..]);
+    }
+    let mut solo = gpu.sessions(&gpu.decoder, 1).unwrap();
+    let alone: Vec<f32> = reversed.iter().flat_map(|z| gpu.run(&gpu.decoder, z, &mut solo).unwrap()).collect();
+    let (ea, eb) = (max_rel(&a, &streamed), max_rel(&b, &alone));
+    println!("gpu mimi decode: two sessions batched against each alone {ea:.2e} {eb:.2e}");
+    assert!(ea < 1e-5 && eb < 1e-5, "{ea} {eb}");
+}
+
+#[test]
+#[ignore = "needs nvrtc, no GPU: compiles every Mimi decoder kernel of the real Phonon config for sm_120"]
+fn every_mimi_kernel_of_the_real_config_compiles_with_nvrtc() {
+    let plan = specrt::codec::graph::plan(&json(&dir().join("phonon-31m-en.hub-92741c5.config.json"))).unwrap();
+    let target = kir::Target::sm_120();
+    let mut all = Vec::new();
+    for (steps, batch) in [(1, 1), (1, 8), (16, 1)] {
+        all.extend(specrt::codec::compile::plan(&plan.decoder, steps, batch).unwrap().kernels(&target).unwrap());
+    }
+    all.sort_by_key(|k| k.name());
+    all.dedup_by_key(|k| k.name());
+    let m = specrt::codec::cuda::module(&all).unwrap();
+    let opts = cudarc::nvrtc::CompileOptions { arch: Some("compute_120"), options: vec!["--std=c++17".into()], ..Default::default() };
+    let ptx = cudarc::nvrtc::compile_ptx_with_opts(m.source.as_str(), opts).unwrap().to_src();
+    for name in &m.kernels {
+        assert!(ptx.contains(&format!(".entry {name}(")), "{name} missing from the PTX");
+    }
+    assert!(m.source.as_str().contains("if (ACT == 4) return (v > 0.0f ? v : expf(v) - 1.0f);"), "ELU is lowered from the kir macro");
+    println!("{} kernels, {} conv variants", m.kernels.len(), all.len());
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
 fn the_gpu_log_mel_and_stem_match_transformers() {
     let host = specrt::speech::HostSpeech::open(&tiny()).unwrap();
     let ctx = cudarc::driver::CudaContext::new(0).unwrap();
