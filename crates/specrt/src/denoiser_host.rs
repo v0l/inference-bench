@@ -239,7 +239,7 @@ impl<'a> HostDenoiser<'a> {
                     }
                 }
             }
-            DitOp::Modulate { rms: true, .. } | DitOp::Map { .. } => bail!("{} runs in the flow head runner (flow_head), not the DiT host", d.label()),
+            DitOp::Modulate { rms: true, .. } | DitOp::Map { .. } | DitOp::RmsNorm { .. } => bail!("{} runs in the flow head runner (flow_head), not the DiT host", d.label()),
             DitOp::Modulate { from, into, rows, set, shift, scale, .. } => {
                 let m = bufs[set].clone();
                 let (a, b) = self.local_span(from, rows, x);

@@ -1,0 +1,75 @@
+kind = "kir-kernel"
+family = "compose"
+name = "dit_timestep_table"
+threads = 256
+
+[args]
+width = "freq_width"
+
+[rows]
+iter = "grid"
+address = "advance"
+per_row = ["out_hi", "out_lo"]
+
+[rows.stride]
+steps = 1
+
+[[param]]
+name = "steps"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "freqs"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "out_hi"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "out_lo"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[const]]
+name = "half"
+value = "freq_half"
+
+[[stage]]
+op = "index"
+name = "col"
+
+[[stage]]
+op = "tile_load"
+name = "ts"
+src = "steps"
+layout = "(width):(0)"
+at = ["i"]
+
+[[stage]]
+op = "tile_load"
+name = "f"
+src = "freqs"
+layout = "((freq_half,2)):((1,0))"
+at = ["i"]
+
+[[stage]]
+op = "epilogue"
+name = "angle"
+expr = "ts * f"
+
+[[stage]]
+op = "epilogue"
+name = "y"
+expr = "select(col < half, cos(angle), sin(angle))"
+
+[[stage]]
+op = "split_store"
+dst = "out_hi"
+lo = "out_lo"
+value = "y"

@@ -1,0 +1,66 @@
+kind = "kir-kernel"
+family = "compose"
+name = "dit_rms_norm"
+threads = 256
+
+[args]
+width = "row_width"
+
+[rows]
+iter = "block"
+address = "advance"
+per_row = ["x", "out"]
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "gamma"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "out"
+role = "activation"
+access = "write"
+
+[[const]]
+name = "eps"
+value = "row_eps"
+
+[[stage]]
+op = "tile_load"
+name = "v"
+src = "x"
+
+[[stage]]
+op = "block_sum"
+name = "total"
+expr = "v * v"
+
+[[stage]]
+op = "epilogue"
+name = "inv"
+expr = "rsqrt(total / width + eps)"
+
+[[stage]]
+op = "tile_load"
+name = "u"
+src = "x"
+
+[[stage]]
+op = "tile_load"
+name = "g"
+src = "gamma"
+
+[[stage]]
+op = "epilogue"
+name = "y"
+expr = "g * u * inv"
+
+[[stage]]
+op = "tile_store"
+dst = "out"
+value = "y"

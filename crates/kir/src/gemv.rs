@@ -33,7 +33,7 @@ pub enum Gemv {
     Rows { n: usize, k: usize, epilogue: String },
 }
 
-pub const ROWS_NAMES: [&str; 4] = ["acc", "old", "g", "r"];
+pub const ROWS_NAMES: [&str; 5] = ["acc", "old", "g", "r", "b"];
 
 pub fn rows_epilogue(text: &str) -> Result<crate::expr::Expr, String> {
     let e = crate::expr::Expr::parse(text)?;
@@ -145,12 +145,14 @@ fn planes_rows(name: &str, k: usize, epilogue: &crate::expr::Expr) -> Result<Str
             "acc" => "        float e_acc = v;\n".to_string(),
             "old" => "        float e_old = *o;\n".to_string(),
             "g" => "        float e_g = aux[m * (size_t)aux_stride + row];\n".to_string(),
+            "b" => "        float e_b = bias[row];\n".to_string(),
             _ => "        float e_r = aux[m * (size_t)aux_stride];\n".to_string(),
         });
     }
+    let bias = if names.iter().any(|n| n == "b") { ", const float* bias" } else { "" };
     Ok(format!(
         "extern \"C\" __global__ void {name}(const unsigned short* w, const unsigned short* xh, const unsigned short* xl, float* out,
-                                       const float* aux, int tokens, int out_stride, int aux_stride) {{
+                                       const float* aux, int tokens, int out_stride, int aux_stride{bias}) {{
     __shared__ float part[{warps}][{m}];
     int row = blockIdx.x;
     int m0 = blockIdx.y * {m};

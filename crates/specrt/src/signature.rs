@@ -348,7 +348,7 @@ impl<'a> Signer<'a> {
         let head = matches!(weight, Weight::LmHead | Weight::MtpHead);
         let rows = if weight == Weight::LmHead { Rows::Out } else { Rows::Tokens };
         let out_cols = match s.epi {
-            _ if head => self.spec.dims.vocab,
+            _ if head => self.spec.dims.head.as_ref().map_or(self.spec.dims.vocab, |h| h.rows),
             Epilogue::Act if output.holds_activation() => self.spec.gate_up_out(s.n),
             _ => s.n,
         };

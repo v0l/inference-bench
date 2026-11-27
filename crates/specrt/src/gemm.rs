@@ -153,7 +153,7 @@ pub fn linear_shape(spec: &Spec, linear: &str) -> GemmShape {
         "cross_q" => (spec.q_dim(), d.hidden, Epilogue::Store, spec.attention.qkv_bias),
         "cross_kv" => (2 * spec.q_dim(), d.hidden, Epilogue::Store, spec.attention.qkv_bias),
         "cross_o" => (d.hidden, spec.q_dim(), Epilogue::Residual, spec.attention.o_bias),
-        _ => (spec.head_rows().len(), d.hidden, Epilogue::Store, false),
+        _ => (spec.head_rows().len(), d.hidden, Epilogue::Store, d.head.as_ref().is_some_and(|h| h.bias)),
     };
     GemmShape::new(n, k, epi, bias).with_act(act(spec))
 }

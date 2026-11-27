@@ -1118,3 +1118,53 @@ fn the_gpu_log_mel_and_stem_match_transformers() {
         }
     }
 }
+
+fn phonon() -> PathBuf {
+    dir().join("tiny-phonon")
+}
+
+fn phonon_ref(key: &str) -> (Vec<f32>, Vec<usize>) {
+    let meta = json(&phonon().join("reference.json"));
+    let entry = &meta["files"][key];
+    let shape: Vec<usize> = entry["shape"].as_array().unwrap_or_else(|| panic!("{key}")).iter().map(|d| d.as_u64().unwrap() as usize).collect();
+    let bytes = std::fs::read(phonon().join("reference").join(entry["file"].as_str().unwrap())).unwrap();
+    let values: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+    assert_eq!(values.len(), shape.iter().product::<usize>(), "{key}");
+    (values, shape)
+}
+
+fn lsd_head(steps: Option<usize>) -> specrt::flow_head::HostHead {
+    let head = specrt::flow_head::FlowHead::from_dir(&phonon(), steps).unwrap();
+    specrt::flow_head::HostHead::load(head, &phonon()).unwrap()
+}
+
+#[test]
+fn the_lsd_flow_head_matches_transformers_with_the_recorded_noise() {
+    let host = lsd_head(None);
+    assert_eq!(host.head.graph.name, "lsd");
+    assert_eq!(host.head.steps, 1);
+    let (hidden, hshape) = phonon_ref("frames.hidden");
+    let (noise, _) = phonon_ref("noise");
+    let (want, _) = phonon_ref("frames.latent");
+    let frames = hshape[0];
+    let mut s = host.session(&vec![1.0; frames]).unwrap();
+    let got = host.frame(&mut s, &hidden, &noise).unwrap();
+    let e = max_rel(&got, &want);
+    println!("lsd head, {frames} frames as one batch: max rel {e:.2e} against transformers");
+    assert!(e < 1e-4, "{e}");
+    let mut one = host.session(&[1.0]).unwrap();
+    let d = noise.len() / frames;
+    let h = hidden.len() / frames;
+    for f in 0..frames {
+        let row = host.frame(&mut one, &hidden[f * h..(f + 1) * h], &noise[f * d..(f + 1) * d]).unwrap();
+        assert_eq!(row, got[f * d..(f + 1) * d], "frame {f} alone equals the batch");
+    }
+    let two = lsd_head(Some(2));
+    let (want2, _) = phonon_ref("frames.steps2");
+    let mut s2 = two.session(&[1.0]).unwrap();
+    let got2 = two.frame(&mut s2, &hidden[..h], &noise[..d]).unwrap();
+    let e2 = max_rel(&got2, &want2[..d]);
+    println!("lsd head, two steps on the first frame: max rel {e2:.2e}");
+    assert!(e2 < 1e-4, "{e2}");
+    assert!(max_rel(&got2, &got[..d]) > 1e-3, "two steps move the latent away from one");
+}

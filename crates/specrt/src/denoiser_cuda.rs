@@ -611,7 +611,7 @@ impl Denoiser {
                 b.arg(&src).arg(&dst);
                 unsafe { b.launch(Self::row_grid(a.bufs[from].cols, r1 - r0)) }?;
             }
-            DitOp::TimestepEmbed { from, into } => {
+            DitOp::TimestepEmbed { from, into, table: None } => {
                 let src = self.ptr_f32(a, from, 0)?;
                 let (hi, lo) = self.ptr_planes(a, into, 0)?;
                 let mut b = s.launch_builder(self.compose_fn(d)?);
@@ -732,7 +732,7 @@ impl Denoiser {
                 }
                 unsafe { b.launch(Self::row_grid(a.bufs[into].cols, rows)) }?;
             }
-            DitOp::Modulate { rms: true, .. } | DitOp::Map { .. } => bail!("{} runs in the flow head runner (flow_head), not the DiT denoiser", d.label()),
+            DitOp::Modulate { rms: true, .. } | DitOp::Map { .. } | DitOp::RmsNorm { .. } | DitOp::TimestepEmbed { table: Some(_), .. } => bail!("{} runs in the flow head runner (flow_head), not the DiT denoiser", d.label()),
             DitOp::Modulate { from, into, rows, set, shift, scale, .. } => {
                 let (r0, r1) = self.span(a, from, rows, seq);
                 let x = self.ptr_f32(a, from, r0)?;

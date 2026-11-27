@@ -593,7 +593,7 @@ impl Gguf {
             quant,
             head_quant: None,
             act_quant: ActQuant::None,
-            dims: Dims { hidden, intermediate, vocab, tie_embeddings: tied, embed_scale: None, logit_softcap: None, logit_scale: None, positions: None, head_rows: None },
+            dims: Dims { hidden, intermediate, vocab, tie_embeddings: tied, embed_scale: None, logit_softcap: None, logit_scale: None, positions: None, head: None, head_rows: None },
             layers: Layers { count: layers, pattern, window: None, split: false, shared_tail: 0 },
             norm: Norm { kind: NormKind::Rmsnorm, eps, unit_offset: false, sandwich: false, pre: true, residual_scale: None, layer_scale: None },
             attention: Attention {
@@ -637,6 +637,7 @@ impl Gguf {
             duplex: None,
             cross: None,
             speech_decode: None,
+            tts: None,
             tensors: Default::default(),
             mtp: (family.mtp && nextn > 0).then(|| crate::spec::Mtp { head_quant: Some(Quant::Bf16), ..crate::spec::Mtp::new(nextn) }),
             vision: None,

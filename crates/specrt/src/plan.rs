@@ -40,7 +40,8 @@ pub enum DitOp {
     Unpatchify { from: &'static str, into: &'static str, channels_last: bool },
     Split { from: &'static str, into: &'static str, rows: Stream, act: bool },
     Copy { from: &'static str, into: &'static str, rows: Stream },
-    TimestepEmbed { from: &'static str, into: &'static str },
+    TimestepEmbed { from: &'static str, into: &'static str, table: Option<&'static str> },
+    RmsNorm { from: &'static str, into: &'static str, rows: Stream, weight: &'static str, eps: &'static str },
     Linear { weight: &'static str, input: &'static str, output: &'static str, rows: Stream, add: bool, bias: bool, act: u8 },
     Modulate { from: &'static str, into: &'static str, rows: Stream, set: &'static str, shift: u8, scale: u8, rms: bool, weight: Option<&'static str> },
     GatedAdd { from: &'static str, into: &'static str, rows: Stream, set: &'static str, gate: u8 },
@@ -64,7 +65,9 @@ impl DitOp {
             DitOp::Split { act: true, from, .. } => format!("silu {from}"),
             DitOp::Split { from, .. } => format!("split {from}"),
             DitOp::Copy { from, .. } => format!("copy {from}"),
+            DitOp::TimestepEmbed { table: Some(t), .. } => format!("timestep embed {}", short(t)),
             DitOp::TimestepEmbed { .. } => "timestep embed".into(),
+            DitOp::RmsNorm { weight, rows, .. } => format!("{} rms norm ({})", short(weight), rows.label()),
             DitOp::Linear { weight, rows, .. } => format!("{} ({})", short(weight), rows.label()),
             DitOp::Modulate { rows, set, shift, scale, rms: true, .. } => format!("{} rms modulate {set}[{shift},{scale}]", rows.label()),
             DitOp::Modulate { rows, set, shift, scale, .. } => format!("{} modulate {set}[{shift},{scale}]", rows.label()),
@@ -86,7 +89,8 @@ impl DitOp {
 
     pub fn flow(&self) -> String {
         match self {
-            DitOp::Patchify { from, into } | DitOp::Unpatchify { from, into, .. } | DitOp::TimestepEmbed { from, into } | DitOp::TableAdd { from, into, .. } => format!("{from} to {into}"),
+            DitOp::Patchify { from, into } | DitOp::Unpatchify { from, into, .. } | DitOp::TimestepEmbed { from, into, .. } | DitOp::TableAdd { from, into, .. } => format!("{from} to {into}"),
+            DitOp::RmsNorm { from, into, rows, .. } => format!("{from} to {into} ({})", rows.label()),
             DitOp::Glu { from, into, rows, .. } => format!("{from} to {into} ({})", rows.label()),
             DitOp::Split { from, into, rows, .. } | DitOp::Copy { from, into, rows } | DitOp::Modulate { from, into, rows, .. } | DitOp::LayerNorm { from, into, rows, .. } => format!("{from} to {into} ({})", rows.label()),
             DitOp::Linear { input, output, rows, add, .. } => format!("{input} to {output} ({}{})", rows.label(), if *add { ", added" } else { "" }),
@@ -108,9 +112,13 @@ impl DitOp {
             DitOp::Split { act: true, .. } => "dit_silu_split",
             DitOp::Split { .. } => "dit_split",
             DitOp::Copy { .. } => "dit_copy",
+            DitOp::TimestepEmbed { table: Some(_), .. } => "dit_timestep_table",
             DitOp::TimestepEmbed { .. } => "dit_timestep",
+            DitOp::RmsNorm { .. } => "dit_rms_norm",
             DitOp::Linear { .. } => "vis_mma",
             DitOp::Modulate { rms: true, .. } => "dit_rms_modulate",
+            DitOp::Modulate { rows: Stream::Seqs, weight: Some(_), .. } => "dit_layer_modulate_w",
+            DitOp::Modulate { rows: Stream::Seqs, .. } => "dit_layer_modulate",
             DitOp::Modulate { .. } => "dit_modulate",
             DitOp::GatedAdd { rows: Stream::Seqs, .. } => "dit_row_gated_add",
             DitOp::GatedAdd { .. } => "dit_gated_add",
@@ -311,6 +319,10 @@ impl Weight {
             Weight::LinOut => vec![w("linear_attn.out_proj")],
             Weight::MixIn => spec.mixer.iter().flat_map(|m| m.projection.iter().map(move |p| format!("{}.{}.weight", m.module, p.tensor))).collect(),
             Weight::MixOut => spec.mixer.iter().map(|m| format!("{}.{}.weight", m.module, m.out_tensor)).collect(),
+            Weight::LmHead if spec.dims.head.is_some() => {
+                let h = spec.dims.head.as_ref().unwrap();
+                [w(&h.tensor)].into_iter().chain(h.bias.then(|| format!("{}.bias", h.tensor))).collect()
+            }
             Weight::LmHead if spec.dims.tie_embeddings => vec![w("embed_tokens")],
             Weight::LmHead => vec![w("lm_head")],
             Weight::MtpFc | Weight::MtpFcHidden | Weight::MtpQkv | Weight::MtpO | Weight::MtpGateUp | Weight::MtpDown | Weight::MtpHead => Vec::new(),
