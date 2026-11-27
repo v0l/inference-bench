@@ -462,9 +462,10 @@ mod tests {
         assert!(big <= a.max_context.max(1));
         assert_eq!(fitting_context(&a, Some(1 << 20), 1), None);
         assert_eq!(fitting_context(&a, None, 1), None);
-        let one = fitting_context_each(&a, Some(96 << 30), 1).unwrap();
-        let four = fitting_context_each(&a, Some(96 << 30), 4).unwrap();
-        assert_eq!(one, big);
-        assert!(four * 4 <= fitting_context(&a, Some(96 << 30), 4).unwrap() && four <= one, "{four} {one}");
+        let tight = Some(a.total_bytes + GPU_RESERVE + a.state_bytes_per_seq * 4 + (2 << 30));
+        let each = fitting_context_each(&a, tight, 4).unwrap();
+        let pooled = fitting_context(&a, tight, 4).unwrap();
+        assert_eq!(fitting_context_each(&a, tight, 1), fitting_context(&a, tight, 1));
+        assert!(pooled < a.max_context && each.abs_diff(pooled / 4) <= 1, "{each} {pooled}");
     }
 }

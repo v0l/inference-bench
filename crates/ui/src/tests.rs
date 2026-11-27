@@ -2479,17 +2479,7 @@ fn the_load_dialog_with_a_million_token_context_fits_desktop_and_phone_widths() 
 
 #[test]
 fn a_context_extension_lifts_the_slider_to_a_million_tokens_and_prices_the_kv_cache() {
-    let mut h = harness("extension", Tab::Models);
-    with_gpu(&mut h, 0, 96 << 30);
-    let d = dir("ext-27b");
-    std::fs::create_dir_all(&d).unwrap();
-    std::fs::copy(fixtures().join("qwen3.8-27b.config.json"), d.join("config.json")).unwrap();
-    let mut m = model("Qwen3.8-27B", true, "dense decoder");
-    (m.path, m.root) = (d.clone(), d);
-    m.context_length = None;
-    h.state_mut().library[0] = m.clone();
-    h.state_mut().open_load_dialog(&m);
-    h.run();
+    let mut h = dialog_27b("extension", |_, _| {});
     let dialog = h.state_mut().load.as_mut().unwrap();
     assert_eq!(dialog.max, 262144);
     dialog.ctx = 1_048_576;
