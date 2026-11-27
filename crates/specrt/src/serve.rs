@@ -212,6 +212,8 @@ pub fn check_pool_tokens(pool_tokens: usize, max_model_len: usize) -> Result<()>
 pub const LATENCY_BUCKETS: [f64; 14] =
     [0.005, 0.01, 0.02, 0.035, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0, 2.5, 10.0];
 pub const COUNT_BUCKETS: [f64; 12] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 256.0, 1024.0, 4096.0, 8192.0, 16384.0];
+pub const WAIT_BUCKETS: [f64; 16] = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0];
+pub const TOKEN_BUCKETS: [f64; 14] = [0.0, 16.0, 64.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0, 32768.0, 65536.0, 131072.0, 262144.0];
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Histogram {
@@ -295,6 +297,14 @@ pub struct Stats {
     pub decode_batch: Histogram,
     pub prefill_tokens_per_step: Histogram,
     pub step_secs: Histogram,
+    pub free_slots: usize,
+    pub long_prompts_in_flight: usize,
+    pub admission_blocked_steps: [u64; 6],
+    pub admission_wait_secs: [Histogram; 7],
+    pub prefill_wait_secs: Histogram,
+    pub prefill_secs: Histogram,
+    pub prompt_tokens: Histogram,
+    pub cached_prompt_tokens: Histogram,
     pub chain: Option<ChainMetrics>,
     pub sessions: Option<crate::sessions::Stats>,
     pub offload: Option<crate::offload::OffloadStats>,
@@ -330,6 +340,14 @@ impl Default for Stats {
             decode_batch: Histogram::new(&COUNT_BUCKETS),
             prefill_tokens_per_step: Histogram::new(&COUNT_BUCKETS),
             step_secs: Histogram::new(&LATENCY_BUCKETS),
+            free_slots: 0,
+            long_prompts_in_flight: 0,
+            admission_blocked_steps: [0; 6],
+            admission_wait_secs: std::array::from_fn(|_| Histogram::new(&WAIT_BUCKETS)),
+            prefill_wait_secs: Histogram::new(&WAIT_BUCKETS),
+            prefill_secs: Histogram::new(&WAIT_BUCKETS),
+            prompt_tokens: Histogram::new(&TOKEN_BUCKETS),
+            cached_prompt_tokens: Histogram::new(&TOKEN_BUCKETS),
             chain: None,
             sessions: None,
             offload: None,
@@ -338,9 +356,19 @@ impl Default for Stats {
     }
 }
 
+impl Stats {
+    pub fn admission_wait(&self, held_by: Option<sched::Blocked>) -> &Histogram {
+        &self.admission_wait_secs[held_by.map_or(6, |b| b as usize)]
+    }
+
+    fn admission_wait_mut(&mut self, held_by: Option<sched::Blocked>) -> &mut Histogram {
+        &mut self.admission_wait_secs[held_by.map_or(6, |b| b as usize)]
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SeqEvent {
-    Started { queued: Duration },
+    Started { queued: Duration, admission: Duration, held_by: Option<sched::Blocked> },
     Prefilled { prefill: Duration },
     Token(u32),
     Preempted,
@@ -1006,11 +1034,16 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
         }
         for e in events {
             let (id, ev) = match e {
-                Event::Started { id, queued } => {
+                Event::Started { id, queued, admission, held_by } => {
                     s.queue_secs.observe(queued.as_secs_f64());
-                    (id, SeqEvent::Started { queued })
+                    s.admission_wait_mut(held_by).observe(admission.as_secs_f64());
+                    s.prefill_wait_secs.observe(queued.saturating_sub(admission).as_secs_f64());
+                    (id, SeqEvent::Started { queued, admission, held_by })
                 }
-                Event::Prefilled { id, prefill } => (id, SeqEvent::Prefilled { prefill }),
+                Event::Prefilled { id, prefill } => {
+                    s.prefill_secs.observe(prefill.as_secs_f64());
+                    (id, SeqEvent::Prefilled { prefill })
+                }
                 Event::Token { id, token } => {
                     s.generated_tokens += 1;
                     if let Some(l) = live.get_mut(&id) {
@@ -1024,6 +1057,10 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
                 Event::Preempted { id } => (id, SeqEvent::Preempted),
                 Event::Logprob { id, logprob } => (id, SeqEvent::Logprob(logprob)),
                 Event::Finished { id, finish, prompt_tokens, completion_tokens, cached_tokens } => {
+                    if finish != Finish::Cancelled || completion_tokens > 0 {
+                        s.prompt_tokens.observe(prompt_tokens as f64);
+                        s.cached_prompt_tokens.observe(cached_tokens as f64);
+                    }
                     (id, SeqEvent::Finished { finish, prompt_tokens, completion_tokens, cached_tokens })
                 }
             };
@@ -1037,6 +1074,9 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
         }
         s.running = sched.running();
         s.waiting = sched.waiting() + encoding(&lane);
+        s.free_slots = sched.free_slots();
+        s.long_prompts_in_flight = sched.long_prompts_in_flight();
+        s.admission_blocked_steps = sched.blocked_steps();
         s.kv_blocks_used = sched.blocks_live();
         s.kv_blocks_cached = sched.blocks_cached();
         s.preemptions = sched.preemptions();
@@ -1064,6 +1104,9 @@ pub struct Completion {
     pub completion_tokens: usize,
     pub finish: Option<Finish>,
     pub queue_secs: f64,
+    pub admission_secs: f64,
+    pub prefill_wait_secs: f64,
+    pub held_by: Option<sched::Blocked>,
     pub prefill_secs: f64,
     pub ttft_secs: f64,
     pub decode_secs: f64,
@@ -1298,7 +1341,12 @@ impl Serving {
         loop {
             let ev = rx.recv().map_err(|_| anyhow::anyhow!("the serving engine has stopped"))?;
             match ev {
-                SeqEvent::Started { queued } => out.queue_secs = queued.as_secs_f64(),
+                SeqEvent::Started { queued, admission, held_by } => {
+                    out.queue_secs = queued.as_secs_f64();
+                    out.admission_secs = admission.as_secs_f64();
+                    out.prefill_wait_secs = queued.saturating_sub(admission).as_secs_f64();
+                    out.held_by = held_by;
+                }
                 SeqEvent::Prefilled { prefill } => out.prefill_secs = prefill.as_secs_f64(),
                 SeqEvent::Preempted => out.preemptions += 1,
                 SeqEvent::Token(t) => {

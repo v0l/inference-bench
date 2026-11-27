@@ -607,9 +607,42 @@ pub enum Finish {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Blocked {
+    Slots,
+    Budget,
+    LongCap,
+    Kv,
+    State,
+    Resume,
+}
+
+impl Blocked {
+    pub const ALL: [Blocked; 6] = [Blocked::Slots, Blocked::Budget, Blocked::LongCap, Blocked::Kv, Blocked::State, Blocked::Resume];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Blocked::Slots => "slots",
+            Blocked::Budget => "budget",
+            Blocked::LongCap => "long_cap",
+            Blocked::Kv => "kv",
+            Blocked::State => "state",
+            Blocked::Resume => "resume",
+        }
+    }
+
+    pub fn label_of(b: Option<Blocked>) -> &'static str {
+        b.map_or("none", Blocked::label)
+    }
+
+    pub fn parse(label: &str) -> Option<Blocked> {
+        Blocked::ALL.into_iter().find(|b| b.label() == label)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    Started { id: SeqId, queued: Duration },
+    Started { id: SeqId, queued: Duration, admission: Duration, held_by: Option<Blocked> },
     Prefilled { id: SeqId, prefill: Duration },
     Token { id: SeqId, token: u32 },
     Preempted { id: SeqId },
@@ -648,9 +681,20 @@ struct Seq {
     cursor: Option<crate::grammar::Cursor>,
     parked: Option<HostSeq>,
     drafts: crate::drafts::Positions,
+    admitted_at: Option<Instant>,
+    held: [Duration; 6],
 }
 
 impl Seq {
+    fn held_by(&self) -> Option<Blocked> {
+        let (i, longest) = self.held.iter().enumerate().max_by_key(|(_, d)| **d)?;
+        (!longest.is_zero()).then(|| Blocked::ALL[i])
+    }
+
+    fn mark_admitted(&mut self) {
+        self.admitted_at.get_or_insert_with(Instant::now);
+    }
+
     fn generated(&self) -> usize {
         self.tokens.len() - self.req.prompt.len()
     }
@@ -688,6 +732,8 @@ pub struct Scheduler<E: Executor> {
     prefix_hits: u64,
     sessions: Option<Sessions>,
     chooser: Option<crate::drafts::DraftChooser>,
+    blocked_steps: [u64; 6],
+    blocked: Option<(Blocked, Instant)>,
 }
 
 struct Held {
@@ -773,7 +819,21 @@ impl<E: Executor> Scheduler<E> {
             prefix_hits: 0,
             sessions: None,
             chooser,
+            blocked_steps: [0; 6],
+            blocked: None,
         }
+    }
+
+    pub fn blocked_steps(&self) -> [u64; 6] {
+        self.blocked_steps
+    }
+
+    pub fn free_slots(&self) -> usize {
+        self.cfg.max_num_seqs.min(self.exec.slots()).saturating_sub(self.running.len()).min(self.free_slots.len())
+    }
+
+    pub fn long_prompts_in_flight(&self) -> usize {
+        self.running.iter().filter(|s| s.prefill_target().saturating_sub(s.computed) > LONG_PROMPT).count()
     }
 
     pub fn draft_chooser(&self) -> Option<&crate::drafts::DraftChooser> {
@@ -1092,6 +1152,8 @@ impl<E: Executor> Scheduler<E> {
             cursor,
             parked: None,
             drafts: Default::default(),
+            admitted_at: None,
+            held: [Duration::ZERO; 6],
         });
         Ok(id)
     }
@@ -1198,24 +1260,46 @@ impl<E: Executor> Scheduler<E> {
         Ok(())
     }
 
+    fn charge_waiting(&mut self) {
+        let Some((b, since)) = self.blocked else { return };
+        let now = Instant::now();
+        for s in self.waiting.iter_mut() {
+            s.held[b as usize] += now.saturating_duration_since(since.max(s.arrived));
+        }
+    }
+
     fn admit(&mut self, budget: usize) -> Result<()> {
+        self.charge_waiting();
+        self.blocked = None;
+        let stop = self.admit_until(budget)?;
+        if let Some(b) = stop {
+            self.blocked_steps[b as usize] += 1;
+            self.blocked = Some((b, Instant::now()));
+        }
+        Ok(())
+    }
+
+    fn admit_until(&mut self, budget: usize) -> Result<Option<Blocked>> {
         let cap = self.cfg.max_num_seqs.min(self.exec.slots());
         let mut planned = 0;
         let mut long_in_flight = if self.cfg.shortest_first { self.running.iter().filter(|s| s.prefill_target() - s.computed > LONG_PROMPT).count() } else { 0 };
         let long_cap = if self.cfg.shortest_first { self.cfg.max_long_in_flight.max(1) } else { usize::MAX };
         while let Some(s) = self.waiting.front() {
-            if self.running.len() >= cap || self.free_slots.is_empty() || planned >= budget {
-                break;
+            if self.running.len() >= cap || self.free_slots.is_empty() {
+                return Ok(Some(Blocked::Slots));
+            }
+            if planned >= budget {
+                return Ok(Some(Blocked::Budget));
             }
             let target = s.prefill_target();
             if target > LONG_PROMPT && long_in_flight >= long_cap {
-                break;
+                return Ok(Some(Blocked::LongCap));
             }
             let need = blocks_for(target + 1);
             let reserve = if self.running.is_empty() { 0 } else { self.reserve() };
             if s.parked.is_some() {
-                if !self.resume_front(reserve)? {
-                    break;
+                if let Some(b) = self.resume_front(reserve)? {
+                    return Ok(Some(b));
                 }
                 continue;
             }
@@ -1244,13 +1328,13 @@ impl<E: Executor> Scheduler<E> {
             }
             if self.pool.free_count() < fresh + reserve + lookahead {
                 self.give_back(hit);
-                break;
+                return Ok(Some(Blocked::Kv));
             }
             let slot = *self.free_slots.last().expect("a free slot");
             if self.exec.acquire_state(slot).is_err() {
                 self.state_refusals += 1;
                 self.give_back(hit);
-                break;
+                return Ok(Some(Blocked::State));
             }
             let mut s = self.waiting.pop_front().expect("front exists");
             if let Some(state) = &hit.snapshot
@@ -1287,6 +1371,7 @@ impl<E: Executor> Scheduler<E> {
             s.slot = Some(slot);
             self.admissions += 1;
             s.admitted = self.admissions;
+            s.mark_admitted();
             let remaining = target - s.computed;
             if remaining > LONG_PROMPT {
                 long_in_flight += 1;
@@ -1295,10 +1380,10 @@ impl<E: Executor> Scheduler<E> {
             }
             self.running.push(s);
         }
-        Ok(())
+        Ok(None)
     }
 
-    fn resume_front(&mut self, reserve: usize) -> Result<bool> {
+    fn resume_front(&mut self, reserve: usize) -> Result<Option<Blocked>> {
         let front = self.waiting.front().expect("front exists");
         let held = front.parked.as_ref().map_or(0, |h| h.blocks);
         let total = held.max(blocks_for(front.tokens.len() + self.exec.draft_tokens()));
@@ -1311,12 +1396,12 @@ impl<E: Executor> Scheduler<E> {
         }
         let tight = self.pool.free_count() < total + reserve + promised;
         if self.pool.free_count() < total + reserve || (tight && !self.running.is_empty()) {
-            return Ok(false);
+            return Ok(Some(Blocked::Resume));
         }
         let slot = *self.free_slots.last().expect("a free slot");
         if self.exec.acquire_state(slot).is_err() {
             self.state_refusals += 1;
-            return Ok(false);
+            return Ok(Some(Blocked::State));
         }
         let mut s = self.waiting.pop_front().expect("front exists");
         let host = s.parked.take().expect("parked");
@@ -1342,8 +1427,9 @@ impl<E: Executor> Scheduler<E> {
         s.slot = Some(slot);
         self.admissions += 1;
         s.admitted = self.admissions;
+        s.mark_admitted();
         self.running.push(s);
-        Ok(true)
+        Ok(None)
     }
 
     fn give_back(&mut self, hit: prefix::Hit) {
@@ -1569,10 +1655,12 @@ impl<E: Executor> Scheduler<E> {
             }
             if !s.started {
                 let queued = s.arrived.elapsed();
+                let admission = s.admitted_at.map_or(queued, |at| at.saturating_duration_since(s.arrived)).min(queued);
+                let held_by = s.held_by();
                 let id = s.id;
                 self.running[i].started = true;
                 self.running[i].began = Some(Instant::now());
-                events.push(Event::Started { id, queued });
+                events.push(Event::Started { id, queued, admission, held_by });
             }
             while left > 0 {
                 let s = &self.running[i];
@@ -2815,6 +2903,175 @@ mod tests {
             peak = peak.max(s.running());
         }
         assert_eq!(peak, 21);
+    }
+
+    fn step_slowly<E: Executor>(s: &mut Scheduler<E>, steps: usize) {
+        for _ in 0..steps {
+            let mut events = Vec::new();
+            s.step(&mut events).unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn reasons_at_start<E: Executor>(s: &mut Scheduler<E>) -> HashMap<SeqId, Option<Blocked>> {
+        let mut out = HashMap::new();
+        let mut steps = 0;
+        while !s.idle() {
+            let mut events = Vec::new();
+            s.step(&mut events).unwrap();
+            for e in events {
+                if let Event::Started { id, held_by, .. } = e {
+                    out.insert(id, held_by);
+                }
+            }
+            std::thread::sleep(Duration::from_micros(500));
+            steps += 1;
+            assert!(steps < 100_000, "the scheduler made no progress");
+        }
+        out
+    }
+
+    fn blocked(s: &Scheduler<Fake>, b: Blocked) -> u64 {
+        s.blocked_steps()[b as usize]
+    }
+
+    #[test]
+    fn full_slots_are_counted_and_name_what_held_the_waiting_sequence() {
+        let mut s = Scheduler::new(Fake::new(1024, 2, 200, 512), Config { max_num_seqs: 2, ..Config::default() });
+        let ids: Vec<SeqId> = (0..3).map(|q| s.submit(request(20, 6, q)).unwrap()).collect();
+        step_slowly(&mut s, 2);
+        assert_eq!((s.running(), s.waiting(), s.free_slots()), (2, 1, 0));
+        assert!(blocked(&s, Blocked::Slots) >= 2);
+        assert_eq!(s.waiting.front().unwrap().held_by(), Some(Blocked::Slots));
+        let reasons = reasons_at_start(&mut s);
+        assert_eq!(reasons[&ids[2]], Some(Blocked::Slots));
+        assert_eq!(blocked(&s, Blocked::Kv) + blocked(&s, Blocked::Budget), 0);
+    }
+
+    #[test]
+    fn a_planned_prefill_budget_is_counted_as_budget() {
+        let cfg = Config { max_batched_tokens: 64, min_prefill_chunk: 64, ..Config::default() };
+        let mut s = Scheduler::new(Fake::new(1024, 4, 200, 512), cfg);
+        let ids: Vec<SeqId> = (0..2).map(|q| s.submit(request(64, 4, q)).unwrap()).collect();
+        step_slowly(&mut s, 1);
+        assert_eq!((s.running(), s.waiting()), (1, 1));
+        assert_eq!(blocked(&s, Blocked::Budget), 1);
+        let reasons = reasons_at_start(&mut s);
+        assert_eq!(reasons[&ids[1]], Some(Blocked::Budget));
+    }
+
+    #[test]
+    fn the_long_prompt_cap_is_counted_as_long_cap() {
+        let mut fake = Fake::new(4096, 4, 600, 512);
+        fake.light = true;
+        let mut s = Scheduler::new(fake, Config { max_batched_tokens: 512, ..Config::default() });
+        let ids: Vec<SeqId> = (0..2).map(|q| s.submit(request(3500, 4, q)).unwrap()).collect();
+        step_slowly(&mut s, 2);
+        assert_eq!((s.running(), s.waiting(), s.long_prompts_in_flight()), (1, 1, 1));
+        assert!(blocked(&s, Blocked::LongCap) >= 2);
+        assert_eq!(s.waiting.front().unwrap().held_by(), Some(Blocked::LongCap));
+        let reasons = reasons_at_start(&mut s);
+        assert_eq!(reasons[&ids[1]], Some(Blocked::LongCap));
+    }
+
+    #[test]
+    fn short_kv_with_nothing_to_evict_is_counted_as_kv() {
+        let mut s = Scheduler::new(Fake::new(1024, 4, 40, 512), Config { reserve_blocks: Some(2), ..Config::default() });
+        let ids: Vec<SeqId> = (0..2).map(|q| s.submit(request(400, 100, q)).unwrap()).collect();
+        step_slowly(&mut s, 2);
+        assert_eq!((s.running(), s.waiting()), (1, 1));
+        assert!(blocked(&s, Blocked::Kv) >= 2);
+        assert_eq!(s.prefix_stats().blocks, 0);
+        assert_eq!(s.waiting.front().unwrap().held_by(), Some(Blocked::Kv));
+        let reasons = reasons_at_start(&mut s);
+        assert_eq!(reasons[&ids[1]], Some(Blocked::Kv));
+    }
+
+    #[test]
+    fn a_refused_recurrent_state_is_counted_as_state() {
+        let mut fake = Fake::new(1024, 8, 400, 512);
+        fake.state_budget = 2;
+        let mut s = Scheduler::new(fake, Config::default());
+        let ids: Vec<SeqId> = (0..3).map(|q| s.submit(request(20, 6, q)).unwrap()).collect();
+        step_slowly(&mut s, 2);
+        assert_eq!((s.running(), s.waiting()), (2, 1));
+        assert!(blocked(&s, Blocked::State) >= 2);
+        assert_eq!(blocked(&s, Blocked::State), s.state_refusals());
+        assert_eq!(s.waiting.front().unwrap().held_by(), Some(Blocked::State));
+        let reasons = reasons_at_start(&mut s);
+        assert_eq!(reasons[&ids[2]], Some(Blocked::State));
+    }
+
+    #[test]
+    fn a_parked_sequence_that_cannot_resume_is_counted_as_resume() {
+        let (mut s, _) = pressured(1 << 30, 0);
+        s.exec.light = true;
+        let mut seen = None;
+        let mut steps = 0;
+        while !s.idle() && seen.is_none() {
+            let before = blocked(&s, Blocked::Resume);
+            let mut events = Vec::new();
+            s.step(&mut events).unwrap();
+            let front = s.waiting.front();
+            if blocked(&s, Blocked::Resume) > before && front.is_some_and(|f| f.parked.is_some()) {
+                let id = front.unwrap().id;
+                std::thread::sleep(Duration::from_millis(40));
+                let mut events = Vec::new();
+                s.step(&mut events).unwrap();
+                let f = s.waiting.iter().find(|f| f.id == id).or_else(|| s.running.iter().find(|f| f.id == id)).unwrap();
+                seen = Some((f.held[Blocked::Resume as usize], f.held_by()));
+            }
+            steps += 1;
+            assert!(steps < 100_000);
+        }
+        let (held, by) = seen.expect("a parked sequence waited to resume");
+        assert!(held >= Duration::from_millis(40), "{held:?}");
+        assert_eq!(by, Some(Blocked::Resume));
+        drain(&mut s);
+        assert_eq!((s.blocks_used(), s.swapped_bytes()), (0, 0));
+    }
+
+    #[test]
+    fn admission_wait_prefill_wait_and_prefill_add_up_to_the_first_token() {
+        let mut fake = Fake::new(1024, 2, 200, 128);
+        fake.token_cost = Duration::from_micros(20);
+        let mut s = Scheduler::new(fake, Config { max_num_seqs: 2, max_batched_tokens: 128, min_prefill_chunk: 64, ..Config::default() });
+        let mut arrived = HashMap::new();
+        for q in 0..5 {
+            let at = Instant::now();
+            arrived.insert(s.submit(request(100 + q as usize * 40, 4, q)).unwrap(), at);
+        }
+        let mut parts: HashMap<SeqId, (Duration, Duration)> = HashMap::new();
+        let mut prefill: HashMap<SeqId, Duration> = HashMap::new();
+        let mut checked = 0;
+        while !s.idle() {
+            let started = Instant::now();
+            let mut events = Vec::new();
+            s.step(&mut events).unwrap();
+            let now = Instant::now();
+            let step = now - started;
+            for e in events {
+                match e {
+                    Event::Started { id, queued, admission, .. } => {
+                        assert!(admission <= queued);
+                        parts.insert(id, (admission, queued - admission));
+                    }
+                    Event::Prefilled { id, prefill: p } => {
+                        prefill.insert(id, p);
+                    }
+                    Event::Token { id, .. } if prefill.contains_key(&id) && arrived.contains_key(&id) => {
+                        let ttft = now - arrived.remove(&id).unwrap();
+                        let (admission, waited) = parts[&id];
+                        let sum = admission + waited + prefill[&id];
+                        assert!(sum <= ttft && ttft - sum <= step + Duration::from_millis(1), "{id}: {admission:?} + {waited:?} + {:?} against {ttft:?}, step {step:?}", prefill[&id]);
+                        checked += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(checked, 5);
+        assert!(parts.values().any(|(a, _)| !a.is_zero()));
     }
 
     #[test]
