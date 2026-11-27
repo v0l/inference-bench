@@ -328,12 +328,23 @@ pub fn timestamps(indices: &[usize], fps: f64, temporal: usize) -> Vec<f64> {
     idx.chunks(temporal).map(|c| (c[0] as f64 / fps + c[temporal - 1] as f64 / fps) / 2.0).collect()
 }
 
+fn run_tool(program: &str, command: &mut Command) -> Result<std::process::Output> {
+    command.output().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow::anyhow!("{program} not found: install ffmpeg")
+        } else {
+            anyhow::anyhow!("run {program}: {e}")
+        }
+    })
+}
+
 pub fn probe_video(path: &Path) -> Result<VideoInfo> {
-    let out = Command::new("ffprobe")
-        .args(["-v", "error", "-select_streams", "v:0", "-count_frames", "-show_entries", "stream=width,height,r_frame_rate,nb_read_frames", "-of", "json"])
-        .arg(path)
-        .output()
-        .context("run ffprobe")?;
+    let out = run_tool(
+        "ffprobe",
+        Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0", "-count_frames", "-show_entries", "stream=width,height,r_frame_rate,nb_read_frames", "-of", "json"])
+            .arg(path),
+    )?;
     ensure!(out.status.success(), "ffprobe failed: {}", String::from_utf8_lossy(&out.stderr));
     let json: serde_json::Value = serde_json::from_slice(&out.stdout)?;
     let s = json["streams"].get(0).context("no video stream")?;
@@ -355,12 +366,19 @@ pub fn decode_frames(path: &Path, info: &VideoInfo, indices: &[usize]) -> Result
     unique.dedup();
     let select: Vec<String> = unique.iter().map(|i| format!("eq(n\\,{i})")).collect();
     let filter = format!("select='{}'", select.join("+"));
-    let out = Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(path)
-        .args(["-vf", &filter, "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
-        .output()
-        .context("run ffmpeg")?;
+    let decode = |sync_flag: &str| {
+        run_tool(
+            "ffmpeg",
+            Command::new("ffmpeg")
+                .args(["-v", "error", "-i"])
+                .arg(path)
+                .args(["-vf", &filter, sync_flag, "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]),
+        )
+    };
+    let mut out = decode("-fps_mode")?;
+    if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("Unrecognized option 'fps_mode'") {
+        out = decode("-vsync")?;
+    }
     ensure!(out.status.success(), "ffmpeg failed: {}", String::from_utf8_lossy(&out.stderr));
     let size = info.height * info.width * 3;
     ensure!(!out.stdout.is_empty() && out.stdout.len() % size == 0, "ffmpeg returned {} bytes", out.stdout.len());
@@ -1192,4 +1210,15 @@ pub fn plan_tiles(ids: &[u32], vis: &VisionTokens, tile_tokens: usize, processed
     }
     ensure!(tiles_left == 0 && next_item == processed.len(), "fewer image placeholders than images");
     Ok(MediaPlan { positions, delta: 0, tags, embeds: Arc::new(Vec::new()), deepstack: Vec::new(), spans })
+}
+
+#[cfg(test)]
+mod tool_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_ffprobe_says_to_install_ffmpeg() {
+        let err = run_tool("ffprobe", &mut Command::new("no-such-binary-for-ffprobe-test")).unwrap_err();
+        assert_eq!(err.to_string(), "ffprobe not found: install ffmpeg");
+    }
 }
