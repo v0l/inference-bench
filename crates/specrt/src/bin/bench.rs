@@ -287,6 +287,10 @@ fn spec_prompts(spec: &Spec) -> Result<Vec<Vec<u32>>> {
         .collect()
 }
 
+fn batch_prompts(prompts: &[Vec<u32>], batch: usize) -> Vec<Vec<u32>> {
+    (0..batch.max(prompts.len())).map(|n| prompts[n % prompts.len()].clone()).collect()
+}
+
 fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize, sampled: bool) -> Result<()> {
     use specrt::sched::{Config, Event, GpuExecutor, Request, Scheduler};
     let prompts = spec_prompts(spec)?;
@@ -301,7 +305,8 @@ fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize, samp
         if let Some(m) = s.mtp.as_mut() {
             m.speculate = speculate;
         }
-        let layout = specrt::runtime::Layout::serving(&s, max_ctx, batch, Some(1 << 30));
+        let kv_bytes = flags().kv_gb.map_or(1 << 30, |gb| (gb * (1u64 << 30) as f64) as usize);
+        let layout = specrt::runtime::Layout::serving(&s, max_ctx, batch, Some(kv_bytes));
         let rt = Runtime::load_layout(&s, layout)?;
         let mut sched = Scheduler::new(GpuExecutor::new(rt)?, Config { max_num_seqs: batch, adaptive_drafts: adaptive, ..Config::default() });
         let mut warm = Vec::new();
@@ -311,18 +316,30 @@ fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize, samp
         }
         let before = sched.exec.rt.spec_stats();
         let (mut decode_secs, mut tokens, mut drafted, mut accepted) = (0.0, 0usize, 0usize, 0usize);
+        let (mut full_secs, mut full_tokens, mut full_steps, mut edge_secs, mut edge_tokens, mut edge_steps) = (0.0, 0usize, 0usize, 0.0, 0usize, 0usize);
+        let mut rows_per_step: std::collections::BTreeMap<usize, usize> = Default::default();
         let mut outs: std::collections::HashMap<u64, Vec<u32>> = Default::default();
         let mut ids = Vec::new();
-        for (n, p) in prompts.iter().enumerate() {
+        for (n, p) in batch_prompts(&prompts, batch).into_iter().enumerate() {
             let sampling = if sampled { Sampling::new(1.0, 100 + n as u32).truncated(20, 0.95, 0.0) } else { Sampling::GREEDY };
-            ids.push(sched.submit(Request { prompt: p.clone(), max_tokens: new_tokens, sampling, stop: vec![], salt: String::new(), media: Vec::new(), grammar: None })?);
+            ids.push(sched.submit(Request { prompt: p, max_tokens: new_tokens, sampling, stop: vec![], salt: format!("copy{n}"), media: Vec::new(), grammar: None })?);
         }
         while !sched.idle() {
             let mut events = Vec::new();
             let r = sched.step(&mut events)?;
-            if r.prefill_tokens == 0 {
+            if r.prefill_tokens == 0 && r.decode_rows > 0 {
                 decode_secs += r.decode_secs;
                 tokens += r.decode_rows + r.accepted;
+                *rows_per_step.entry(r.decode_rows).or_default() += 1;
+                if r.decode_rows == batch {
+                    full_secs += r.decode_secs;
+                    full_tokens += r.decode_rows + r.accepted;
+                    full_steps += 1;
+                } else {
+                    edge_secs += r.decode_secs;
+                    edge_tokens += r.decode_rows + r.accepted;
+                    edge_steps += 1;
+                }
             }
             drafted += r.drafted;
             accepted += r.accepted;
@@ -338,15 +355,19 @@ fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize, samp
         }
         let rows = (after.rows - before.rows).max(1) as f64;
         println!(
-            "{} speculate={speculate} k={} batch={batch} prompts={} new={new_tokens} decode={:.1} tok/s aggregate ({:.1} per sequence) mean_acceptance_length={:.3} draft_acceptance={:.3} drafted={drafted} accepted={accepted}",
+            "{} speculate={speculate} k={} batch={batch} sequences={} new={new_tokens} decode={:.1} tok/s aggregate ({:.1} per sequence) full-batch decode={:.1} tok/s over {full_steps} steps of {:.2} ms ramp+drain decode={:.1} tok/s over {edge_steps} steps mean_acceptance_length={:.3} draft_acceptance={:.3} drafted={drafted} accepted={accepted}",
             spec.name,
             s.mtp.as_ref().map_or(0, |m| m.draft_tokens),
-            prompts.len(),
+            ids.len(),
             tokens as f64 / decode_secs,
             tokens as f64 / decode_secs / batch as f64,
+            full_tokens as f64 / full_secs,
+            full_secs * 1e3 / full_steps.max(1) as f64,
+            edge_tokens as f64 / edge_secs,
             1.0 + (after.accepted - before.accepted) as f64 / rows,
             accepted as f64 / drafted.max(1) as f64,
         );
+        println!("  decode steps by rows {rows_per_step:?}");
         let k = s.mtp.as_ref().map_or(0, |m| m.draft_tokens);
         let per_position: Vec<f64> = (0..k.min(4)).map(|j| (after.position_accepted[j] - before.position_accepted[j]) as f64 / rows).collect();
         println!(
@@ -356,7 +377,9 @@ fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize, samp
         println!(
             "{}",
             serde_json::json!({
-                "speculate": speculate, "k": k, "prompts": prompts.len(), "new_tokens": new_tokens,
+                "speculate": speculate, "k": k, "prompts": prompts.len(), "sequences": ids.len(), "new_tokens": new_tokens,
+                "full_batch_decode_tok_s": full_tokens as f64 / full_secs, "full_batch_steps": full_steps,
+                "edge_decode_tok_s": edge_tokens as f64 / edge_secs, "edge_steps": edge_steps,
                 "steps": after.steps - before.steps, "rows": rows as u64,
                 "mean_acceptance_length": 1.0 + (after.accepted - before.accepted) as f64 / rows,
                 "per_position_accepted": (0..k.min(4)).map(|j| after.position_accepted[j] - before.position_accepted[j]).collect::<Vec<_>>(),
@@ -922,6 +945,16 @@ mod tests {
         let c = compare_logits(&a, &b);
         assert_eq!((c.identical, c.top1_agree), (1, 1));
         assert!(c.max_kl > 0.1 && c.max_abs == 3.5);
+    }
+
+    #[test]
+    fn a_speculative_batch_larger_than_the_prompt_set_still_runs_one_sequence_per_row() {
+        let prompts: Vec<Vec<u32>> = (0..20).map(|i| vec![i]).collect();
+        let batch = batch_prompts(&prompts, 32);
+        assert_eq!(batch.len(), 32);
+        assert_eq!(batch[20], vec![0]);
+        assert_eq!(batch[31], vec![11]);
+        assert_eq!(batch_prompts(&prompts, 8).len(), 20);
     }
 
     #[test]
