@@ -262,6 +262,10 @@ pub fn select_act(spec: &Spec, target: &kir::Target, linear: &str, tokens: usize
     kg::select(target, &policy, &request(spec, linear, tokens, weight)).map_err(anyhow::Error::msg)
 }
 
+pub fn candidates(spec: &Spec, target: &kir::Target, linear: &str, tokens: usize, weight: WeightKind) -> Vec<KernelChoice> {
+    kg::candidates(target, &policy(spec), &request(spec, linear, tokens, weight))
+}
+
 pub fn batch_part_len(spec: &Spec, target: &kir::Target, fp4: bool) -> usize {
     let linears: Vec<&str> = if fp4 {
         FP4_LINEARS.iter().copied().chain(spec.served_linears(Quant::Nvfp4G16)).collect()

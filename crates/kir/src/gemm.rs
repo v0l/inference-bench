@@ -750,6 +750,75 @@ fn skinny_variant(r: &Request, tuning: &Tuning) -> Option<Variant> {
     Some(if r.shape.n >= SKINNY_WIDE_MIN_ROWS { Variant::SkinnyWide } else { Variant::Skinny })
 }
 
+fn plain(r: &Request, name: String, path: GemmPath, tile: Tile, kernel: Option<KernelInstance>) -> Choice {
+    Choice { name, quant: None, reduce: None, tile, path, decoder: decoder_for(path, r.weight), kernel }
+}
+
+fn fp8_act_choice(t: &Target, policy: &Policy, r: &Request, variant: Variant) -> Result<Choice, GemmError> {
+    let scale = policy.fp8_weights.unwrap_or(Fp8Scale::Block);
+    let tile = policy.tuning.tile(variant);
+    let name = format!("{}_f8{}", r.linear, variant.suffix());
+    let k = KernelInstance::fp8_act(t, &name, r.shape, tile, scale)?;
+    let quant = match scale {
+        Fp8Scale::Block => "quant_rows_fp8",
+        Fp8Scale::Channel => "quant_rows_fp8_token",
+    };
+    Ok(Choice { quant: Some(quant), ..plain(r, name, GemmPath::F8a, tile, Some(k)) })
+}
+
+fn fp4_act_choice(t: &Target, policy: &Policy, r: &Request, variant: Variant) -> Result<Choice, GemmError> {
+    let tile = policy.tuning.fp4_tile(variant);
+    let name = format!("{}_f4a{}", r.linear, variant.suffix());
+    let k = KernelInstance::fp4_act(t, &name, r.shape, tile, &policy.tuning)?;
+    Ok(Choice { quant: Some("quant_rows_fp4"), ..plain(r, name, GemmPath::F4a, tile, Some(k)) })
+}
+
+fn batch_choice(t: &Target, r: &Request, rows: usize, tile: Tile) -> Result<Choice, GemmError> {
+    let (stem, path) = if r.weight == WeightFormat::Fp8 { ("f8b", GemmPath::F8b) } else { ("f4b", GemmPath::F4b) };
+    let name = format!("{}_{stem}{}", r.linear, batch_suffix(rows));
+    let k = KernelInstance::batch(t, &name, r.shape, r.weight, rows)?;
+    Ok(Choice { reduce: Some(format!("{}_{stem}_reduce", r.linear)), ..plain(r, name, path, tile, Some(k)) })
+}
+
+fn weight_tile_choice(t: &Target, policy: &Policy, r: &Request, variant: Variant) -> Result<Choice, GemmError> {
+    let tuning = &policy.tuning;
+    let suffix = variant.suffix();
+    if r.weight == WeightFormat::Fp4 {
+        let tile = tuning.tile(variant);
+        let name = format!("{}_f4w{suffix}", r.linear);
+        let k = KernelInstance::gemm(t, &name, r.shape, WeightFormat::Fp4, tile, true, false)?;
+        return Ok(plain(r, name, GemmPath::F4w, tile, Some(k)));
+    }
+    let w = r.weight;
+    let stem = if w == WeightFormat::Fp8 && policy.fp8_weights.is_none() && !r.linear.ends_with("head") { "f8w" } else { "mma" };
+    let name = format!("{}_{stem}{suffix}", r.linear);
+    let tile = tuning.mma_tile(variant, w, r.shape.n);
+    let k = KernelInstance::gemm(t, &name, r.shape, w, tile, r.split, false)?;
+    Ok(plain(r, name, GemmPath::Mma, tile, Some(k)))
+}
+
+pub fn candidates(t: &Target, policy: &Policy, r: &Request) -> Vec<Choice> {
+    let head = r.linear.ends_with("head");
+    let tiled = matches!(r.weight, WeightFormat::Fp8 | WeightFormat::Fp4);
+    if policy.tuning.tile != TileChoice::Auto || head || !tiled || !t.has(Feature::Mma16816) {
+        return select(t, policy, r).into_iter().collect();
+    }
+    let mut out = Vec::new();
+    let fp8_act = policy.fp8_act && policy.fp8_weights.is_some() && t.has(Feature::Fp8Mma);
+    let fp4_act = policy.fp4_act && t.has(Feature::BlockScaledFp4);
+    match r.weight {
+        WeightFormat::Fp8 if fp8_act => out.extend(Variant::FP8_ACT.into_iter().filter_map(|v| fp8_act_choice(t, policy, r, v).ok())),
+        WeightFormat::Fp4 if fp4_act => out.extend(Variant::FP4_ACT.into_iter().filter_map(|v| fp4_act_choice(t, policy, r, v).ok())),
+        _ => {}
+    }
+    let batch = r.tokens <= BATCH_MAX_TOKENS && (r.weight == WeightFormat::Fp4 || BATCH_LINEARS.contains(&r.linear));
+    if batch {
+        out.extend(BATCH_VARIANTS.into_iter().filter(|&v| v >= r.tokens).filter_map(|v| batch_choice(t, r, v, Tile::TINY).ok()));
+    }
+    out.extend(Variant::MMA.into_iter().filter_map(|v| weight_tile_choice(t, policy, r, v).ok()));
+    out
+}
+
 pub fn select(t: &Target, policy: &Policy, r: &Request) -> Result<Choice, GemmError> {
     let tuning = &policy.tuning;
     let auto = tuning.tile == TileChoice::Auto;
