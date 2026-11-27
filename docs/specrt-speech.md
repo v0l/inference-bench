@@ -106,7 +106,7 @@ What slice b built (#1478):
 ### 2.5 Accuracy bar
 
 - Tiny fixture, CPU and GPU1: mel within 1e-4 absolute of `reference/mel.*` (the test's f64 reference DFT gets 8.3e-6), encoder states within 1e-4 relative of `encoder.out`, prefix and greedy logits within 1e-3 relative (bf16 weights: 2e-2) of `prefix.logits` and `greedy.logits`, the 12 greedy tokens and the detected language identical.
-- Real models: word error rate against transformers `generate` (same model, f32, greedy, no timestamps) on a fixed clip set: LibriSpeech test-clean, the first 200 utterances (about 25 minutes, CC BY 4.0), plus 5 long clips over 30 s from the same set joined, normalised with `EnglishTextNormalizer` from the transformers whisper folder. Gate: WER within 0.3 points absolute of transformers on `whisper-base.en` and `whisper-large-v3-turbo`, and at least 98% of utterances with an identical transcript. The same clips through agentbench's candle path give the parity line for slice h.
+- Real models: word error rate against transformers `generate` (same model, f32, greedy, no timestamps) on a fixed clip set: LibriSpeech test-clean, the first 200 utterances (about 25 minutes, CC BY 4.0), plus 5 long clips over 30 s from the same set joined, normalised with `EnglishTextNormalizer` from the transformers whisper folder. Gate: WER within 0.3 points absolute of transformers on `whisper-base.en` and `whisper-large-v3-turbo`, and at least 98% of utterances with an identical transcript. The same clips through agentbench's candle path give the parity line for slice h. Met (#1480, section 2.7): gap 0.00 and 205/205 identical on both models.
 
 ### 2.6 Decoding rules (#1479)
 
@@ -115,6 +115,40 @@ What slice b built (#1478):
 Order of a step, as transformers applies its processors: the row plan (suppress, begin suppress, timestamp masks) as logit edits plus an allow range, then the summed timestamp probability rule, then temperature and top k. Greedy picks the argmax; sampling draws from `sampler::uniform` (seeded splitmix), so sampled tokens are not torch's, and the fallback test feeds the sampled tokens transformers drew and checks that our rules allow each one.
 
 Tiny fixture, CPU, f32 host decoder: greedy `generate` (12 tokens), the timestamp run with language detection (2 windows, 122 tokens, segments and times), the 1.5 s two window clip with previous text (seek 78, the second prompt starts with `<|startofprev|>`), and the fallback run (temperatures 0, 0.4, 0.8: a window redone and kept at 0.4, a window skipped as silence) are token identical to transformers, every compression ratio equal, average log probability within 2e-3 when we decode (1e-5 on the recorded scores), and every fallback and skip decision identical.
+
+### 2.7 Real models (#1480)
+
+The engine runs Whisper on GPU1 through `speech::gpu::GpuEngine`, with every kernel from kir: the log-mel front end and conv stem (`emit_mel`, `emit_line`), each linear of the encoder graph and the decoder plan as a `line_conv` GEMM with the bias, residual or GELU in its epilogue, LayerNorm as the `layernorm_segment` rows family, the position add as `Kernel::add`, and both attentions (encoder self attention, decoder self attention over its KV, cross attention over `cross_kv`) as `vis_flash_kv_rows`. Weights are f32 (`Checkpoint` now reads F16 exactly, so the turbo checkpoint loads as stored). The GPU engine walks the same lowered plans as the host decoder (`HostDecoder::decode`, the encoder graph plan), and `speech::transcribe::Transcriber` drives the host and GPU engines with the same decoding rules. On the tiny fixture it gives `encoder.out` within 9.6e-7, `prefix.logits` 7.5e-7 and `greedy.logits` 7.8e-7 relative, and the greedy, timestamp, long and fallback runs token for token (`the_gpu_transcriber_matches_transformers_and_the_host_on_every_tiny_run`).
+
+Clip set (`crates/specrt/tests/fixtures/speech/librispeech-clips.json`, made by `whisper_wer.py clips`): LibriSpeech test-clean (CC BY 4.0), the first 200 utterances in speaker, chapter, utterance order, plus 5 long clips of consecutive utterances of one chapter after the first 200, joined with 0.5 s of silence until past 30 s (30.6 to 36.2 s). 1357.3 s of audio in all. Each clip is transcribed greedy with no timestamps; a clip over 30 s is decoded long form (timestamps on, no previous text conditioning, temperature 0) by both transformers and the engine, since transformers refuses long form without timestamps. Language `en` and task `transcribe` on the multilingual turbo. Words scored after `EnglishTextNormalizer` with the model's `normalizer.json`, against the LibriSpeech transcripts; "identical" compares the decoded text before normalising.
+
+| model | run | WER all % | WER 200 short % | WER 5 long % | gap to transformers | identical transcripts | time for 1357 s |
+|---|---|---|---|---|---|---|---|
+| whisper-base.en | transformers 5.23, CPU f32 | 6.08 | 6.39 | 3.61 | | | 77 s (16 threads) |
+| whisper-base.en | engine, GPU1 f32 | 6.08 | 6.39 | 3.61 | +0.00 | 205/205 (100%) | 17.7 s |
+| whisper-base.en | agentbench candle `hear`, GPU1 | 14.39 | 8.48 | 61.45 | +8.31 | 120/205 (58.5%) | 105 s |
+| whisper-large-v3-turbo | transformers 5.23, CPU f32 | 2.26 | 2.39 | 1.20 | | | 519 s (16 threads) |
+| whisper-large-v3-turbo | engine, GPU1 f32 | 2.26 | 2.39 | 1.20 | +0.00 | 205/205 (100%) | 170 s |
+| whisper-large-v3-turbo | agentbench candle `hear`, GPU1 | 2.39 | 2.54 | 1.20 | +0.13 | 128/205 (62.4%) | 155 s |
+
+The gate of 2.5 holds on both models: engine word error rate equal to transformers (gap 0.00, bar 0.3) and every transcript identical (bar 98%). Engine times are decode only, the model loaded once (base.en 0.3 GB, turbo 3.5 GB of f32 weights); the engine decodes one token per launch chain at batch 1, f32, so the turbo is slower than its size suggests. Candle times include a model load per clip (`hear` loads once per WAV).
+
+Parity line for slice h, from the candle rows: on short clips candle is 0.15 (turbo) to 2.09 (base.en) points behind transformers (its decoding differs: `suppress_tokens` only, no begin suppress, its own mel), and on the long clips base.en candle loses most of the text (61.45%): it cuts 30 s windows back to back with no seek by timestamp, and three of the five base.en long transcripts keep 4 to 22 of 79 to 96 words. Moving agentbench to the engine is a gain on both models.
+
+Rerun (CPU references under `MemoryMax=16G`, engine and candle on GPU1):
+
+```
+D=/mnt/data/tmp/speech-1480; S=crates/specrt/scripts/whisper_wer.py; PY=~/.venv-vllm/bin/python
+curl -sSL https://www.openslr.org/resources/12/test-clean.tar.gz | tar xz -C $D
+$PY $S clips $D/LibriSpeech/test-clean $D/clips
+M=$(ls -d ~/.cache/huggingface/hub/models--openai--whisper-base.en/snapshots/*)
+systemd-run --user --wait --collect -P -q -p MemoryMax=16G -p MemorySwapMax=0 -E CUDA_VISIBLE_DEVICES= -E HF_HUB_OFFLINE=1 --working-directory=$PWD $PY $S reference $M $D/clips/manifest.jsonl $D/ref.jsonl --threads 16
+cargo build --release -p inference-bench-specrt --bin whisper
+~/.agents/bin/gpu-run 1 --min-free 8000 -- systemd-run --user --wait --collect -P -q -p MemoryMax=16G -p MemorySwapMax=0 -E CUDA_VISIBLE_DEVICES=1 -E CUDA_DEVICE_ORDER=PCI_BUS_ID $CARGO_TARGET_DIR/release/whisper $M $D/clips/manifest.jsonl $D/engine.jsonl
+(cd ~/git/agentbench && cargo build --release -p agent-voice --features speech-cuda --example hear)
+$PY $S candle <target>/release/examples/hear ~/.local/share/agentbench/models whisper-base.en $D/clips/manifest.jsonl $D/candle.jsonl --prefix "$HOME/.agents/bin/gpu-run 1 --min-free 8000 --"
+$PY $S score $M $D/clips/manifest.jsonl $D/ref.jsonl engine=$D/engine.jsonl candle=$D/candle.jsonl
+```
 
 ## 3. Text to speech
 
@@ -248,6 +282,7 @@ The weights are seeded and come out bit identical.
 | `phonon_tensors_match_the_gap_list` | Phonon's parameter split, the depthwise upsample, no RVQ codebooks, packed qkv, LayerNorm with bias, layer scale, ratios, context 250, one LSD step, the voice shape |
 | `the_vibevoice_acoustic_decoder_is_the_haru_codec_decoder_tensor_for_tensor` | the renamed VibeVoice decoder equals Haru's `codec.decoder` in all 276 shapes, 343,695,969 parameters |
 | `the_speech_fixture_stays_under_2_mb` | size |
+| `the_gpu_transcriber_matches_transformers_and_the_host_on_every_tiny_run` | GPU1: the kir GPU engine against the reference and the host, every tiny run token for token |
 
 ## 7. Slices
 
