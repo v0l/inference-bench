@@ -86,19 +86,21 @@ def vllm_acceptance(d, mode, k=2):
 
 
 def run_lines(d):
-    out = []
-    for path in sorted(glob.glob(os.path.join(d, "specrt-run-*.json"))):
-        r = load(path)
+    rows = []
+    runs = [load(p) for p in glob.glob(os.path.join(d, "specrt-run-*.json"))]
+    order = {(kv, m): i for i, (kv, m) in enumerate((kv, m) for kv, _ in KVS for m in MODES)}
+    for r in sorted(runs, key=lambda r: (order.get((r["kv_dtype"], r["mode"]), 99), r["started"])):
         k = r.get("draft_tokens", 2)
         acc = f"{1 + r['spec_accepted'] / (r['spec_drafted'] / k):.2f}" if r.get("spec_drafted") else "n/a"
-        out.append(
-            f"- `{r['label']}`: {r['started']} to {r['finished']}, commit {r['commit']}"
-            f"{' (with ' + str(r['dirty_files']) + ' changed files)' if r.get('dirty_files') else ''}, spec `{r['spec']}`, "
-            f"KV {r['kv_dtype']} {r['kv_cache_gb']} GB {r.get('kv_layout', '')}, load {r['load_s']} s, "
-            f"mean acceptance length {acc} (drafted {r['spec_drafted']}, accepted {r['spec_accepted']}), "
-            f"GPU before `{r['gpu_before']}`, loaded `{r['gpu_loaded']}`"
-        )
-    return out
+        commit = r["commit"] + (f" +{r['dirty_files']} changed" if r.get("dirty_files") else "")
+        card = lambda s: "; ".join(x.strip() for x in s.splitlines())
+        rows.append([
+            f"`{r['label']}`", r.get("suites", "single concurrent" + (" prefix held" if r["kv_dtype"] == "fp8" else "")), f"{r['started'][:16]} to {r['finished'][11:16]}", commit, f"{r['kv_dtype']} {r['kv_cache_gb']} GB",
+            r.get("kv_layout", "").replace("kv_tokens=", ""), str(r["load_s"]), acc, card(r["gpu_before"]), card(r["gpu_loaded"]),
+        ])
+    if not rows:
+        return []
+    return table(rows, ["run", "suites", "window (UTC)", "commit", "KV", "KV tokens", "load s", "acceptance length", "cards before", "cards loaded"])
 
 
 def report(d):
@@ -111,7 +113,7 @@ def report(d):
     out.append("")
     lines = run_lines(d)
     if lines:
-        out += ["Runs (card state is `index, memory.used, utilization.gpu, clocks.sm`):", ""] + lines + [""]
+        out += ["specrt runs. Card state is `index, memory.used, utilization.gpu, clocks.sm` per GPU; GPU0 is the user's app, the runs are on GPU1. Acceptance length is 1 plus accepted over rounds, from the server's `inference_spec_*` counters over the whole run:", ""] + lines + [""]
     for mode in MODES:
         a = vllm_acceptance(d, mode)
         if a is not None:
