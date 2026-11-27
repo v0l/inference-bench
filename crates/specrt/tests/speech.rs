@@ -73,11 +73,11 @@ const TTS: &[Need] = &[
     Need { piece: "Mimi transposed conv upsampling (ratios 6, 5, 4) with an overlap tail", state: "exists as codec conv_up", evidence: Some(("specrt/src/codec/graph.rs", "\"conv_up\" =>")), slice: "e" },
     Need { piece: "Mimi depthwise transposed conv 12.5 Hz to 200 Hz upsample (groups = channels, no bias)", state: "exists: conv_up groups = channels, the line_dwup kernel", evidence: Some(("specrt/src/codec/host.rs", "pub fn lower_dw_up(")), slice: "e" },
     Need { piece: "Mimi decoder transformer at 200 Hz: 2 layers, LayerNorm, layer scale, rope pairs, sliding context 250", state: "exists: codec attention node over a per session ring KV of context steps, layer_norm node", evidence: Some(("specrt/src/codec/graph.rs", "\"attention\" =>")), slice: "e" },
-    Need { piece: "flow LM backbone: 6 layer LayerNorm transformer, packed qkv, rope pairs, GELU MLP, no bias", state: "new family file and decoder graph entries (LayerNorm kind, GELU dense MLP)", evidence: Some(("specrt/src/spec.rs", "pub enum NormKind")), slice: "f" },
-    Need { piece: "LSD flow head: adaLN res blocks with LayerNorm, two timestep embedders averaged, one step", state: "close to graphs/meanflow.toml: LayerNorm modulate, bias, rms-var timestep norm are new", evidence: Some(("specrt/src/denoiser.rs", "\"modulate\" =>")), slice: "f" },
-    Need { piece: "EOS head with threshold and frames after EOS", state: "new sampler rule", evidence: None, slice: "f" },
-    Need { piece: "voice conditioning: 125 Mimi frames through speaker_proj, prefilled before the text", state: "new input node; prefill of embedding rows exists", evidence: Some(("specrt/src/plan.rs", "Splice")), slice: "f" },
-    Need { piece: "sentence chunking and normalisation, sentencepiece tokenizer", state: "new host code", evidence: None, slice: "f" },
+    Need { piece: "flow LM backbone: 6 layer LayerNorm transformer, packed qkv, rope pairs, GELU MLP, no bias", state: "exists: specs/family-gradium_phonon_tts.toml on graphs/decoder.toml, [norm] kind = layer_norm, fused_qkv, rope interleaved, mapped gelu, named eos head", evidence: Some(("specrt/specs/family-gradium_phonon_tts.toml", "kind = \"layer_norm\"")), slice: "f" },
+    Need { piece: "LSD flow head: adaLN res blocks with LayerNorm, two timestep embedders averaged, one step", state: "exists: graphs/lsd.toml, layer modulate with weight and bias, rms_norm with alpha, stored timestep table, biased rows GEMV", evidence: Some(("specrt/graphs/lsd.toml", "expr = \"silu(cond_emb + (s_emb + t_emb) / 2)\"")), slice: "f" },
+    Need { piece: "EOS head with threshold and frames after EOS", state: "exists: [embedding] head = eos_head, speech::tts::plan::Eos from [tts.params]", evidence: Some(("specrt/src/speech/tts/plan.rs", "pub fn should_stop(&mut self, logit: f32) -> bool")), slice: "f" },
+    Need { piece: "voice conditioning: 125 Mimi frames through speaker_proj, prefilled before the text", state: "exists: [[inputs.node]] stream_replace_unbiased on the voice stream, prompt positions before the text", evidence: Some(("specrt/specs/stream_replace_unbiased.toml", "name = \"stream_replace_unbiased\"")), slice: "f" },
+    Need { piece: "sentence chunking and normalisation, sentencepiece tokenizer", state: "exists: speech::tts::text (normalisation and rewrite rules) and speech::tts::plan, tokenizer.json through tokenizers", evidence: Some(("specrt/src/speech/tts/plan.rs", "pub fn chunks(")), slice: "f" },
 ];
 
 fn engine_source(rel: &str) -> String {
@@ -116,7 +116,7 @@ fn the_engine_refuses_whisper_as_text_chat_and_says_which_ops_are_missing() {
     for m in &missing {
         println!("  {m}");
     }
-    assert_eq!(missing.len(), 2, "{missing:#?}");
+    assert_eq!(missing.len(), 0, "{missing:#?}");
     for slice in ["a", "b", "c", "e", "f"] {
         assert!(WHISPER.iter().chain(TTS).any(|n| n.slice == slice), "slice {slice} has no gap");
     }
@@ -1261,6 +1261,70 @@ fn a_shuffled_voice_changes_the_prefill() {
     voice.rows.rotate_left(w);
     let got = t.prefill_hidden(Some(&voice), &recorded_tokens()).unwrap();
     assert!(max_rel(&got, &want) > 1e-2, "the voice frames reach the backbone through speaker_proj");
+}
+
+#[test]
+#[ignore = "needs nvrtc, no GPU: compiles the LSD head and the input node kernels of the real Phonon config for sm_120"]
+fn every_lsd_head_and_input_kernel_of_the_real_config_compiles_with_nvrtc() {
+    let config = json(&dir().join("phonon-31m-en.hub-92741c5.config.json"));
+    let t = kir::Target::sm_120();
+    let opts = || cudarc::nvrtc::CompileOptions { arch: Some("compute_120"), options: vec!["--std=c++17".into()], ..Default::default() };
+    for steps in [1, 2] {
+        let head = specrt::flow_head::FlowHead::from_config(&config, Some(steps)).unwrap();
+        let ks = specrt::flow_head_cuda::kernels(&head, &t, &head.gated_epilogues(1, &t).unwrap()).unwrap();
+        let src = ks.source().unwrap();
+        let ptx = cudarc::nvrtc::compile_ptx_with_opts(src.as_str(), opts()).unwrap_or_else(|e| panic!("{e:?}\n{}", src.as_str())).to_src();
+        for n in ks.names() {
+            assert!(ptx.contains(&format!(".entry {n}(")), "{n} missing from the PTX");
+        }
+        assert!(ks.names().iter().any(|n| n.ends_with("_gated_bias")), "the res block fc2 carries its bias and the gated residual");
+        println!("{steps} step: {} head kernels", ks.names().len());
+    }
+    let spec = specrt::spec::Spec::from_hf_config_tts(&config.to_string()).unwrap();
+    let inputs = specrt::codegen::input_kernels(&spec, &t).unwrap();
+    let src = kir::cuda::emit_module(&inputs).unwrap();
+    let ptx = cudarc::nvrtc::compile_ptx_with_opts(src.as_str(), opts()).unwrap_or_else(|e| panic!("{e:?}\n{}", src.as_str())).to_src();
+    for k in &inputs {
+        assert!(ptx.contains(&format!(".entry {}(", k.name)), "{} missing from the PTX", k.name);
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn the_gpu_lsd_head_matches_transformers_and_the_host() {
+    use specrt::flow_head::FlowHead;
+    use specrt::flow_head_cuda::CudaHead;
+    let ctx = cudarc::driver::CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+    let cache = std::env::var_os("SPECRT_CACHE").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("specrt-lsd-jit"));
+    let jit = specrt::jit::Jit::new(ctx.clone(), cache).unwrap();
+    let (hidden, hshape) = phonon_ref("frames.hidden");
+    let (noise, _) = phonon_ref("noise");
+    let (latents, _) = phonon_ref("frames.latent");
+    let (steps2, _) = phonon_ref("frames.steps2");
+    let host = lsd_head(None);
+    let mut hs = host.session(&vec![1.0; hshape[0]]).unwrap();
+    let host_latent = host.frame(&mut hs, &hidden, &noise).unwrap();
+    let host_codec = host.output(&hs, "codec").unwrap().to_vec();
+    let (h, d) = (hshape[1], noise.len() / hshape[0]);
+    for fuse in [true, false] {
+        let head = CudaHead::load(&stream, &jit, FlowHead::from_dir(&phonon(), None).unwrap(), &phonon(), fuse).unwrap();
+        let mut s = head.session(&vec![1.0; hshape[0]]).unwrap();
+        let got = head.frame(&mut s, &hidden, &noise).unwrap();
+        let codec = head.read(&s, "codec").unwrap();
+        let (e, eh, c) = (max_rel(&got, &latents), max_rel(&got, &host_latent), max_rel(&codec, &host_codec));
+        println!("gpu lsd head fuse {fuse}: max rel {e:.2e} against transformers, {eh:.2e} against the host, codec latent {c:.2e}, {} launches", s.launches);
+        assert!(e < 1e-4 && eh < 1e-4 && c < 1e-4, "{e} {eh} {c}");
+        let mut one = head.session(&[1.0]).unwrap();
+        let alone: Vec<f32> = (0..hshape[0]).flat_map(|f| head.frame(&mut one, &hidden[f * h..(f + 1) * h], &noise[f * d..(f + 1) * d]).unwrap()).collect();
+        assert!(max_rel(&alone, &got) < 1e-5, "one session at a time equals the batch");
+    }
+    let two = CudaHead::load(&stream, &jit, FlowHead::from_dir(&phonon(), Some(2)).unwrap(), &phonon(), true).unwrap();
+    let mut s = two.session(&[1.0]).unwrap();
+    let got = two.frame(&mut s, &hidden[..h], &noise[..d]).unwrap();
+    let e = max_rel(&got, &steps2[..d]);
+    println!("gpu lsd head two steps: max rel {e:.2e}");
+    assert!(e < 1e-4, "{e}");
 }
 
 #[test]
