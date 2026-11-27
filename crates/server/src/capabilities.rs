@@ -1,15 +1,16 @@
 use serde_json::{Value, json};
 
-pub const CHAT: u8 = 1;
-pub const COMPLETIONS: u8 = 2;
-pub const BENCH: u8 = 4;
-pub const IMAGES: u8 = 8;
-pub const VIDEOS: u8 = 16;
-pub const DUPLEX: u8 = 32;
-pub const VOICES: u8 = 64;
-pub const TRANSCRIBE: u8 = 128;
-const MEDIA: u8 = IMAGES | VIDEOS;
-const GENERATE: u8 = CHAT | COMPLETIONS;
+pub const CHAT: u16 = 1;
+pub const COMPLETIONS: u16 = 2;
+pub const BENCH: u16 = 4;
+pub const IMAGES: u16 = 8;
+pub const VIDEOS: u16 = 16;
+pub const DUPLEX: u16 = 32;
+pub const VOICES: u16 = 64;
+pub const TRANSCRIBE: u16 = 128;
+pub const SPEECH: u16 = 256;
+const MEDIA: u16 = IMAGES | VIDEOS;
+const GENERATE: u16 = CHAT | COMPLETIONS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Usage {
@@ -32,23 +33,25 @@ impl Usage {
 
 pub struct Field {
     pub name: &'static str,
-    pub on: u8,
+    pub on: u16,
     pub usage: Usage,
     pub ty: &'static str,
     pub note: &'static str,
 }
 
-const fn f(name: &'static str, on: u8, usage: Usage, ty: &'static str, note: &'static str) -> Field {
+const fn f(name: &'static str, on: u16, usage: Usage, ty: &'static str, note: &'static str) -> Field {
     Field { name, on, usage, ty, note }
 }
 
 pub const FIELDS: &[Field] = &[
-    f("model", CHAT | COMPLETIONS | BENCH | MEDIA | DUPLEX | TRANSCRIBE, Usage::Read, "string", "a configured model id or served name; defaults to the only model; on transcriptions whisper-1 or an unknown id picks the loaded speech to text model"),
+    f("model", CHAT | COMPLETIONS | BENCH | MEDIA | DUPLEX | TRANSCRIBE | SPEECH, Usage::Read, "string", "a configured model id or served name; defaults to the only model; on transcriptions whisper-1 or an unknown id picks the loaded speech to text model; on speech kokoro, tts-1 or an unknown id picks the loaded text to speech model"),
+    f("input", SPEECH, Usage::Read, "string", "the text to say, 1 to 20000 characters"),
+    f("speed", SPEECH, Usage::Ignored, "number", "accepted and ignored"),
     f("file", TRANSCRIBE, Usage::Read, "file", "multipart: a WAV, PCM16 or float32, any rate (resampled to the model's), mono or stereo (downmixed), up to media.max_audio_bytes"),
     f("language", TRANSCRIBE, Usage::Read, "string", "ISO code such as en; skips language detection on multilingual models, ignored by English only ones"),
     f("type", DUPLEX, Usage::Validated, "string", "start; then control messages say, mode, interrupt, stop. The server sends ready, text, said, late, queued, end and error events and binary PCM16 frames"),
     f("card", DUPLEX, Usage::Read, "string or object", "the character card as text, or its fields from the model family (persona, name, gender, backchannel, other_name, relationship, situation for Haru)"),
-    f("voice", DUPLEX, Usage::Read, "string or object", "voice reference: base64 PCM16 mono at the model rate, {id} from /v1/duplex/voices, or {wav} base64"),
+    f("voice", DUPLEX | SPEECH, Usage::Read, "string or object", "voice reference: base64 PCM16 mono at the model rate, {id} from /v1/duplex/voices, or {wav} base64; on speech a voice name from /v1/audio/voices, case insensitive, an unknown name such as alloy gets the model's default voice"),
     f("speak_first", DUPLEX, Usage::Read, "boolean", "the model opens the conversation"),
     f("mode", DUPLEX, Usage::Validated, "string", "free (default) or relay: with an empty say queue relay only allows silence"),
     f("resume", DUPLEX, Usage::Read, "string", "the resume token of a dropped session, when duplex.keep_idle_secs is set"),
@@ -82,7 +85,7 @@ pub const FIELDS: &[Field] = &[
     f("top_p", GENERATE, Usage::Read, "number", ""),
     f("top_k", GENERATE, Usage::Read, "integer", "extension"),
     f("min_p", GENERATE, Usage::Read, "number", "extension"),
-    f("seed", GENERATE | MEDIA | DUPLEX, Usage::Read, "integer", "on images the same seed gives the same image, image i of n uses seed + i; on videos the same seed gives the same clip"),
+    f("seed", GENERATE | MEDIA | DUPLEX | SPEECH, Usage::Read, "integer", "on images the same seed gives the same image, image i of n uses seed + i; on videos the same seed gives the same clip; on speech the same seed gives the same samples, random when absent"),
     f("stop", GENERATE, Usage::Read, "string or array of strings", ""),
     f("stream", GENERATE | IMAGES, Usage::Read, "boolean", "on images: server sent events image_generation.progress, image_generation.partial_image, image_generation.completed"),
     f("stream_options", GENERATE, Usage::Read, "object", "include_usage"),
@@ -98,7 +101,7 @@ pub const FIELDS: &[Field] = &[
     f("n", GENERATE | IMAGES, Usage::Read, "integer", "1 to 16; above 1 needs a model loaded with more than one parallel request; on images 1 to the family's max_images"),
     f("logprobs", GENERATE, Usage::Read, "boolean or integer", "boolean on chat, integer on completions; needs the batched engine"),
     f("top_logprobs", CHAT, Usage::Read, "integer", "needs logprobs: true"),
-    f("response_format", GENERATE | IMAGES | TRANSCRIBE, Usage::Validated, "object or string", "chat and completions: json_object, json_schema, needs the batched engine; images: b64_json (default) or url, served from /v1/images/files for images.file_ttl_secs; transcriptions: json (default, {text}), text or verbose_json (language, duration, segments)"),
+    f("response_format", GENERATE | IMAGES | TRANSCRIBE | SPEECH, Usage::Validated, "object or string", "chat and completions: json_object, json_schema, needs the batched engine; images: b64_json (default) or url, served from /v1/images/files for images.file_ttl_secs; transcriptions: json (default, {text}), text or verbose_json (language, duration, segments); speech: pcm streams audio/L16 frame by frame, anything else answers one audio/wav"),
     f("frequency_penalty", GENERATE, Usage::ZeroOnly, "number", "only 0 or null is accepted"),
     f("presence_penalty", GENERATE, Usage::ZeroOnly, "number", "only 0 or null is accepted"),
     f("user", GENERATE | MEDIA, Usage::Ignored, "string", "accepted and ignored"),
@@ -115,7 +118,7 @@ pub fn model_features(model: &str) -> Result<inference_bench_core::doctor::Model
     inference_bench_core::doctor::features(model).map(|(_, f)| f)
 }
 
-fn endpoint_of(method: &str, path: &str) -> u8 {
+fn endpoint_of(method: &str, path: &str) -> u16 {
     match (method, path) {
         ("POST", "/v1/chat/completions") => CHAT,
         ("POST", "/v1/completions") => COMPLETIONS,
@@ -125,11 +128,12 @@ fn endpoint_of(method: &str, path: &str) -> u8 {
         ("GET", "/v1/duplex") => DUPLEX,
         ("POST", "/v1/duplex/voices") => VOICES,
         ("POST", "/v1/audio/transcriptions") => TRANSCRIBE,
+        ("POST", "/v1/audio/speech") => SPEECH,
         _ => 0,
     }
 }
 
-pub fn fields_json(on: u8) -> Value {
+pub fn fields_json(on: u16) -> Value {
     Value::Array(
         FIELDS
             .iter()
@@ -153,6 +157,10 @@ pub fn routes_with_fields(routes: &[crate::landing::ApiRoute]) -> Value {
                     v["content_type"] = json!("multipart/form-data");
                     v["unknown_fields"] = json!("ignored");
                 }
+                if r.path == "/v1/audio/speech" {
+                    v["unknown_fields"] = json!("ignored");
+                    v["responses"] = json!({"pcm": "audio/L16, PCM16 little endian mono streamed frame by frame, rate in x-sample-rate, cache-control no-store", "other": "audio/wav, PCM16 mono"});
+                }
                 if r.path == "/v1/realtime" {
                     v["protocol"] = json!("websocket");
                     v["client_events"] = json!(["session.update", "input_audio_buffer.append"]);
@@ -175,7 +183,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     fn read_by_handlers() -> BTreeSet<String> {
-        let source = concat!(include_str!("app.rs"), include_str!("images.rs"), include_str!("videos.rs"), include_str!("duplex.rs"));
+        let source = concat!(include_str!("app.rs"), include_str!("images.rs"), include_str!("videos.rs"), include_str!("duplex.rs"), include_str!("audio.rs"));
         let mut names = BTreeSet::new();
         let marker = "body[\"";
         for (at, _) in source.match_indices(marker) {
@@ -219,7 +227,7 @@ mod tests {
     fn field_names_are_unique_and_every_generate_endpoint_has_fields() {
         let names: BTreeSet<&str> = FIELDS.iter().map(|f| f.name).collect();
         assert_eq!(names.len(), FIELDS.len());
-        for on in [CHAT, COMPLETIONS, BENCH, IMAGES, VIDEOS, DUPLEX, VOICES, TRANSCRIBE] {
+        for on in [CHAT, COMPLETIONS, BENCH, IMAGES, VIDEOS, DUPLEX, VOICES, TRANSCRIBE, SPEECH] {
             assert!(!fields_json(on).as_array().unwrap().is_empty());
         }
     }

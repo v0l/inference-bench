@@ -1500,3 +1500,81 @@ fn every_real_phonon_step_matches_transformers_when_fed_its_latent_and_noise() {
     assert!(wz < 1e-3 && wg < 1e-3 && ec < 1e-3 && wc < 1e-3, "{wz} {wg} {ec} {wc}");
     assert!(ea < 1e-3 && ega < 1e-3, "{ea} {ega}");
 }
+
+#[test]
+fn the_speaker_streams_the_engine_frames_and_stops_when_the_listener_goes() {
+    use specrt::speech::tts::service::{Job, Speak, Speaker};
+    let model = tiny_speaker_dir("speaker");
+    let mut speaker = Speaker::open_host(&model).unwrap();
+    let info = speaker.info();
+    assert_eq!((info.device.as_str(), info.frame_samples, info.sample_rate), ("CPU", 1920, 24_000));
+    let t = phonon_tts();
+    let text = json(&phonon().join("reference.json"))["text"].as_str().unwrap().to_string();
+    let job = Job { text: text.clone(), voice: Some(phonon().join("voice.safetensors")), seed: 7 };
+    let mut frames: Vec<Vec<f32>> = Vec::new();
+    let spoken = speaker.speak(&job, &mut |f| {
+        frames.push(f.to_vec());
+        true
+    }).unwrap();
+    assert!(frames.len() > 1 && frames.iter().all(|f| f.len() == 1920), "{} frames", frames.len());
+    assert_eq!((spoken.frames, spoken.samples, spoken.stopped), (frames.len(), frames.len() * 1920, false));
+    let tok = tokenizers::Tokenizer::from_file(phonon().join("tokenizer.json")).unwrap();
+    let norm = specrt::speech::tts::text::Normalize::for_lang(specrt::speech::tts::text::Lang::En);
+    let chunks = specrt::speech::tts::plan::chunks(&tok, &norm.apply(&text), &t.rules).unwrap();
+    let voice = phonon_voice(&t);
+    let scale = t.noise_scale(t.tts.param("temperature").unwrap() as f32);
+    let mimi = specrt::codec::HostCodec::open(&model).unwrap();
+    let (mut want, mut at) = (Vec::new(), 0u64);
+    for c in chunks.iter().filter(|c| !c.tokens.is_empty()) {
+        let got = t.generate(Some(&voice), &c.tokens, c.frames_after_eos, c.frame_budget, |_| {
+            at += 1;
+            specrt::flow_head::frame_noise(7, at - 1, t.latent_dim()).iter().map(|v| v * scale).collect()
+        }).unwrap();
+        want.extend(mimi.decode(&got.iter().flat_map(|f| f.codec.clone()).collect::<Vec<_>>()).unwrap());
+    }
+    let streamed: Vec<f32> = frames.concat();
+    let e = max_rel(&streamed, &want);
+    println!("speaker on the tiny fixture: {} frames in {} chunks, max rel {e:.2e} against the engine loop decoded whole", frames.len(), spoken.chunks);
+    assert_eq!(streamed.len(), want.len());
+    assert!(e < 1e-5, "{e}");
+    let mut seen = 0;
+    let cut = speaker.speak(&job, &mut |_| {
+        seen += 1;
+        seen < 2
+    }).unwrap();
+    assert_eq!((seen, cut.stopped, cut.samples), (2, true, 2 * 1920), "the work stops after the frame in hand");
+    let mut again = Vec::new();
+    speaker.speak(&job, &mut |f| {
+        again.extend_from_slice(f);
+        true
+    }).unwrap();
+    assert_eq!(again, streamed, "the same seed speaks the same samples");
+    let _ = std::fs::remove_dir_all(&model);
+}
+
+fn tiny_speaker_dir(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("specrt-tiny-speaker-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    for f in ["config.json", "tokenizer.json"] {
+        std::fs::copy(phonon().join(f), d.join(f)).unwrap();
+    }
+    std::fs::copy(phonon().join("model.safetensors"), d.join("flow.safetensors")).unwrap();
+    std::fs::copy(mimi().join("model.safetensors"), d.join("mimi.safetensors")).unwrap();
+    let mut map = serde_json::Map::new();
+    for f in ["flow.safetensors", "mimi.safetensors"] {
+        let bytes = std::fs::read(d.join(f)).unwrap();
+        for n in safetensors::SafeTensors::deserialize(&bytes).unwrap().names() {
+            map.insert(n.to_string(), Value::from(f));
+        }
+    }
+    std::fs::write(d.join("model.safetensors.index.json"), serde_json::json!({"weight_map": map}).to_string()).unwrap();
+    d
+}
+
+#[test]
+fn the_real_phonon_config_names_its_voice_catalogue() {
+    let spec = specrt::spec::Spec::from_hf_config_tts(&std::fs::read_to_string(dir().join("phonon-31m-en.hub-92741c5.config.json")).unwrap()).unwrap();
+    let v = spec.tts.unwrap().voices;
+    assert_eq!((v.repo.as_str(), v.catalogue.as_str(), v.default.as_str()), ("gradium/phonon-voices", "voices.jsonl", "Hadley"));
+}

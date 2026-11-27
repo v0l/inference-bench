@@ -58,6 +58,11 @@ conditions = "conditions"
 frame_budget = "ceil((tokens / 3 + 2) * frame_rate)"
 language = "en"
 
+[tts.voices]
+repo = "gradium/phonon-voices"
+catalogue = "voices.jsonl"
+default = "Hadley"
+
 [tts.params]
 eos_threshold = { config = "eos_threshold" }
 frames_after_eos = 1

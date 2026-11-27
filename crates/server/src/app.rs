@@ -185,6 +185,8 @@ fn api_routes() -> Vec<(ApiRoute, MethodRouter<Arc<AppState>>)> {
         (r("POST", "/v1/duplex/voices", "Upload a voice reference (base64 PCM16 or WAV) for duplex sessions, returns its id"), post(crate::duplex::upload_voice)),
         (r("POST", "/v1/audio/transcriptions", "Speech to text (OpenAI): multipart file (WAV PCM16 or float, any rate, mono or stereo), json, text or verbose_json"), post(crate::audio::transcriptions)),
         (r("GET", "/v1/audio/models", "Speech to text models, with label, size_mb, installed and default"), get(crate::audio::models)),
+        (r("POST", "/v1/audio/speech", "Text to speech (OpenAI): JSON input and voice; pcm streams audio/L16 frame by frame, anything else answers one audio/wav"), post(crate::audio::speech)),
+        (r("GET", "/v1/audio/voices", "Voices of the text to speech model: id, label, installed"), get(crate::audio::voices)),
         (r("GET", "/v1/audio/status", "Where speech models run: device, reading_on, speaking_on"), get(crate::audio::status)),
         (r("GET", "/v1/realtime", "OpenAI Realtime subset over websocket for duplex models: session.update, input_audio_buffer.append, output audio and transcript deltas; turn events do not apply"), get(crate::duplex::realtime)),
         (r("POST", "/load", "Load the default model, or ?model=ID"), post(load_default)),

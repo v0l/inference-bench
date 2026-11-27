@@ -383,6 +383,7 @@ pub struct FamilyTts {
     pub conditions: String,
     pub frame_budget: String,
     pub language: String,
+    pub voices: crate::spec::TtsVoices,
     pub params: std::collections::BTreeMap<String, ParamSource>,
     pub tokens: std::collections::BTreeMap<String, ParamSource>,
     pub condition: FamilyTtsCondition,
@@ -413,6 +414,7 @@ impl FamilyTts {
             conditions: self.conditions.clone(),
             frame_budget: self.frame_budget.clone(),
             language: self.language.clone(),
+            voices: self.voices.clone(),
             params: read_params(&self.params, config).context("[tts.params]")?,
             tokens: read_params(&self.tokens, config).context("[tts.tokens]")?,
             condition: crate::spec::TtsCondition {

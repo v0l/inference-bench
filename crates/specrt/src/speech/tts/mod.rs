@@ -1,5 +1,7 @@
 pub mod plan;
+pub mod service;
 pub mod text;
+pub mod voices;
 
 use super::decoder::{HostDecoder, Sequence};
 use crate::flow_head::{FlowHead, HostHead};
@@ -168,6 +170,29 @@ impl HostTts {
         let (tokens, streams) = self.prompt(voice, text)?;
         let mut seq = self.decoder.new_sequence();
         let out = self.decoder.prefill_with(&mut seq, &tokens, streams)?;
+        self.session_from(seq, &out)
+    }
+
+    pub fn voice_prefix(&self, voice: &Voice) -> Result<Sequence> {
+        let (tokens, streams) = self.prompt(Some(voice), &[])?;
+        let n = tokens.len() - 1;
+        let streams = streams.into_iter().map(|(k, v)| {
+            let w = v.len() / tokens.len();
+            (k, v[..n * w].to_vec())
+        }).collect();
+        let mut seq = self.decoder.new_sequence();
+        self.decoder.prefill_with(&mut seq, &tokens[..n], streams)?;
+        Ok(seq)
+    }
+
+    pub fn start_after(&self, prefix: &Sequence, text: &[u32]) -> Result<(Session, Vec<f32>, f32)> {
+        let (tokens, streams) = self.prompt(None, text)?;
+        let mut seq = prefix.clone();
+        let out = self.decoder.prefill_with(&mut seq, &tokens, streams)?;
+        self.session_from(seq, &out)
+    }
+
+    fn session_from(&self, seq: Sequence, out: &super::decoder::Out) -> Result<(Session, Vec<f32>, f32)> {
         let h = self.spec.dims.hidden;
         let last = out.hidden[out.hidden.len() - h..].to_vec();
         let eos = *out.logits.last().context("the prefill wrote no head row")?;

@@ -52,6 +52,7 @@ struct Inner {
     duplex_frames_out: u64,
     duplex_late: u64,
     transcriptions: BTreeMap<String, (u64, f64, f64)>,
+    speeches: BTreeMap<String, (u64, f64, f64)>,
 }
 
 #[derive(Default)]
@@ -130,6 +131,14 @@ impl Metrics {
     pub fn transcription(&self, model: &str, audio_secs: f64, secs: f64) {
         let mut m = self.inner.lock().unwrap();
         let e = m.transcriptions.entry(model.to_string()).or_default();
+        e.0 += 1;
+        e.1 += audio_secs;
+        e.2 += secs;
+    }
+
+    pub fn speech(&self, model: &str, audio_secs: f64, secs: f64) {
+        let mut m = self.inner.lock().unwrap();
+        let e = m.speeches.entry(model.to_string()).or_default();
         e.0 += 1;
         e.1 += audio_secs;
         e.2 += secs;
@@ -255,6 +264,18 @@ impl Metrics {
         let _ = writeln!(o, "# HELP inference_transcription_seconds_total Seconds spent transcribing, by model.\n# TYPE inference_transcription_seconds_total counter");
         for (model, (_, _, spent)) in &m.transcriptions {
             let _ = writeln!(o, "inference_transcription_seconds_total{{model=\"{model}\"}} {spent}");
+        }
+        let _ = writeln!(o, "# HELP inference_speech_total Speech requests finished, by model.\n# TYPE inference_speech_total counter");
+        for (model, (n, _, _)) in &m.speeches {
+            let _ = writeln!(o, "inference_speech_total{{model=\"{model}\"}} {n}");
+        }
+        let _ = writeln!(o, "# HELP inference_speech_audio_seconds_total Seconds of audio spoken, by model.\n# TYPE inference_speech_audio_seconds_total counter");
+        for (model, (_, audio, _)) in &m.speeches {
+            let _ = writeln!(o, "inference_speech_audio_seconds_total{{model=\"{model}\"}} {audio}");
+        }
+        let _ = writeln!(o, "# HELP inference_speech_seconds_total Seconds spent speaking, by model.\n# TYPE inference_speech_seconds_total counter");
+        for (model, (_, _, spent)) in &m.speeches {
+            let _ = writeln!(o, "inference_speech_seconds_total{{model=\"{model}\"}} {spent}");
         }
         let _ = writeln!(o, "# HELP inference_image_jobs_total Image generation jobs finished, by model.\n# TYPE inference_image_jobs_total counter");
         for (model, n) in &m.image_jobs {
