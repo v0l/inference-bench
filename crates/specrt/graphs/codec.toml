@@ -58,3 +58,57 @@ node = [
   { op = "linear", weight = "{prefix}.fc2", cin = "4 * ch", cout = "ch", in = "t", out = "t" },
   { op = "scale_add", weight = "{prefix}.ffn_gamma", channels = "ch", in = "t" },
 ]
+
+[[codec]]
+name = "mimi-decoder"
+model_types = ["gradium_phonon_tts"]
+section = "mimi"
+decoder = "decode"
+defaults = [
+  ["norm_eps", "0.00001"],
+]
+let = [
+  ["n", "len(ratios)"],
+  ["top", "n_filters * pow(2, n)"],
+  ["hop", "prod(ratios)"],
+  ["latent_stride", "sample_rate / hop / frame_rate"],
+  ["d", "transformer_d_model"],
+]
+
+[[codec.macro]]
+name = "decode"
+node = [
+  { op = "conv", weight = "mimi.quantizer.output_proj", cin = "quantizer_dimension", cout = "quantizer_output_dimension", k = "1", bias = "false" },
+  { op = "conv_up", weight = "mimi.upsample.convtr.convtr", cin = "dimension", cout = "dimension", k = "2 * latent_stride", stride = "latent_stride", groups = "dimension", bias = "false" },
+  { call = "layer", repeat = "transformer_num_layers", var = "l", prefix = "mimi.decoder_transformer.transformer.layers.{l}" },
+  { op = "conv", weight = "mimi.decoder.model.0.conv", cin = "dimension", cout = "top", k = "kernel_size" },
+  { call = "up", repeat = "n", var = "i", args = { cin = "top / pow(2, i)", stride = "ratios[i]", at = "2 + 3 * i" } },
+  { op = "conv", weight = "mimi.decoder.model.{last}.conv", cin = "n_filters", cout = "channels", k = "last_kernel_size", act = "elu", args = { last = "3 * n + 2" } },
+]
+
+[[codec.macro]]
+name = "layer"
+node = [
+  { op = "layer_norm", weight = "{prefix}.norm1", channels = "d", eps = "norm_eps", out = "t" },
+  { op = "attention", weight = "{prefix}.self_attn.in_proj", channels = "d", heads = "transformer_num_heads", context = "transformer_context", theta = "transformer_max_period", layout = "blocks", rope = "pairs", in = "t", out = "t", args = { out = "'{prefix}.self_attn.out_proj'" } },
+  { op = "scale_add", weight = "{prefix}.layer_scale_1.scale", channels = "d", in = "t" },
+  { op = "layer_norm", weight = "{prefix}.norm2", channels = "d", eps = "norm_eps", out = "t" },
+  { op = "linear", weight = "{prefix}.linear1", cin = "d", cout = "transformer_dim_feedforward", act = "gelu", bias = "false", in = "t", out = "t" },
+  { op = "linear", weight = "{prefix}.linear2", cin = "transformer_dim_feedforward", cout = "d", bias = "false", in = "t", out = "t" },
+  { op = "scale_add", weight = "{prefix}.layer_scale_2.scale", channels = "d", in = "t" },
+]
+
+[[codec.macro]]
+name = "up"
+node = [
+  { op = "conv_up", weight = "mimi.decoder.model.{at}.convtr", cin = "cin", cout = "cin / 2", k = "2 * stride", stride = "stride", act = "elu" },
+  { call = "residual", repeat = "n_residual_layers", var = "j", prefix = "mimi.decoder.model.{r}", args = { ch = "cin / 2", r = "at + 1 + j", dilation = "pow(dilation_base, j)" } },
+]
+
+[[codec.macro]]
+name = "residual"
+node = [
+  { op = "conv", weight = "{prefix}.block.1.conv", cin = "ch", cout = "ch / compress", k = "residual_kernel_size", dilation = "dilation", act = "elu", out = "t" },
+  { op = "conv", weight = "{prefix}.block.3.conv", cin = "ch / compress", cout = "ch", k = "1", act = "elu", in = "t", out = "t" },
+  { op = "add", channels = "ch", in = "t" },
+]

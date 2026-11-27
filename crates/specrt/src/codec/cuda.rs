@@ -1,11 +1,11 @@
-use super::compile::{Kind, LaunchPlan, plan};
+use super::compile::{Kind, LaunchPlan, Part, plan};
 use super::graph::{CodecOp, Stack};
 use super::host::{HostCodec, HostStack, Param};
 use crate::codegen::Module;
 use crate::jit::Jit;
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
-use kir::conv::{ConvKernel, LINE_ROW_KERNELS, THREADS};
+use kir::conv::{ConvKernel, LINE_ROW_KERNELS, RING_THREADS, THREADS};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -27,7 +27,7 @@ struct Dev {
 
 pub struct GpuStack {
     stack: Stack,
-    weights: BTreeMap<usize, Dev>,
+    weights: BTreeMap<(usize, Part), Dev>,
 }
 
 pub struct Sessions {
@@ -89,20 +89,36 @@ pub struct CudaCodec {
 
 fn upload(stream: &Arc<CudaStream>, h: &HostStack) -> Result<GpuStack> {
     let mut weights = BTreeMap::new();
-    for (i, (op, p)) in h.stack.ops.iter().zip(&h.params).enumerate() {
-        let dev = match (op, p) {
-            (_, Param::Conv(c)) => Dev { w: stream.clone_htod(&c.w)?, b: stream.clone_htod(&c.b)? },
-            (_, Param::Linear { w, b }) => Dev { w: stream.clone_htod(w)?, b: stream.clone_htod(b)? },
-            (CodecOp::RmsNorm { .. } | CodecOp::ScaleAdd { .. }, Param::Vec(g)) => Dev { w: stream.clone_htod(g)?, b: stream.alloc_zeros(1)? },
-            _ => continue,
+    for (i, p) in h.params.iter().enumerate() {
+        let mut put = |part: Part, w: &[f32], b: &[f32]| -> Result<()> {
+            weights.insert((i, part), Dev { w: stream.clone_htod(w)?, b: stream.clone_htod(if b.is_empty() { &[0.0f32][..] } else { b })? });
+            Ok(())
         };
-        weights.insert(i, dev);
+        match p {
+            Param::Conv(c) => put(Part::Main, &c.w, &c.b)?,
+            Param::Linear { w, b } | Param::Norm { w, b } => put(Part::Main, w, b)?,
+            Param::Vec(g) => put(Part::Main, g, &[])?,
+            Param::Attention { qkv, out } => {
+                let c = out.len().isqrt();
+                put(Part::Main, qkv, &vec![0.0; 3 * c])?;
+                put(Part::Out, out, &vec![0.0; c])?;
+            }
+        }
     }
     Ok(GpuStack { stack: h.stack.clone(), weights })
 }
 
 fn rows(n: usize) -> LaunchConfig {
     LaunchConfig { grid_dim: (n.div_ceil(256).max(1) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }
+}
+
+fn state_floats(op: &CodecOp) -> usize {
+    match op {
+        CodecOp::Conv { k, stride, cin, .. } => (k - stride) * cin,
+        CodecOp::ConvUp { cin, .. } => *cin,
+        CodecOp::Attention { .. } => op.state_floats(),
+        _ => 0,
+    }
 }
 
 impl CudaCodec {
@@ -115,7 +131,9 @@ impl CudaCodec {
         let target = crate::codegen::cuda_target(ctx)?;
         let mut all = Vec::new();
         for &(steps, batch) in shapes {
-            all.extend(plan(&host.plan.encoder, steps * host.plan.frame_samples, batch)?.kernels(&target)?);
+            if host.plan.has_encoder() {
+                all.extend(plan(&host.plan.encoder, steps * host.plan.frame_samples, batch)?.kernels(&target)?);
+            }
             all.extend(plan(&host.plan.decoder, steps, batch)?.kernels(&target)?);
         }
         all.sort_by_key(ConvKernel::name);
@@ -126,10 +144,11 @@ impl CudaCodec {
         for name in &m.kernels {
             fns.insert(name.to_string(), loaded.function(name)?);
         }
+        use cudarc::driver::sys::CUfunction_attribute as A;
         for k in &all {
-            use cudarc::driver::sys::CUfunction_attribute as A;
             fns[&k.name()].set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, k.smem_bytes() as i32)?;
         }
+        fns["line_ring_attention"].set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, target.smem_limit as i32)?;
         let stream = stream.clone();
         let encoder = upload(&stream, &host.encoder)?;
         let decoder = upload(&stream, &host.decoder)?;
@@ -140,13 +159,8 @@ impl CudaCodec {
     pub fn sessions(&self, which: &GpuStack, batch: usize) -> Result<Sessions> {
         let mut state = BTreeMap::new();
         for (i, op) in which.stack.ops.iter().enumerate() {
-            let cols = match op {
-                CodecOp::Conv { k, stride, .. } => k - stride,
-                CodecOp::ConvUp { .. } => 1,
-                _ => 0,
-            };
-            if cols > 0 {
-                let n = batch * cols * op_cin(op);
+            let n = batch * state_floats(op);
+            if n > 0 {
                 state.insert(i, [self.stream.alloc_zeros(n)?, self.stream.alloc_zeros(n)?]);
             }
         }
@@ -185,41 +199,88 @@ impl CudaCodec {
         let dptr = |v: &CudaSlice<f32>| v.device_ptr(s).0;
         for l in &p.launches {
             let (x, y) = (ptrs[l.input], ptrs[l.output]);
-            let (t, to) = (l.t_in as i32, l.t_out as i32);
+            let t = l.t_in as i32;
+            let ring = || -> Result<u64> { Ok(dptr(&sessions.state.get(&l.op).context("an attention launch has ring state")?[0])) };
             match &l.kind {
-                Kind::Conv { shape, gelu, residual, rows } => {
-                    let k = &self.kernels[&super::compile::conv_kernel(&self.target, *shape, *gelu, *residual, *rows)?.name()];
-                    let dev = &which.weights[&l.op];
+                Kind::Conv { shape, gelu, residual, rows, act } => {
+                    let k = &self.kernels[&super::compile::conv_kernel(&self.target, *shape, *gelu, *residual, *rows, *act)?.name()];
+                    let dev = &which.weights[&(l.op, l.part)];
                     let st = match l.layer.and_then(|i| sessions.state.get(&i)) {
-                        Some(pair) => dptr(&pair[0]),
-                        None => dptr(&dev.b),
+                        Some(pair) if shape.context() > 0 => dptr(&pair[0]),
+                        _ => dptr(&dev.b),
                     };
                     let scale = match l.scale {
-                        Some(sc) => dptr(&which.weights[&sc].w),
+                        Some(sc) => dptr(&which.weights[&(sc, Part::Main)].w),
                         None => dptr(&dev.b),
                     };
-                    let (w, bias) = (dptr(&dev.w), dptr(&dev.b));
+                    let (w, bias, to) = (dptr(&dev.w), dptr(&dev.b), l.t_out as i32);
                     let (gx, gy, gz) = k.line_grid(sessions.batch * l.t_out);
                     let mut lb = s.launch_builder(&self.fns[&k.name()]);
                     lb.arg(&x).arg(&st).arg(&w).arg(&bias).arg(&scale).arg(&y).arg(&b).arg(&t).arg(&to);
                     unsafe { lb.launch(LaunchConfig { grid_dim: (gx, gy, gz), block_dim: (THREADS, 1, 1), shared_mem_bytes: k.smem_bytes() }) }?;
                 }
                 Kind::Depthwise { channels, taps } => {
-                    let dev = &which.weights[&l.op];
+                    let dev = &which.weights[&(l.op, Part::Main)];
                     let st = dptr(&sessions.state[&l.op][0]);
-                    let scale = dptr(&which.weights[&l.scale.context("a depthwise launch folds its scale")?].w);
+                    let scale = dptr(&which.weights[&(l.scale.context("a depthwise launch folds its scale")?, Part::Main)].w);
                     let (w, bias, c, kk) = (dptr(&dev.w), dptr(&dev.b), *channels as i32, *taps as i32);
                     let mut lb = s.launch_builder(&self.fns["line_dwconv"]);
                     lb.arg(&x).arg(&st).arg(&w).arg(&bias).arg(&scale).arg(&y).arg(&b).arg(&t).arg(&c).arg(&kk);
                     unsafe { lb.launch(rows(sessions.batch * l.t_out * channels)) }?;
                 }
-                Kind::Rms { channels, eps } => {
-                    let g = dptr(&which.weights[&l.op].w);
+                Kind::DwUp { channels, stride } => {
+                    let dev = &which.weights[&(l.op, Part::Main)];
+                    let st = dptr(&sessions.state[&l.op][0]);
+                    let (w, bias, c, ss) = (dptr(&dev.w), dptr(&dev.b), *channels as i32, *stride as i32);
+                    let mut lb = s.launch_builder(&self.fns["line_dwup"]);
+                    lb.arg(&x).arg(&st).arg(&w).arg(&bias).arg(&y).arg(&b).arg(&t).arg(&c).arg(&ss);
+                    unsafe { lb.launch(rows(sessions.batch * l.t_in * stride * channels)) }?;
+                }
+                Kind::Rms { channels, eps } | Kind::Layer { channels, eps } => {
+                    let dev = &which.weights[&(l.op, Part::Main)];
+                    let (g, beta) = (dptr(&dev.w), dptr(&dev.b));
                     let (pp, c, e) = ((sessions.batch * l.t_in) as i32, *channels as i32, *eps);
                     let per = 256 / 32;
-                    let mut lb = s.launch_builder(&self.fns["line_rms"]);
-                    lb.arg(&x).arg(&y).arg(&g).arg(&pp).arg(&c).arg(&e);
-                    unsafe { lb.launch(LaunchConfig { grid_dim: ((sessions.batch * l.t_in).div_ceil(per) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
+                    let cfg = LaunchConfig { grid_dim: ((sessions.batch * l.t_in).div_ceil(per) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+                    if matches!(l.kind, Kind::Rms { .. }) {
+                        let mut lb = s.launch_builder(&self.fns["line_rms"]);
+                        lb.arg(&x).arg(&y).arg(&g).arg(&pp).arg(&c).arg(&e);
+                        unsafe { lb.launch(cfg) }?;
+                    } else {
+                        let mut lb = s.launch_builder(&self.fns["line_layernorm"]);
+                        lb.arg(&x).arg(&y).arg(&g).arg(&beta).arg(&pp).arg(&c).arg(&e);
+                        unsafe { lb.launch(cfg) }?;
+                    }
+                }
+                Kind::Rope { heads, head_dim, context, theta } => {
+                    let r = ring()?;
+                    let (h, d, st) = (*heads as i32, *head_dim as i32, (1 + 2 * context * heads * head_dim) as i32);
+                    let mut lb = s.launch_builder(&self.fns["line_rope"]);
+                    lb.arg(&x).arg(&r).arg(&b).arg(&t).arg(&h).arg(&d).arg(&st).arg(theta);
+                    unsafe { lb.launch(rows(sessions.batch * l.t_in * heads * head_dim)) }?;
+                }
+                Kind::Ring { heads, head_dim, context } => {
+                    let r = ring()?;
+                    let (h, d, w) = (*heads as i32, *head_dim as i32, *context as i32);
+                    let scale = 1.0f32 / (*head_dim as f32).sqrt();
+                    let mut lb = s.launch_builder(&self.fns["line_ring_attention"]);
+                    lb.arg(&x).arg(&r).arg(&y).arg(&b).arg(&t).arg(&h).arg(&d).arg(&w).arg(&scale);
+                    let smem = kir::conv::ring_attention_smem(*context, *head_dim);
+                    unsafe { lb.launch(LaunchConfig { grid_dim: ((sessions.batch * l.t_in * heads) as u32, 1, 1), block_dim: (RING_THREADS, 1, 1), shared_mem_bytes: smem }) }?;
+                }
+                Kind::RingStore { channels, context } => {
+                    let r = ring()?;
+                    let (dm, w) = (*channels as i32, *context as i32);
+                    let mut lb = s.launch_builder(&self.fns["line_ring_store"]);
+                    lb.arg(&x).arg(&r).arg(&b).arg(&t).arg(&dm).arg(&w);
+                    unsafe { lb.launch(rows(sessions.batch * l.t_in.min(*context) * channels)) }?;
+                }
+                Kind::Advance { context, channels } => {
+                    let r = ring()?;
+                    let st = (1 + 2 * context * channels) as i32;
+                    let mut lb = s.launch_builder(&self.fns["line_advance"]);
+                    lb.arg(&r).arg(&b).arg(&t).arg(&st);
+                    unsafe { lb.launch(rows(sessions.batch)) }?;
                 }
                 Kind::Shift { channels, context } => {
                     let layer = l.layer.context("a shift has a layer")?;
@@ -239,12 +300,5 @@ impl CudaCodec {
             }
         }
         Ok(())
-    }
-}
-
-fn op_cin(op: &CodecOp) -> usize {
-    match op {
-        CodecOp::Conv { cin, .. } | CodecOp::ConvUp { cin, .. } | CodecOp::Linear { cin, .. } => *cin,
-        CodecOp::RmsNorm { channels, .. } | CodecOp::ScaleAdd { channels, .. } => *channels,
     }
 }

@@ -214,6 +214,10 @@ fn eval_node(n: &Node, env: &Env) -> Result<Value> {
                 Value::List(items) => Value::Num(items.len() as f64),
                 v => bail!("len of {v:?}"),
             },
+            ("prod", [l]) => match eval_node(l, env)? {
+                Value::List(items) => Value::Num(items.iter().product()),
+                v => bail!("prod of {v:?}"),
+            },
             ("min", [a, b]) => Value::Num(num(a)?.min(num(b)?)),
             ("max", [a, b]) => Value::Num(num(a)?.max(num(b)?)),
             ("pow", [a, b]) => Value::Num(num(a)?.powf(num(b)?)),

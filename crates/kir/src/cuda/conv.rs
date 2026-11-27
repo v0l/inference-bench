@@ -546,7 +546,7 @@ const LINE_SEQ: &str = r#"extern "C" __global__ void line_layernorm(const float*
     for (int c = lane; c < C; c += 32) y[p * C + c] = (row[c] - mean) * r * gamma[c] + beta[c];
 }
 
-extern "C" __global__ void line_dwup(const float* x, const float* st, const float* w, float* y, int B, int T, int C, int S) {
+extern "C" __global__ void line_dwup(const float* x, const float* st, const float* w, const float* bias, float* y, int B, int T, int C, int S) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (size_t)B * T * S * C) return;
     int c = idx % C;
@@ -556,10 +556,11 @@ extern "C" __global__ void line_dwup(const float* x, const float* st, const floa
     int t = bt % T, b = bt / T;
     float cur = x[bt * C + c];
     float prev = t > 0 ? x[(bt - 1) * C + c] : st[(size_t)b * C + c];
-    y[idx] = fmaf(cur, w[(size_t)c * 2 * S + r], prev * w[(size_t)c * 2 * S + r + S]);
+    size_t n = (size_t)r * C + c;
+    y[idx] = bias[n] + fmaf(prev, w[2 * n], cur * w[2 * n + 1]);
 }
 
-extern "C" __global__ void line_rope(float* qkv, const float* pos, int B, int T, int H, int D, float theta) {
+extern "C" __global__ void line_rope(float* qkv, const float* ring, int B, int T, int H, int D, int S, float theta) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     int half = D / 2;
     if (idx >= (size_t)B * T * 2 * H * half) return;
@@ -571,15 +572,15 @@ extern "C" __global__ void line_rope(float* qkv, const float* pos, int B, int T,
     size_t bt = m / 2;
     int t = bt % T, b = bt / T;
     float inv = 1.0f / powf(theta, (float)(2 * i) / (float)D);
-    float f = ((float)((int)pos[b] + t)) * inv;
-    float c = cosf(f), s = sinf(f);
+    float f = ((float)((int)ring[(size_t)b * S] + t)) * inv;
+    float c = (float)cos((double)f), s = (float)sin((double)f);
     float* v = qkv + bt * 3 * H * D + (size_t)part * H * D + (size_t)h * D + 2 * i;
     float a = v[0], e = v[1];
     v[0] = a * c - e * s;
     v[1] = e * c + a * s;
 }
 
-extern "C" __global__ void line_ring_attention(const float* qkv, const float* rk, const float* rv, const float* pos, float* out, int B, int T, int H, int D, int W, float scale) {
+extern "C" __global__ void line_ring_attention(const float* qkv, const float* ring, float* out, int B, int T, int H, int D, int W, float scale) {
     extern __shared__ float ring_smem[];
     float* sc = ring_smem;
     float* qs = sc + W;
@@ -588,7 +589,10 @@ extern "C" __global__ void line_ring_attention(const float* qkv, const float* rk
     size_t bt = blockIdx.x / H;
     int t = bt % T, b = bt / T;
     int DM = H * D;
-    int p0 = (int)pos[b];
+    const float* rs = ring + (size_t)b * (1 + 2 * (size_t)W * DM);
+    const float* rk = rs + 1;
+    const float* rv = rk + (size_t)W * DM;
+    int p0 = (int)rs[0];
     int a = p0 + t;
     int n = a + 1 < W ? a + 1 : W;
     for (int d = threadIdx.x; d < D; d += blockDim.x) qs[d] = qkv[bt * 3 * DM + (size_t)h * D + d];
@@ -596,7 +600,7 @@ extern "C" __global__ void line_ring_attention(const float* qkv, const float* rk
     float mx = -INFINITY;
     for (int j = threadIdx.x; j < n; j += blockDim.x) {
         int k = a - n + 1 + j;
-        const float* kr = k >= p0 ? qkv + ((size_t)b * T + (k - p0)) * 3 * DM + DM : rk + ((size_t)b * W + k % W) * DM;
+        const float* kr = k >= p0 ? qkv + ((size_t)b * T + (k - p0)) * 3 * DM + DM : rk + (size_t)(k % W) * DM;
         float acc = 0.0f;
         for (int d = 0; d < D; d++) acc = fmaf(qs[d], kr[(size_t)h * D + d], acc);
         acc *= scale;
@@ -634,14 +638,14 @@ extern "C" __global__ void line_ring_attention(const float* qkv, const float* rk
         float acc = 0.0f;
         for (int j = 0; j < n; j++) {
             int k = a - n + 1 + j;
-            const float* vr = k >= p0 ? qkv + ((size_t)b * T + (k - p0)) * 3 * DM + 2 * DM : rv + ((size_t)b * W + k % W) * DM;
+            const float* vr = k >= p0 ? qkv + ((size_t)b * T + (k - p0)) * 3 * DM + 2 * DM : rv + (size_t)(k % W) * DM;
             acc = fmaf(sc[j], vr[(size_t)h * D + d], acc);
         }
         out[bt * DM + (size_t)h * D + d] = acc * inv;
     }
 }
 
-extern "C" __global__ void line_ring_store(const float* qkv, float* rk, float* rv, const float* pos, int B, int T, int DM, int W) {
+extern "C" __global__ void line_ring_store(const float* qkv, float* ring, int B, int T, int DM, int W) {
     int n = T < W ? T : W;
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (size_t)B * n * DM) return;
@@ -649,15 +653,16 @@ extern "C" __global__ void line_ring_store(const float* qkv, float* rk, float* r
     size_t m = idx / DM;
     int i = m % n, b = m / n;
     int t = T - n + i;
-    int slot = ((int)pos[b] + t) % W;
+    float* rs = ring + (size_t)b * (1 + 2 * (size_t)W * DM);
+    int slot = ((int)rs[0] + t) % W;
     const float* row = qkv + ((size_t)b * T + t) * 3 * DM;
-    rk[((size_t)b * W + slot) * DM + e] = row[DM + e];
-    rv[((size_t)b * W + slot) * DM + e] = row[2 * DM + e];
+    rs[1 + (size_t)slot * DM + e] = row[DM + e];
+    rs[1 + (size_t)W * DM + (size_t)slot * DM + e] = row[2 * DM + e];
 }
 
-extern "C" __global__ void line_advance(float* pos, int B, int T) {
+extern "C" __global__ void line_advance(float* ring, int B, int T, int S) {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b < B) pos[b] += (float)T;
+    if (b < B) ring[(size_t)b * S] += (float)T;
 }
 "#;
 
