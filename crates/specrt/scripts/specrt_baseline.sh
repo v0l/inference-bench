@@ -57,7 +57,7 @@ $f16_layers
 
 [runtime.prefix_cache]
 enabled = true
-max_snapshots = 24
+max_snapshots = 16
 
 [[models]]
 id = "$model"
