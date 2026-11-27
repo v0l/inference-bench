@@ -612,7 +612,7 @@ fn context_row(ui: &mut egui::Ui, d: &mut LoadDialog, f: &Field, env: &Env) {
                     }
                     let labels: Vec<String> = choices.iter().map(|x| format!("{x}x  {}", tokens(native * x))).collect();
                     let options: Vec<(usize, &str, Option<usize>)> = choices.iter().zip(&labels).map(|(x, l)| (*x, l.as_str(), None)).collect();
-                    segments(ui, &mut factor, &options);
+                    ui.push_id("rope-factor", |ui| segments(ui, &mut factor, &options));
                     hint(ui, "YaRN stretches the positions the model was trained on. Short prompts give slightly different answers than with it off.");
                 }
             }

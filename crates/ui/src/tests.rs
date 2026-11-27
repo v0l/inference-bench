@@ -2664,6 +2664,41 @@ fn unlocking_keeps_the_pool_and_the_parallel_requests_the_lock_showed() {
 }
 
 #[test]
+fn the_rope_box_and_both_kv_rows_fit_desktop_and_phone_widths() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    for (w, hgt, tag) in [(1280.0, 800.0, "1280x800"), (390.0, 844.0, "390x844"), (390.0, 2400.0, "390-tall")] {
+        let mut h = harness_at(&format!("rope-kv-{tag}"), Tab::Models, egui::vec2(w, hgt));
+        with_gpu(&mut h, 0, 96 << 30);
+        let m = real_model("Small-0.6B");
+        h.state_mut().library[0] = m.clone();
+        h.state_mut().open_load_dialog(&m);
+        h.run();
+        let steps: [(&str, fn(&mut crate::load::LoadDialog)); 4] = [
+            ("rope-off", |_| {}),
+            ("rope-on4", |d| d.set_extension(Some(4))),
+            ("kv-locked", |d| d.set_extension(None)),
+            ("kv-unlocked", |d| d.set_locked(false)),
+        ];
+        for (name, step) in steps {
+            step(h.state_mut().load.as_mut().unwrap());
+            h.run();
+            if w < 500.0 {
+                h.state_mut().load.as_mut().unwrap().details = false;
+            }
+            h.run();
+            let screen = h.ctx.content_rect();
+            for label in ["RoPE scaling", "kv cache", "KV CACHE SIZE", "CONTEXT LENGTH"] {
+                for n in h.query_all_by_label_contains(label) {
+                    assert!(n.rect().right() <= screen.right() + 0.5, "{tag} {name}: {label} ends at {} past {}", n.rect().right(), screen.right());
+                }
+            }
+            h.render().unwrap().save(out.join(format!("load-{name}-{tag}.png"))).unwrap();
+        }
+    }
+}
+
+#[test]
 fn no_mix_of_context_requests_pool_and_kv_type_leaves_one_request_without_room() {
     let mut h = dialog_27b("kv-never-short", |_, _| {});
     for pinned in [false, true] {
