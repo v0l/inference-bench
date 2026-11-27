@@ -684,7 +684,9 @@ fn kv_size_row(ui: &mut egui::Ui, d: &mut LoadDialog, f: &Field, env: &Env) {
                 Line::new().legend("each request up to").value(format!("{} tokens", tokens(d.context_cap()))).size(11.0).show(ui);
             }
         });
-        flip = toggle(ui, LOCK_LABEL, locked).clicked();
+        let r = toggle(ui, LOCK_LABEL, locked);
+        r.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::CheckBox, true, locked, LOCK_LABEL));
+        flip = r.clicked();
     });
     if reset || (flip && !locked) {
         d.set_locked(true);

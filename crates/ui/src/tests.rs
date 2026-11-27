@@ -2645,6 +2645,24 @@ fn an_unlocked_kv_cache_caps_the_context_so_one_request_fits() {
 }
 
 #[test]
+fn unlocking_keeps_the_pool_and_the_parallel_requests_the_lock_showed() {
+    let mut h = dialog_27b("kv-unlock-keeps", |_, _| {});
+    let (pool, seqs) = {
+        let d = h.state().load.as_ref().unwrap();
+        (d.kv_bytes().unwrap(), d.seqs)
+    };
+    h.get_by_label(crate::load::LOCK_LABEL).click();
+    h.run();
+    let d = h.state().load.as_ref().unwrap();
+    assert!(!d.locked());
+    assert_eq!(d.seqs, seqs);
+    assert!(d.kv_bytes().unwrap().abs_diff(pool) < 1 << 20, "{} {pool}", d.kv_bytes().unwrap());
+    h.get_by_label(crate::load::LOCK_LABEL).click();
+    h.run();
+    assert!(h.state().load.as_ref().unwrap().locked());
+}
+
+#[test]
 fn no_mix_of_context_requests_pool_and_kv_type_leaves_one_request_without_room() {
     let mut h = dialog_27b("kv-never-short", |_, _| {});
     for pinned in [false, true] {
