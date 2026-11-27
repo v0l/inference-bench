@@ -128,6 +128,23 @@ def reference(args):
             print(r["id"], f"{time.time() - start:.1f}s", proc.tokenizer.decode(tokens, skip_special_tokens=True)[:80], flush=True)
 
 
+def candle(args):
+    done = set()
+    if os.path.exists(args.out):
+        done = {json.loads(line)["id"] for line in open(args.out)}
+    with open(args.out, "a") as f:
+        for r in load_manifest(args.manifest):
+            if r["id"] in done:
+                continue
+            start = time.time()
+            out = subprocess.run(args.prefix.split() + [args.hear, r["wav"], args.models, args.model], check=True, capture_output=True, text=True).stdout.splitlines()
+            out = [l for l in out if not l.startswith("gpu-run:")]
+            text = "\n".join(out[2:]).strip()
+            f.write(json.dumps({"id": r["id"], "text": text, "seconds": round(time.time() - start, 3)}) + "\n")
+            f.flush()
+            print(r["id"], f"{time.time() - start:.1f}s", text[:80], flush=True)
+
+
 def edits(a, b):
     prev = list(range(len(b) + 1))
     for i, x in enumerate(a, 1):
@@ -201,6 +218,13 @@ def main():
     r.add_argument("manifest")
     r.add_argument("out")
     r.add_argument("--threads", type=int, default=8)
+    k = sub.add_parser("candle")
+    k.add_argument("hear")
+    k.add_argument("models")
+    k.add_argument("model")
+    k.add_argument("manifest")
+    k.add_argument("out")
+    k.add_argument("--prefix", default="")
     s = sub.add_parser("score")
     s.add_argument("model")
     s.add_argument("manifest")
@@ -208,7 +232,7 @@ def main():
     s.add_argument("runs", nargs="*")
     s.add_argument("--json")
     a = p.parse_args()
-    {"clips": clips, "reference": reference, "score": score}[a.cmd](a)
+    {"clips": clips, "reference": reference, "candle": candle, "score": score}[a.cmd](a)
 
 
 if __name__ == "__main__":

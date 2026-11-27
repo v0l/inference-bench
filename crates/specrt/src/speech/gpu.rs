@@ -129,7 +129,7 @@ impl GpuEngine {
         let encoder = HostEncoder::new(&config)?;
         let decoder = HostDecoder::open(dir, false)?;
         let ck = crate::weights::Checkpoint::open(dir)?;
-        let target = crate::codegen::cuda_target(&stream.context())?;
+        let target = crate::codegen::cuda_target(stream.context())?;
         let mut weight_bytes = 0usize;
         let mut up = |v: &[f32]| -> Result<CudaSlice<f32>> {
             weight_bytes += 4 * v.len();
