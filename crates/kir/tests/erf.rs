@@ -44,6 +44,17 @@ fn gelu_is_the_exact_erf_form() {
 }
 
 #[test]
+fn elu_is_x_above_zero_and_exp_minus_one_below() {
+    let e = Expr::parse("elu(x)").unwrap();
+    for (x, want) in [(0.0, 0.0), (1.5, 1.5), (-1.0, (-1.0f64).exp() - 1.0), (-3.0, (-3.0f64).exp() - 1.0), (1e-3, 1e-3)] {
+        assert!((at(&e, x) - want).abs() < 1e-15, "elu({x}) = {}", at(&e, x));
+    }
+    let lowered = kir::expr::apply_macro("elu", Expr::Raw("v".into())).unwrap();
+    assert_eq!(lowered.lower(Dialect::Cuda, &[]).unwrap(), "(v > 0.0f ? v : expf(v) - 1.0f)");
+    assert!(kir::expr::unary_macro("elu").is_some() && kir::expr::unary_macro("relu6").is_none());
+}
+
+#[test]
 fn erf_lowers_to_erff_in_cuda_and_a_polynomial_in_wgsl() {
     let e = Expr::parse("erf(x * 0.5)").unwrap().subst(&|n| (n == "x").then(|| Expr::Raw("v".into()))).unwrap();
     assert_eq!(e.lower(Dialect::Cuda, &[]).unwrap(), "erff(v * 0.5f)");
