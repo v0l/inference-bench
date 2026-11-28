@@ -99,6 +99,8 @@ pub struct LoadConfig {
     pub seed: u64,
     pub sample_every: Duration,
     pub media: Option<MediaLoad>,
+    pub prefixes: usize,
+    pub prefix_share: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -157,6 +159,23 @@ pub fn prompt(words: usize, salt: u64) -> String {
     out
 }
 
+pub fn shared_prompt(words: usize, salt: u64, prefixes: usize, share: f64) -> String {
+    if prefixes == 0 || share <= 0.0 {
+        return prompt(words, salt);
+    }
+    let id = salt % prefixes as u64;
+    let shared = (words as f64 * share.min(1.0)) as usize;
+    let mut rng = Rng::new(id.wrapping_mul(7919).wrapping_add(3));
+    let mut out = format!("Conversation {id}. Notes so far:\n");
+    for _ in 0..shared {
+        out.push_str(WORDS[(rng.next() % WORDS.len() as u64) as usize]);
+        out.push(' ');
+    }
+    out.push('\n');
+    out.push_str(&prompt(words - shared, salt));
+    out
+}
+
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
 pub struct Outcome {
     pub planned_prompt: usize,
@@ -212,7 +231,7 @@ fn one(agent: &ureq::Agent, cfg: &LoadConfig, p: &Planned, salt: u64) -> Outcome
     let chat = cfg.media.is_some();
     let body = if let Some(load) = &cfg.media { media_body(cfg, load, p, salt) } else { json!({
         "model": cfg.model,
-        "prompt": prompt(p.prompt_words, salt),
+        "prompt": shared_prompt(p.prompt_words, salt, cfg.prefixes, cfg.prefix_share),
         "max_tokens": p.max_tokens,
         "temperature": 0,
         "stream": true,
@@ -309,6 +328,34 @@ pub struct Report {
     pub running_max: Option<f64>,
     pub samples: Vec<Sample>,
     pub errors: Vec<String>,
+    pub per_request: Vec<RequestRow>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct RequestRow {
+    pub planned_prompt: usize,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub ttft_secs: f64,
+    pub total_secs: f64,
+    pub decode_tok_s: f64,
+    pub itl_p95: f64,
+}
+
+impl RequestRow {
+    fn of(o: &Outcome) -> Self {
+        let decode = o.total_secs - o.ttft_secs;
+        let mut gaps = o.gaps.clone();
+        RequestRow {
+            planned_prompt: o.planned_prompt,
+            prompt_tokens: o.prompt_tokens,
+            completion_tokens: o.completion_tokens,
+            ttft_secs: o.ttft_secs,
+            total_secs: o.total_secs,
+            decode_tok_s: if decode > 0.0 { o.completion_tokens.saturating_sub(1) as f64 / decode } else { 0.0 },
+            itl_p95: percentile(&mut gaps, 0.95),
+        }
+    }
 }
 
 pub fn percentile(v: &mut [f64], p: f64) -> f64 {
@@ -356,6 +403,7 @@ pub fn summarise(outcomes: &[Outcome], wall: f64, samples: Vec<Sample>) -> Repor
         running_max: samples.iter().filter_map(|s| s.running).reduce(f64::max),
         samples,
         errors,
+        per_request: ok.iter().map(|o| RequestRow::of(o)).collect(),
     }
 }
 
@@ -517,6 +565,8 @@ mod tests {
             seed: 1,
             sample_every: Duration::from_secs(1),
             media: Some(MediaLoad::Images(2)),
+            prefixes: 0,
+            prefix_share: 0.0,
         };
         let p = Planned { at: Duration::ZERO, prompt_words: 0, max_tokens: 8 };
         let a = media_body(&cfg, cfg.media.as_ref().unwrap(), &p, 1);
@@ -541,6 +591,8 @@ mod tests {
             seed: 1,
             sample_every: Duration::from_secs(1),
             media: None,
+            prefixes: 0,
+            prefix_share: 0.0,
         };
         let p = plan(&cfg);
         let span = p.last().unwrap().at.as_secs_f64();
@@ -563,5 +615,19 @@ mod tests {
         assert_eq!(r.preemptions, Some(3.0));
         assert_eq!(r.kv_use_max, Some(0.5));
         assert_eq!(r.running_max, Some(4.0));
+        assert_eq!(r.per_request.len(), 2);
+        assert_eq!(r.per_request[1].itl_p95, 0.5);
+    }
+
+    #[test]
+    fn prompts_of_one_conversation_share_their_prefix_and_differ_after_it() {
+        let a = shared_prompt(4000, 3, 4, 0.8);
+        let b = shared_prompt(2000, 7, 4, 0.8);
+        let c = shared_prompt(4000, 4, 4, 0.8);
+        let common = |x: &str, y: &str| x.bytes().zip(y.bytes()).take_while(|(p, q)| p == q).count();
+        assert!(common(&a, &b) > 1600 * 5, "{}", common(&a, &b));
+        assert!(common(&a, &c) < 40);
+        assert_ne!(a, shared_prompt(4000, 11, 4, 0.8));
+        assert_eq!(shared_prompt(100, 3, 0, 0.8), prompt(100, 3));
     }
 }

@@ -1151,6 +1151,8 @@ fn record_generation(state: &AppState, model: &str, g: &Generation, max_tokens: 
         prompt_tokens = g.prompt_tokens,
         completion_tokens = g.completion_tokens,
         ttft_ms = g.ttft_secs * 1000.0,
+        queue_ms = g.queue_secs * 1000.0,
+        admission_ms = g.admission_secs * 1000.0,
         decode_tok_s = decode_rate(g),
         finish_reason = reason,
         "generation finished"

@@ -28,6 +28,7 @@ fn request_id_is_returned_and_present_on_every_line_for_the_request() {
     assert_eq!(f["completion_tokens"], 3);
     assert_eq!(f["finish_reason"], "length");
     assert!(f["ttft_ms"].is_number() && f["decode_tok_s"].is_number());
+    assert!(f["queue_ms"].is_number() && f["admission_ms"].is_number());
     let span = finished["spans"].as_array().unwrap().iter().find(|s| s["name"] == "request").unwrap();
     assert_eq!(span["model"], "m");
     assert_eq!(span["backend"], "fake");
