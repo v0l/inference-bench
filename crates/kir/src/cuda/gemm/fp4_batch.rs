@@ -2,7 +2,8 @@ use super::prim;
 
 pub fn body() -> String {
     [
-        prim::batch_helpers("f4b"),
+        prim::batch_helpers("f4b", prim::L2_PREFETCH_128),
+        prim::bf16x2_decode("f4b"),
         r##"
 __device__ __forceinline__ unsigned f4b_byte(const uint4& q, int i) {
     unsigned word = (i >> 2) == 0 ? q.x : (i >> 2) == 1 ? q.y : (i >> 2) == 2 ? q.z : q.w;
@@ -62,10 +63,10 @@ __device__ __forceinline__ void gemv_f4b(const void* w, const unsigned char* sca
         if (it + 1 < nc) load_w(c_begin + it + 1, nq, ns);
         const bf16_t* xh = xs + (it % STAGES) * STAGE;
         const bf16_t* xl = xh + PLANE;
-        float sc[MJ][2][2];
+        unsigned sc[MJ][2][2];
 "##.to_string(),
-        prim::unroll_nest(8, &[("i", "MJ"), ("h", "2")], true, r##"sc[i][h][0] = e4m3_to_f32(s[i][h] & 0xffu);
-sc[i][h][1] = e4m3_to_f32((s[i][h] >> 8) & 0xffu);
+        prim::unroll_nest(8, &[("i", "MJ"), ("h", "2")], true, r##"sc[i][h][0] = f4b_scale_bf16x2(s[i][h] & 0xffu);
+sc[i][h][1] = f4b_scale_bf16x2((s[i][h] >> 8) & 0xffu);
 "##),
         r##"#pragma unroll
         for (int k = 0; k < 8; k++) {
@@ -77,12 +78,12 @@ sc[i][h][1] = e4m3_to_f32((s[i][h] >> 8) & 0xffu);
             }
 #pragma unroll
             for (int i = 0; i < MJ; i++) {
-                float s0 = sc[i][0][k >> 2];
-                float s1 = sc[i][1][k >> 2];
-                unsigned a0 = fp4_pair_bf16(f4b_byte(q[i][0], 2 * k), s0);
-                unsigned a1 = fp4_pair_bf16(f4b_byte(q[i][1], 2 * k), s1);
-                unsigned a2 = fp4_pair_bf16(f4b_byte(q[i][0], 2 * k + 1), s0);
-                unsigned a3 = fp4_pair_bf16(f4b_byte(q[i][1], 2 * k + 1), s1);
+                unsigned s0 = sc[i][0][k >> 2];
+                unsigned s1 = sc[i][1][k >> 2];
+                unsigned a0 = f4b_e2m1x2_bf16(f4b_byte(q[i][0], 2 * k), s0);
+                unsigned a1 = f4b_e2m1x2_bf16(f4b_byte(q[i][1], 2 * k), s1);
+                unsigned a2 = f4b_e2m1x2_bf16(f4b_byte(q[i][0], 2 * k + 1), s0);
+                unsigned a3 = f4b_e2m1x2_bf16(f4b_byte(q[i][1], 2 * k + 1), s1);
 #pragma unroll
                 for (int n = 0; n < NT; n++) {
                     mma_bf16(acc[i][n], a0, a1, a2, a3, bl[n].x, bl[n].y);

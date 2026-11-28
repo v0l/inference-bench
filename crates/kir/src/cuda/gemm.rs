@@ -11,6 +11,7 @@ mod fp8_batch;
 mod ggml_batch;
 mod ggml_gemv;
 pub mod prim;
+mod swap;
 
 use super::quant;
 
@@ -20,7 +21,7 @@ pub fn fp4_act_source() -> String {
 
 fn uses_fp4(k: &KernelInstance) -> bool {
     match k.kind {
-        Kind::Tile { wf, .. } | Kind::Batch { wf, .. } | Kind::BatchReduce { wf, .. } => wf == WeightFormat::Fp4,
+        Kind::Tile { wf, .. } | Kind::Batch { wf, .. } | Kind::BatchReduce { wf, .. } | Kind::Swap { wf, .. } => wf == WeightFormat::Fp4,
         Kind::Fp4Act { .. } | Kind::QuantFp4 | Kind::Gemv { .. } | Kind::HeadNormFp4 { .. } => true,
         Kind::Fp8Act { .. } | Kind::QuantFp8 { .. } | Kind::GgmlBatch { .. } | Kind::GgmlGemv { .. } => false,
     }
@@ -35,7 +36,14 @@ fn batch_of(k: &KernelInstance) -> Option<WeightFormat> {
 }
 
 pub fn needs_arch_features(kernels: &[KernelInstance]) -> bool {
-    kernels.iter().any(|k| matches!(k.kind, Kind::Fp4Act { .. } | Kind::QuantFp4))
+    kernels.iter().any(|k| matches!(k.kind, Kind::Fp4Act { .. } | Kind::QuantFp4 | Kind::Swap { wf: WeightFormat::Fp4, .. }))
+}
+
+fn swap_of(k: &KernelInstance) -> Option<WeightFormat> {
+    match k.kind {
+        Kind::Swap { wf, .. } => Some(wf),
+        _ => None,
+    }
 }
 
 pub fn gemm_library(kernels: &[KernelInstance]) -> String {
@@ -68,6 +76,15 @@ pub fn gemm_library(kernels: &[KernelInstance]) -> String {
     }
     if any(&|k| matches!(k.kind, Kind::HeadNormFp4 { .. })) {
         push(&fp4_head::body());
+    }
+    if any(&|k| swap_of(k).is_some()) {
+        push(&format!("constexpr int SWP_KC = {BATCH_KC};\n{}", swap::common()));
+    }
+    if any(&|k| swap_of(k) == Some(WeightFormat::Fp4)) {
+        push(&swap::fp4());
+    }
+    if any(&|k| swap_of(k) == Some(WeightFormat::Fp8)) {
+        push(&swap::fp8());
     }
     out
 }
@@ -116,6 +133,28 @@ pub fn emit_gemm(k: &KernelInstance) -> Result<String, GemmError> {
             wm = tile.wm,
             wn = tile.wn,
             epi = shape.epi.cuda(),
+        ),
+        Kind::Swap { shape, wf: WeightFormat::Fp4, swap, .. } => format!(
+            "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const unsigned char* s, const unsigned char* xq, const unsigned char* xs, float* out, bf16_t* oh, bf16_t* ol, float* part, int tokens, int splits) {{\n    swap_f4<{n}, {kk}, {epi}, {nt}, {warps}, {mj}, {d}>(w, s, xq, xs, out, oh, ol, part, tokens, splits);\n}}\n\n",
+            n = shape.n,
+            kk = shape.k,
+            epi = shape.epi.cuda(),
+            nt = swap.nt(),
+            warps = swap.warps,
+            mj = swap.mj,
+            d = swap.depth,
+        ),
+        Kind::Swap { shape, scale, swap, .. } => format!(
+            "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const float* s, const float* b, const unsigned char* xq, const float* xs, float* out, bf16_t* oh, bf16_t* ol, float* part, int tokens, int splits) {{\n    swap_f8<{n}, {kk}, {epi}, {bias}, {per_token}, {nt}, {warps}, {mj}, {d}>(w, s, b, xq, xs, out, oh, ol, part, tokens, splits);\n}}\n\n",
+            n = shape.n,
+            kk = shape.k,
+            epi = shape.epi.cuda(),
+            bias = shape.bias,
+            per_token = scale == Some(Fp8Scale::Channel),
+            nt = swap.nt(),
+            warps = swap.warps,
+            mj = swap.mj,
+            d = swap.depth,
         ),
         Kind::Batch { shape, wf: WeightFormat::Fp4, batch, blocks_per_sm } => format!(
             "extern \"C\" __global__ void __launch_bounds__({threads}, {blocks_per_sm}) {name}(const void* w, const unsigned char* s, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, float* part, int tokens, int splits) {{\n    gemv_f4b<{n}, {kk}, {epi}, {nt}, {warps}, {stages}, {mj}>(w, s, xh, xl, out, oh, ol, part, tokens, splits);\n}}\n\n",

@@ -13,6 +13,11 @@ pub const F4A_SKINNY_STAGES: usize = 3;
 pub const FP8_ACT_STAGES: usize = 2;
 pub const BATCH_KC: usize = 128;
 pub const BATCH_VARIANTS: [usize; 4] = [8, 16, 32, 64];
+pub const SWAP_VARIANTS: [usize; 6] = [8, 16, 24, 32, 48, 64];
+const SWAP_WARPS: usize = 4;
+const SWAP_DEPTH: usize = 2;
+const SWAP_WIDE_TILES: usize = 4;
+const SWAP_MIN_CHUNKS: usize = 4;
 pub const BATCH_MAX_TOKENS: usize = 64;
 pub const BATCH_REDUCE_BLOCK: usize = 256;
 pub const BATCH_LINEARS: [&str; 6] = ["qkv", "o", "gate_up", "down", "lin_in", "lin_out"];
@@ -343,7 +348,43 @@ impl BatchShape {
 }
 
 pub fn batch_part_len(t: &Target, n: usize, k: usize) -> usize {
-    BATCH_VARIANTS.iter().map(|&v| BatchShape::for_tokens(v)).map(|s| s.splits(t, n, k) * n * s.tokens).max().unwrap_or(0)
+    let batch = BATCH_VARIANTS.iter().map(|&v| BatchShape::for_tokens(v)).map(|s| s.splits(t, n, k) * n * s.tokens);
+    let swap = SWAP_VARIANTS.iter().map(|&v| SwapShape::for_tokens(v)).map(|s| s.splits(t, n, k) * n * s.tokens);
+    batch.chain(swap).max().unwrap_or(0)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SwapShape {
+    pub tokens: usize,
+    pub warps: usize,
+    pub mj: usize,
+    pub depth: usize,
+}
+
+impl SwapShape {
+    pub fn for_tokens(tokens: usize) -> SwapShape {
+        let tokens = SWAP_VARIANTS.iter().copied().find(|&v| v >= tokens).unwrap_or(BATCH_MAX_TOKENS);
+        let mj = if tokens / 8 > SWAP_WIDE_TILES { 1 } else { 2 };
+        SwapShape { tokens, warps: SWAP_WARPS, mj, depth: SWAP_DEPTH }
+    }
+
+    pub fn nt(&self) -> usize {
+        self.tokens / 8
+    }
+
+    pub fn rows(&self) -> usize {
+        self.warps * self.mj * 16
+    }
+
+    pub fn threads(&self) -> u32 {
+        (self.warps * 32) as u32
+    }
+
+    pub fn splits(&self, t: &Target, n: usize, k: usize) -> usize {
+        let blocks = n.div_ceil(self.rows());
+        let most = (k / BATCH_KC / SWAP_MIN_CHUNKS).max(1);
+        (1..=most).find(|&s| blocks * s >= t.sm_count as usize).unwrap_or(most)
+    }
 }
 
 pub fn ggml_part_len(t: &Target, n: usize, k: usize) -> usize {
@@ -374,6 +415,7 @@ pub enum Kind {
     Fp8Act { shape: GemmShape, tile: Tile, stages: usize, scale: Fp8Scale },
     Fp4Act { shape: GemmShape, tile: Tile, stages: usize },
     Batch { shape: GemmShape, wf: WeightFormat, batch: BatchShape, blocks_per_sm: usize },
+    Swap { shape: GemmShape, wf: WeightFormat, scale: Option<Fp8Scale>, swap: SwapShape },
     GgmlBatch { shape: GemmShape, batch: BatchShape, blocks_per_sm: usize, split: bool },
     GgmlGemv { shape: GemmShape, split: bool },
     BatchReduce { shape: GemmShape, wf: WeightFormat },
@@ -391,6 +433,7 @@ impl Kind {
             Kind::Fp8Act { .. } => "Fp8ActMma",
             Kind::Fp4Act { .. } => "BlockScaledFp4Mma",
             Kind::Batch { .. } => "BatchRowsMma",
+            Kind::Swap { .. } => "SwapRowsMma",
             Kind::GgmlBatch { .. } => "GgmlBatchRowsMma",
             Kind::GgmlGemv { .. } => "GgmlGemv",
             Kind::BatchReduce { .. } => "BatchReduce",
@@ -407,6 +450,8 @@ impl Kind {
             Kind::Tile { main: Mainloop::DequantF16 { .. }, .. } => &[Feature::ShaderF16],
             Kind::Fp8Act { .. } => &[Feature::Fp8Mma, Feature::CpAsync],
             Kind::Fp4Act { .. } => &[Feature::BlockScaledFp4, Feature::CpAsync],
+            Kind::Swap { wf: WeightFormat::Fp4, .. } => &[Feature::BlockScaledFp4, Feature::WarpShuffle],
+            Kind::Swap { .. } => &[Feature::Fp8Mma],
             Kind::QuantFp8 { .. } => &[Feature::Fp8Mma],
             Kind::QuantFp4 => &[Feature::BlockScaledFp4],
             Kind::BatchReduce { .. } => &[],
@@ -498,6 +543,19 @@ impl KernelInstance {
         let batch = BatchShape::for_tokens(tokens);
         let kind = Kind::Batch { shape, wf, batch, blocks_per_sm: batch.blocks_per_sm(t) };
         KernelInstance::build(t, name.to_string(), kind, batch.threads(), batch.smem())
+    }
+
+    pub fn swap(t: &Target, name: &str, shape: GemmShape, wf: WeightFormat, scale: Option<Fp8Scale>, tokens: usize) -> Result<KernelInstance, GemmError> {
+        let swap = SwapShape::for_tokens(tokens);
+        let scale = if wf == WeightFormat::Fp8 { Some(scale.unwrap_or(Fp8Scale::Block)) } else { None };
+        KernelInstance::build(t, name.to_string(), Kind::Swap { shape, wf, scale, swap }, swap.threads(), 0)
+    }
+
+    pub fn swap_shape(&self) -> Option<SwapShape> {
+        match self.kind {
+            Kind::Swap { swap, .. } => Some(swap),
+            _ => None,
+        }
     }
 
     pub fn ggml_batch(t: &Target, name: &str, shape: GemmShape, tokens: usize, split: bool) -> Result<KernelInstance, GemmError> {
@@ -633,6 +691,15 @@ impl KernelInstance {
                 }
             }
             Kind::GgmlBatch { shape, .. } => check_shape(shape, BATCH_KC)?,
+            Kind::Swap { shape, wf, .. } => {
+                if !matches!(wf, WeightFormat::Fp4 | WeightFormat::Fp8) {
+                    return bad(format!("swapped rows have no {} decoder", wf.label()));
+                }
+                check_shape(shape, BATCH_KC)?;
+                if !shape.n.is_multiple_of(16) {
+                    return bad("swapped rows need n a multiple of 16".into());
+                }
+            }
             Kind::GgmlGemv { shape, .. } => {
                 check_shape(shape, GGML_SUPER_BLOCK)?;
                 if shape.k > GGML_GEMV_MAX_K || !shape.n.is_multiple_of(ggml_gemv_rows(shape.n)) {
@@ -685,6 +752,8 @@ pub enum GemmPath {
     F8a,
     F8b,
     F4b,
+    F8s,
+    F4s,
     Ggr,
     Ggv,
     Rows,
@@ -734,6 +803,8 @@ fn decoder_for(path: GemmPath, weight: WeightFormat) -> &'static str {
         GemmPath::F4a => "nvfp4 x nvfp4 act",
         GemmPath::F8b => "fp8 batch rows",
         GemmPath::F4b => "nvfp4 batch rows",
+        GemmPath::F8s => "fp8 x fp8 act swapped rows",
+        GemmPath::F4s => "nvfp4 x nvfp4 act swapped rows",
         GemmPath::Ggr => "ggml batch rows",
         GemmPath::Ggv => "ggml gemv",
         GemmPath::Rows => "bf16 one block per row",
@@ -802,6 +873,24 @@ fn batch_choice(t: &Target, r: &Request, rows: usize, tile: Tile) -> Result<Choi
     Ok(Choice { reduce: Some(format!("{}_{stem}_reduce", r.linear)), ..plain(r, name, path, tile, Some(k)) })
 }
 
+pub fn swap_suffix(tokens: usize) -> usize {
+    SwapShape::for_tokens(tokens).tokens
+}
+
+fn swap_choice(t: &Target, policy: &Policy, r: &Request, rows: usize) -> Result<Choice, GemmError> {
+    let fp4 = r.weight == WeightFormat::Fp4;
+    let (stem, path, reduce) = if fp4 { ("f4s", GemmPath::F4s, "f4b") } else { ("f8s", GemmPath::F8s, "f8b") };
+    let scale = policy.fp8_weights.unwrap_or(Fp8Scale::Block);
+    let name = format!("{}_{stem}{}", r.linear, swap_suffix(rows));
+    let k = KernelInstance::swap(t, &name, r.shape, r.weight, (!fp4).then_some(scale), rows)?;
+    let quant = match (fp4, scale) {
+        (true, _) => "quant_rows_fp4",
+        (false, Fp8Scale::Block) => "quant_rows_fp8",
+        (false, Fp8Scale::Channel) => "quant_rows_fp8_token",
+    };
+    Ok(Choice { quant: Some(quant), reduce: Some(format!("{}_{reduce}_reduce", r.linear)), ..plain(r, name, path, Tile::TINY, Some(k)) })
+}
+
 fn weight_tile_choice(t: &Target, policy: &Policy, r: &Request, variant: Variant) -> Result<Choice, GemmError> {
     let tuning = &policy.tuning;
     let suffix = variant.suffix();
@@ -831,6 +920,14 @@ pub fn candidates(t: &Target, policy: &Policy, r: &Request) -> Vec<Choice> {
         WeightFormat::Fp4 if fp4_act && FP4_ACT_LINEARS.contains(&r.linear) => out.extend(Variant::FP4_ACT.into_iter().filter_map(|v| fp4_act_choice(t, policy, r, v).ok())),
         _ => {}
     }
+    let swap = match r.weight {
+        WeightFormat::Fp8 => fp8_act,
+        WeightFormat::Fp4 => fp4_act && FP4_ACT_LINEARS.contains(&r.linear),
+        _ => false,
+    };
+    if swap && r.tokens <= BATCH_MAX_TOKENS {
+        out.extend(SWAP_VARIANTS.into_iter().filter(|&v| v >= r.tokens).filter_map(|v| swap_choice(t, policy, r, v).ok()));
+    }
     let batch = r.tokens <= BATCH_MAX_TOKENS && (r.weight == WeightFormat::Fp4 || BATCH_LINEARS.contains(&r.linear));
     if batch {
         out.extend(BATCH_VARIANTS.into_iter().filter(|&v| v >= r.tokens).filter_map(|v| batch_choice(t, r, v, Tile::TINY).ok()));
@@ -849,12 +946,22 @@ pub fn tuned(t: &Target, policy: &Policy, r: &Request) -> bool {
 }
 
 pub fn act_rows(tokens: usize) -> bool {
-    tokens > BATCH_VARIANTS[0]
+    tokens > 1
 }
 
 pub fn eligible(t: &Target, policy: &Policy, r: &Request) -> Vec<Choice> {
     let act = act_rows(r.tokens);
-    candidates(t, policy, r).into_iter().filter(|c| act || !matches!(c.path, GemmPath::F8a | GemmPath::F4a)).collect()
+    candidates(t, policy, r).into_iter().filter(|c| act || !c.path.quantises()).collect()
+}
+
+impl GemmPath {
+    pub fn quantises(self) -> bool {
+        matches!(self, GemmPath::F8a | GemmPath::F4a | GemmPath::F8s | GemmPath::F4s)
+    }
+
+    pub fn swapped(self) -> bool {
+        matches!(self, GemmPath::F8s | GemmPath::F4s)
+    }
 }
 
 pub fn tune_bucket(tokens: usize) -> Option<usize> {
@@ -865,20 +972,26 @@ const BATCH_WORK_EXP: f64 = 0.3;
 const ACT_WIDE_WORK: f64 = 0.3;
 const TILE_MMA_WORK: f64 = 4.0;
 const TINY_MMA_WORK: f64 = 1.5;
+const SWAP_BASE_WORK: f64 = 0.9;
+const SWAP_TILE_WORK: f64 = 0.03;
 
 pub fn estimate(t: &Target, policy: &Policy, c: &Choice, tokens: usize) -> f64 {
     let Some(k) = c.kernel.as_ref() else { return f64::INFINITY };
     let shape = match k.kind {
-        Kind::Tile { shape, .. } | Kind::Fp8Act { shape, .. } | Kind::Fp4Act { shape, .. } | Kind::Batch { shape, .. } => shape,
+        Kind::Tile { shape, .. } | Kind::Fp8Act { shape, .. } | Kind::Fp4Act { shape, .. } | Kind::Batch { shape, .. } | Kind::Swap { shape, .. } => shape,
         _ => return f64::INFINITY,
     };
-    let weight = if matches!(c.path, GemmPath::F4a | GemmPath::F4b | GemmPath::F4w) { WeightFormat::Fp4 } else { WeightFormat::Fp8 };
+    let weight = if matches!(c.path, GemmPath::F4a | GemmPath::F4b | GemmPath::F4w | GemmPath::F4s) { WeightFormat::Fp4 } else { WeightFormat::Fp8 };
     let (n, sms) = (shape.n, t.sm_count.max(1) as usize);
     let bytes = (n * shape.k) as f64 * weight.bytes_per_weight();
     let (blocks, per_sm, work, launches) = match k.kind {
         Kind::Batch { batch, blocks_per_sm, .. } => {
             let splits = batch.splits(t, n, shape.k);
             (n.div_ceil(batch.rows()) * splits, blocks_per_sm, (batch.tokens as f64 / BATCH_VARIANTS[0] as f64).powf(BATCH_WORK_EXP), 1 + (splits > 1) as usize)
+        }
+        Kind::Swap { swap, .. } => {
+            let splits = swap.splits(t, n, shape.k);
+            (n.div_ceil(swap.rows()) * splits, MAX_BLOCKS_PER_SM, SWAP_BASE_WORK + SWAP_TILE_WORK * (swap.nt() - 1) as f64, 2 + (splits > 1) as usize)
         }
         _ => {
             let tile = c.tile;

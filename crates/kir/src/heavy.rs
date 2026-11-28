@@ -25,6 +25,7 @@ pub enum Family {
     Fp8Act { scale: Fp8Scale },
     Fp4Act { stages: usize },
     Batch { wf: WeightFormat, tokens: usize },
+    Swap { wf: WeightFormat, scale: Option<Fp8Scale>, tokens: usize },
     GgmlBatch { tokens: usize, split: bool },
     GgmlGemv { split: bool },
     BatchReduce { wf: WeightFormat },
@@ -209,7 +210,7 @@ fn rename(s: Stage, from: &str, to: &str) -> Result<Stage, String> {
 
 fn shape_of(k: &KernelInstance) -> Option<GemmShape> {
     match k.kind {
-        Kind::Tile { shape, .. } | Kind::Fp8Act { shape, .. } | Kind::Fp4Act { shape, .. } | Kind::Batch { shape, .. } | Kind::GgmlBatch { shape, .. } | Kind::GgmlGemv { shape, .. } | Kind::BatchReduce { shape, .. } => Some(shape),
+        Kind::Tile { shape, .. } | Kind::Fp8Act { shape, .. } | Kind::Fp4Act { shape, .. } | Kind::Batch { shape, .. } | Kind::Swap { shape, .. } | Kind::GgmlBatch { shape, .. } | Kind::GgmlGemv { shape, .. } | Kind::BatchReduce { shape, .. } => Some(shape),
         Kind::QuantFp8 { .. } | Kind::QuantFp4 | Kind::Gemv { .. } | Kind::HeadNormFp4 { .. } => None,
     }
 }
@@ -300,6 +301,7 @@ impl Heavy {
             Kind::Fp8Act { tile, scale, .. } => (Family::Fp8Act { scale }, Some(tile)),
             Kind::Fp4Act { tile, stages, .. } => (Family::Fp4Act { stages }, Some(tile)),
             Kind::Batch { wf, batch, .. } => (Family::Batch { wf, tokens: batch.tokens }, None),
+            Kind::Swap { wf, scale, swap, .. } => (Family::Swap { wf, scale, tokens: swap.tokens }, None),
             Kind::GgmlBatch { batch, split, .. } => (Family::GgmlBatch { tokens: batch.tokens, split }, None),
             Kind::GgmlGemv { split, .. } => (Family::GgmlGemv { split }, None),
             Kind::BatchReduce { wf, .. } => (Family::BatchReduce { wf }, None),
@@ -318,6 +320,7 @@ impl Heavy {
             Family::Fp8Act { scale } => KernelInstance::fp8_act(t, name, shape, tile()?, scale),
             Family::Fp4Act { stages } => KernelInstance::fp4_act(t, name, shape, tile()?, &Tuning { fp4_stages: Some(stages), ..Tuning::default() }),
             Family::Batch { wf, tokens } => KernelInstance::batch(t, name, shape, wf, tokens),
+            Family::Swap { wf, scale, tokens } => KernelInstance::swap(t, name, shape, wf, scale, tokens),
             Family::GgmlBatch { tokens, split } => KernelInstance::ggml_batch(t, name, shape, tokens, split),
             Family::GgmlGemv { split } => KernelInstance::ggml_gemv(t, name, shape, split),
             Family::BatchReduce { wf } => KernelInstance::batch_reduce(t, name, shape, wf),
@@ -342,6 +345,7 @@ impl Heavy {
     fn rows_and_acc(&self, k: &KernelInstance) -> (usize, usize) {
         match k.kind {
             Kind::Batch { batch, .. } | Kind::GgmlBatch { batch, .. } => (batch.tokens, batch.tokens * batch.rows()),
+            Kind::Swap { swap, .. } => (swap.tokens, swap.tokens * swap.rows() * swap.depth),
             Kind::GgmlGemv { shape, .. } => (1, k.threads as usize / 32 * ggml_gemv_rows(shape.n)),
             Kind::BatchReduce { .. } => (1, k.threads as usize),
             _ => self.tile.or(k.tile()).map_or((1, k.threads as usize), |t| (t.bm, t.bm * t.bn)),

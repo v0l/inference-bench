@@ -165,6 +165,48 @@ fn launch_choice(g: &Gpu, spec: &Spec, c: &KernelChoice, w: &Weights, d: &Bufs, 
             b.arg(packed).arg(scales).arg(&d.q).arg(&d.qs4).arg(&d.out).arg(&d.oh).arg(&d.ol).arg(&tokens_i);
             unsafe { b.launch(cfg((n.div_ceil(c.tile.bn) as u32, tokens.div_ceil(c.tile.bm) as u32), c.tile.threads(), smem)) }.unwrap();
         }
+        GemmPath::F8s | GemmPath::F4s => {
+            let shape = c.kernel.as_ref().unwrap().swap_shape().unwrap();
+            let fp4 = c.path == GemmPath::F4s;
+            let quant = g.func(c.quant.unwrap(), 0);
+            let width = k as i32;
+            let mut b = s.launch_builder(&quant);
+            if fp4 {
+                let Weights::Fp4 { scales, .. } = w else { unreachable!() };
+                b.arg(&d.hi).arg(&d.lo).arg(scales).arg(&d.q).arg(&d.qs4).arg(&width);
+                unsafe { b.launch(cfg(((k / FP4_GROUP).div_ceil(128) as u32, tokens as u32), 128, 0)) }.unwrap();
+            } else {
+                b.arg(&d.hi).arg(&d.lo).arg(&d.q).arg(&d.qscale).arg(&width);
+                let qc = if spec.quant == Quant::Fp8Channel { cfg((tokens as u32, 1), 256, 0) } else { cfg(((k / FP8_BLOCK) as u32, tokens as u32), (FP8_BLOCK / 2) as u32, 0) };
+                unsafe { b.launch(qc) }.unwrap();
+            }
+            let splits = shape.splits(&g.target, n, k);
+            let splits_i = splits as i32;
+            let f = g.func(&c.name, 0);
+            let mut b = s.launch_builder(&f);
+            weight_args(&mut b, w);
+            if !fp4 {
+                b.arg(&d.dummy);
+            }
+            b.arg(&d.q);
+            if fp4 {
+                b.arg(&d.qs4);
+            } else {
+                b.arg(&d.qscale);
+            }
+            b.arg(&d.out).arg(&d.oh).arg(&d.ol).arg(&d.part).arg(&tokens_i).arg(&splits_i);
+            unsafe { b.launch(cfg((n.div_ceil(shape.rows()) as u32, splits as u32), shape.threads(), 0)) }.unwrap();
+            if splits > 1 {
+                let reduce = g.func(c.reduce.as_ref().unwrap(), 0);
+                let mut b = s.launch_builder(&reduce);
+                b.arg(&d.part);
+                if !fp4 {
+                    b.arg(&d.dummy);
+                }
+                b.arg(&d.out).arg(&d.oh).arg(&d.ol).arg(&tokens_i).arg(&splits_i);
+                unsafe { b.launch(cfg(((tokens * n).div_ceil(BATCH_REDUCE_BLOCK) as u32, 1), BATCH_REDUCE_BLOCK as u32, 0)) }.unwrap();
+            }
+        }
         GemmPath::F8b | GemmPath::F4b => {
             let shape = c.kernel.as_ref().unwrap().batch_shape().unwrap();
             let splits = shape.splits(&g.target, n, k);

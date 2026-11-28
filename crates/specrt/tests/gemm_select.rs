@@ -88,15 +88,14 @@ fn exact_specs_never_select_an_act_quant_path() {
 }
 
 #[test]
-fn single_row_batches_stay_weight_only_on_act_quant_specs() {
+fn single_row_decode_stays_weight_only_on_act_quant_specs() {
     let t = kir::Target::sm_120();
     for (model, _, spec) in specs().into_iter().filter(|s| s.1 == "act") {
         for linear in LINEARS {
             for kind in kinds(&spec, linear) {
-                for n in 1..=8 {
-                    let c = specrt::gemm::select(&spec, &t, linear, n, kind).unwrap();
-                    assert!(c.quant.is_none(), "{model} {linear} {n} rows took {}", c.name);
-                }
+                let c = specrt::gemm::select(&spec, &t, linear, 1, kind).unwrap();
+                assert!(c.quant.is_none(), "{model} {linear} 1 row took {}", c.name);
+                assert!(specrt::gemm::eligible(&spec, &t, linear, 1, kind, true).iter().all(|c| c.quant.is_none()), "{model} {linear}");
             }
         }
     }

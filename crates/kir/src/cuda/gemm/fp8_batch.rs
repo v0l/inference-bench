@@ -2,7 +2,8 @@ use super::prim;
 
 pub fn body() -> String {
     [
-        prim::batch_helpers("f8b"),
+        prim::batch_helpers("f8b", prim::L2_PREFETCH_128),
+        prim::bf16x2_decode("f8b"),
         r##"
 __device__ __forceinline__ unsigned f8b_word(const uint4& a, const uint4& b, int i) {
     const uint4& q = i < 4 ? a : b;
@@ -77,10 +78,10 @@ __device__ __forceinline__ void gemv_f8b(const void* w, const float* scales, con
             for (int i = 0; i < MJ; i++) {
                 unsigned w0 = f8b_word(q[i][0][0], q[i][0][1], k);
                 unsigned w1 = f8b_word(q[i][1][0], q[i][1][1], k);
-                unsigned a0 = e4m3_pair_bf16(w0 & 0xffffu);
-                unsigned a1 = e4m3_pair_bf16(w1 & 0xffffu);
-                unsigned a2 = e4m3_pair_bf16(w0 >> 16);
-                unsigned a3 = e4m3_pair_bf16(w1 >> 16);
+                unsigned a0 = f8b_e4m3x2_bf16(w0 & 0xffffu);
+                unsigned a1 = f8b_e4m3x2_bf16(w1 & 0xffffu);
+                unsigned a2 = f8b_e4m3x2_bf16(w0 >> 16);
+                unsigned a3 = f8b_e4m3x2_bf16(w1 >> 16);
 #pragma unroll
                 for (int n = 0; n < NT; n++) {
                     mma_bf16(c[i][n], a0, a1, a2, a3, bl[n].x, bl[n].y);
