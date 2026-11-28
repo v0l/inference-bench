@@ -241,13 +241,23 @@ pub fn for_stride(var: &str, init: &str, bound: &str, step: &str, body: &str) ->
     }
 }
 
-pub fn warp_tiles(rows: &str, cols: &str, body: &str) -> String {
-    let head = format!(
-        "for (int tile = warp; tile < ({rows} / 16) * ({cols} / 8); tile += WARPS) {{
-    int m0 = (tile / ({cols} / 8)) * 16;
-    int n0 = (tile % ({cols} / 8)) * 8;
-"
-    );
+pub fn lower_tiles(body: &str) -> String {
+    let head = "for (int idx = warp; idx < (C / 16) * (C / 16 + 1); idx += WARPS) {
+    int mb = 0;
+    while ((mb + 1) * (mb + 2) <= idx) mb++;
+    int m0 = mb * 16;
+    int n0 = (idx - mb * (mb + 1)) * 8;
+";
+    format!("{head}{}}}\n", at(4, body))
+}
+
+pub fn upper_tiles(body: &str) -> String {
+    let head = "for (int idx = warp; idx < (C / 16) * (C / 8) - (C / 16) * (C / 16 + 1); idx += WARPS) {
+    int mb = 0;
+    while ((mb + 1) * (C / 8) - (mb + 1) * (mb + 2) <= idx) mb++;
+    int m0 = mb * 16;
+    int n0 = (2 * mb + 2 + idx - (mb * (C / 8) - mb * (mb + 1))) * 8;
+";
     format!("{head}{}}}\n", at(4, body))
 }
 

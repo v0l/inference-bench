@@ -1,4 +1,4 @@
-use super::prim::{at, for_stride, kernel, tri_leaf, tri_merge, warp_tiles};
+use super::prim::{at, for_stride, kernel, lower_tiles, tri_leaf, tri_merge, upper_tiles};
 
 const HEADER: &str = r##"extern "C" __global__ void __launch_bounds__(256, 2) gdn_chunk_prep(const float* qn, const float* kn, const float* mix,
                                                                  const float* g, const float* beta, float* w,
@@ -42,7 +42,7 @@ auto k_col = [&](int k, int n) { return ks[n * LA_KS + k]; };
 "##;
 
 const KK: &str = r##"float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-if (n0 <= m0 + 15) mma_split_tile<LA_D / 16, LA_LO>(acc, m0, n0, lane, k_row, k_col);
+mma_split_tile<LA_D / 16, LA_LO>(acc, m0, n0, lane, k_row, k_col);
 #pragma unroll
 for (int e = 0; e < 4; e++) {
     int i = m0 + g8 + (e >> 1) * 8;
@@ -51,16 +51,18 @@ for (int e = 0; e < 4; e++) {
 }
 "##;
 
+const KK_UPPER: &str = r##"#pragma unroll
+for (int e = 0; e < 4; e++) A[(m0 + g8 + (e >> 1) * 8) * LA_AS + n0 + 2 * t4 + (e & 1)] = 0.0f;
+"##;
+
 const QK_SETUP: &str = r##"const float* qc = qn + ((size_t)t0 * LA_KH + kh) * LA_D;
 float* ac = aqk + (size_t)(c * LA_VH + h) * C * C;
 int live = min(C, tokens - t0);
 "##;
 
 const QK: &str = r##"float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-if (n0 <= m0 + 15)
-    mma_split_tile<LA_D / 16, LA_LO>(
-        acc, m0, n0, lane, [&](int m, int k) { return m < live ? qc[(size_t)m * LA_KH * LA_D + k] : 0.0f; },
-        k_col);
+mma_split_tile<LA_D / 16, LA_LO>(
+    acc, m0, n0, lane, [&](int m, int k) { return m < live ? qc[(size_t)m * LA_KH * LA_D + k] : 0.0f; }, k_col);
 #pragma unroll
 for (int e = 0; e < 4; e += 2) {
     int i = m0 + g8 + (e >> 1) * 8;
@@ -69,6 +71,10 @@ for (int e = 0; e < 4; e += 2) {
     float v1 = j + 1 <= i && i < live ? acc[e + 1] * expf(gs[i] - gs[j + 1]) : 0.0f;
     gdn_frag_put<C / 16, LA_LO>((unsigned*)ac, i, j, v0, v1);
 }
+"##;
+
+const QK_UPPER: &str = r##"#pragma unroll
+for (int e = 0; e < 4; e += 2) gdn_frag_put<C / 16, LA_LO>((unsigned*)ac, m0 + g8 + (e >> 1) * 8, n0 + 2 * t4, 0.0f, 0.0f);
 "##;
 
 const UNIT_DIAGONAL: &str = r##"if (tid < C) A[tid * LA_AS + tid] = 1.0f;
@@ -156,9 +162,11 @@ pub fn body() -> String {
     let mut o = String::from(SETUP);
     o += &for_stride("i", "tid", "C * LA_D", "blockDim.x", LOAD_K);
     o += CUMSUM;
-    o += &warp_tiles("C", "C", KK);
+    o += &lower_tiles(KK);
+    o += &upper_tiles(KK_UPPER);
     o += QK_SETUP;
-    o += &warp_tiles("C", "C", QK);
+    o += &lower_tiles(QK);
+    o += &upper_tiles(QK_UPPER);
     o += "__syncthreads();\n";
     o += &tri_leaf(0);
     o += &tri_merge(0);
