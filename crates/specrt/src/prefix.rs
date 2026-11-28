@@ -378,6 +378,14 @@ impl PrefixCache {
         self.find(hashes, Some((root, tokens)), max_tokens, pool)
     }
 
+    pub fn peek(&self, root: &Hash, tokens: &[u32], hashes: &[Hash], max_tokens: usize) -> usize {
+        let limit = hashes.len().min(max_tokens / PAGE);
+        let run = hashes[..limit].iter().take_while(|h| self.entries.contains_key(*h)).count();
+        let depth = if self.hybrid { (0..run).rev().find(|&i| self.states.contains_key(&hashes[i])).map_or(0, |i| i + 1) } else { run };
+        let tail = self.best_tail(root, tokens, hashes, run, max_tokens).map_or(0, |(n, _)| n);
+        tail.max(depth * PAGE)
+    }
+
     fn best_tail(&self, root: &Hash, tokens: &[u32], hashes: &[Hash], run: usize, max_tokens: usize) -> Option<(usize, Hash)> {
         for t in (0..=run).rev() {
             let parent = if t == 0 { root } else { &hashes[t - 1] };
