@@ -229,6 +229,7 @@ impl Runtime {
         let live = rows.len();
         ensure!(live >= 1 && live <= self.slots && pad_to >= live && pad_to < st.bb.tokens.len(), "{live} rows padded to {pad_to} for {} slots", self.slots);
         ensure!(rows.iter().all(|r| r.slot < self.slots && r.pos < self.max_ctx), "decode row out of range");
+        self.settle(rows.iter().map(|r| r.slot))?;
         let n = pad_to;
         let pad = DecodeRow { slot: self.slots, token: 0, pos: 0, sampling: Sampling::GREEDY, step: 0 };
         let padded: Vec<DecodeRow> = rows.iter().copied().chain(std::iter::repeat(pad)).take(n).collect();
@@ -288,6 +289,7 @@ impl Runtime {
         let live = rows.len();
         ensure!(live >= 1 && live <= self.slots, "{live} decode rows for {} slots", self.slots);
         ensure!(rows.iter().all(|r| r.slot < self.slots && r.pos < self.max_ctx), "decode row out of range");
+        self.settle(rows.iter().map(|r| r.slot))?;
         let n = st.rows_for(live);
         let pad = DecodeRow { slot: self.slots, token: 0, pos: 0, sampling: Sampling::GREEDY, step: 0 };
         let padded: Vec<DecodeRow> = rows.iter().copied().chain(std::iter::repeat(pad)).take(n).collect();

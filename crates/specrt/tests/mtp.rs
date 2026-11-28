@@ -628,6 +628,76 @@ fn eager_speculation_matches_plain_greedy_alone_and_in_a_batch() {
 
 #[test]
 #[ignore = "needs a CUDA GPU"]
+fn a_snapshot_taken_right_after_a_speculative_round_holds_the_committed_state() {
+    let s = spec(2);
+    let ps: Vec<Vec<u32>> = prompts().into_iter().take(4).collect();
+    let want = plain_greedy(&s, &ps);
+    for blocking in [true, false] {
+        let mut rt = Runtime::load_layout(&s, layout(1)).unwrap();
+        tables(&mut rt, 1);
+        let mut st = rt.stepper().unwrap();
+        for (i, (p, w)) in ps.iter().zip(&want).enumerate() {
+            let mut out = vec![rt.prefill_slot(&mut st, 0, p, 0, Some((Sampling::GREEDY, 0))).unwrap().unwrap()];
+            for _ in 0..3 + i {
+                let row = SpecRow { slot: 0, token: *out.last().unwrap(), pos: p.len() + out.len() - 1, sampling: Sampling::GREEDY, step: out.len() as u32, max_accept: NEW - out.len() - 1 };
+                out.extend(rt.speculate(&[row]).unwrap().remove(0));
+            }
+            let snap = if blocking { rt.snapshot_state_blocking(0).unwrap() } else { rt.snapshot_state(0).unwrap() };
+            let at = out.len();
+            for _ in 0..3 {
+                let row = SpecRow { slot: 0, token: *out.last().unwrap(), pos: p.len() + out.len() - 1, sampling: Sampling::GREEDY, step: out.len() as u32, max_accept: NEW - out.len() - 1 };
+                out.extend(rt.speculate(&[row]).unwrap().remove(0));
+            }
+            out.truncate(at);
+            rt.restore_state(0, &snap).unwrap();
+            while out.len() < NEW {
+                let row = DecodeRow { slot: 0, token: *out.last().unwrap(), pos: p.len() + out.len() - 1, sampling: Sampling::GREEDY, step: out.len() as u32 };
+                out.push(rt.decode(&mut st, &[row]).unwrap()[0]);
+            }
+            check(&format!("prompt {i}, blocking {blocking}"), &[out], std::slice::from_ref(w));
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn plain_decode_after_speculation_in_the_same_slot_matches_plain_greedy() {
+    let s = spec(2);
+    let ps: Vec<Vec<u32>> = prompts().into_iter().take(6).collect();
+    let want = plain_greedy(&s, &ps);
+    let mut rt = Runtime::load_layout(&s, layout(3)).unwrap();
+    tables(&mut rt, 3);
+    let mut st = rt.stepper().unwrap();
+    for (g, (ps, ws)) in ps.chunks(3).zip(want.chunks(3)).enumerate() {
+        let mut out: Vec<Vec<u32>> = ps.iter().enumerate().map(|(i, p)| vec![rt.prefill_slot(&mut st, i, p, 0, Some((Sampling::GREEDY, 0))).unwrap().unwrap()]).collect();
+        let mut round = 0;
+        while out.iter().any(|o| o.len() < NEW) {
+            let live: Vec<usize> = (0..ps.len()).filter(|&i| out[i].len() < NEW).collect();
+            let speculating: Vec<usize> = live.iter().copied().filter(|&i| (round + i) % 3 != 0).collect();
+            let plain: Vec<usize> = live.iter().copied().filter(|i| !speculating.contains(i)).collect();
+            if !speculating.is_empty() {
+                let rows: Vec<SpecRow> = speculating.iter().map(|&i| SpecRow { slot: i, token: *out[i].last().unwrap(), pos: ps[i].len() + out[i].len() - 1, sampling: Sampling::GREEDY, step: out[i].len() as u32, max_accept: NEW - out[i].len() - 1 }).collect();
+                for (&i, e) in speculating.iter().zip(rt.speculate(&rows).unwrap()) {
+                    out[i].extend(e);
+                }
+            }
+            if !plain.is_empty() {
+                let rows: Vec<DecodeRow> = plain.iter().map(|&i| DecodeRow { slot: i, token: *out[i].last().unwrap(), pos: ps[i].len() + out[i].len() - 1, sampling: Sampling::GREEDY, step: out[i].len() as u32 }).collect();
+                for (&i, t) in plain.iter().zip(rt.decode(&mut st, &rows).unwrap()) {
+                    out[i].push(t);
+                }
+            }
+            round += 1;
+        }
+        for o in &mut out {
+            o.truncate(NEW);
+        }
+        check(&format!("group {g}"), &out, ws);
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
 fn a_speculative_round_synchronises_the_stream_at_most_once() {
     let s = spec(2);
     let ps = prompts();

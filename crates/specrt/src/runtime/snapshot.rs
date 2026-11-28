@@ -155,6 +155,7 @@ impl Runtime {
             return self.mixer_snapshot(slot);
         }
         self.ensure_snapshot_slot(slot)?;
+        self.settle([slot])?;
         let (conv, ssm) = self.state_lens()?;
         let gb = self.gdn.as_ref().context("no linear layers")?;
         self.stream.synchronize()?;
@@ -171,6 +172,7 @@ impl Runtime {
             return self.mixer_snapshot(slot);
         }
         self.ensure_snapshot_slot(slot)?;
+        self.settle([slot])?;
         let (conv, ssm) = self.state_lens()?;
         let pending = self.pending_len();
         let total = conv + ssm + pending;
@@ -227,6 +229,7 @@ impl Runtime {
             "snapshot does not match this model's recurrent state"
         );
         self.acquire_state(slot)?;
+        self.forget_deferred(slot)?;
         let gb = self.gdn.as_mut().context("no linear layers")?;
         self.stream.memcpy_htod(snap.conv(), &mut gb.conv_state.slice_mut(slot * conv..(slot + 1) * conv))?;
         self.stream.memcpy_htod(snap.ssm(), &mut gb.ssm_state.slice_mut(slot * ssm..(slot + 1) * ssm))?;

@@ -58,25 +58,26 @@ fn gdn_recurrent_state_kernels_speed_on_27b_shaped_layers() {
         let lin = unit(data(rows * la.in_proj_rows(), 10, 1.0));
         let ba = unit(data(rows * la.ba_rows(), 11, 1.0));
         let out = stream.alloc_zeros::<f32>(rows * la.value_dim()).unwrap();
-        let klog = stream.alloc_zeros::<f32>(layers * rows * la.value_dim()).unwrap();
-        let dlog = stream.alloc_zeros::<f32>(layers * rows * la.value_dim()).unwrap();
-        let glog = stream.alloc_zeros::<f32>(layers * rows * vh).unwrap();
+        let logged = nseq * layers * k1;
+        let klog = stream.alloc_zeros::<f32>(logged * la.value_dim()).unwrap();
+        let dlog = stream.alloc_zeros::<f32>(logged * la.value_dim()).unwrap();
+        let glog = stream.alloc_zeros::<f32>(logged * vh).unwrap();
         let vslots = stream.clone_htod(&(0..rows as i32).map(|r| r / k1 as i32).collect::<Vec<i32>>()).unwrap();
         let sslots = stream.clone_htod(&(0..nseq as i32).collect::<Vec<i32>>()).unwrap();
-        let accepted = stream.clone_htod(&(0..nseq as i32).map(|s| [1, 2, 1, 2, 0][s as usize % 5]).collect::<Vec<i32>>()).unwrap();
-        let (seq_slots, k1_i, log_rows) = (layers as i32, k1 as i32, rows as i32);
-        let run_verify = || {
+        let none = stream.alloc_zeros::<i32>(nseq).unwrap();
+        let pend = stream.clone_htod(&(0..nseq).map(|s| [2, 3, 2, 3, 1][s % 5]).collect::<Vec<i32>>()).unwrap();
+        let (seq_slots, k1_i, log_rows) = (layers as i32, k1 as i32, k1 as i32);
+        let run_verify = |pend: &cudarc::driver::CudaSlice<i32>| {
             for l in 0..layers {
                 let slot = l as i32;
-                let (kl, dl, gl) = (klog.slice(l * rows * la.value_dim()..), dlog.slice(l * rows * la.value_dim()..), glog.slice(l * rows * vh..));
                 let mut b = stream.launch_builder(&verify);
-                b.arg(&mix).arg(&lin).arg(&ba).arg(&neg_a).arg(&dt_bias).arg(&norm_w).arg(&state).arg(&out).arg(&kl).arg(&dl).arg(&gl).arg(&slot).arg(&seq_slots).arg(&vslots).arg(&k1_i);
+                b.arg(&mix).arg(&lin).arg(&ba).arg(&neg_a).arg(&dt_bias).arg(&norm_w).arg(&state).arg(&out).arg(&klog).arg(&dlog).arg(&glog).arg(pend).arg(&slot).arg(&seq_slots).arg(&vslots).arg(&k1_i).arg(&log_rows);
                 unsafe { b.launch(LaunchConfig { grid_dim: (vh as u32, nseq as u32, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 }) }.unwrap();
             }
         };
         let run_commit = || {
             let mut b = stream.launch_builder(&commit);
-            b.arg(&state).arg(&klog).arg(&dlog).arg(&glog).arg(&seq_slots).arg(&vslots).arg(&k1_i).arg(&accepted).arg(&log_rows);
+            b.arg(&state).arg(&klog).arg(&dlog).arg(&glog).arg(&pend).arg(&seq_slots).arg(&vslots).arg(&k1_i).arg(&log_rows);
             unsafe { b.launch(LaunchConfig { grid_dim: (vh as u32, nseq as u32, layers as u32), block_dim: (threads, 1, 1), shared_mem_bytes: 0 }) }.unwrap();
         };
         let run_step = || {
@@ -88,17 +89,18 @@ fn gdn_recurrent_state_kernels_speed_on_27b_shaped_layers() {
             }
         };
         let bytes = (nseq * state_seq * 4) as f64;
-        let v = time_ms(&ctx, &stream, &run_verify);
+        let v = time_ms(&ctx, &stream, &|| run_verify(&none));
+        let f = time_ms(&ctx, &stream, &|| run_verify(&pend));
         let c = time_ms(&ctx, &stream, &run_commit);
         let s = time_ms(&ctx, &stream, &run_step);
         let gbs = |b: f64, ms: f32| b / ms as f64 / 1e6;
         eprintln!(
-            "seqs={nseq}: verify {v:.3} ms ({:.0} GB/s read, {:.0}% of probe); commit {c:.3} ms ({:.0} GB/s, {:.0}% of copy); verify+commit {:.3} ms; step {s:.3} ms ({:.0} GB/s, {:.0}% of copy)",
+            "seqs={nseq}: round (verify with replay and store) {f:.3} ms ({:.0} GB/s, {:.0}% of copy); verify alone {v:.3} ms ({:.0} GB/s read, {:.0}% of probe); flush commit {c:.3} ms ({:.0} GB/s); step {s:.3} ms ({:.0} GB/s, {:.0}% of copy)",
+            gbs(2.0 * bytes, f),
+            100.0 * gbs(2.0 * bytes, f) / wall.copy_gbs,
             gbs(bytes, v),
             100.0 * gbs(bytes, v) / wall.read_gbs,
             gbs(2.0 * bytes, c),
-            100.0 * gbs(2.0 * bytes, c) / wall.copy_gbs,
-            v + c,
             gbs(2.0 * bytes, s),
             100.0 * gbs(2.0 * bytes, s) / wall.copy_gbs,
         );

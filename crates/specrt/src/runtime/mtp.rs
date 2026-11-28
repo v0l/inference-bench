@@ -147,6 +147,10 @@ pub(super) struct MtpState {
     dlog: CudaSlice<f32>,
     glog: CudaSlice<f32>,
     clog: CudaSlice<f32>,
+    pend: CudaSlice<i32>,
+    settling: CudaSlice<i32>,
+    log_rows: usize,
+    deferred: Vec<Cell<bool>>,
     drafted: Vec<usize>,
     graphs: HashMap<(usize, usize), CudaGraph>,
     capture_secs: Vec<(usize, f64)>,
@@ -208,6 +212,7 @@ impl MtpState {
         let parts = vb_rows * s.attention.heads * crate::codegen::decode_splits(rt.max_ctx);
         let layers = s.linear_layers();
         let (vd, value_heads, conv_dim) = s.linear_attention.as_ref().map_or((0, 0, 0), |la| (la.value_heads * la.key_head_dim, la.value_heads, la.conv_dim()));
+        let logged = (rt.slots + 1) * layers * k1;
         let z = |n: usize| stream.alloc_zeros::<f32>(n.max(1));
         let zi = |n: usize| stream.alloc_zeros::<i32>(n.max(1));
         Ok(MtpState {
@@ -242,10 +247,14 @@ impl MtpState {
             didx: zi(vb_rows)?,
             rin: zi(10 * acap)?,
             res: zi(rows + acap)?,
-            klog: z(layers * rows * vd)?,
-            dlog: z(layers * rows * vd)?,
-            glog: z(layers * rows * value_heads)?,
+            klog: z(logged * vd)?,
+            dlog: z(logged * vd)?,
+            glog: z(logged * value_heads)?,
             clog: z(layers * rows * conv_dim)?,
+            pend: zi(rt.slots + 1)?,
+            settling: zi(rt.slots + 1)?,
+            log_rows: k1,
+            deferred: (0..=rt.slots).map(|_| Cell::new(false)).collect(),
             drafted: vec![0; rt.slots + 1],
             graphs: HashMap::new(),
             capture_secs: Vec::new(),
@@ -313,6 +322,42 @@ impl Runtime {
         if let Some(m) = self.mtp.as_mut() {
             m.drafted[slot] = 0;
         }
+    }
+
+    pub(super) fn forget_deferred(&self, slot: usize) -> Result<()> {
+        let Some(m) = self.mtp.as_ref() else { return Ok(()) };
+        if m.deferred.get(slot).is_some_and(|d| d.replace(false)) {
+            self.up_i32(&[0], &m.pend.slice(slot..slot + 1))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn settle(&self, slots: impl IntoIterator<Item = usize>) -> Result<()> {
+        let (Some(m), Some(gb)) = (self.mtp.as_ref(), self.gdn.as_ref()) else { return Ok(()) };
+        let due: Vec<i32> = slots.into_iter().filter(|&s| m.deferred.get(s).is_some_and(|d| d.replace(false))).map(|s| s as i32).collect();
+        if due.is_empty() {
+            return Ok(());
+        }
+        self.up_i32(&due, &m.settling)?;
+        let la = &gb.la;
+        let layers = self.spec.linear_layers();
+        let (seq_slots, one, log_rows, n, clear) = (layers as i32, 1i32, m.log_rows as i32, due.len() as i32, 1i32);
+        let mut b = self.launcher(self.kernel("gdn_commit"));
+        b.arg(&*gb.ssm_state).arg(&m.klog).arg(&m.dlog).arg(&m.glog).arg(&m.pend).arg(&seq_slots).arg(&m.settling).arg(&one).arg(&log_rows);
+        let config = LaunchConfig {
+            grid_dim: (la.value_heads as u32, due.len() as u32, layers as u32),
+            block_dim: ((la.value_head_dim * self.linear_tuning.ksplit) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { b.launch(config) }?;
+        let mut b = self.launcher(self.kernel("gdn_defer"));
+        b.arg(&m.pend).arg(&m.settling).arg(&one).arg(&m.settling).arg(&n).arg(&clear);
+        unsafe { b.launch(cfg(grid(due.len(), 128), 128)) }?;
+        Ok(())
+    }
+
+    pub(super) fn settle_all(&self) -> Result<()> {
+        self.settle(0..=self.slots)
     }
 
     pub(super) fn mtp_pending_host(&self, slot: usize) -> Result<Vec<f32>> {
@@ -566,15 +611,13 @@ impl Runtime {
         let la = &gb.la;
         let seq_slots = self.spec.linear_layers() as i32;
         let (vd, rows_i, k1_i) = (la.value_dim(), m.rows, k1 as i32);
+        let log_rows = m.log_rows as i32;
         let l = g.slot as usize;
         let clog = m.clog.slice(l * rows_i * la.conv_dim()..);
         let mut b = self.launcher(self.kernel("gdn_conv_verify"));
         b.arg(&gb.pre_lin).arg(&g.conv).arg(&*gb.conv_state).arg(&gb.pre_mix).arg(&clog).arg(&g.slot).arg(&seq_slots).arg(&m.vb.slots).arg(&k1_i);
         let config = LaunchConfig { grid_dim: (grid(la.conv_dim(), 256), nseq as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
         unsafe { b.launch(config) }?;
-        let klog = m.klog.slice(l * rows_i * vd..);
-        let dlog = m.dlog.slice(l * rows_i * vd..);
-        let glog = m.glog.slice(l * rows_i * la.value_heads..);
         let mut b = self.launcher(self.kernel("gdn_verify"));
         b.arg(&gb.pre_mix)
             .arg(&gb.pre_lin)
@@ -584,13 +627,15 @@ impl Runtime {
             .arg(&g.norm)
             .arg(&*gb.ssm_state)
             .arg(&gb.o)
-            .arg(&klog)
-            .arg(&dlog)
-            .arg(&glog)
+            .arg(&m.klog)
+            .arg(&m.dlog)
+            .arg(&m.glog)
+            .arg(&m.pend)
             .arg(&g.slot)
             .arg(&seq_slots)
             .arg(&m.vb.slots)
-            .arg(&k1_i);
+            .arg(&k1_i)
+            .arg(&log_rows);
         let config = LaunchConfig {
             grid_dim: (la.value_heads as u32, nseq as u32, 1),
             block_dim: ((la.value_head_dim * self.linear_tuning.ksplit) as u32, 1, 1),
@@ -741,22 +786,10 @@ impl Runtime {
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;
-        let mut b = self.launcher(self.kernel("gdn_commit"));
-        b.arg(&*gb.ssm_state)
-            .arg(&m.klog)
-            .arg(&m.dlog)
-            .arg(&m.glog)
-            .arg(&seq_slots)
-            .arg(&m.vb.slots)
-            .arg(&k1)
-            .arg(&accepted)
-            .arg(&log_rows);
-        let config = LaunchConfig {
-            grid_dim: (la.value_heads as u32, nseq as u32, layers),
-            block_dim: ((la.value_head_dim * self.linear_tuning.ksplit) as u32, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe { b.launch(config) }?;
+        let (n_i, clear) = (nseq as i32, 0i32);
+        let mut b = self.launcher(self.kernel("gdn_defer"));
+        b.arg(&m.pend).arg(&m.vb.slots).arg(&k1).arg(&accepted).arg(&n_i).arg(&clear);
+        unsafe { b.launch(cfg(grid(nseq, 128), 128)) }?;
         Ok(())
     }
 
@@ -857,6 +890,11 @@ impl Runtime {
         let m = self.mtp.as_mut().expect("an MTP spec");
         for r in rows {
             m.drafted[r.slot] = m.k;
+        }
+        if self.gdn.is_some() {
+            for r in rows {
+                m.deferred[r.slot].set(true);
+            }
         }
         m.stats.steps += 1;
         m.stats.rows += live as u64;
