@@ -2,7 +2,7 @@ use super::prim;
 
 pub fn body() -> String {
     [
-        prim::batch_helpers("f4b", prim::L2_PREFETCH_128),
+        prim::batch_helpers("f4b", ""),
         prim::bf16x2_decode("f4b"),
         r##"
 __device__ __forceinline__ unsigned f4b_byte(const uint4& q, int i) {

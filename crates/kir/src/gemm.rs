@@ -775,6 +775,7 @@ pub struct Policy {
     pub fp4_act: bool,
     pub select: Select,
     pub launch_bytes: u64,
+    pub swap: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -925,7 +926,7 @@ pub fn candidates(t: &Target, policy: &Policy, r: &Request) -> Vec<Choice> {
         WeightFormat::Fp4 => fp4_act && FP4_ACT_LINEARS.contains(&r.linear),
         _ => false,
     };
-    if swap && r.tokens <= BATCH_MAX_TOKENS {
+    if policy.swap && swap && r.tokens <= BATCH_MAX_TOKENS {
         out.extend(SWAP_VARIANTS.into_iter().filter(|&v| v >= r.tokens).filter_map(|v| swap_choice(t, policy, r, v).ok()));
     }
     let batch = r.tokens <= BATCH_MAX_TOKENS && (r.weight == WeightFormat::Fp4 || BATCH_LINEARS.contains(&r.linear));
@@ -945,12 +946,12 @@ pub fn tuned(t: &Target, policy: &Policy, r: &Request) -> bool {
     policy.select != Select::Fixed && tune_bucket(r.tokens).is_some() && tunable(t, policy, r)
 }
 
-pub fn act_rows(tokens: usize) -> bool {
-    tokens > 1
+pub fn act_rows(policy: &Policy, tokens: usize) -> bool {
+    tokens > if policy.swap { 1 } else { BATCH_VARIANTS[0] }
 }
 
 pub fn eligible(t: &Target, policy: &Policy, r: &Request) -> Vec<Choice> {
-    let act = act_rows(r.tokens);
+    let act = act_rows(policy, r.tokens);
     candidates(t, policy, r).into_iter().filter(|c| act || !c.path.quantises()).collect()
 }
 
@@ -1026,12 +1027,13 @@ pub fn pick_key(t: &Target, policy: &Policy, r: &Request, bucket: usize, candida
     let p = policy;
     let kernels: Vec<KernelInstance> = candidates.iter().filter_map(|c| c.kernel.clone()).collect();
     format!(
-        "{} | {:?} fp8_weights={:?} fp8_act={} fp4_act={} | {:?} {:?} split={} rows={bucket} | {}",
+        "{} | {:?} fp8_weights={:?} fp8_act={} fp4_act={} swap={} | {:?} {:?} split={} rows={bucket} | {}",
         t.describe(),
         p.tuning,
         p.fp8_weights,
         p.fp8_act,
         p.fp4_act,
+        p.swap,
         r.shape,
         r.weight,
         r.split,

@@ -139,7 +139,7 @@ fn sm120_gets_the_block_scaled_fp4_mma_and_sm80_does_not() {
 }
 
 fn policy(fp8: bool, fp4: bool) -> Policy {
-    Policy { tuning: Tuning::default(), fp8_weights: fp8.then_some(Fp8Scale::Channel), fp8_act: fp8, fp4_act: fp4, ..Policy::default() }
+    Policy { tuning: Tuning::default(), fp8_weights: fp8.then_some(Fp8Scale::Channel), fp8_act: fp8, fp4_act: fp4, swap: true, ..Policy::default() }
 }
 
 fn req(linear: &str, shape: GemmShape, tokens: usize, weight: WeightFormat) -> Request<'_> {

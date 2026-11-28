@@ -102,6 +102,26 @@ fn single_row_decode_stays_weight_only_on_act_quant_specs() {
 }
 
 #[test]
+fn swap_rows_off_keeps_the_previous_candidates_and_the_nine_row_act_threshold() {
+    let t = kir::Target::sm_120();
+    let mut spec = fixture("qwen3.8-27b-nvfp4");
+    spec.runtime.swap_rows = false;
+    for linear in LINEARS {
+        for kind in kinds(&spec, linear) {
+            for n in TOKENS {
+                let all = specrt::gemm::eligible(&spec, &t, linear, n, kind, true);
+                assert!(all.iter().all(|c| !c.path.swapped()), "{linear} {n}");
+                if n <= 8 {
+                    assert!(all.iter().all(|c| c.quant.is_none()), "{linear} {n}");
+                }
+            }
+        }
+    }
+    let kernels = specrt::gemm::gemm_kernels(&spec, &t).unwrap();
+    assert!(kernels.kernels.iter().all(|k| k.swap_shape().is_none()));
+}
+
+#[test]
 fn fixed_keeps_the_old_thresholds() {
     let t = kir::Target::sm_120();
     let mut spec = fixture("qwen3.8-27b-nvfp4");

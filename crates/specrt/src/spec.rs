@@ -190,6 +190,8 @@ pub struct RuntimeOptions {
     pub gemm_fp32: bool,
     #[serde(default = "yes", skip_serializing_if = "is_yes")]
     pub chunked_scan: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub swap_rows: bool,
     pub kv_dtype: KvDtype,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_f16_layers: Option<usize>,
@@ -481,7 +483,7 @@ impl PrefixCacheOptions {
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, pdl: false, fuse: true, store_epilogue: false, pdl_hoist: false, tile: TileChoice::Auto, gemm_select: GemmSelect::Measured, big_tile: None, fp4_tile: None, fp8_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), split_activations: None, gemm_fp32: false, chunked_scan: true, kv_dtype: KvDtype::F16, kv_f16_layers: None, rope_extension: None, cache_dir: None, cache_max_bytes: None, compile_jobs: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default(), offload: crate::offload::OffloadSettings::default(), requant: Requant::default(), quantize: QuantizeChoice::Off, quantize_recipe: None, quantize_cache: false }
+        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, pdl: false, fuse: true, store_epilogue: false, pdl_hoist: false, tile: TileChoice::Auto, gemm_select: GemmSelect::Measured, big_tile: None, fp4_tile: None, fp8_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), split_activations: None, gemm_fp32: false, chunked_scan: true, swap_rows: true, kv_dtype: KvDtype::F16, kv_f16_layers: None, rope_extension: None, cache_dir: None, cache_max_bytes: None, compile_jobs: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default(), offload: crate::offload::OffloadSettings::default(), requant: Requant::default(), quantize: QuantizeChoice::Off, quantize_recipe: None, quantize_cache: false }
     }
 }
 

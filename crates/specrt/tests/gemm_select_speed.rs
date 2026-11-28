@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 const TOKENS: &str = "1,2,3,4,6,8,9,12,16,17,24,32,48,64,96";
 const LINEARS: [&str; 6] = ["qkv", "o", "gate_up", "down", "lin_in", "lin_out"];
-const ROTATE_BYTES: usize = 512 << 20;
+const ROTATE_BYTES: usize = 2 << 30;
 const CHAIN: usize = 32;
 const REPS: usize = 7;
 
@@ -332,7 +332,7 @@ fn sweep(model: &'static str, spec: &Spec, ctx: &Arc<CudaContext>, rows: &mut Ve
         };
         for kind in weight_kinds(spec, linear) {
             let fp4 = kind == WeightKind::Fp4;
-            let copies = ROTATE_BYTES.div_ceil(Weights::bytes(fp4, n, k)).clamp(2, 16);
+            let copies = ROTATE_BYTES.div_ceil(Weights::bytes(fp4, n, k)).clamp(2, 64);
             let ws: Vec<Weights> = (0..copies).map(|c| Weights::new(&stream, fp4, n, k, 11 + c as u64)).collect();
             for &tokens in &tokens_list {
                 if tokens == 1 {

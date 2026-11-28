@@ -1,7 +1,27 @@
 use super::prim;
 
 pub fn common() -> String {
-    [prim::batch_helpers("swp", prim::L2_PREFETCH_128), prim::batch_store("swp")].concat()
+    [
+        prim::batch_helpers("swp", prim::L2_PREFETCH_128),
+        prim::batch_store("swp"),
+        r##"__device__ __forceinline__ uint2 swp_load8(const void* p) {
+    uint2 r;
+    asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v2.u32 {%0,%1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(p));
+    return r;
+}
+
+"##
+        .to_string(),
+        r##"__device__ __forceinline__ unsigned swp_load4(const void* p) {
+    unsigned r;
+    asm volatile("ld.global.nc.L1::no_allocate.L2::256B.u32 %0, [%1];" : "=r"(r) : "l"(p));
+    return r;
+}
+
+"##
+        .to_string(),
+    ]
+    .concat()
 }
 
 fn head(scale_rows: &str) -> String {
@@ -84,7 +104,7 @@ srow[i] = scales + FP4_HEADER + (size_t)min(row0 + i * 16 + g + 8 * p, N - 1) * 
         for (int i = 0; i < MJ; i++) {
 #pragma unroll
             for (int h = 0; h < 2; h++) wq[d][i][h] = swp_load16(wrow[i][h] + (size_t)c * (SWP_KC / 2));
-            ws[d][i] = __ldg((const uint2*)(srow[i] + (size_t)c * (SWP_KC / FP4_GROUP)));
+            ws[d][i] = swp_load8(srow[i] + (size_t)c * (SWP_KC / FP4_GROUP));
         }
     };
 "##
@@ -210,7 +230,7 @@ if (!PER_TOKEN) {
 #pragma unroll
     for (int i = 0; i < MJ; i++)
 #pragma unroll
-        for (int h = 0; h < 2; h++) sw[i][h] = __ldg(srow[i][h] + kt);
+        for (int h = 0; h < 2; h++) sw[i][h] = __uint_as_float(swp_load4(srow[i][h] + kt));
 #pragma unroll
     for (int n = 0; n < NT; n++) {
         float s0 = __ldg(xs + (size_t)min(n * 8 + 2 * t, last) * CHUNKS + kt);
