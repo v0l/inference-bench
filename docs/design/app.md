@@ -1,196 +1,43 @@
-# App redesign: an inference server, LM Studio style
+# The desktop app
 
-Issue #577. Goal g5: an LM Studio style desktop app with a model library and downloads, model
-details, chat and server control. Benchmarking and comparison are not a user-facing feature (non-goal);
-the `inference-bench bench`, `batch` and `matrix` commands and the result store in `crates/core` stay
-as dev tooling for g6 and have no screen.
+`crates/ui` (`inference-bench-ui`): an LM Studio style app on egui and egui_bench. Benchmarking is not a feature of the app; the `bench`, `batch` and `matrix` commands stay in the CLI as dev tooling. Every answer about whether a model runs and how it loads comes from specrt (`Spec::from_hf_config`, the family files, `wgsl::unsupported`, `solve`), never from a list in `crates/core` or `crates/ui`; a test holds every specrt fixture config supported by the library.
 
-## The flow
+![models](../img/app/models.png)
 
-```
-pick a model (search)  ->  load it (per-load options)  ->  chat with it, or serve it
-        models                 load dialog                     chat / server
-```
+## Rail and pages
 
-The loaded model and the memory it takes are visible on every page: a model bar on chat and server,
-and the status bar at the bottom everywhere.
+Rail: **chat**, **models**, **server**, **hardware**, **settings** (`crates/ui/src/shell.rs`). The chat tab reads **generate** when an image or video model is loaded and **voice** for a duplex model. The loaded model and its memory show on every page: a model bar on chat and server (`modelbar.rs`) and the status bar at the bottom.
 
-## What the old app got wrong
-
-| old | problem | new |
+| Page | Code | What it does |
 |---|---|---|
-| bench tab, bench targets in settings | a benchmark product | removed from the app, CLI only |
-| logs tab | a page of its own for a server concern | a pane on the server page |
-| `specrt_ctx` and `gpu_bandwidth_gbs` in settings | context is a per-model load choice; bandwidth is a property of the card, not a preference | context slider in the load dialog; bandwidth input and the decode ceiling row are gone |
-| model list unsearchable | a library of dozens of checkpoints cannot be scanned | search field filters by name, repo, architecture, quant and format |
-| placement bands on the model detail | multi-host deployment is a server concern | stays in the server TOML, read-only on the server page |
-| llama.cpp and vLLM support chips on every model | comparison with other engines | one chip: whether this app runs the model |
-| icon of bars and a measured line | a benchmark chart | a server stack with status lights |
+| Chat | `chat.rs` | conversation with the loaded model, attachments for vision models, thinking toggle, tool calls |
+| Generate | `imagegen.rs`, `videogen.rs` | prompt, size presets, seed, steps, guidance, n, progress and stop, result grid; see [diffusion.md](diffusion.md) |
+| Voice | `duplex.rs` | websocket address and CLI line for a duplex model; see [speech.md](speech.md) |
+| Models | `models.rs`, `detail.rs`, `crates/core/src/library.rs`, `crates/core/src/discover.rs` | the library (search across name, repo, architecture, quant and format; a runs here chip from specrt), discover (Hugging Face search, file lists, resumable downloads), the model detail (summary, layers, vision tower, parameters and memory against context) |
+| Load dialog | `load.rs` | profile, the solved plan ([distributed.md](distributed.md)), context and memory estimates, every engine option from `options::schema()` grouped and folded, remember per model |
+| Server | `server.rs`, `serving.rs`, `sessions.rs`, `logs.rs` | start and stop the OpenAI server, settings for the next start, the request table, logs, the pipeline panel, saved sessions |
+| Hardware | `hardware.rs` | GPUs and links, cluster sharing, pairing, running a cluster |
+| Settings | `settings.rs` | model folders, Hugging Face token, spec updates ([../guides/specs-update.md](../guides/specs-update.md)), default profile, theme, data folder |
 
-## Screens
+![load dialog](../img/app/load-dialog.png)
 
-Rail: **chat**, **models**, **server**, **settings**. Four items, no bench, no logs.
+## Load dialog
 
-### Model bar (chat and server)
+Opened from the model bar, a library card or the detail. It solves on every change (`specrt::solve`) and shows the strategy, reasons and any shortfall; moving the slots or KV controls pins them. Load hands the engine exactly the `Solved` it showed (`EngineChoice.solved`), and the engine fails with the stage error rather than fall back. The dialog says "will span N GPUs" when the memory it sizes is more than the largest GPU and blocks the load when the planner says it does not fit. Options come from `options::schema()`, so a new engine option appears without UI work. The choice is kept per model in `settings.json` (`model_engine`), with `default_profile` for new models. Image, video and duplex models open their own load pages.
 
-Purpose: the one place that says what is loaded and lets you change it, as in LM Studio's top bar.
+## Hardware and clusters
 
-```
-+----------------------------------------------------------------------------------------+
-| (o) ready  [ Qwen3-0.6B  4k ctx ]  [ select a model v ]  [ UNLOAD ]       VRAM 11 / 96 GB |
-+----------------------------------------------------------------------------------------+
-```
+Everything on the page comes from specrt: GPUs and links from `specrt::hardware::probe` (driver API, `cuDeviceCanAccessPeer`; a wgpu probe without CUDA), peers from `cluster::decode_peer`, plans from `solve`.
 
-- Lamp and chip: loading, ready, failed (the egui_bench chat header states).
-- Picker: a popup with a search field above the usable models. Choosing one opens the load dialog
-  for it. It never loads silently, so the context choice is always made.
-- `unload` frees the card. `load` appears when nothing is loaded and a model is picked.
-- VRAM is the card's used and total, measured (cyan).
+- This machine: host, RAM, one line per GPU (name, arch, total and free memory, bandwidth and TFLOP/s as the planner sees them), the link between each pair, network interfaces usable for mDNS.
+- Cluster: "Share this machine's GPU in a cluster" (off) with an interface picker; it announces `_inference-bench._tcp` with a versioned TXT record (`v=2`, host, app version, busy, serving, one `gN` entry per GPU).
+- Pair: the peer shows an 8 character code (5 minutes, 3 tries). It feeds a SPAKE2 exchange (`crates/specrt/src/pairing.rs`); the cluster key from `cluster.key` then travels under ChaCha20-Poly1305 with an HKDF key, never over mDNS. Peers must be paired before they can be selected.
+- Run a cluster: pick a model, context and parallel requests, include or exclude each GPU; the preview shows stages per `host / GPU n`, layer ranges, memory, step and hop time, the slowest stage. Load starts local stage servers and asks each peer for its stages, then loads through `[placement.remote]`.
 
-### Load dialog
+![chat](../img/app/chat.png)
 
-A modal, 520 wide, opened from the model bar, the library cards and the model detail.
+![server](../img/app/server.png)
 
-```
-LOAD QWEN3-0.6B
-+- context ---------------------------------------------------------+
-| context length   [=========o-----------------------]  8192 tokens   |
-|                  512                              40960 (model max)|
-+- memory ----------------------------------------------------------+
-| weights          1.2 GB          (from the spec and checkpoint)     |
-| kv cache         0.9 GB          (8192 tokens)                      |
-| state            0 B                                                |
-| total            2.1 GB   of  38.4 GB free on the GPU               |
-| (ok) fits in free memory                                            |
-+--------------------------------------------------------------------+
-| [x] remember for this model                                         |
-|                                        [ LOAD ]  [ CANCEL ]         |
-+--------------------------------------------------------------------+
-```
+## Tests
 
-Fields:
-
-- **context length**: slider from 512 to the model's own maximum (`max_position_embeddings` from
-  the config via the detail view, bounded by the engine's `MAX_CTX`), step 512, amber because the
-  user sets it. The default is the last choice for this model, else the app default (8192),
-  clamped to the maximum, and reduced to the largest value that fits free memory when it would not.
-- **memory**: weights plus kv cache plus recurrent state from `ModelAnatomy`, the same numbers
-  the engine uses, against `total - used` from the GPU poll. Cyan, as measured or derived from the
-  device. The verdict line is `status(ok)`: green when it fits, red "does not fit" when it does not.
-  With no GPU reading the line says the free memory is unknown and does not block loading.
-- **remember for this model**: stores the choice in `settings.json` under the model name.
-- **kv cache type**: not shown. The spec has no kv dtype yet (#324). When it does, the dialog lists
-  the values the spec and `runtime` accept, never a list of its own (`ui-follows-engine`).
-- Load stays enabled when the estimate is red: the estimate is a guess and the engine is the
-  authority. The engine's out of memory error comes back as the load failure on the model bar.
-
-### Models
-
-Purpose: library and downloads in one place.
-
-```
-MODELS                                                          [ CHECK SPECS NOW ]
-[ my models 12 | discover ]
-[ search models by name, architecture or quant ............................... ]
- models 12   shown 3   usable 2                                   [x] show unusable
- +- Qwen3-0.6B ------------------------------------------ [safetensors] [loaded] -+
- | size 1.2 GB  arch Qwen3ForCausalLM  quant BF16  context 40960                  |
- | [supported] [vision: no]                                                       |
- | [ LOAD ] [ DETAILS ] [ REVEAL ] [ DELETE ]                                     |
- +--------------------------------------------------------------------------------+
- not here? [ SEARCH HUGGING FACE FOR "qwen" ]
-```
-
-- The search field filters the library live. Every word must match the name, repo, architecture,
-  quant or format, case-insensitively. Nothing to submit.
-- `discover` keeps the Hugging Face search (submit to query), file listing and resumable
-  downloads. The library pane offers a shortcut into it with the typed text.
-- `load` opens the load dialog. `details` opens the detail view.
-
-### Model detail
-
-What the model is and what loading costs it. Opened from a card, with `back`, `load` and
-`compare with` (two checkpoints side by side on one scale is a model view, not a benchmark).
-
-```
-[BACK] Qwen3-0.6B  [config.json] [BF16]                       [LOAD]  compare with [ none v]
-+- summary -------------------------------------------------------+
-| architecture  Qwen3ForCausalLM   parameters 0.6 B   quant BF16   |
-| max context   40960              vision no           mtp none    |
-+- layers --- block diagram --- vision tower --- parameters and memory --- memory against context
-+- numbers --------------------------------------------------------+
-```
-
-Removed: placement bands over the layer strip, the decode ceiling row (it needed a bandwidth the
-user had to type). `memory against context` stays: it is the cost of loading, drawn against the
-card's free memory.
-
-### Server
-
-Purpose: OpenAI server control, its request log and the logs.
-
-```
-SERVER
-[model bar]
-+- local server ----------------------------------------- (o) running -+
-| address  http://127.0.0.1:1234/v1        serving  Qwen3-0.6B          |
-| [ STOP SERVER ]                                                       |
-+- settings (next start) --- port, api key, allow other machines -------+
-+- placement ---------------- read-only, from the server TOML ----------+
-| objective latency   context 8192   slots 1                            |
-| alpha   24 GiB   layers 0..30        beta   24 GiB   layers 30..60    |
-+- use it ----------------------------------------------------------+
-[ requests | logs ]
- time      request                     status   ms
-```
-
-- `requests` is the access table; `logs` is the old logs page (level, search, copy, save, clear).
-- `placement` shows only when `server.toml` in the data folder configures devices. It is the
-  same `placement` table `inference-bench serve` reads, so the app and the daemon cannot disagree.
-  There is no placement editor: multi-host setups are written in the TOML, validated by
-  `inference-bench plan`, and nothing about them belongs on a model page. No other screen needs
-  multi-host UI.
-
-### Settings
-
-App-wide only: **model folders**, **hugging face token**, **spec updates**, **app** (theme, data
-folder). Gone: bench targets, native engine context, gpu bandwidth.
-
-Migration: `specrt_ctx` becomes `default_ctx` (serde alias, so old files read), the starting
-point of the load dialog's slider for a model with no remembered choice. `gpu_bandwidth_gbs`,
-`endpoints` and `placement` are dropped; serde ignores them in an old file.
-
-## Chat
-
-Unchanged apart from the model bar replacing the ad hoc picker, and the context bar reading the
-context the model was loaded with instead of a global setting.
-
-## Icon
-
-Dark tile, a stack of three server units with status lights: the top unit lit cyan (serving), an
-amber light for the user's setting, green for ready. It reads as a local server at 16 px and in the
-house palette; no bars, no measured line.
-
-## Order of work
-
-1. This document.
-2. Remove the bench UI and the settings it needed; drop bandwidth and placement from the detail.
-3. Library search.
-4. Load dialog with slider and estimates, per-model memory in settings.
-5. Model bar.
-6. Rail of four, logs folded into server, placement on the server page.
-7. Icon, screenshots, README.
-
-## Hardware tab (issue #657)
-
-Rail: **chat**, **models**, **server**, **hardware**, **settings**. Everything on the page comes from specrt: GPUs and links from `specrt::hardware::probe` (cudarc driver API, `cuDeviceCanAccessPeer`, no `nvidia-smi`), peers from `cluster::decode_peer`, placement from `PlacementConfig::place`.
-
-![hardware](hardware.png)
-
-- **This machine**: host, RAM, one line per GPU (name, arch, total and free memory, bandwidth and TFLOP/s as the planner sees them), the link between each GPU pair (peer to peer or staged through host memory) and the network interfaces usable for mDNS.
-- **Cluster**: "Share this machine's GPU in a cluster" (off by default) with an interface picker. On announces `_inference-bench._tcp` with a versioned TXT record (`v=2`, host, app version, busy, serving, one `gN` entry per GPU). The peer list shows `host: 2 x GPU`, memory, idle or busy, and what it serves. A v1 stage announcement still decodes as a one-GPU peer.
-- **Pair**: the peer shows a short code (8 characters, 5 minutes, 3 tries). The coordinator types it. The code feeds a SPAKE2 exchange, so a recorded exchange cannot be brute forced offline; the cluster key from `cluster.key` then travels under ChaCha20-Poly1305 with a key derived by HKDF from the exchange, never over mDNS. Peers must be paired before they can be selected.
-- **Run a cluster**: pick a model, context and parallel requests, include or exclude each local and remote GPU. The preview shows both objectives: stage per `host / GPU n`, layer range, memory, step and hop time with the hop kind (peer copy, host staged, network), the slowest stage and the bottleneck. The app plans with tensor parallel limited to 1 until #658 (`PlacementConfig::max_tp`), and shows the tp plan the planner would pick as a dimmed "with tensor parallel (#658)" line. Load starts local stage servers in process and asks each peer for its stages, then loads through `[placement.remote]` with the generated key file.
-- **Server tab**: a pipeline panel with per stage busy time, calls, tokens, hop time and bytes, and the lost stage by name.
-
-Two-instance GPU check (supervisor, GPU free, loopback): see `docs/specrt-distributed.md`, section "App cluster check".
+`crates/ui/src/tests.rs`, `tests_images.rs`, `tests_video.rs`, `tests_duplex.rs` drive pages through the egui test harness at desktop and phone widths; tests marked `renders with wgpu` write screenshots to `SHOTS=<dir>`. Load, placement and hardware changes are verified by running the real app in a headless sway, loading through the dialog and reading `nvidia-smi --query-compute-apps`.
