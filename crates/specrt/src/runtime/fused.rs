@@ -32,6 +32,7 @@ impl Runtime {
         if part.start == 0 {
             self.reset_slot(part.slot)?;
         }
+        self.settle(rows.iter().map(|r| r.slot).chain([part.slot]))?;
         let ids: Vec<i32> =
             rows.iter().map(|r| r.token as i32).chain(part.tokens.iter().map(|&t| t as i32)).collect();
         let pos: Vec<i32> = rows.iter().map(|r| r.pos as i32).collect();

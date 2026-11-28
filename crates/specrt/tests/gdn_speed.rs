@@ -8,6 +8,105 @@ fn data(len: usize, seed: u32, scale: f32) -> Vec<f32> {
     (0..len).map(|i| (((i as u32).wrapping_mul(2654435761).wrapping_add(seed) >> 8) & 0xffff) as f32 / 65535.0 * scale - scale / 2.0).collect()
 }
 
+fn time_ms(ctx: &std::sync::Arc<CudaContext>, stream: &std::sync::Arc<cudarc::driver::CudaStream>, f: &dyn Fn()) -> f32 {
+    f();
+    f();
+    let mut times = Vec::new();
+    for _ in 0..10 {
+        let e0 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).unwrap();
+        e0.record(stream).unwrap();
+        f();
+        let e1 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).unwrap();
+        e1.record(stream).unwrap();
+        stream.synchronize().unwrap();
+        times.push(e0.elapsed_ms(&e1).unwrap());
+    }
+    times.sort_by(f32::total_cmp);
+    times[5]
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU with NVRTC"]
+fn gdn_recurrent_state_kernels_speed_on_27b_shaped_layers() {
+    let spec = Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b.toml")).unwrap();
+    let la = spec.linear_attention.clone().unwrap();
+    let (vh, d) = (la.value_heads, la.key_head_dim);
+    let layers = spec.linear_layers();
+    let ctx = CudaContext::new(0).unwrap();
+    let wall = specrt::bandwidth::probe(&ctx).unwrap();
+    let jit = Jit::new(ctx.clone(), std::env::temp_dir().join(format!("specrt-gdn-state-{}", std::process::id()))).unwrap();
+    let stream = ctx.default_stream();
+    let target = specrt::codegen::cuda_target(&ctx).unwrap();
+    let module = Module::generate_kv(&spec, 4096, 1, &target).unwrap();
+    let loaded = jit.load(&module).unwrap();
+    let verify = loaded.function("gdn_verify").unwrap();
+    let commit = loaded.function("gdn_commit").unwrap();
+    let step = loaded.function("gdn_step").unwrap();
+    let threads = (d * kir::linear::LinearTuning::for_target(&target).ksplit) as u32;
+    let k1 = spec.speculative().map_or(3, |m| m.draft_tokens + 1);
+    let state_seq = layers * vh * d * d;
+    let unit = |v: Vec<f32>| stream.clone_htod(&v).unwrap();
+    let neg_a = unit(data(vh, 6, 1.0).iter().map(|v| -0.5 - v.abs()).collect());
+    let dt_bias = unit(data(vh, 7, 0.2));
+    let norm_w = unit(data(d, 8, 0.4).iter().map(|v| v + 1.0).collect());
+    eprintln!("probe read {:.0} GB/s copy {:.0} GB/s, {layers} layers, k+1 = {k1}", wall.read_gbs, wall.copy_gbs);
+    let seqs: Vec<usize> = std::env::var("SPECRT_GDN_SEQS").unwrap_or("1,8,16,32".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    for nseq in seqs {
+        let rows = nseq * k1;
+        let state = unit(data(nseq * state_seq, 9, 0.02));
+        let mix = unit(data(rows * la.conv_dim(), 3, 1.0));
+        let lin = unit(data(rows * la.in_proj_rows(), 10, 1.0));
+        let ba = unit(data(rows * la.ba_rows(), 11, 1.0));
+        let out = stream.alloc_zeros::<f32>(rows * la.value_dim()).unwrap();
+        let logged = nseq * layers * k1;
+        let klog = stream.alloc_zeros::<f32>(logged * la.value_dim()).unwrap();
+        let dlog = stream.alloc_zeros::<f32>(logged * la.value_dim()).unwrap();
+        let glog = stream.alloc_zeros::<f32>(logged * vh).unwrap();
+        let vslots = stream.clone_htod(&(0..rows as i32).map(|r| r / k1 as i32).collect::<Vec<i32>>()).unwrap();
+        let sslots = stream.clone_htod(&(0..nseq as i32).collect::<Vec<i32>>()).unwrap();
+        let none = stream.alloc_zeros::<i32>(nseq).unwrap();
+        let pend = stream.clone_htod(&(0..nseq).map(|s| [2, 3, 2, 3, 1][s % 5]).collect::<Vec<i32>>()).unwrap();
+        let (seq_slots, k1_i, log_rows) = (layers as i32, k1 as i32, k1 as i32);
+        let run_verify = |pend: &cudarc::driver::CudaSlice<i32>| {
+            for l in 0..layers {
+                let slot = l as i32;
+                let mut b = stream.launch_builder(&verify);
+                b.arg(&mix).arg(&lin).arg(&ba).arg(&neg_a).arg(&dt_bias).arg(&norm_w).arg(&state).arg(&out).arg(&klog).arg(&dlog).arg(&glog).arg(pend).arg(&slot).arg(&seq_slots).arg(&vslots).arg(&k1_i).arg(&log_rows);
+                unsafe { b.launch(LaunchConfig { grid_dim: (vh as u32, nseq as u32, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 }) }.unwrap();
+            }
+        };
+        let run_commit = || {
+            let mut b = stream.launch_builder(&commit);
+            b.arg(&state).arg(&klog).arg(&dlog).arg(&glog).arg(&pend).arg(&seq_slots).arg(&vslots).arg(&k1_i).arg(&log_rows);
+            unsafe { b.launch(LaunchConfig { grid_dim: (vh as u32, nseq as u32, layers as u32), block_dim: (threads, 1, 1), shared_mem_bytes: 0 }) }.unwrap();
+        };
+        let run_step = || {
+            for l in 0..layers {
+                let slot = l as i32;
+                let mut b = stream.launch_builder(&step);
+                b.arg(&mix).arg(&lin).arg(&ba).arg(&neg_a).arg(&dt_bias).arg(&norm_w).arg(&state).arg(&out).arg(&slot).arg(&seq_slots).arg(&sslots);
+                unsafe { b.launch(LaunchConfig { grid_dim: (vh as u32, nseq as u32, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 }) }.unwrap();
+            }
+        };
+        let bytes = (nseq * state_seq * 4) as f64;
+        let v = time_ms(&ctx, &stream, &|| run_verify(&none));
+        let f = time_ms(&ctx, &stream, &|| run_verify(&pend));
+        let c = time_ms(&ctx, &stream, &run_commit);
+        let s = time_ms(&ctx, &stream, &run_step);
+        let gbs = |b: f64, ms: f32| b / ms as f64 / 1e6;
+        eprintln!(
+            "seqs={nseq}: round (verify with replay and store) {f:.3} ms ({:.0} GB/s, {:.0}% of copy); verify alone {v:.3} ms ({:.0} GB/s read, {:.0}% of probe); flush commit {c:.3} ms ({:.0} GB/s); step {s:.3} ms ({:.0} GB/s, {:.0}% of copy)",
+            gbs(2.0 * bytes, f),
+            100.0 * gbs(2.0 * bytes, f) / wall.copy_gbs,
+            gbs(bytes, v),
+            100.0 * gbs(bytes, v) / wall.read_gbs,
+            gbs(2.0 * bytes, c),
+            gbs(2.0 * bytes, s),
+            100.0 * gbs(2.0 * bytes, s) / wall.copy_gbs,
+        );
+    }
+}
+
 #[test]
 #[ignore = "needs a CUDA GPU with NVRTC"]
 fn gdn_chunk_kernels_speed_on_a_27b_shaped_layer() {

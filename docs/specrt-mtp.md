@@ -22,6 +22,7 @@ draft_tokens = 2      # k, 1 to 3
 speculate = true
 max_batch = 8         # optional: plain decode when more sequences decode at once
 graph = false         # optional: capture the whole speculative round in a CUDA graph (needs [runtime] graphs)
+defer_commit = true   # fold the delta-net state commit into the next round's verify (false: commit every round)
 ```
 
 ```toml
@@ -134,8 +135,8 @@ so the pending buffer holds raw residuals for both.
   pending; the drafts are dropped.
 - Speculative step (`Runtime::speculate`): if a row has no drafts yet, one MTP row (pending hidden,
   newest token) and the chain make them. The target verifies `k + 1` rows per sequence
-  (`verify_rows`), `spec_accept` decides on the device, the commit kernels advance the recurrent
-  state by the accepted rows, then the MTP runs over the `a + 1` accepted rows (writing its KV) and
+  (`verify_rows`), `spec_accept` decides on the device, the accepted row count is kept for the
+  next round's verify to apply (see below), then the MTP runs over the `a + 1` accepted rows (writing its KV) and
   chains `k` new drafts from the last one.
 - Plain decode on an MTP spec (`mtp_after_decode`, above `max_batch`): after the decode the MTP
   writes its KV for the row before and the decode row's hidden becomes pending, so a sequence can
@@ -152,14 +153,24 @@ verification at all:
   the same sequence and logs the row's conv input.
 - `gdn_verify` runs the recurrent step of `gdn_step` over the `k + 1` rows of a sequence in order,
   with the state in registers, and logs per row and value head the normalised key, the delta
-  `beta (v - S^T k)` and the decay. It writes the outputs but never the state.
-- After acceptance, `gdn_commit` reloads the state and applies the logged rank-1 updates of the
-  first `a + 1` rows (`S = exp(g) S; S += k delta^T`, the same float operations in the same order
-  as `gdn_step`), and `gdn_conv_commit` shifts the accepted inputs into the window.
+  `beta (v - S^T k)` and the decay into the slot's own log (`klog`, `dlog`, `glog`, indexed by
+  slot and layer). It writes the outputs, and the state only for the replay below.
+- After acceptance, `gdn_defer` records `a + 1` in the slot's `pend` count and `gdn_conv_commit`
+  shifts the accepted inputs into the window. The state is not touched.
+- The next round's `gdn_verify` loads the state, first applies the `pend` logged rank-1 updates of
+  the previous round (`S = exp(g) S; S += k delta^T`, the same float operations in the same order
+  as `gdn_step`), stores it once, then verifies the new rows. The state crosses the bus twice per
+  round (one read, one write) instead of three times.
+- Anything else that reads or replaces a slot's state settles it first: plain decode, fused decode
+  and prefill, prefill, state snapshots (prefix cache, parking), `linear_states`. `settle` runs
+  `gdn_commit` (the same replay, then a store) for the slots that still have a pending count.
+  Resetting, acquiring, releasing or restoring a slot drops its pending count.
+- `[mtp] defer_commit = false` settles right after every round, which is the old per-round commit.
 
-The extra cost is one more read of the state per step (151 MB, about 0.1 ms on this card) and a
-log of 1.9 MB per sequence and row on the 27B. Rejected rows cost nothing to undo. KV needs no
-rollback: rejected positions are overwritten before they are read.
+Per round at k = 2 and 2.4 accepted tokens this moves 2 x 151 MB per sequence plus the log
+(about 6 MB) against 3 x 151 MB before; a snapshot ring (vLLM's per-row state slots) would write
+`k + 1` states, 453 MB. Rejected rows cost nothing to undo. KV needs no rollback: rejected
+positions are overwritten before they are read.
 
 Because the verify row computes exactly what `gdn_step` computes, greedy speculative output equals
 greedy plain output token for token as long as the GEMMs pick the same tile for the verify batch as
@@ -462,6 +473,51 @@ read ceiling), `mtp_head_f4w_tiny` 2.7 ms (two draft heads), `batch_decode_atten
 `lin_in_f8_narrow` 2.0 ms, `gdn_verify` 1.3 ms, `gdn_commit` 1.2 ms. The two heads and the fused
 head plus accept were not done; the weight GEMVs at 17 to 32 rows need an mma small-M kernel, since the
 existing 32-row GEMV is slower than the act-quant tile GEMM there (see above).
+
+## Delta-net state traffic: deferred commit (#1515)
+
+The f32 state is 151 MB per sequence on the 27B. Before #1515 a round read it in `gdn_verify` and
+read and wrote it again in `gdn_commit` (three crossings). Now the commit is folded into the next
+round's verify (see Delta-net rollback above), and the verify kernel stages the q/k norms and gates
+of up to four rows in shared memory before it touches the state, with the replay loop kept rolled
+(an unrolled replay spilled 200 B per thread in `gdn_commit`). All recurrence arithmetic is
+unchanged, so the state stays bit identical.
+
+Synthetic 27B layers (`tests/gdn_speed.rs`, 48 layers, k = 2, GPU1, probe 1,672 GB/s read and
+1,472 GB/s copy). A round is one verify call per layer; "old" is verify plus the separate commit:
+
+| sequences | old verify | old commit | old round | new round (replay, store, verify) | new round GB/s (read + write) |
+|---|---|---|---|---|---|
+| 1 | 0.655 ms | 0.206 ms | 0.86 ms | 0.93 ms | 325 |
+| 8 | 2.198 ms | 1.658 ms | 3.86 ms | 2.50 ms | 966 |
+| 16 | 3.495 ms | 3.328 ms | 6.82 ms | 3.93 ms | 1,231 (84% of copy) |
+| 32 | 6.323 ms | 6.662 ms | 12.99 ms | 7.62 ms | 1,268 (86% of copy) |
+
+Verify alone (no replay) reads at 46 to 60% of the probe at 16 to 32 sequences, from 41 to 46%.
+Forcing two or three 512-thread blocks per SM (`__launch_bounds__` 64 or 40 registers) spills and
+runs 1.4x to 3x slower, so the kernel stays at one block per SM.
+
+Real 27B NVFP4, `bench --speculative ... 1024 64 16` under nsys, 16 sequences:
+
+| | `[mtp] defer_commit = false` | default (deferred) |
+|---|---|---|
+| `gdn_verify` per call at 16 sequences | 72.4 us | 90.9 us |
+| `gdn_verify` x 48 per round | 3.48 ms | 4.36 ms |
+| `gdn_commit` per round | 4.71 ms | none |
+| verify plus commit per round | 8.19 ms | 4.36 ms |
+| full-batch round | 40.98 ms | 37.60 ms |
+| full-batch decode | 947 tok/s | 1,034 tok/s |
+
+`bench --ab --rounds 6 --a-set spec.mtp.defer_commit=false tests/fixtures/qwen3.8-27b-nvfp4.toml
+<batch> 128` (B is the default): batch 16 A 759.5, B 787.0 tok/s, A/B ratio medians 1.044 and
+1.028 over the two passes, verdict PASS B faster (+3.6%, under the 5% the issue asked for). Batch 1:
+98.9 against 98.8 tok/s, no difference outside the A/A band. The scheduled bench gains less than
+the full-batch round because ramp and drain steps and the scheduler are in it.
+
+`gdn_step` is unchanged: 53.7 us per call at 16 rows in the model (2.58 ms per step), 6.5 ms at 32
+rows on the synthetic layer, which is 101% of the copy probe. It reads and writes the state once
+per token already, so the 2.5 ms at 32 rows that #1515 asked for needs fewer state bytes (a bf16
+state, step 4 of the issue), not a faster kernel.
 
 ## Prompt-lookup drafter: replay result (#405)
 

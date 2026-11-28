@@ -2486,6 +2486,7 @@ impl Runtime {
     ) -> Result<()> {
         let n = tokens.len();
         self.check_tokens(tokens)?;
+        self.settle([self.seq as usize])?;
         let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         self.stream.memcpy_htod(&ids, &mut self.pre.tokens.slice_mut(..n))?;
         self.stream.memcpy_htod(&[start as i32], &mut self.buf.pos)?;
@@ -2773,6 +2774,8 @@ impl Runtime {
             gb.conv_pool.release(slot);
             return Err(e);
         }
+        self.forget_deferred(slot)?;
+        let gb = self.gdn.as_mut().expect("checked above");
         let conv = gb.conv_pool.stride_bytes() / 4;
         let ssm = gb.ssm_pool.stride_bytes() / 4;
         self.stream.memset_zeros(&mut gb.conv_state.slice_mut(slot * conv..(slot + 1) * conv))?;
@@ -2826,6 +2829,7 @@ impl Runtime {
         if slot >= self.slots {
             return;
         }
+        let _ = self.forget_deferred(slot);
         let _ = self.stream.synchronize();
         if let Some(gb) = self.gdn.as_mut() {
             gb.ssm_pool.release(slot);
@@ -2841,6 +2845,7 @@ impl Runtime {
     pub fn reset_slot(&mut self, seq: usize) -> Result<()> {
         ensure!(seq < self.slots, "slot {seq} out of {}", self.slots);
         self.mtp_forget(seq);
+        self.forget_deferred(seq)?;
         self.zero_prelude_state(seq)?;
         if self.mixer.is_some() {
             return self.zero_mixer_state(seq);
@@ -2994,6 +2999,7 @@ impl Runtime {
     }
 
     pub fn linear_states(&self) -> Result<LinearStates> {
+        self.settle_all()?;
         let gb = self.gdn.as_ref().context("no linear layers")?;
         let layers = self.spec.linear_layers();
         let conv = self.slots * layers * gb.la.conv_dim() * (gb.la.conv_kernel - 1);

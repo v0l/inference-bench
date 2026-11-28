@@ -105,43 +105,99 @@ extern "C" __global__ void gdn_conv_commit(float* state, const float* log, int s
 extern "C" __global__ void __launch_bounds__(LA_D * LA_KSPLIT) gdn_verify(const float* mix, const float* lin,
                                                                           const float* ba, const float* neg_a,
                                                                           const float* dt_bias, const float* norm_w,
-                                                                          const float* state, float* out, float* klog,
-                                                                          float* dlog, float* glog, int slot,
-                                                                          int seq_slots, const int* slots, int rows) {
+                                                                          float* state, float* out, float* klog,
+                                                                          float* dlog, float* glog, const int* pend,
+                                                                          int slot, int seq_slots, const int* slots,
+                                                                          int rows, int log_rows) {
     constexpr int KS = LA_D / LA_KSPLIT;
+    constexpr int VR = 4;
     __shared__ float scratch[32];
-    __shared__ float q_s[LA_D];
-    __shared__ float k_s[LA_D];
+    __shared__ float q_rows[VR][LA_D];
+    __shared__ float k_rows[VR][LA_D];
+    __shared__ float decay_rows[VR];
+    __shared__ float beta_rows[VR];
     __shared__ float part[LA_KSPLIT][LA_D];
     __shared__ float delta_s[LA_D];
     int h = blockIdx.x;
     int seq = blockIdx.y;
-    slot += slots[seq * rows] * seq_slots;
+    int owner = slots[seq * rows];
+    slot += owner * seq_slots;
     int kh = la_kh(h);
     int tid = threadIdx.x;
     int v = tid % LA_D;
     int ks = tid / LA_D;
-    const float* S = state + ((size_t)slot * LA_VH + h) * LA_STATE;
+    float* S = state + ((size_t)slot * LA_VH + h) * LA_STATE;
     float s[KS];
 #pragma unroll
     for (int i = 0; i < KS; i++) s[i] = S[(ks * KS + i) * LA_D + v];
-    for (int r = 0; r < rows; r++) {
+    for (int r = 0; r < rows && r < 0 + VR; r++) {
         size_t row = (size_t)seq * rows + r;
         const float* m = mix + row * LA_CONV_DIM;
-        const float* l = lin + row * LA_IN_ROWS;
-        const float* b = ba + row * LA_BA_ROWS;
         float qv = tid < LA_D ? m[kh * LA_D + tid] : 0.0f;
         float kv = tid < LA_D ? m[LA_KEY_DIM + kh * LA_D + tid] : 0.0f;
         float qss = block_reduce<false>(qv * qv, scratch);
         float kss = block_reduce<false>(kv * kv, scratch);
         if (tid < LA_D) {
-            q_s[tid] = l2_q(qv, qss);
-            k_s[tid] = l2_k(kv, kss);
+            q_rows[r - 0][tid] = l2_q(qv, qss);
+            k_rows[r - 0][tid] = l2_k(kv, kss);
         }
-        float g, beta;
-        gdn_gate(b, neg_a, dt_bias, h, g, beta);
-        float decay = expf(g);
+        if (tid == 0) {
+            float g, beta;
+            gdn_gate(ba + row * LA_BA_ROWS, neg_a, dt_bias, h, g, beta);
+            decay_rows[r - 0] = expf(g);
+            beta_rows[r - 0] = beta;
+        }
+    }
+    __syncthreads();
+    int pending = pend[owner];
+#pragma unroll 1
+    for (int r = 0; r < pending; r++) {
+        size_t row = (size_t)slot * log_rows + r;
+        const float* kr = klog + (row * LA_VH + h) * LA_D;
+        float decay = glog[row * LA_VH + h];
+        float d = dlog[(row * LA_VH + h) * LA_D + v];
+#pragma unroll
+        for (int i = 0; i < KS; i++) {
+            int k = ks * KS + i;
+            s[i] = __fmul_rn(s[i], decay);
+            s[i] = __fmaf_rn(kr[k], d, s[i]);
+        }
+    }
+    if (pending > 0) {
+#pragma unroll
+        for (int i = 0; i < KS; i++) S[(ks * KS + i) * LA_D + v] = s[i];
+    }
+    for (int r0 = 0; r0 < rows; r0 += VR) {
+    if (r0 > 0) {
+        for (int r = r0; r < rows && r < r0 + VR; r++) {
+            size_t row = (size_t)seq * rows + r;
+            const float* m = mix + row * LA_CONV_DIM;
+            float qv = tid < LA_D ? m[kh * LA_D + tid] : 0.0f;
+            float kv = tid < LA_D ? m[LA_KEY_DIM + kh * LA_D + tid] : 0.0f;
+            float qss = block_reduce<false>(qv * qv, scratch);
+            float kss = block_reduce<false>(kv * kv, scratch);
+            if (tid < LA_D) {
+                q_rows[r - r0][tid] = l2_q(qv, qss);
+                k_rows[r - r0][tid] = l2_k(kv, kss);
+            }
+            if (tid == 0) {
+                float g, beta;
+                gdn_gate(ba + row * LA_BA_ROWS, neg_a, dt_bias, h, g, beta);
+                decay_rows[r - r0] = expf(g);
+                beta_rows[r - r0] = beta;
+            }
+        }
         __syncthreads();
+    }
+    for (int r = r0; r < rows && r < r0 + VR; r++) {
+        size_t row = (size_t)seq * rows + r;
+        size_t logged = (size_t)slot * log_rows + r;
+        const float* l = lin + row * LA_IN_ROWS;
+        const float* m = mix + row * LA_CONV_DIM;
+        const float* q_s = q_rows[r - r0];
+        const float* k_s = k_rows[r - r0];
+        float decay = decay_rows[r - r0];
+        float beta = beta_rows[r - r0];
         float acc = 0.0f;
 #pragma unroll
         for (int i = 0; i < KS; i++) {
@@ -167,11 +223,11 @@ extern "C" __global__ void __launch_bounds__(LA_D * LA_KSPLIT) gdn_verify(const 
             acc = __fmaf_rn(s[i], q_s[k], acc);
         }
         if (tid < LA_D) {
-            size_t at = (row * LA_VH + h) * LA_D + tid;
+            size_t at = (logged * LA_VH + h) * LA_D + tid;
             klog[at] = k_s[tid];
             dlog[at] = delta_s[tid];
         }
-        if (tid == 0) glog[row * LA_VH + h] = decay;
+        if (tid == 0) glog[logged * LA_VH + h] = decay;
         __syncthreads();
         part[ks][v] = acc;
         __syncthreads();
@@ -183,36 +239,45 @@ extern "C" __global__ void __launch_bounds__(LA_D * LA_KSPLIT) gdn_verify(const 
         float inv = rsqrtf(block_reduce<false>(o * o, scratch) / LA_D + EPS);
         if (ks == 0) out[row * LA_VALUE_DIM + h * LA_D + v] = norm_w[v] * (o * inv) * silu(l[LA_Z_OFF + h * LA_D + v]);
     }
+    }
 }
 
 extern "C" __global__ void __launch_bounds__(LA_D * LA_KSPLIT) gdn_commit(float* state, const float* klog, const float* dlog,
-                                                                          const float* glog, int seq_slots,
-                                                                          const int* slots, int rows,
-                                                                          const int* accepted, int log_rows) {
+                                                                          const float* glog, const int* pend,
+                                                                          int seq_slots, const int* slots, int rows,
+                                                                          int log_rows) {
     constexpr int KS = LA_D / LA_KSPLIT;
     int h = blockIdx.x;
     int seq = blockIdx.y;
     int layer = blockIdx.z;
-    int slot = layer + slots[seq * rows] * seq_slots;
+    int owner = slots[seq * rows];
+    int pending = pend[owner];
+    if (pending == 0) return;
+    int slot = layer + owner * seq_slots;
     int v = threadIdx.x % LA_D;
     int ks = threadIdx.x / LA_D;
-    size_t base = (size_t)layer * log_rows;
     float* S = state + ((size_t)slot * LA_VH + h) * LA_STATE;
     float s[KS];
 #pragma unroll
     for (int i = 0; i < KS; i++) s[i] = S[(ks * KS + i) * LA_D + v];
-    for (int r = 0; r <= accepted[seq]; r++) {
-        size_t row = base + (size_t)seq * rows + r;
-        const float* k_s = klog + (row * LA_VH + h) * LA_D;
+#pragma unroll 1
+    for (int r = 0; r < pending; r++) {
+        size_t row = (size_t)slot * log_rows + r;
+        const float* kr = klog + (row * LA_VH + h) * LA_D;
         float decay = glog[row * LA_VH + h];
         float d = dlog[(row * LA_VH + h) * LA_D + v];
 #pragma unroll
         for (int i = 0; i < KS; i++) {
             int k = ks * KS + i;
             s[i] = __fmul_rn(s[i], decay);
-            s[i] = __fmaf_rn(k_s[k], d, s[i]);
+            s[i] = __fmaf_rn(kr[k], d, s[i]);
         }
     }
 #pragma unroll
     for (int i = 0; i < KS; i++) S[(ks * KS + i) * LA_D + v] = s[i];
+}
+
+extern "C" __global__ void gdn_defer(int* pend, const int* slots, int rows, const int* accepted, int n, int clear) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) pend[slots[i * rows]] = clear ? 0 : accepted[i] + 1;
 }

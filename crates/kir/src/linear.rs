@@ -69,7 +69,7 @@ impl Family {
             Family::Conv => &["gdn_conv_step", "gdn_conv_prefill", "gdn_conv_keep"],
             Family::Step => &["gdn_step", "gdn_qk_prep", "gdn_gates"],
             Family::Chunk => &["gdn_chunk_prep", "gdn_chunk_scan", "gdn_gated_norm"],
-            Family::Verify => &["gdn_conv_verify", "gdn_conv_commit", "gdn_verify", "gdn_commit"],
+            Family::Verify => &["gdn_conv_verify", "gdn_conv_commit", "gdn_verify", "gdn_commit", "gdn_defer"],
             Family::Draft => &[
                 "mtp_fc_in",
                 "mtp_draft",
