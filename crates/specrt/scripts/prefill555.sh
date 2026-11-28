@@ -9,7 +9,7 @@ rounds=${ROUNDS:-3}
 specs=${SPECS:-qwen3.8-27b-nvfp4 qwen3.8-27b}
 alt=${ALT_BIN:-}
 mkdir -p "$out"
-run() { systemd-run --user --wait --collect -P -p MemoryMax=16G -p MemorySwapMax=0 --working-directory="$here" "$@"; }
+run() { systemd-run --user --wait --collect -P -p MemoryMax=16G -p MemorySwapMax=0 -E CUDA_VISIBLE_DEVICES -E CUDA_DEVICE_ORDER --working-directory="$here" "$@"; }
 summary() { grep -E "SUMMARY.*cold|rror|panick"; }
 for r in $(seq "$rounds"); do
     for s in $specs; do
