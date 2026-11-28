@@ -217,15 +217,15 @@ fn act_quant_paths_are_never_candidates_without_act_quant_or_at_one_row() {
 }
 
 #[test]
-fn swapped_rows_cover_every_row_count_up_to_the_batch_limit_with_one_bucket() {
+fn swapped_rows_cover_every_row_count_up_to_their_limit_with_one_bucket() {
     let t = Target::sm_120();
     let act = policy(true, true);
-    for n in 2..=64 {
+    for n in 2..=kir::gemm::SWAP_MAX_TOKENS {
         let swaps: Vec<String> = eligible(&t, &act, &req("gate_up", gate_up(), n, WeightFormat::Fp4)).into_iter().filter(|c| c.path.swapped()).map(|c| c.name).collect();
         let bucket = kir::gemm::SwapShape::for_tokens(n);
         assert!(bucket.tokens >= n && swaps.contains(&format!("gate_up_f4s{}", bucket.tokens)), "{n}: {swaps:?}");
     }
-    assert!(eligible(&t, &act, &req("gate_up", gate_up(), 65, WeightFormat::Fp4)).iter().all(|c| !c.path.swapped()));
+    assert!(eligible(&t, &act, &req("gate_up", gate_up(), kir::gemm::SWAP_MAX_TOKENS + 1, WeightFormat::Fp4)).iter().all(|c| !c.path.swapped()));
 }
 
 #[test]

@@ -13,7 +13,8 @@ pub const F4A_SKINNY_STAGES: usize = 3;
 pub const FP8_ACT_STAGES: usize = 2;
 pub const BATCH_KC: usize = 128;
 pub const BATCH_VARIANTS: [usize; 4] = [8, 16, 32, 64];
-pub const SWAP_VARIANTS: [usize; 6] = [8, 16, 24, 32, 48, 64];
+pub const SWAP_VARIANTS: [usize; 3] = [8, 16, 24];
+pub const SWAP_MAX_TOKENS: usize = 24;
 const SWAP_WARPS: usize = 4;
 const SWAP_DEPTH: usize = 2;
 const SWAP_WIDE_TILES: usize = 4;
@@ -363,7 +364,7 @@ pub struct SwapShape {
 
 impl SwapShape {
     pub fn for_tokens(tokens: usize) -> SwapShape {
-        let tokens = SWAP_VARIANTS.iter().copied().find(|&v| v >= tokens).unwrap_or(BATCH_MAX_TOKENS);
+        let tokens = SWAP_VARIANTS.iter().copied().find(|&v| v >= tokens).unwrap_or(SWAP_MAX_TOKENS);
         let mj = if tokens / 8 > SWAP_WIDE_TILES { 1 } else { 2 };
         SwapShape { tokens, warps: SWAP_WARPS, mj, depth: SWAP_DEPTH }
     }
@@ -926,7 +927,7 @@ pub fn candidates(t: &Target, policy: &Policy, r: &Request) -> Vec<Choice> {
         WeightFormat::Fp4 => fp4_act && FP4_ACT_LINEARS.contains(&r.linear),
         _ => false,
     };
-    if policy.swap && swap && r.tokens <= BATCH_MAX_TOKENS {
+    if policy.swap && swap && r.tokens <= SWAP_MAX_TOKENS {
         out.extend(SWAP_VARIANTS.into_iter().filter(|&v| v >= r.tokens).filter_map(|v| swap_choice(t, policy, r, v).ok()));
     }
     let batch = r.tokens <= BATCH_MAX_TOKENS && (r.weight == WeightFormat::Fp4 || BATCH_LINEARS.contains(&r.linear));
