@@ -214,9 +214,9 @@ pub fn chunk_ptrs(n: usize) -> String {
         n,
         "int t0 = c * C;
 size_t ch = (size_t)(c * LA_VH + h);
-const uint4* wp = (const uint4*)w + ch * (C * LA_D / 4) + 2 * (warp * KD * 32 + lane);
-const uint4* qp = (const uint4*)qe + ch * (C * LA_D / 4) + 2 * (warp * KD * 32 + lane);
-const uint4* ap = (const uint4*)aqk + ch * (C * C / 4) + 2 * (warp * KC * 32 + lane);
+const uint4* wp = (const uint4*)w + ch * (C * LA_D / 4) + LA_FS * (warp * KD * 32 + lane);
+const uint4* qp = (const uint4*)qe + ch * (C * LA_D / 4) + LA_FS * (warp * KD * 32 + lane);
+const uint4* ap = (const uint4*)aqk + ch * (C * C / 4) + LA_FS * (warp * KC * 32 + lane);
 const uint4* kp = (const uint4*)kt;
 float decay = expf(gc[ch * C + C - 1]);
 float acc[NT][4];

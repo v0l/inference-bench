@@ -47,7 +47,7 @@ pub fn library() -> String {
 gdn_pack2(v0, v1, hi, lo);
 int rec = ((m >> 4) * KSTEPS + (k >> 4)) * 32 + (m & 7) * 4 + ((k & 7) >> 1);
 int reg = ((m >> 3) & 1) + 2 * ((k >> 3) & 1);
-base[rec * 8 + reg] = hi;
+base[rec * (LO ? 8 : 4) + reg] = hi;
 if (LO) base[rec * 8 + 4 + reg] = lo;
 ",
     );
@@ -66,7 +66,7 @@ if (LO) {
 mma_bf16(acc[n], ah.x, ah.y, ah.z, ah.w, bh0, bh1);
 ";
     let step = format!(
-        "uint4 ah = ap[kk * 64];\nuint4 al = LO ? ap[kk * 64 + 1] : ah;\n{}",
+        "uint4 ah = ap[kk * (LO ? 64 : 32)];\nuint4 al = LO ? ap[kk * 64 + 1] : ah;\n{}",
         unroll_block(0, "int n = 0; n < NT; n++", inner)
     );
     let body = unroll_block(0, "int kk = 0; kk < KS; kk++", &step);

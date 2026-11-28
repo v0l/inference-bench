@@ -26,6 +26,7 @@ constexpr int LA_KS = LA_D + 1;
 constexpr int LA_AS = LA_CHUNK + 1;
 constexpr int LA_COLS = 32;
 constexpr bool LA_LO = true;
+constexpr int LA_FS = 2;
 constexpr float LA_L2_EPS = 1e-6f;
 static_assert(LA_D % LA_COLS == 0 && LA_D <= 128, "linear head dim");
 static_assert(LA_VH % LA_KH == 0, "linear head groups");
@@ -112,7 +113,7 @@ __device__ __forceinline__ void gdn_frag_put(unsigned* base, int m, int k, float
     gdn_pack2(v0, v1, hi, lo);
     int rec = ((m >> 4) * KSTEPS + (k >> 4)) * 32 + (m & 7) * 4 + ((k & 7) >> 1);
     int reg = ((m >> 3) & 1) + 2 * ((k >> 3) & 1);
-    base[rec * 8 + reg] = hi;
+    base[rec * (LO ? 8 : 4) + reg] = hi;
     if (LO) base[rec * 8 + 4 + reg] = lo;
 }
 
@@ -343,7 +344,7 @@ __device__ __forceinline__ void gdn_mma_planes(float (*acc)[4], const uint4* ap,
                                                const unsigned short* bl, int pitch, int g, int t) {
 #pragma unroll
     for (int kk = 0; kk < KS; kk++) {
-        uint4 ah = ap[kk * 64];
+        uint4 ah = ap[kk * (LO ? 64 : 32)];
         uint4 al = LO ? ap[kk * 64 + 1] : ah;
 #pragma unroll
         for (int n = 0; n < NT; n++) {
@@ -415,9 +416,9 @@ extern "C" __global__ void __launch_bounds__(LA_CHUNK * 2) gdn_chunk_scan(const 
     for (int c = 0; c < chunks; c++) {
         int t0 = c * C;
         size_t ch = (size_t)(c * LA_VH + h);
-        const uint4* wp = (const uint4*)w + ch * (C * LA_D / 4) + 2 * (warp * KD * 32 + lane);
-        const uint4* qp = (const uint4*)qe + ch * (C * LA_D / 4) + 2 * (warp * KD * 32 + lane);
-        const uint4* ap = (const uint4*)aqk + ch * (C * C / 4) + 2 * (warp * KC * 32 + lane);
+        const uint4* wp = (const uint4*)w + ch * (C * LA_D / 4) + LA_FS * (warp * KD * 32 + lane);
+        const uint4* qp = (const uint4*)qe + ch * (C * LA_D / 4) + LA_FS * (warp * KD * 32 + lane);
+        const uint4* ap = (const uint4*)aqk + ch * (C * C / 4) + LA_FS * (warp * KC * 32 + lane);
         const uint4* kp = (const uint4*)kt;
         float decay = expf(gc[ch * C + C - 1]);
         float acc[NT][4];
@@ -457,7 +458,7 @@ extern "C" __global__ void __launch_bounds__(LA_CHUNK * 2) gdn_chunk_scan(const 
 #pragma unroll
         for (int j = 0; j < DPW; j++) {
             if (warp + j * WARPS >= KD) continue;
-            const uint4* kj = kp + ch * (C * LA_D / 4) + 2 * ((warp + j * WARPS) * KC * 32 + lane);
+            const uint4* kj = kp + ch * (C * LA_D / 4) + LA_FS * ((warp + j * WARPS) * KC * 32 + lane);
             float a2[NT][4];
 #pragma unroll
             for (int n = 0; n < NT; n++)

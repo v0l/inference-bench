@@ -232,8 +232,10 @@ pub(crate) fn constants(s: &LinearShape, u: &LinearTuning) -> String {
     let _ = writeln!(o, "constexpr int LA_COLS = {};", u.cols);
     if s.chunk_single_bf16 {
         let _ = writeln!(o, "constexpr bool LA_LO = false;");
+        let _ = writeln!(o, "constexpr int LA_FS = 1;");
     } else {
         let _ = writeln!(o, "constexpr bool LA_LO = true;");
+        let _ = writeln!(o, "constexpr int LA_FS = 2;");
     }
     let _ = writeln!(o, "constexpr float LA_L2_EPS = 1e-6f;");
     let _ = writeln!(o, "static_assert(LA_D % LA_COLS == 0 && LA_D <= 128, \"linear head dim\");");

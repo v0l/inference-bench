@@ -26,6 +26,7 @@ constexpr int LA_KS = LA_D + 1;
 constexpr int LA_AS = LA_CHUNK + 1;
 constexpr int LA_COLS = 32;
 constexpr bool LA_LO = true;
+constexpr int LA_FS = 2;
 constexpr float LA_L2_EPS = 1e-6f;
 static_assert(LA_D % LA_COLS == 0 && LA_D <= 128, "linear head dim");
 static_assert(LA_VH % LA_KH == 0, "linear head groups");

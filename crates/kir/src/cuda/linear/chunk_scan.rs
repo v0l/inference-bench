@@ -55,7 +55,7 @@ for (int c = 0; c < chunks; c++) {
         "#pragma unroll
 for (int j = 0; j < DPW; j++) {
     if (warp + j * WARPS >= KD) continue;
-    const uint4* kj = kp + ch * (C * LA_D / 4) + 2 * ((warp + j * WARPS) * KC * 32 + lane);
+    const uint4* kj = kp + ch * (C * LA_D / 4) + LA_FS * ((warp + j * WARPS) * KC * 32 + lane);
     float a2[NT][4];
 ",
     ));
