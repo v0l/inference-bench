@@ -343,6 +343,8 @@ fn report(rows: &[Row], specs: &[(&'static str, Spec, Spec)], t: &kir::Target) -
 #[ignore = "needs an sm_120 GPU; timing only"]
 fn gemm_family_sweep_at_decode_row_counts() {
     let ctx = CudaContext::new(0).unwrap();
+    let picks = specrt::runtime::load_picks(&specrt::runtime::tune_path(&specrt::jit::default_cache_dir()));
+    eprintln!("{picks} measured picks loaded from the kernel cache");
     let specs: Vec<(&'static str, Spec, Spec)> = vec![
         ("27b", fixture_spec("qwen3.8-27b-nvfp4"), fixture_spec("qwen3.8-27b-nvfp4-exact")),
         ("4b", four_b(true), four_b(false)),

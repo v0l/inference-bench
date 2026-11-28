@@ -73,6 +73,8 @@ Act-quant candidates are only eligible when the spec sets `act_quant` (FP8 linea
 
 No formula fits the table within 5%. Fits tried on the 480 (linear, rows, spec) cells: bytes over bandwidth with occupancy and an MMA term per family (least squares, 9 to 16 free parameters, misses 40 to 100 cells by more than 5%, worst 1.6x to 3.6x), and the hand formula above (misses 43 of 448 cells at 64 rows or fewer, worst 1.65x, mean 1.022 of the fastest against 1.053 for the old thresholds). Picking per bucket from measurement misses none: every cell is within 2.3% of its fastest eligible kernel. So the formula is only the cold default. `tests/gemm_select.rs` checks both claims against the checked-in sweep.
 
+Run to run: a second sweep at 12 and 24 rows on 28 Nov (344 cells) reads a median of 0.996 of the first, with 5% of cells 13% or more faster, mostly the batched GEMV at 12 rows (`lin_in_f8b16` 110.1 to 87.4 us). The fastest kernel changed in 5 of 32 cells, by 1.116x at most (27B FP8 `down` at 12 rows: `f8_narrow` first, `f8b16` second). That is why the pick is measured on the loaded model at load rather than taken from this table: the runtime tuner timed `f8b16` at 93.6 us and `f8_narrow` at 103.1 us for that cell on the 27B and kept `f8b16`. The cache file keeps every candidate's time beside the pick (third column).
+
 ## End to end
 
 `bench --ab --rounds 6 --a-set runtime.gemm_select=fixed <spec> <batch> 128`, GPU1, 20 prompts, MTP k = 2, both arms in one process, the measured picks cached before the run.
@@ -100,3 +102,7 @@ SEQS=1 crates/specrt/scripts/nsys1516.sh
 ```
 
 Each under `~/.agents/bin/gpu-run 1 --min-free 80000 -- systemd-run --user --wait --collect -P -q -p MemoryMax=24G -p MemorySwapMax=0 -E CUDA_VISIBLE_DEVICES=1 -E CUDA_DEVICE_ORDER=PCI_BUS_ID -E HOME`. The first measured load of the 27B times 88 (linear, bucket) cells; later loads read `gemm-select.tsv`.
+
+## Numerics
+
+Outputs at 8 rows or fewer are unchanged (same kernels). Above 8 rows the act-quant specs now quantise activations at 9 to 16 rows too, as they already did at 17 rows and more, and the exact specs stay weight only. On GPU1: `fp8_batch` 6/6, `fp4_batch` 3/3, `fp8_gemm` 3/3, `mtp` 18/18 (the torch reference test skipped, its refs are not on this host), `tiny27b` 9/9, `real_27b_nvfp4_agrees_with_vllm_greedy_and_logprobs` (teacher forced top-1 1,219 of 1,280, mean KL 0.0133, p99 0.110; gates 90% and 0.05), `real_27b_mtp_acceptance_on_vllms_own_greedy_tokens` (acceptance length 2.340), `real_27b_nvfp4_first_layers_match_the_dequantised_checkpoint`. `tiny27b` `speculative_greedy_with_act_quant_equals_its_plain_greedy` and `fusion_plan` `batched_decode_puts_the_residual_and_act_in_the_split_reduce` pin `gemm_select = "fixed"`. On the tiny 27B fixture (256 wide) the formula picks the `_mma_tiny` tile for the 3 row verify where the old rule took `f8b8`; both are weight only, but the summation order differs from the 1 row GEMV plain decode uses, and the act spec greedy comparison of speculative against plain decode diverges on one of the four prompts. Under the old rule verify and plain decode also run different kernels (`f8b8` against the GEMV) and happen to agree. The fusion test checks the split reduce of the 8 row GEMV, which the formula no longer picks on the tiny shapes.
