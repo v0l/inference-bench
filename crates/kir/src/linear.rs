@@ -11,7 +11,7 @@ pub struct LinearTuning {
 impl LinearTuning {
     pub fn for_target(t: &Target) -> LinearTuning {
         let _ = t;
-        LinearTuning { chunk: 64, ksplit: 4, cols: 16 }
+        LinearTuning { chunk: 64, ksplit: 4, cols: 32 }
     }
 
     pub fn chunk_threads(&self) -> u32 {

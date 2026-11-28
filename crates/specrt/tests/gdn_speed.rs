@@ -25,6 +25,22 @@ fn time_ms(ctx: &std::sync::Arc<CudaContext>, stream: &std::sync::Arc<cudarc::dr
     times[5]
 }
 
+fn check_against_baseline(tokens: usize, name: &str, host: &[f32]) -> String {
+    let hash = host.iter().fold(0xcbf29ce484222325u64, |h, v| (h ^ v.to_bits() as u64).wrapping_mul(0x100000001b3));
+    let Ok(dir) = std::env::var("SPECRT_GDN_BASELINE") else { return format!("{hash:016x}") };
+    let path = Path::new(&dir).join(format!("{name}-{tokens}.bin"));
+    let Ok(bytes) = std::fs::read(&path) else {
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, host.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        return format!("{hash:016x} saved");
+    };
+    let base: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+    let scale = base.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let diff = base.iter().zip(host).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+    let same = base.iter().zip(host).all(|(a, b)| a.to_bits() == b.to_bits());
+    format!("{hash:016x} {} max_abs_diff {diff:.3e} of {scale:.3e}", if same { "bit-identical" } else { "differs" })
+}
+
 #[test]
 #[ignore = "needs a CUDA GPU with NVRTC"]
 fn gdn_recurrent_state_kernels_speed_on_27b_shaped_layers() {
@@ -174,8 +190,19 @@ fn gdn_chunk_kernels_speed_on_a_27b_shaped_layer() {
             let cfg = LaunchConfig { grid_dim: (vh as u32, (d / cols) as u32, 1), block_dim: ((c / 16 * 32) as u32, 1, 1), shared_mem_bytes: 0 };
             unsafe { b.launch(cfg) }.unwrap();
         };
+        run_prep();
+        run_scan();
+        stream.synchronize().unwrap();
+        let outputs = [("o", &o), ("state", &state)];
+        let mut line = String::new();
+        for (name, buf) in outputs {
+            let host = stream.clone_dtoh(buf).unwrap();
+            line += &format!(" {name}={}", check_against_baseline(tokens, name, &host));
+        }
+        eprintln!("gdn tokens={tokens}: outputs{line}");
+        let s0 = time(&run_scan);
         let p = time(&run_prep);
         let s = time(&run_scan);
-        eprintln!("gdn tokens={tokens}: prep min {:.3} ms median {:.3} ms; scan min {:.3} ms median {:.3} ms", p.0, p.1, s.0, s.1);
+        eprintln!("gdn tokens={tokens}: prep min {:.3} ms median {:.3} ms; scan min {:.3} ms median {:.3} ms (scan first {:.3})", p.0, p.1, s.0, s.1, s0.1);
     }
 }

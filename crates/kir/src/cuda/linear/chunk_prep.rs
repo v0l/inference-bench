@@ -1,6 +1,6 @@
-use super::prim::{for_stride, kernel, tri_leaf, tri_merge, warp_tiles};
+use super::prim::{at, for_stride, kernel, tri_leaf, tri_merge, warp_tiles};
 
-const HEADER: &str = r##"extern "C" __global__ void __launch_bounds__(256) gdn_chunk_prep(const float* qn, const float* kn, const float* mix,
+const HEADER: &str = r##"extern "C" __global__ void __launch_bounds__(256, 2) gdn_chunk_prep(const float* qn, const float* kn, const float* mix,
                                                                  const float* g, const float* beta, float* w,
                                                                  float* u, float* aqk, float* gc, float* qe, float* kt, int tokens)"##;
 
@@ -77,21 +77,52 @@ const float* vc = mix + (size_t)t0 * LA_CONV_DIM + LA_V_OFF + h * LA_D;
 auto t_at = [&](int m, int k) { return k <= m ? A[m * LA_AS + k] : 0.0f; };
 "##;
 
-const WY: &str = r##"float uu[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-float ww[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-mma_split_tile<C / 16>(uu, m0, n0, lane, t_at,
-                       [&](int k, int n) { return k < live ? vc[(size_t)k * LA_CONV_DIM + n] * bs[k] : 0.0f; });
-mma_split_tile<C / 16>(ww, m0, n0, lane, t_at,
-                       [&](int k, int n) { return ks[k * LA_KS + n] * bs[k] * expf(gs[k]); });
+const WY: &str = r##"constexpr int MB = C / 16;
 unsigned* wp = (unsigned*)w + (size_t)(c * LA_VH + h) * C * LA_D;
+for (int nt = warp; nt < LA_D / 8; nt += WARPS) {
+    int n = nt * 8 + g8;
+    float uu[MB][4], ww[MB][4];
 #pragma unroll
-for (int e = 0; e < 4; e += 2) {
-    int i = m0 + g8 + (e >> 1) * 8;
-    int d = n0 + 2 * t4;
-    size_t at = ((size_t)(t0 + i) * LA_VH + h) * LA_D + d;
-    u[at] = uu[e];
-    u[at + 1] = uu[e + 1];
-    gdn_frag_put<LA_D / 16>(wp, i, d, ww[e], ww[e + 1]);
+    for (int mb = 0; mb < MB; mb++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) uu[mb][e] = ww[mb][e] = 0.0f;
+#pragma unroll
+    for (int kk = 0; kk < MB; kk++) {
+        int k = kk * 16 + 2 * t4;
+        auto vb = [&](int r) { return r < live ? vc[(size_t)r * LA_CONV_DIM + n] * bs[r] : 0.0f; };
+        auto kb = [&](int r) { return ks[r * LA_KS + n] * bs[r] * expf(gs[r]); };
+        unsigned uh0, ul0, uh1, ul1, wh0, wl0, wh1, wl1;
+        gdn_pack2(vb(k), vb(k + 1), uh0, ul0);
+        gdn_pack2(vb(k + 8), vb(k + 9), uh1, ul1);
+        gdn_pack2(kb(k), kb(k + 1), wh0, wl0);
+        gdn_pack2(kb(k + 8), kb(k + 9), wh1, wl1);
+#pragma unroll
+        for (int mb = kk; mb < MB; mb++) {
+            int m0 = mb * 16;
+            unsigned th[4], tl[4];
+            gdn_pack2(t_at(m0 + g8, k), t_at(m0 + g8, k + 1), th[0], tl[0]);
+            gdn_pack2(t_at(m0 + g8 + 8, k), t_at(m0 + g8 + 8, k + 1), th[1], tl[1]);
+            gdn_pack2(t_at(m0 + g8, k + 8), t_at(m0 + g8, k + 9), th[2], tl[2]);
+            gdn_pack2(t_at(m0 + g8 + 8, k + 8), t_at(m0 + g8 + 8, k + 9), th[3], tl[3]);
+            mma_bf16(uu[mb], tl[0], tl[1], tl[2], tl[3], uh0, uh1);
+            mma_bf16(uu[mb], th[0], th[1], th[2], th[3], ul0, ul1);
+            mma_bf16(uu[mb], th[0], th[1], th[2], th[3], uh0, uh1);
+            mma_bf16(ww[mb], tl[0], tl[1], tl[2], tl[3], wh0, wh1);
+            mma_bf16(ww[mb], th[0], th[1], th[2], th[3], wl0, wl1);
+            mma_bf16(ww[mb], th[0], th[1], th[2], th[3], wh0, wh1);
+        }
+    }
+#pragma unroll
+    for (int mb = 0; mb < MB; mb++)
+#pragma unroll
+        for (int e = 0; e < 4; e += 2) {
+            int i = mb * 16 + g8 + (e >> 1) * 8;
+            int d = nt * 8 + 2 * t4;
+            size_t at = ((size_t)(t0 + i) * LA_VH + h) * LA_D + d;
+            u[at] = uu[mb][e];
+            u[at + 1] = uu[mb][e + 1];
+            gdn_frag_put<LA_D / 16>(wp, i, d, ww[mb][e], ww[mb][e + 1]);
+        }
 }
 "##;
 
@@ -127,7 +158,7 @@ pub fn body() -> String {
     o += &tri_leaf(0);
     o += &tri_merge(0);
     o += UNIT_DIAGONAL;
-    o += &warp_tiles("C", "LA_D", WY);
+    o += &format!("{{\n{}}}\n", at(4, WY));
     o += GATES_OUT;
     o += &for_stride("p", "tid", "C * LA_D / 2", "blockDim.x", Q_EXP);
     o += &for_stride("p", "tid", "C * LA_D / 2", "blockDim.x", K_TAIL);
