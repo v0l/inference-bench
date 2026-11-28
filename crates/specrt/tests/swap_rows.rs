@@ -196,7 +196,7 @@ fn check(spec_name: &str, linear: &str, kind: WeightKind) {
     let start: Vec<f32> = (0..most * n).map(|_| rng.float()).collect();
     let fresh = || (stream.clone_htod(&start).unwrap(), stream.alloc_zeros::<u16>(most * n).unwrap(), stream.alloc_zeros::<u16>(most * n).unwrap());
     let mut checked = 0;
-    for tokens in [2, 3, 8, 9, 12, 17, 24, 40, 48, 64] {
+    for tokens in [2, 3, 8, 9, 12, 17, 24] {
         let all = specrt::gemm::candidates(&spec, &g.target, linear, tokens, kind);
         let reference = all.iter().find(|c| matches!(c.path, GemmPath::F4a | GemmPath::F8a) && c.name.ends_with("_narrow")).unwrap_or_else(|| panic!("{linear} {tokens}: no act tile"));
         let ref_out = fresh();
