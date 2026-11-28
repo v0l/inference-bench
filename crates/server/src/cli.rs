@@ -47,6 +47,8 @@ pub struct ServeArgs {
     pub prefill_burst_tokens: Option<usize>,
     #[arg(long, help = "Prompts over 2048 tokens read at the same time (default 1)")]
     pub max_long_in_flight: Option<usize>,
+    #[arg(long, help = "Times later requests may start ahead of one that does not fit the KV cache yet (default 32, 0 is strict arrival order)")]
+    pub max_overtakes: Option<usize>,
     #[arg(long, help = "Cap prefill per step once a decoder has waited this many ms since its last token (default 0, off)")]
     pub stall_budget_ms: Option<u64>,
     #[arg(long, help = "Smallest prompt chunk per step while the stall cap is active (default 0, no floor)")]
@@ -103,6 +105,7 @@ impl ServeArgs {
         config.admit_lookahead = self.admit_lookahead.or(config.admit_lookahead);
         config.prefill_burst_tokens = self.prefill_burst_tokens.or(config.prefill_burst_tokens);
         config.max_long_in_flight = self.max_long_in_flight.or(config.max_long_in_flight);
+        config.max_overtakes = self.max_overtakes.or(config.max_overtakes);
         config.stall_budget_ms = self.stall_budget_ms.or(config.stall_budget_ms);
         config.min_stall_chunk_tokens = self.min_stall_chunk_tokens.or(config.min_stall_chunk_tokens);
         if let Some(n) = self.idle_unload_secs {

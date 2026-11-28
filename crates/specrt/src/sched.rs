@@ -554,6 +554,7 @@ pub struct Config {
     pub admit_lookahead: usize,
     pub prefill_burst_tokens: usize,
     pub max_long_in_flight: usize,
+    pub max_overtakes: usize,
     pub adaptive_drafts: bool,
     pub stall_budget: Duration,
     pub min_stall_chunk: usize,
@@ -576,6 +577,7 @@ impl Default for Config {
             admit_lookahead: 0,
             prefill_burst_tokens: 0,
             max_long_in_flight: 1,
+            max_overtakes: 32,
             adaptive_drafts: false,
             stall_budget: Duration::ZERO,
             min_stall_chunk: 0,
@@ -683,6 +685,9 @@ struct Seq {
     drafts: crate::drafts::Positions,
     admitted_at: Option<Instant>,
     held: [Duration; 6],
+    waiting_on: Option<Blocked>,
+    overtaken: usize,
+    hashes: Vec<Hash>,
 }
 
 impl Seq {
@@ -1154,6 +1159,9 @@ impl<E: Executor> Scheduler<E> {
             drafts: Default::default(),
             admitted_at: None,
             held: [Duration::ZERO; 6],
+            waiting_on: None,
+            overtaken: 0,
+            hashes: Vec::new(),
         });
         Ok(id)
     }
@@ -1261,9 +1269,10 @@ impl<E: Executor> Scheduler<E> {
     }
 
     fn charge_waiting(&mut self) {
-        let Some((b, since)) = self.blocked else { return };
+        let Some((stop, since)) = self.blocked else { return };
         let now = Instant::now();
         for s in self.waiting.iter_mut() {
+            let b = s.waiting_on.unwrap_or(stop);
             s.held[b as usize] += now.saturating_duration_since(since.max(s.arrived));
         }
     }
@@ -1284,107 +1293,162 @@ impl<E: Executor> Scheduler<E> {
         let mut planned = 0;
         let mut long_in_flight = if self.cfg.shortest_first { self.running.iter().filter(|s| s.prefill_target() - s.computed > LONG_PROMPT).count() } else { 0 };
         let long_cap = if self.cfg.shortest_first { self.cfg.max_long_in_flight.max(1) } else { usize::MAX };
-        while let Some(s) = self.waiting.front() {
+        for s in self.waiting.iter_mut() {
+            s.waiting_on = None;
+        }
+        let mut first = None;
+        let mut i = 0;
+        let stop = loop {
+            if i >= self.waiting.len() {
+                break None;
+            }
             if self.running.len() >= cap || self.free_slots.is_empty() {
-                return Ok(Some(Blocked::Slots));
+                break Some(Blocked::Slots);
             }
             if planned >= budget {
-                return Ok(Some(Blocked::Budget));
+                break Some(Blocked::Budget);
             }
-            let target = s.prefill_target();
-            if target > LONG_PROMPT && long_in_flight >= long_cap {
-                return Ok(Some(Blocked::LongCap));
-            }
-            let need = blocks_for(target + 1);
             let reserve = if self.running.is_empty() { 0 } else { self.reserve() };
-            if s.parked.is_some() {
-                if let Some(b) = self.resume_front(reserve)? {
-                    return Ok(Some(b));
+            let s = &self.waiting[i];
+            let firm = s.admitted > 0 || s.overtaken >= self.cfg.max_overtakes;
+            let outcome = if s.parked.is_some() { self.resume_at(i, reserve)? } else { self.admit_at(i, reserve, long_in_flight >= long_cap)? };
+            match outcome {
+                Ok(remaining) => {
+                    if remaining > LONG_PROMPT {
+                        long_in_flight += 1;
+                    } else {
+                        planned += remaining;
+                    }
+                    let mut fenced = false;
+                    for s in self.waiting.iter_mut().take(i).filter(|s| s.waiting_on == Some(Blocked::Kv)) {
+                        s.overtaken += 1;
+                        fenced |= s.overtaken >= self.cfg.max_overtakes;
+                    }
+                    if fenced {
+                        break first;
+                    }
                 }
-                continue;
-            }
-            let lookahead = if self.running.is_empty() { 0 } else { self.promise(s, 0).saturating_sub(need).min(self.cfg.admit_lookahead) + self.running_promise() };
-            let hit = match self.cache.as_mut() {
-                Some(cache) => {
-                    let hashes = prefix::block_hashes(&s.root, &s.keys[..target]);
-                    let limit = if s.generated() == 0 { target - 1 } else { target };
-                    cache.lookup_with_tail(&s.root, &s.keys[..target], &hashes, limit, &mut self.pool)
-                }
-                None => prefix::Hit::default(),
-            };
-            let from_disk = self.session_hit(s, target, hit.tokens);
-            let hit = if from_disk.is_some() {
-                self.give_back(hit);
-                prefix::Hit::default()
-            } else {
-                hit
-            };
-            let fresh = need - hit.blocks.len();
-            while self.pool.free_count() < fresh + reserve + lookahead {
-                let evicted = self.cache.as_mut().is_some_and(|c| c.evict_one(&mut self.pool)) || self.spill_one_session();
-                if !evicted {
-                    break;
+                Err(b) => {
+                    self.waiting[i].waiting_on = Some(b);
+                    first.get_or_insert(b);
+                    if firm || matches!(b, Blocked::State | Blocked::Resume) {
+                        break Some(b);
+                    }
+                    i += 1;
                 }
             }
-            if self.pool.free_count() < fresh + reserve + lookahead {
-                self.give_back(hit);
-                return Ok(Some(Blocked::Kv));
-            }
-            let slot = *self.free_slots.last().expect("a free slot");
-            if self.exec.acquire_state(slot).is_err() {
-                self.state_refusals += 1;
-                self.give_back(hit);
-                return Ok(Some(Blocked::State));
-            }
-            let mut s = self.waiting.pop_front().expect("front exists");
-            if let Some(state) = &hit.snapshot
-                && let Err(e) = self.exec.restore(slot, state) {
-                    self.exec.release_state(slot);
-                    self.give_back(hit);
-                    self.waiting.push_front(s);
-                    return Err(e);
-                }
-            self.free_slots.pop();
-            if s.generated() == 0 && self.cache.is_some() {
-                self.prefix_queries += s.req.prompt.len() as u64;
-                self.prefix_hits += hit.tokens as u64;
-            }
-            if s.generated() == 0 {
-                s.cached = hit.tokens;
-            }
-            s.computed = hit.tokens;
-            s.blocks = hit.blocks;
-            if let Some(src) = hit.tail {
-                let dst = self.pool.alloc().expect("checked free blocks");
-                self.exec.copy_block(src, dst)?;
-                s.blocks.push(dst);
-                self.pool.release(&mut vec![src]);
-            }
-            for _ in s.blocks.len()..blocks_for(target) {
-                s.blocks.push(self.pool.alloc().expect("checked free blocks"));
-            }
-            self.exec.set_table(slot, &s.blocks)?;
-            self.exec.set_media(slot, s.media.as_deref())?;
-            if let Some(entry) = from_disk {
-                self.restore_session(&entry, &mut s, slot);
-            }
-            s.slot = Some(slot);
-            self.admissions += 1;
-            s.admitted = self.admissions;
-            s.mark_admitted();
-            let remaining = target - s.computed;
-            if remaining > LONG_PROMPT {
-                long_in_flight += 1;
-            } else {
-                planned += remaining;
-            }
-            self.running.push(s);
-        }
-        Ok(None)
+        };
+        Ok(stop.or(first))
     }
 
-    fn resume_front(&mut self, reserve: usize) -> Result<Option<Blocked>> {
-        let front = self.waiting.front().expect("front exists");
+    fn reclaimable(&self) -> usize {
+        self.pool.cache_only() + self.sessions.as_ref().map_or(0, |s| s.held.values().map(|h| h.blocks.len()).sum())
+    }
+
+    fn block_hashes_of(&mut self, i: usize, target: usize) -> Vec<Hash> {
+        let s = &mut self.waiting[i];
+        let mut hashes = std::mem::take(&mut s.hashes);
+        let have = hashes.len().min(target / PAGE);
+        hashes.truncate(have);
+        let parent = hashes.last().copied().unwrap_or(s.root);
+        hashes.extend(prefix::block_hashes(&parent, &s.keys[have * PAGE..target]));
+        hashes
+    }
+
+    fn admit_at(&mut self, i: usize, reserve: usize, long_full: bool) -> Result<Result<usize, Blocked>> {
+        let target = self.waiting[i].prefill_target();
+        let hashes = if self.cache.is_some() { self.block_hashes_of(i, target) } else { Vec::new() };
+        let s = &self.waiting[i];
+        let limit = if s.generated() == 0 { target - 1 } else { target };
+        let peeked = self.cache.as_ref().map_or(0, |c| c.peek(&s.root, &s.keys[..target], &hashes, limit));
+        let disk = self.session_hit(s, target, peeked);
+        let covered = disk.as_ref().map_or(peeked, |e| e.tokens);
+        if long_full && target - covered > LONG_PROMPT {
+            self.waiting[i].hashes = hashes;
+            return Ok(Err(Blocked::LongCap));
+        }
+        let need = blocks_for(target + 1);
+        let lookahead = if self.running.is_empty() { 0 } else { self.promise(s, 0).saturating_sub(need).min(self.cfg.admit_lookahead) + self.running_promise() };
+        let shared = if disk.is_some() { 0 } else { peeked / PAGE };
+        if self.pool.free_count() + self.reclaimable() < need - shared + reserve + lookahead {
+            self.waiting[i].hashes = hashes;
+            return Ok(Err(Blocked::Kv));
+        }
+        let hit = match self.cache.as_mut() {
+            Some(cache) => cache.lookup_with_tail(&s.root, &s.keys[..target], &hashes, limit, &mut self.pool),
+            None => prefix::Hit::default(),
+        };
+        self.waiting[i].hashes = hashes;
+        let s = &self.waiting[i];
+        let from_disk = self.session_hit(s, target, hit.tokens);
+        let hit = if from_disk.is_some() {
+            self.give_back(hit);
+            prefix::Hit::default()
+        } else {
+            hit
+        };
+        let want = need - hit.blocks.len() + reserve + lookahead;
+        while self.pool.free_count() < want {
+            let evicted = self.cache.as_mut().is_some_and(|c| c.evict_one(&mut self.pool)) || self.spill_one_session();
+            if !evicted {
+                break;
+            }
+        }
+        if self.pool.free_count() < want {
+            self.give_back(hit);
+            return Ok(Err(Blocked::Kv));
+        }
+        let slot = *self.free_slots.last().expect("a free slot");
+        if self.exec.acquire_state(slot).is_err() {
+            self.state_refusals += 1;
+            self.give_back(hit);
+            return Ok(Err(Blocked::State));
+        }
+        let mut s = self.waiting.remove(i).expect("index in range");
+        if let Some(state) = &hit.snapshot
+            && let Err(e) = self.exec.restore(slot, state) {
+                self.exec.release_state(slot);
+                self.give_back(hit);
+                self.waiting.insert(i, s);
+                return Err(e);
+            }
+        self.free_slots.pop();
+        s.hashes = Vec::new();
+        s.waiting_on = None;
+        if s.generated() == 0 && self.cache.is_some() {
+            self.prefix_queries += s.req.prompt.len() as u64;
+            self.prefix_hits += hit.tokens as u64;
+        }
+        if s.generated() == 0 {
+            s.cached = hit.tokens;
+        }
+        s.computed = hit.tokens;
+        s.blocks = hit.blocks;
+        if let Some(src) = hit.tail {
+            let dst = self.pool.alloc().expect("checked free blocks");
+            self.exec.copy_block(src, dst)?;
+            s.blocks.push(dst);
+            self.pool.release(&mut vec![src]);
+        }
+        for _ in s.blocks.len()..blocks_for(target) {
+            s.blocks.push(self.pool.alloc().expect("checked free blocks"));
+        }
+        self.exec.set_table(slot, &s.blocks)?;
+        self.exec.set_media(slot, s.media.as_deref())?;
+        if let Some(entry) = from_disk {
+            self.restore_session(&entry, &mut s, slot);
+        }
+        s.slot = Some(slot);
+        self.admissions += 1;
+        s.admitted = self.admissions;
+        s.mark_admitted();
+        let remaining = target - s.computed;
+        self.running.push(s);
+        Ok(Ok(remaining))
+    }
+
+    fn resume_at(&mut self, i: usize, reserve: usize) -> Result<Result<usize, Blocked>> {
+        let front = &self.waiting[i];
         let held = front.parked.as_ref().map_or(0, |h| h.blocks);
         let total = held.max(blocks_for(front.tokens.len() + self.exec.draft_tokens()));
         let promised = self.running_promise();
@@ -1396,14 +1460,14 @@ impl<E: Executor> Scheduler<E> {
         }
         let tight = self.pool.free_count() < total + reserve + promised;
         if self.pool.free_count() < total + reserve || (tight && !self.running.is_empty()) {
-            return Ok(Some(Blocked::Resume));
+            return Ok(Err(Blocked::Resume));
         }
         let slot = *self.free_slots.last().expect("a free slot");
         if self.exec.acquire_state(slot).is_err() {
             self.state_refusals += 1;
-            return Ok(Some(Blocked::State));
+            return Ok(Err(Blocked::State));
         }
-        let mut s = self.waiting.pop_front().expect("front exists");
+        let mut s = self.waiting.remove(i).expect("index in range");
         let host = s.parked.take().expect("parked");
         let mut blocks = Vec::with_capacity(total);
         for _ in 0..total {
@@ -1416,7 +1480,7 @@ impl<E: Executor> Scheduler<E> {
             self.exec.release_state(slot);
             self.pool.release(&mut blocks);
             s.parked = Some(host);
-            self.waiting.push_front(s);
+            self.waiting.insert(i, s);
             return Err(e);
         }
         self.swapped_bytes -= host.bytes as u64;
@@ -1429,7 +1493,7 @@ impl<E: Executor> Scheduler<E> {
         s.admitted = self.admissions;
         s.mark_admitted();
         self.running.push(s);
-        Ok(None)
+        Ok(Ok(0))
     }
 
     fn give_back(&mut self, hit: prefix::Hit) {
@@ -3532,6 +3596,123 @@ mod tests {
         assert!(old.steps_to_first_token >= 30, "the 512 floor reads 16k in about 32 steps, got {}", old.steps_to_first_token);
         let burst = long_prompts_beside_decoders(Config { prefill_burst_tokens: 16384, ..long_cfg(512) }, 1);
         assert!(burst.steps_to_first_token <= 6, "a 16k prompt took {} steps", burst.steps_to_first_token);
+    }
+
+    fn started(events: &[Event], want: SeqId) -> bool {
+        events.iter().any(|e| matches!(e, Event::Started { id, .. } if *id == want))
+    }
+
+    #[test]
+    fn a_short_prompt_is_admitted_past_a_long_prompt_waiting_for_the_long_cap() {
+        let mut fake = Fake::new(8192, 8, 4000, 512);
+        fake.light = true;
+        let mut s = Scheduler::new(fake, Config { max_long_in_flight: 2, max_batched_tokens: 512, ..Config::default() });
+        for q in 0..2 {
+            s.submit(request(6000, 4, q)).unwrap();
+        }
+        step_slowly(&mut s, 1);
+        assert_eq!(s.long_prompts_in_flight(), 2);
+        let long = s.submit(request(6000, 4, 2)).unwrap();
+        let short = s.submit(request(200, 4, 3)).unwrap();
+        let mut events = Vec::new();
+        s.step(&mut events).unwrap();
+        assert!(started(&events, short), "the short prompt waited behind the long cap");
+        assert_eq!(s.waiting.iter().map(|q| q.id).collect::<Vec<_>>(), vec![long]);
+        assert_eq!(s.waiting.front().unwrap().waiting_on, Some(Blocked::LongCap));
+        drain(&mut s);
+        assert_eq!(s.blocks_used(), 0);
+    }
+
+    #[test]
+    fn a_mostly_cached_long_prompt_does_not_count_against_the_long_cap() {
+        let mut fake = Fake::new(20480, 8, 6000, 4096);
+        fake.light = true;
+        fake.hybrid = false;
+        let cfg = Config { max_long_in_flight: 1, max_batched_tokens: 4096, ..cached_config(1024, 64) };
+        let mut s = Scheduler::new(fake, cfg);
+        let full = request(16384, 4, 7);
+        let mut warm = full.clone();
+        warm.prompt.truncate(15360);
+        warm.max_tokens = 1;
+        run_one(&mut s, warm);
+        s.submit(request(8000, 4, 1)).unwrap();
+        step_slowly(&mut s, 1);
+        assert_eq!(s.long_prompts_in_flight(), 1);
+        let id = s.submit(full.clone()).unwrap();
+        let mut events = Vec::new();
+        s.step(&mut events).unwrap();
+        assert!(started(&events, id), "a 16k prompt with 15k cached waited for the long cap");
+        let (_, all, _) = drain(&mut s);
+        let cached = all.iter().find_map(|e| match e { Event::Finished { id: i, cached_tokens, .. } if *i == id => Some(*cached_tokens), _ => None }).unwrap();
+        assert_eq!(cached, 15360);
+    }
+
+    #[test]
+    fn a_prompt_that_does_not_fit_the_kv_pool_does_not_block_smaller_ones() {
+        let mut s = Scheduler::new(Fake::new(1024, 4, 60, 512), Config { reserve_blocks: Some(2), ..Config::default() });
+        s.submit(request(400, 100, 1)).unwrap();
+        step_slowly(&mut s, 1);
+        let big = s.submit(request(600, 100, 2)).unwrap();
+        let small = s.submit(request(100, 4, 3)).unwrap();
+        let mut events = Vec::new();
+        s.step(&mut events).unwrap();
+        assert!(started(&events, small), "the small prompt waited behind one that does not fit");
+        assert_eq!(s.waiting.front().map(|q| (q.id, q.waiting_on)), Some((big, Some(Blocked::Kv))));
+        let (got, _, _) = drain(&mut s);
+        assert_eq!(got[&big], expected(&request(600, 100, 2).prompt, 100, &[]));
+        assert_eq!(s.blocks_used(), 0);
+    }
+
+    fn steps_until_big_starts(max_overtakes: usize, window: usize) -> Option<usize> {
+        let mut s = Scheduler::new(Fake::new(1024, 8, 60, 512), Config { reserve_blocks: Some(2), max_overtakes, ..Config::default() });
+        let mut big = None;
+        for n in 0..window {
+            s.submit(request(100, 30, n as u32)).unwrap();
+            if n == 10 {
+                big = Some(s.submit(request(600, 4, 9999)).unwrap());
+            }
+            let mut events = Vec::new();
+            s.step(&mut events).unwrap();
+            if big.is_some_and(|b| started(&events, b)) {
+                return Some(n - 10);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn a_large_prompt_behind_a_steady_stream_of_small_ones_still_starts_within_a_bound() {
+        assert_eq!(steps_until_big_starts(usize::MAX, 400), None, "without the bound the stream starves the large prompt");
+        let bounded = steps_until_big_starts(4, 400).expect("the large prompt started");
+        assert!(bounded <= 80, "started after {bounded} steps");
+    }
+
+    #[test]
+    fn parked_sequences_are_never_overtaken() {
+        let (mut s, want) = pressured(1 << 30, 0);
+        let mut got: HashMap<SeqId, Vec<u32>> = HashMap::new();
+        let mut checked = 0;
+        while !s.idle() {
+            let before: Vec<SeqId> = s.waiting.iter().map(|q| q.id).collect();
+            let running: Vec<SeqId> = s.running.iter().map(|q| q.id).collect();
+            let mut events = Vec::new();
+            s.step(&mut events).unwrap();
+            for e in &events {
+                if let Event::Token { id, token } = e {
+                    got.entry(*id).or_default().push(*token);
+                }
+            }
+            let pos = |id: SeqId| before.iter().position(|&b| b == id);
+            let admitted: Vec<SeqId> = s.running.iter().map(|q| q.id).filter(|id| !running.contains(id) && before.contains(id)).collect();
+            for w in s.waiting.iter().filter(|q| q.parked.is_some()) {
+                checked += 1;
+                for &a in &admitted {
+                    assert!(pos(w.id).is_some_and(|p| pos(a).unwrap() < p), "{a} was admitted past parked {}", w.id);
+                }
+            }
+        }
+        assert!(checked > 0, "something was parked");
+        assert_eq!(got, want);
     }
 
     #[test]

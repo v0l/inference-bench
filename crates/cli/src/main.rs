@@ -252,6 +252,10 @@ enum Cmd {
         seed: u64,
         #[arg(long, help = "Send chat requests with media instead of text prompts: images:N or video:FILE")]
         media: Option<String>,
+        #[arg(long, default_value_t = 0, help = "Conversations whose prompts share a leading context; 0 makes every prompt unique")]
+        prefixes: usize,
+        #[arg(long, default_value_t = 0.8, help = "Share of each prompt that is its conversation's shared context, with --prefixes")]
+        prefix_share: f64,
         #[arg(long, help = "Print the report as JSON")]
         json: bool,
     },
@@ -851,7 +855,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Results { json } => print_results(&store::load_all(&data), *json)?,
-        Cmd::Loadtest { url, model, api_key, requests, rate, clients, mix, max_prompt, output, seed, media, json } => {
+        Cmd::Loadtest { url, model, api_key, requests, rate, clients, mix, max_prompt, output, seed, media, prefixes, prefix_share, json } => {
             use inference_bench_core::loadtest::{LengthMix, LoadConfig, MediaLoad, run};
             let media = media.as_deref().map(MediaLoad::parse).transpose().map_err(anyhow::Error::msg)?;
             let mut mix = LengthMix::parse(mix).map_err(anyhow::Error::msg)?;
@@ -874,6 +878,8 @@ fn main() -> Result<()> {
                 seed: *seed,
                 sample_every: std::time::Duration::from_secs(1),
                 media,
+                prefixes: *prefixes,
+                prefix_share: *prefix_share,
             };
             let quiet = *json;
             let report = run(&cfg, &mut |i, o| {

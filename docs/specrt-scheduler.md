@@ -40,7 +40,8 @@ to allocate and free, and a table entry is the same for all layers. The kernels 
 - **Admission.** A waiting request is admitted when a slot is free and the pool has blocks for
   its whole prompt plus one, plus a reserve (1 percent of the pool, at least 1 block) once anything
   else is running. A request that could never fit (prompt plus `max_tokens` larger than the whole
-  pool, or than `max_model_len`) is refused at submit with a 400.
+  pool, or than `max_model_len`) is refused at submit with a 400. Admission scans the queue in
+  arrival order instead of stopping at the head (#1518, see "Admission past a blocked head").
 - **Preemption by recompute.** When a decoder needs a new block and the pool is empty, the most
   recently admitted sequence is preempted: its blocks and slot are freed and it goes back to the
   front of the waiting queue with its prompt and every token generated so far. When it is admitted
@@ -376,3 +377,41 @@ The cap never goes below the floor. Same rig, 3 rounds, budget 0 as the control 
 | 600 / 2048 | 1.31 s | 1.39 s | 19.0 s | not run | not run | | |
 
 The stall p99 tracks the floor, not the budget: a step of N tokens stalls decoders for about N / 1,490 s, so a floor of 2048 or more is the same as no cap (1.31 s) and a floor of 1024 gives 0.74 s. Only floors of 512 or less get under 0.5 s, and at 512 the long-mix TTFT p50 is 7.6 to 8.3 s and p99 31.7 to 33.5 s, the same as floor 1024 (7.9 s, 29.7 s): the long-mix loss is not the chunk size falling, it is any cap at all while decoders are running, because eight long prompts all run beside decoders that keep hitting the budget. Floors 256, 2048 and the 600 budget were not run through the long mix because their stall rows already fail the stall bar (2048, 600/1024) or follow the 400/512 result (256 is a smaller chunk than 512, so TTFT can only be worse). No (budget, floor) passes both bars, so the default stays 0 (off). Budget 200 was not run: with any floor the stall p99 is set by the floor.
+
+## Admission past a blocked head (#1518, 27 Nov 2026)
+
+Admission used to serve the waiting queue only from the front. A long prompt waiting for the long prompt cap, or a prompt that did not fit the KV pool yet, held back every request behind it while slots and KV were free. Now `Scheduler::admit_until` walks the queue in arrival order and admits every request that fits:
+
+- A request refused for the long prompt cap or for KV is skipped and the scan goes on. Full slots and a planned prefill budget still end the scan, and so do a refused recurrent state and a parked sequence that cannot resume yet.
+- The long prompt cap counts the tokens left to read after the prefix cache or a disk session, the same count used once a prompt is running. A 30k agent turn with 29k cached is not long. The cache is read with `PrefixCache::peek`, which does not touch the LRU, so a skipped prompt does not keep its blocks warm.
+- Parked (swapped) and preempted sequences (admitted before) are never overtaken: when one of them cannot go, the scan stops.
+- Fairness: each time a later request starts ahead of one held for KV, that one's overtake count goes up. At `serve.max_overtakes` (default 32; server.toml `max_overtakes`, `--max-overtakes`, load dialog "queue overtakes"; 0 is strict arrival order) it blocks the queue again, so a large prompt behind a steady stream of small ones still starts. A prompt held for the long cap is not counted: it starts as soon as a long prompt finishes, and short prompts never take the long cap from it.
+- `inference_admission_blocked_steps_total{reason}` counts the reason that ended the scan, or when the scan reached the end of the queue, the first reason that held a request. Each request's held time is charged to its own reason, not the head's.
+
+Tests (`sched.rs`): `a_short_prompt_is_admitted_past_a_long_prompt_waiting_for_the_long_cap`, `a_mostly_cached_long_prompt_does_not_count_against_the_long_cap`, `a_prompt_that_does_not_fit_the_kv_pool_does_not_block_smaller_ones` (all three fail on the old head-only rule), `a_large_prompt_behind_a_steady_stream_of_small_ones_still_starts_within_a_bound` (no bound: never starts in 400 steps; bound 4: starts within 80) and `parked_sequences_are_never_overtaken`.
+
+Simulated tables (Fake executor; `print_load_table` "both" row, the same as `print_sweep_table` whole 1024 min 512, which are the server defaults; 1.2k prompts arriving beside a 20k prompt and three 6k to 12k prompts, long cap 1):
+
+| decoders | 1.2k TTFT p50 before / after | 1.2k TTFT p95 before / after | long TTFT p50 before / after | long TTFT max before / after | step p95 before / after |
+|---|---|---|---|---|---|
+| 8 | 2.43 / 0.33 s | 3.72 / 0.33 s | 8.73 / 8.65 s | 9.27 / 9.61 s | 0.182 / 0.182 s |
+| 16 | 3.15 / 0.42 s | 4.79 / 0.42 s | 11.28 / 11.20 s | 12.00 / 12.43 s | 0.227 / 0.227 s |
+| 20 | 3.51 / 0.46 s | 5.33 / 0.46 s | 12.56 / 12.48 s | 13.37 / 13.84 s | 0.250 / 0.250 s |
+
+The 1.2k TTFT p95 is lower or equal in every row of both tables at every decoder count. Rows with `shortest_first` off ("master", "min512") have no long cap and are unchanged; every other row drops to under 0.9 s (the worst is `whole 0 min 512` at 20 decoders, 6.02 to 0.86 s). The long prompts lose 3 to 4% at the max because the short ones now read their prompts in steps the long ones used to have alone; p50 does not move. With `whole_prompt_tokens` 2048 or more the long rows lose more (8 decoders, whole 4096: long p50 4.44 to 6.64 s, max 7.29 to 8.07 s), since every short prompt is then read whole in one step ahead of them; the server default is 1024. `print_long_prompt_table` (24 prompts of 15k to 18k, nothing short to overtake) is identical before and after.
+
+### Real 27B check (GPU1, 28 Nov 2026)
+
+Rig: `crates/specrt/scripts/admit1518_rounds.sh` (one server per arm, arms alternated, 3 rounds). Qwen3.8-27B NVFP4 with MTP and the prefix cache on, 8 slots, 26 GB KV, server defaults otherwise (`max_long_in_flight` 4, burst 16384, whole prompt 1024, min prefill 512), `--max-concurrent 64` so the HTTP layer does not hold requests back. Load: 60 requests, Poisson 1/s, 12 clients, prompts 55% 1k to 8k words and 45% 15k to 30k, 4 conversations whose prompts share their first 90% (prefix hit rate 33%), 128 to 384 tokens out. Master is `2bc21c2d` with the loadtest and log commit on top. Queue wait is the server's `queue_ms` per request (arrival to first prefill step), the rest is the client.
+
+| | master (3 rounds) | branch (3 rounds) | mean master / branch |
+|---|---|---|---|
+| queue wait p50 | 0.05 / 0.05 / 0.05 s | 0.05 / 0.05 / 0.05 s | 0.047 / 0.046 s |
+| queue wait p95 | 0.22 / 1.28 / 0.32 s | 2.80 / 0.36 / 0.32 s | 0.61 / 1.16 s |
+| TTFT p50 | 10.46 / 10.76 / 11.16 s | 12.05 / 11.31 / 11.18 s | 10.80 / 11.51 s |
+| TTFT p95 | 18.17 / 19.30 / 21.06 s | 21.42 / 21.06 / 21.08 s | 19.51 / 21.18 s |
+| long prompt TTFT p95 | 18.85 / 22.92 / 22.70 s | 24.14 / 22.30 / 22.75 s | 21.49 / 23.06 s |
+| decode tok/s per request p50 | 18.1 / 18.5 / 16.9 | 16.7 / 16.1 / 16.9 | 17.9 / 16.6 |
+| ITL p95 | 48.7 / 48.6 / 49.5 ms | 48.3 / 49.4 / 49.6 ms | 48.9 / 49.1 ms |
+
+On this mix admission never blocks: `inference_admission_blocked_steps_total` is 0 for every reason in every run, and the longest arrival to admission time is 15 ms. The queue wait is the time an admitted prompt waits for its first prefill step behind longer prompts already being read, which this change does not touch, and its p95 is two or three requests out of 60 (the round to round spread is larger than any arm difference). The third rounds are the same to two digits, including decode tok/s per request (16.89 / 16.88). Rounds 1 and 2 have the branch 1.5 to 2.4 tok/s lower with a 6 to 12 s longer wall time, so two more alternated rounds were run: master 16.9 / 16.9 tok/s, TTFT p95 18.98 / 21.04 s, long TTFT p95 20.55 / 22.79 s, wall 142.8 / 138.0 s; branch 16.9 / 17.0 tok/s, TTFT p95 21.05 / 21.13 s, long TTFT p95 22.79 / 22.36 s, wall 137.8 / 142.3 s. The same two run shapes (about 138 s and about 142 s of wall) turn up in both arms, so the gap in rounds 1 and 2 is run to run spread, not a cost of the change. Over all five rounds the long TTFT p95 mean is 21.56 s on master and 22.87 s on the branch (+6%). The issue's bar (queue wait p95 down 30%) is not met because there is no admission wait to remove here; long TTFT p95 (+6% over five rounds) and ITL p95 (+0.4%) are inside its bounds. With `max_long_in_flight` 1 and 24 clients (one run per arm) the long cap does block (8 to 10 steps), and TTFT p50 is 29.3 s on the branch against 29.6 s on master: with every slot busy, admitting past the head changes little. Which part of the 7.9 s on the user's app is admission, prefill wait or full slots is read from the #1519 series once the app runs a build that has them.
