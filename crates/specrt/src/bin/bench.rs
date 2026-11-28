@@ -288,7 +288,7 @@ fn spec_prompts(spec: &Spec) -> Result<Vec<Vec<u32>>> {
 }
 
 fn batch_prompts(prompts: &[Vec<u32>], batch: usize) -> Vec<Vec<u32>> {
-    (0..batch.max(prompts.len())).map(|n| prompts[n % prompts.len()].clone()).collect()
+    (0..prompts.len().div_ceil(batch) * batch).map(|n| prompts[n % prompts.len()].clone()).collect()
 }
 
 fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize, sampled: bool) -> Result<()> {
@@ -960,7 +960,9 @@ mod tests {
         assert_eq!(batch.len(), 32);
         assert_eq!(batch[20], vec![0]);
         assert_eq!(batch[31], vec![11]);
-        assert_eq!(batch_prompts(&prompts, 8).len(), 20);
+        assert_eq!(batch_prompts(&prompts, 8).len(), 24);
+        assert_eq!(batch_prompts(&prompts, 16).len(), 32);
+        assert_eq!(batch_prompts(&prompts, 1).len(), 20);
     }
 
     #[test]

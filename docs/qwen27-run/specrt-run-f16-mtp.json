@@ -1,0 +1,18 @@
+{
+  "label": "specrt-f16-mtp",
+  "kv_dtype": "f16",
+  "mode": "mtp",
+  "spec": "qwen3.8-27b-nvfp4.toml",
+  "commit": "0810eb2e",
+  "dirty_files": 0,
+  "started": "2026-11-27T23:43:59+00:00",
+  "finished": "2026-11-27T23:45:22+00:00",
+  "load_s": 11,
+  "kv_cache_gb": 28,
+  "kv_layout": "kv_tokens=431760",
+  "draft_tokens": 2,
+  "gpu_before": "0, 61434 MiB, 100 %, 1852 MHz\n1, 5 MiB, 0 %, 180 MHz",
+  "gpu_loaded": "0, 61434 MiB, 100 %, 1702 MHz\n1, 57456 MiB, 23 %, 2310 MHz",
+  "spec_drafted": 8050,
+  "spec_accepted": 6800
+}

@@ -1,0 +1,18 @@
+{
+  "label": "specrt-nomtp",
+  "kv_dtype": "fp8",
+  "mode": "nomtp",
+  "spec": "qwen3.8-27b-nvfp4.toml",
+  "commit": "0810eb2e",
+  "dirty_files": 0,
+  "started": "2026-11-27T23:25:44+00:00",
+  "finished": "2026-11-27T23:43:49+00:00",
+  "load_s": 9,
+  "kv_cache_gb": 14,
+  "kv_layout": "kv_tokens=451680",
+  "draft_tokens": 2,
+  "gpu_before": "0, 61610 MiB, 100 %, 2017 MHz\n1, 5 MiB, 0 %, 180 MHz",
+  "gpu_loaded": "0, 61661 MiB, 100 %, 2047 MHz\n1, 40720 MiB, 9 %, 2280 MHz",
+  "spec_drafted": 0,
+  "spec_accepted": 0
+}
