@@ -16,8 +16,10 @@ pub const BATCH_VARIANTS: [usize; 4] = [8, 16, 32, 64];
 pub const BATCH_MAX_TOKENS: usize = 64;
 pub const BATCH_REDUCE_BLOCK: usize = 256;
 pub const BATCH_LINEARS: [&str; 6] = ["qkv", "o", "gate_up", "down", "lin_in", "lin_out"];
+const FP4_ACT_LINEARS: [&str; 2] = ["gate_up", "down"];
 pub const SKINNY_WIDE_MIN_ROWS: usize = 16384;
 pub const ROWS_MAX_TOKENS: usize = 32;
+pub const TUNE_BUCKETS: [usize; 11] = [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96];
 pub const FP8_HUGE_MIN_TOKENS: usize = 256;
 pub const GGB_MIN_TOKENS: usize = 32;
 pub const GGML_VARIANTS: [usize; 3] = [8, 16, 32];
@@ -84,6 +86,16 @@ impl WeightFormat {
 
     pub fn bytes(self) -> bool {
         matches!(self, WeightFormat::Q8 | WeightFormat::Fp8)
+    }
+
+    pub fn bytes_per_weight(self) -> f64 {
+        match self {
+            WeightFormat::Bf16 => 2.0,
+            WeightFormat::Q8 => 1.0 + 4.0 / Q8_GROUP as f64,
+            WeightFormat::Fp8 => 1.0 + 4.0 / FP8_BLOCK as f64,
+            WeightFormat::Fp4 => 0.5 + 1.0 / FP4_GROUP as f64,
+            WeightFormat::Ggml => 0.5625,
+        }
     }
 
     pub fn wrow(self, bk: usize) -> usize {
@@ -679,11 +691,21 @@ pub enum GemmPath {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Select {
+    #[default]
+    Fixed,
+    Formula,
+    Measured,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Policy {
     pub tuning: Tuning,
     pub fp8_weights: Option<Fp8Scale>,
     pub fp8_act: bool,
     pub fp4_act: bool,
+    pub select: Select,
+    pub launch_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -798,17 +820,15 @@ fn weight_tile_choice(t: &Target, policy: &Policy, r: &Request, variant: Variant
 }
 
 pub fn candidates(t: &Target, policy: &Policy, r: &Request) -> Vec<Choice> {
-    let head = r.linear.ends_with("head");
-    let tiled = matches!(r.weight, WeightFormat::Fp8 | WeightFormat::Fp4);
-    if policy.tuning.tile != TileChoice::Auto || head || !tiled || !t.has(Feature::Mma16816) {
-        return select(t, policy, r).into_iter().collect();
+    if !tunable(t, policy, r) {
+        return fixed_select(t, policy, r).into_iter().collect();
     }
     let mut out = Vec::new();
     let fp8_act = policy.fp8_act && policy.fp8_weights.is_some() && t.has(Feature::Fp8Mma);
     let fp4_act = policy.fp4_act && t.has(Feature::BlockScaledFp4);
     match r.weight {
         WeightFormat::Fp8 if fp8_act => out.extend(Variant::FP8_ACT.into_iter().filter_map(|v| fp8_act_choice(t, policy, r, v).ok())),
-        WeightFormat::Fp4 if fp4_act => out.extend(Variant::FP4_ACT.into_iter().filter_map(|v| fp4_act_choice(t, policy, r, v).ok())),
+        WeightFormat::Fp4 if fp4_act && FP4_ACT_LINEARS.contains(&r.linear) => out.extend(Variant::FP4_ACT.into_iter().filter_map(|v| fp4_act_choice(t, policy, r, v).ok())),
         _ => {}
     }
     let batch = r.tokens <= BATCH_MAX_TOKENS && (r.weight == WeightFormat::Fp4 || BATCH_LINEARS.contains(&r.linear));
@@ -819,7 +839,152 @@ pub fn candidates(t: &Target, policy: &Policy, r: &Request) -> Vec<Choice> {
     out
 }
 
+fn tunable(t: &Target, policy: &Policy, r: &Request) -> bool {
+    let tiled = matches!(r.weight, WeightFormat::Fp8 | WeightFormat::Fp4);
+    policy.tuning.tile == TileChoice::Auto && BATCH_LINEARS.contains(&r.linear) && tiled && t.has(Feature::Mma16816)
+}
+
+pub fn tuned(t: &Target, policy: &Policy, r: &Request) -> bool {
+    policy.select != Select::Fixed && tune_bucket(r.tokens).is_some() && tunable(t, policy, r)
+}
+
+pub fn act_rows(tokens: usize) -> bool {
+    tokens > BATCH_VARIANTS[0]
+}
+
+pub fn eligible(t: &Target, policy: &Policy, r: &Request) -> Vec<Choice> {
+    let act = act_rows(r.tokens);
+    candidates(t, policy, r).into_iter().filter(|c| act || !matches!(c.path, GemmPath::F8a | GemmPath::F4a)).collect()
+}
+
+pub fn tune_bucket(tokens: usize) -> Option<usize> {
+    TUNE_BUCKETS.iter().copied().find(|&b| b >= tokens.max(1))
+}
+
+const BATCH_WORK_EXP: f64 = 0.3;
+const ACT_WIDE_WORK: f64 = 0.3;
+const TILE_MMA_WORK: f64 = 4.0;
+const TINY_MMA_WORK: f64 = 1.5;
+
+pub fn estimate(t: &Target, policy: &Policy, c: &Choice, tokens: usize) -> f64 {
+    let Some(k) = c.kernel.as_ref() else { return f64::INFINITY };
+    let shape = match k.kind {
+        Kind::Tile { shape, .. } | Kind::Fp8Act { shape, .. } | Kind::Fp4Act { shape, .. } | Kind::Batch { shape, .. } => shape,
+        _ => return f64::INFINITY,
+    };
+    let weight = if matches!(c.path, GemmPath::F4a | GemmPath::F4b | GemmPath::F4w) { WeightFormat::Fp4 } else { WeightFormat::Fp8 };
+    let (n, sms) = (shape.n, t.sm_count.max(1) as usize);
+    let bytes = (n * shape.k) as f64 * weight.bytes_per_weight();
+    let (blocks, per_sm, work, launches) = match k.kind {
+        Kind::Batch { batch, blocks_per_sm, .. } => {
+            let splits = batch.splits(t, n, shape.k);
+            (n.div_ceil(batch.rows()) * splits, blocks_per_sm, (batch.tokens as f64 / BATCH_VARIANTS[0] as f64).powf(BATCH_WORK_EXP), 1 + (splits > 1) as usize)
+        }
+        _ => {
+            let tile = c.tile;
+            let tm = tokens.max(1).div_ceil(tile.bm);
+            let per_sm = (t.smem_per_sm() as usize / (k.smem_bytes as usize + t.smem_reserved_per_block() as usize)).clamp(1, MAX_BLOCKS_PER_SM);
+            let work = match c.path {
+                GemmPath::F8a | GemmPath::F4a if tile.bm > Tile::SMALL.bm => 1.0 + ACT_WIDE_WORK * (tile.bm as f64 / Tile::SMALL.bm as f64 - 1.0),
+                GemmPath::F8a | GemmPath::F4a => 1.0,
+                _ if tile.bm > Tile::TINY.bm => TILE_MMA_WORK,
+                _ => TINY_MMA_WORK,
+            };
+            (n.div_ceil(tile.bn) * tm, per_sm, work * tm as f64, 1 + c.quant.is_some() as usize)
+        }
+    };
+    let fill = (blocks as f64 / sms as f64).min(1.0);
+    let slots = sms * per_sm;
+    let waves = blocks.div_ceil(slots);
+    let tail = if waves > 1 { blocks as f64 / (waves * slots) as f64 } else { 1.0 };
+    bytes * work / (fill * tail) + (launches as u64 * policy.launch_bytes) as f64
+}
+
+fn formula_pick(t: &Target, policy: &Policy, r: &Request, all: Vec<Choice>) -> Option<Choice> {
+    all.into_iter().map(|c| (estimate(t, policy, &c, r.tokens), c)).min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, c)| c)
+}
+
+fn picks() -> &'static std::sync::RwLock<std::collections::HashMap<String, String>> {
+    static PICKS: std::sync::OnceLock<std::sync::RwLock<std::collections::HashMap<String, String>>> = std::sync::OnceLock::new();
+    PICKS.get_or_init(Default::default)
+}
+
+pub fn pick_key(t: &Target, policy: &Policy, r: &Request, bucket: usize, candidates: &[Choice]) -> String {
+    let p = policy;
+    let kernels: Vec<KernelInstance> = candidates.iter().filter_map(|c| c.kernel.clone()).collect();
+    format!(
+        "{} | {:?} fp8_weights={:?} fp8_act={} fp4_act={} | {:?} {:?} split={} rows={bucket} | {}",
+        t.describe(),
+        p.tuning,
+        p.fp8_weights,
+        p.fp8_act,
+        p.fp4_act,
+        r.shape,
+        r.weight,
+        r.split,
+        instances_hash(&kernels)
+    )
+}
+
+pub fn record_pick(key: String, suffix: String) {
+    picks().write().unwrap_or_else(|e| e.into_inner()).insert(key, suffix);
+    memo().write().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+fn memo() -> &'static std::sync::RwLock<std::collections::HashMap<u64, Choice>> {
+    static MEMO: std::sync::OnceLock<std::sync::RwLock<std::collections::HashMap<u64, Choice>>> = std::sync::OnceLock::new();
+    MEMO.get_or_init(Default::default)
+}
+
+fn memo_key(t: &Target, policy: &Policy, r: &Request) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (t.language as u8, t.compute_capability, t.arch_specific, t.sm_count, t.smem_limit, t.features, t.max_threads).hash(&mut h);
+    (policy, r.linear, r.shape, r.tokens, r.weight, r.split).hash(&mut h);
+    h.finish()
+}
+
+pub fn measured_pick(key: &str) -> Option<String> {
+    picks().read().unwrap_or_else(|e| e.into_inner()).get(key).cloned()
+}
+
+pub fn pick_suffix<'a>(r: &Request, name: &'a str) -> &'a str {
+    name.strip_prefix(r.linear).unwrap_or(name)
+}
+
+pub fn tuned_request<'a>(r: &Request<'a>, bucket: usize) -> Request<'a> {
+    Request { tokens: bucket, ..*r }
+}
+
 pub fn select(t: &Target, policy: &Policy, r: &Request) -> Result<Choice, GemmError> {
+    if policy.select != Select::Fixed
+        && let Some(bucket) = tune_bucket(r.tokens)
+        && tunable(t, policy, r)
+    {
+        let memo_key = memo_key(t, policy, r);
+        if let Some(c) = memo().read().unwrap_or_else(|e| e.into_inner()).get(&memo_key) {
+            return Ok(c.clone());
+        }
+        if let Some(c) = tuned_select(t, policy, r, bucket) {
+            memo().write().unwrap_or_else(|e| e.into_inner()).insert(memo_key, c.clone());
+            return Ok(c);
+        }
+    }
+    fixed_select(t, policy, r)
+}
+
+fn tuned_select(t: &Target, policy: &Policy, r: &Request, bucket: usize) -> Option<Choice> {
+    let all = eligible(t, policy, r);
+    if policy.select == Select::Measured
+        && let Some(suffix) = measured_pick(&pick_key(t, policy, r, bucket, &eligible(t, policy, &tuned_request(r, bucket))))
+        && let Some(c) = all.iter().find(|c| pick_suffix(r, &c.name) == suffix)
+    {
+        return Some(c.clone());
+    }
+    formula_pick(t, policy, r, all)
+}
+
+fn fixed_select(t: &Target, policy: &Policy, r: &Request) -> Result<Choice, GemmError> {
     let tuning = &policy.tuning;
     let auto = tuning.tile == TileChoice::Auto;
     let variant = variant_for(t, tuning, r.linear, r.shape.n, r.tokens);

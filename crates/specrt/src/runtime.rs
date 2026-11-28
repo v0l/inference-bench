@@ -23,6 +23,8 @@ pub(crate) mod snapshot;
 mod stage;
 pub mod step;
 mod stream;
+mod tune;
+pub use tune::{TUNE_FILE, TunedPick, load_picks, tune_path};
 pub use fused::PrefillPart;
 use exec::Plans;
 pub use mtp::{SpecRow, SpecStats};
@@ -1023,6 +1025,8 @@ pub struct Runtime {
     pub quant_cache: Option<crate::quant_cache::Usage>,
     pub bytes_read: u64,
     pub load_secs: f64,
+    pub gemm_tune_secs: f64,
+    pub gemm_picks: Vec<TunedPick>,
     pub peak_host_rss_bytes: u64,
     ctx: Arc<CudaContext>,
     baseline_free: usize,
@@ -1525,6 +1529,8 @@ impl Runtime {
             quant_cache,
             bytes_read: read_bytes,
             load_secs: 0.0,
+            gemm_tune_secs: 0.0,
+            gemm_picks: Vec::new(),
             peak_host_rss_bytes: 0,
             ctx: ctx.clone(),
             baseline_free: free_before,
@@ -1544,6 +1550,18 @@ impl Runtime {
             rt.mtp = Some(mtp::MtpState::new(&rt, w)?);
         }
         rt.build_expert_cache(weight_bytes)?;
+        if use_mma && tp.is_none() && role.whole() && rt.streamer.is_none() && spec.runtime.gemm_select == crate::spec::GemmSelect::Measured {
+            let started = Instant::now();
+            rt.fill_tune_inputs()?;
+            let picks = rt.tune_gemms()?;
+            if !picks.is_empty() {
+                rt.plans = Plans::compile(spec, use_mma, &target, &crate::compile::Options::planes(max_ctx), role)?;
+            }
+            let measured = picks.iter().filter(|p| !p.cached).count();
+            rt.gemm_tune_secs = started.elapsed().as_secs_f64();
+            tracing::info!(spec = %spec.name, picks = picks.len(), measured, secs = rt.gemm_tune_secs, "gemm selection");
+            rt.gemm_picks = picks;
+        }
         let hosts_vision = role.first && tp.is_none_or(|(_, rank, _)| rank == 0);
         if let Some(v) = spec.vision.as_ref().filter(|_| hosts_vision)
             && crate::vision_encoder::has_tower(&checkpoint, &v.config) {
@@ -1899,16 +1917,30 @@ impl Runtime {
         tokens: usize,
     ) -> Result<()> {
         let choice = crate::codegen::select_act(&self.spec, &self.target, name, tokens, w.kind(), !matches!(w, DeviceMatrix::Fp4 { act: false, .. }))?;
+        self.tc_choice(&choice, w, bias, x, out, rows, tokens)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tc_choice(
+        &self,
+        choice: &crate::codegen::KernelChoice,
+        w: &DeviceMatrix,
+        bias: Option<&CudaSlice<f32>>,
+        x: (CudaView<u16>, CudaView<u16>),
+        out: GemmOut,
+        rows: usize,
+        tokens: usize,
+    ) -> Result<()> {
         use crate::codegen::GemmPath;
         match (choice.path, &self.fp8_act, &self.fp4_act) {
-            (GemmPath::F8a, Some(fa), _) => return self.tc_fp8(fa, &choice, w, bias, x, out, rows, tokens),
-            (GemmPath::F4a, _, Some(fa)) => return self.tc_fp4(fa, &choice, w, x, out, rows, tokens),
-            (GemmPath::F8b, _, _) => return self.tc_f8b(&choice, w, bias, x, out, rows, tokens),
-            (GemmPath::F4b, _, _) => return self.tc_f4b(&choice, w, x, out, rows, tokens),
-            (GemmPath::Rows, _, _) => return self.tc_rows(&choice, w, x, out, rows, tokens),
-            (GemmPath::Ggr, _, _) => return self.tc_ggr(&choice, w, bias, x, out, rows, tokens),
-            (GemmPath::Ggv, _, _) => return self.tc_ggv(&choice, w, bias, x, out, rows),
-            (GemmPath::Ggb, _, _) => return self.tc_ggb(&choice, w, bias, x, out, rows, tokens),
+            (GemmPath::F8a, Some(fa), _) => return self.tc_fp8(fa, choice, w, bias, x, out, rows, tokens),
+            (GemmPath::F4a, _, Some(fa)) => return self.tc_fp4(fa, choice, w, x, out, rows, tokens),
+            (GemmPath::F8b, _, _) => return self.tc_f8b(choice, w, bias, x, out, rows, tokens),
+            (GemmPath::F4b, _, _) => return self.tc_f4b(choice, w, x, out, rows, tokens),
+            (GemmPath::Rows, _, _) => return self.tc_rows(choice, w, x, out, rows, tokens),
+            (GemmPath::Ggr, _, _) => return self.tc_ggr(choice, w, bias, x, out, rows, tokens),
+            (GemmPath::Ggv, _, _) => return self.tc_ggv(choice, w, bias, x, out, rows),
+            (GemmPath::Ggb, _, _) => return self.tc_ggb(choice, w, bias, x, out, rows, tokens),
             _ => {}
         }
         let (kernel, tile) = (choice.name.as_str(), choice.tile);
@@ -2086,7 +2118,7 @@ impl Runtime {
         use crate::codegen::{BATCH_REDUCE_BLOCK as F8B_REDUCE_BLOCK, BatchShape};
         let DeviceMatrix::Fp8 { values, .. } = w else { unreachable!("tc_f8b takes FP8 weights") };
         let width = values.len() / rows;
-        let shape = BatchShape::for_tokens(tokens);
+        let shape = choice.kernel.as_ref().and_then(|k| k.batch_shape()).unwrap_or(BatchShape::for_tokens(tokens));
         let splits = shape.splits(&self.target, rows, width);
         let (n, s) = (tokens as i32, splits as i32);
         let mut b = self.launcher(self.kernel(&choice.name));
@@ -2134,7 +2166,7 @@ impl Runtime {
         use crate::codegen::{BATCH_REDUCE_BLOCK as F4B_REDUCE_BLOCK, BatchShape};
         let DeviceMatrix::Fp4 { packed, .. } = w else { unreachable!("tc_f4b takes NVFP4 weights") };
         let width = packed.len() * 2 / rows;
-        let shape = BatchShape::for_tokens(tokens);
+        let shape = choice.kernel.as_ref().and_then(|k| k.batch_shape()).unwrap_or(BatchShape::for_tokens(tokens));
         let splits = shape.splits(&self.target, rows, width);
         let (n, s) = (tokens as i32, splits as i32);
         let mut b = self.launcher(self.kernel(&choice.name));
