@@ -1,8 +1,8 @@
 use kir::compose::Stage;
 use kir::expr::Expr;
 use kir::gemm::{
-    BatchShape, Epilogue, Fp4Gemv, Fp8Scale, GemmPath, GemmShape, KernelInstance, MmaShape, Policy, Request, Tile, TileChoice,
-    Tuning, Variant, WeightFormat, select,
+    BatchShape, Epilogue, Fp4Gemv, Fp8Scale, GemmPath, GemmShape, KernelInstance, MmaShape, Policy, Request, Select, Tile, TileChoice,
+    Tuning, Variant, WeightFormat, candidates, eligible, pick_key, pick_suffix, record_pick, select, tune_bucket, tuned_request,
 };
 use kir::gemv::{Gemv, GemvKernel};
 use kir::heavy::{self, Family, Heavy, HeavyError, Slot};
@@ -139,7 +139,7 @@ fn sm120_gets_the_block_scaled_fp4_mma_and_sm80_does_not() {
 }
 
 fn policy(fp8: bool, fp4: bool) -> Policy {
-    Policy { tuning: Tuning::default(), fp8_weights: fp8.then_some(Fp8Scale::Channel), fp8_act: fp8, fp4_act: fp4 }
+    Policy { tuning: Tuning::default(), fp8_weights: fp8.then_some(Fp8Scale::Channel), fp8_act: fp8, fp4_act: fp4, ..Policy::default() }
 }
 
 fn req(linear: &str, shape: GemmShape, tokens: usize, weight: WeightFormat) -> Request<'_> {
@@ -179,6 +179,66 @@ fn selection_reproduces_the_decode_and_prefill_paths() {
     assert_eq!(select(&t, &small, &req("o", down(), 4, WeightFormat::Fp8)).unwrap().name, "o_f8");
     let plain = Policy { fp8_act: false, ..small };
     assert_eq!(select(&t, &plain, &req("o", down(), 4, WeightFormat::Fp8)).unwrap().name, "o_mma");
+}
+
+fn lin_in() -> GemmShape {
+    GemmShape::new(16384, 5120, Epilogue::Store, false)
+}
+
+#[test]
+fn the_formula_takes_the_act_quant_tile_at_twelve_rows_where_the_fixed_rule_took_the_16_row_gemv() {
+    let t = Target::sm_120();
+    let fixed = policy(true, true);
+    let formula = Policy { select: Select::Formula, ..fixed };
+    let r = req("lin_in", lin_in(), 12, WeightFormat::Fp8);
+    assert_eq!(select(&t, &fixed, &r).unwrap().name, "lin_in_f8b16");
+    let c = select(&t, &formula, &r).unwrap();
+    assert_eq!((c.path, c.quant), (GemmPath::F8a, Some("quant_rows_fp8_token")), "{}", c.name);
+    assert_eq!(select(&t, &formula, &req("lin_in", lin_in(), 4, WeightFormat::Fp8)).unwrap().name, "lin_in_f8b8");
+}
+
+#[test]
+fn act_quant_paths_are_never_candidates_without_act_quant_or_at_eight_rows_or_fewer() {
+    let t = Target::sm_120();
+    let exact = Policy { fp8_act: false, fp4_act: false, ..policy(true, false) };
+    for n in [1, 4, 9, 24, 64] {
+        for (l, s, w) in [("lin_in", lin_in(), WeightFormat::Fp8), ("gate_up", gate_up(), WeightFormat::Fp4), ("down", down(), WeightFormat::Fp8)] {
+            assert!(eligible(&t, &exact, &req(l, s, n, w)).iter().all(|c| c.quant.is_none()), "{l} {n}");
+        }
+    }
+    let act = policy(true, true);
+    for n in 1..=8 {
+        assert!(eligible(&t, &act, &req("qkv", qkv(), n, WeightFormat::Fp8)).iter().all(|c| c.quant.is_none()), "{n}");
+    }
+    assert!(eligible(&t, &act, &req("qkv", qkv(), 9, WeightFormat::Fp8)).iter().any(|c| c.quant.is_some()));
+}
+
+#[test]
+fn a_measured_pick_overrides_the_formula_for_its_target_shape_and_bucket_only() {
+    let t = Target::sm_120();
+    let p = Policy { select: Select::Measured, ..policy(true, true) };
+    let shape = GemmShape::new(12288, 4096, Epilogue::Store, false);
+    let r = req("o", shape, 12, WeightFormat::Fp8);
+    let cold = select(&t, &p, &r).unwrap().name;
+    let other = eligible(&t, &p, &r).into_iter().map(|c| c.name).find(|n| *n != cold).unwrap();
+    let bucket = tune_bucket(12).unwrap();
+    let key = pick_key(&t, &p, &r, bucket, &eligible(&t, &p, &tuned_request(&r, bucket)));
+    record_pick(key, pick_suffix(&r, &other).to_string());
+    assert_eq!(select(&t, &p, &r).unwrap().name, other);
+    assert_eq!(select(&t, &p, &req("o", shape, 10, WeightFormat::Fp8)).unwrap().name, other, "10 rows share the 12 row bucket");
+    assert_eq!(select(&t, &Policy { select: Select::Formula, ..p }, &r).unwrap().name, cold);
+    let few = Target { sm_count: 48, ..t };
+    assert_eq!(select(&few, &p, &r).unwrap().name, select(&few, &Policy { select: Select::Formula, ..p }, &r).unwrap().name, "another card keeps its own picks");
+}
+
+#[test]
+fn a_tuned_batch_choice_carries_its_own_row_bucket() {
+    let t = Target::sm_120();
+    let p = policy(true, false);
+    let all = candidates(&t, &p, &req("o", down(), 12, WeightFormat::Fp8));
+    let b32 = all.iter().find(|c| c.name == "o_f8b32").expect("the 32 row gemv is a candidate at 12 rows");
+    assert_eq!(b32.kernel.as_ref().unwrap().batch_shape().unwrap().tokens, 32);
+    assert!(all.iter().all(|c| c.name != "o_f8b8"), "8 rows cannot hold 12");
 }
 
 #[test]

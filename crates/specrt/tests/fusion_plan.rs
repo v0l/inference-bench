@@ -76,7 +76,9 @@ fn hybrid_decode_selects_the_hand_fusions() {
 
 #[test]
 fn batched_decode_puts_the_residual_and_act_in_the_split_reduce() {
-    let r = report(&hybrid(), Phase::Decode, 8, &sm120());
+    let mut spec = hybrid();
+    spec.runtime.gemm_select = specrt::spec::GemmSelect::Fixed;
+    let r = report(&spec, Phase::Decode, 8, &sm120());
     assert_groups(&r, "layer full", &[&["o reduce", "o residual"], &["qk norm", "rope", "kv write"]]);
     let full = section(&r, "layer full");
     assert!(matches!(kept_apart(full, "o", "o reduce"), Reason::Cost), "{}", r.render());

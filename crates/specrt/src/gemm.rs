@@ -1,4 +1,4 @@
-use crate::spec::{ActQuant, Activation, Quant, RuntimeOptions, Spec, TileChoice};
+use crate::spec::{ActQuant, Activation, GemmSelect, Quant, RuntimeOptions, Spec, TileChoice};
 use anyhow::Result;
 use kir::gemm::{self as kg, Epilogue, Fp4Gemv, Fp8Scale, GemmShape, KernelInstance, Policy, Request, Tuning, Variant};
 use std::collections::BTreeMap;
@@ -104,7 +104,18 @@ pub fn policy(spec: &Spec) -> Policy {
         fp8_weights: fp8_scale(spec),
         fp8_act: spec.quant.is_fp8() && fp8_act_enabled(spec),
         fp4_act: spec.mlp.quant == Some(Quant::Nvfp4G16) && fp4_act_enabled(spec),
+        select: match spec.runtime.gemm_select {
+            GemmSelect::Measured => kg::Select::Measured,
+            GemmSelect::Formula => kg::Select::Formula,
+            GemmSelect::Fixed => kg::Select::Fixed,
+        },
+        launch_bytes: 0,
     }
+}
+
+pub fn policy_on(spec: &Spec, target: &kir::Target, act: bool) -> Policy {
+    let p = policy(spec);
+    Policy { fp4_act: p.fp4_act && act, launch_bytes: crate::fusion::Costs::for_target(target).launch_bytes, ..p }
 }
 
 fn act(spec: &Spec) -> kir::Activation {
@@ -258,8 +269,15 @@ pub fn gemv_into(spec: &Spec, linear: &str, weight: WeightKind, normed: bool, st
 }
 
 pub fn select_act(spec: &Spec, target: &kir::Target, linear: &str, tokens: usize, weight: WeightKind, act: bool) -> Result<KernelChoice> {
-    let policy = Policy { fp4_act: policy(spec).fp4_act && act, ..policy(spec) };
-    kg::select(target, &policy, &request(spec, linear, tokens, weight)).map_err(anyhow::Error::msg)
+    kg::select(target, &policy_on(spec, target, act), &request(spec, linear, tokens, weight)).map_err(anyhow::Error::msg)
+}
+
+pub fn candidates(spec: &Spec, target: &kir::Target, linear: &str, tokens: usize, weight: WeightKind) -> Vec<KernelChoice> {
+    kg::candidates(target, &policy_on(spec, target, true), &request(spec, linear, tokens, weight))
+}
+
+pub fn eligible(spec: &Spec, target: &kir::Target, linear: &str, tokens: usize, weight: WeightKind, act: bool) -> Vec<KernelChoice> {
+    kg::eligible(target, &policy_on(spec, target, act), &request(spec, linear, tokens, weight))
 }
 
 pub fn batch_part_len(spec: &Spec, target: &kir::Target, fp4: bool) -> usize {

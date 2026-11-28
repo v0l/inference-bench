@@ -309,7 +309,8 @@ fn switching_the_draft_count_every_step_equals_plain_greedy() {
 #[test]
 #[ignore = "needs a CUDA GPU"]
 fn speculative_greedy_with_act_quant_equals_its_plain_greedy() {
-    let s = with_drafts(act_spec(), 2);
+    let mut s = with_drafts(act_spec(), 2);
+    s.runtime.gemm_select = specrt::spec::GemmSelect::Fixed;
     let ps = speculation_prompts();
     let want = plain_greedy(&s, &ps);
     let (got, _) = speculative_greedy(&s, &ps, None);

@@ -216,6 +216,8 @@ $PY crates/specrt/scripts/reference.py tiny-mtp crates/specrt/tests/fixtures/tin
 | `gguf_logits.rs` | GGUF Q4_K, Q8_0, BF16 logits vs llama.cpp | 2 | 7 | `SPECRT_GGUF_DIR` | 3 GB |
 | `wgsl.rs` | wgpu backend, needs the `wgpu` feature | 2 | 18 | GPU adapter; `--features wgpu` | 3 GB |
 | `gemm_speed.rs` | GEMM timing at 27B shapes (`SPECRT_GEMM_TOKENS`, `SPECRT_BK`, `SPECRT_FP8_BK`) | 3, timing | 4 | none | 4 GB; print only |
+| `gemm_select_speed.rs` | GEMM family sweep (#1516, `docs/perf/gemm-select.md`): every family `select` may pick for each 27B and 4B NVFP4 linear at 1 to 96 rows, rotating weights, the act quant launch inside the time; prints the table and the fastest per cell, `SPECRT_SWEEP_TOKENS` picks rows, `SPECRT_SWEEP_OUT` writes the TSV | 3, timing | 1 | none | 8 GB, 20 min |
+| `gemm_select.rs` | GEMM selection (#1516): the sm_120 picks for the 27B, 4B and 0.6B specs pinned in `golden/gemm-select-sm120.txt` (`GOLDEN_UPDATE=1` rewrites), exact specs never take an act quant path, 1 to 8 rows stay weight only, `fixed` keeps the old thresholds, the measured per bucket pick is within 5% of the fastest eligible kernel at every cell of `docs/perf/gemm-select/sweep-sm120.tsv`, and the formula cold default is no worse than the old thresholds on it | CPU | 6 | none | none, 0.01 s |
 | `flash_speed.rs` | attention timing (`SPECRT_FLASH_*`) | 3, timing | 1 | none | 2 GB |
 | `gdn_speed.rs` | delta-net timing (`SPECRT_GDN_TOKENS`) | 3, timing | 1 | none | 2 GB |
 | `kir_speed.rs` | kir kernel timing | 3, timing | 1 | none | 1 GB |
@@ -287,7 +289,7 @@ flock /tmp/gpu27.lock systemd-run --user --wait --collect -P -q \
 - Never stop, restart or signal the user's app, local-llm.service or anything on the Spark without being told to. The Spark rule: `free -g` first, stay under 20 GB, lock file, per-issue target dir.
 - If a tier 5 run needs memory you do not have, do not queue behind the lock for hours. Run tiers 1 to 3, then report.
 - Evidence enough to hand back: tier 1 green, every tier 2 or 3 file your change touches green with the `test result:` lines pasted, and the exact tier 5 command (test names, ref dir, spec) for the supervisor's window. A change specific to the 27B checkpoint still has a tier 2 proof if the code path exists in the tiny Qwen3.5 fixtures.
-- Config rule: behaviour comes from the spec TOML or server config. There are no env vars for behaviour. The variables the tests read (`SPECRT_REF_DIR`, `SPECRT_GGUF_*`, `SPECRT_VISION_*`, `SPECRT_27B_*`, and the `SPECRT_GEMM_*` and `SPECRT_FLASH_*` lists in `gemm_speed.rs` and `flash_speed.rs`) are test inputs and parameters, not engine knobs: nothing under `src/` reads them.
+- Config rule: behaviour comes from the spec TOML or server config. There are no env vars for behaviour. The variables the tests read (`SPECRT_REF_DIR`, `SPECRT_GGUF_*`, `SPECRT_VISION_*`, `SPECRT_27B_*`, and the `SPECRT_GEMM_*`, `SPECRT_SWEEP_*` and `SPECRT_FLASH_*` lists in `gemm_speed.rs`, `gemm_select_speed.rs` and `flash_speed.rs`) are test inputs and parameters, not engine knobs: nothing under `src/` reads them.
 
 ## Measuring speed
 

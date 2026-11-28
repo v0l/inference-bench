@@ -230,7 +230,7 @@ fn main() -> Result<()> {
         println!("offload: {} of {} layers streamed, staging {:.2} GB, per token {:.2} GB over the link", rt.streamed_layers(), plan.layers.len(), rt.staging_bytes() as f64 / 1e9, plan.streamed_bytes_per_token() as f64 / 1e9);
     }
     println!(
-        "{} quant={:?} arch={} jit_cache_hit={} jit_compile={:.2}s jit_load_module={:.2}s load={:.2}s weights={:.2} GB in {:.2}s device={:.2} GB peak_host_rss={:.2} GB",
+        "{} quant={:?} arch={} jit_cache_hit={} jit_compile={:.2}s jit_load_module={:.2}s load={:.2}s weights={:.2} GB in {:.2}s device={:.2} GB peak_host_rss={:.2} GB gemm_select={} picks ({} measured) in {:.2}s",
         spec.name,
         spec.quant,
         rt.arch,
@@ -242,6 +242,9 @@ fn main() -> Result<()> {
         rt.weight_secs,
         rt.device_bytes as f64 / 1e9,
         rt.peak_host_rss_bytes as f64 / 1e9,
+        rt.gemm_picks.len(),
+        rt.gemm_picks.iter().filter(|p| !p.cached).count(),
+        rt.gemm_tune_secs,
     );
     for &prompt_len in &prompts {
         let prompt: Vec<u32> = (0..prompt_len as u32).map(|i| 1000 + i * 7 % 5000).collect();
