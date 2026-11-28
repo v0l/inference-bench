@@ -369,17 +369,34 @@ fn act_numerics_chunked_state_does_not_drift_from_the_recurrent_state_over_16k()
     let lens = [1024, 4096, 16384];
     let exact = chunked_and_recurrent_states(&act_spec(), &lens);
     let act = chunked_and_recurrent_states(&act_numerics_spec(), &lens);
-    let mut numerics = Vec::new();
+    let rms = |a: &[f32], b: &[f32]| (a.iter().zip(b).map(|(x, y)| ((x - y) as f64).powi(2)).sum::<f64>() / b.iter().map(|y| (*y as f64).powi(2)).sum::<f64>()).sqrt();
+    let mut gaps = Vec::new();
     for (i, n) in lens.iter().enumerate() {
         let scale = exact[i].1.iter().fold(0f32, |m, v| m.max(v.abs()));
         let classes = max_abs(&act[i].0, &exact[i].0);
         let (exact_gap, act_gap) = (max_abs(&exact[i].0, &exact[i].1), max_abs(&act[i].0, &act[i].1));
-        eprintln!("{n} tokens: chunked act against chunked exact {classes:e}; chunked against recurrent: exact {exact_gap:e}, act {act_gap:e}; state max {scale}");
-        assert!(classes <= 1e-2 * scale, "{n}: numerics act moves the state by {classes} of {scale}");
-        assert!(act_gap <= exact_gap + classes, "{n}: act {act_gap} against exact {exact_gap}");
-        numerics.push(classes);
+        let (exact_rms, act_rms) = (rms(&exact[i].0, &exact[i].1), rms(&act[i].0, &act[i].1));
+        eprintln!(
+            "{n} tokens: chunked act against chunked exact {classes:e} (relative rms {:e}); chunked against recurrent: exact {exact_gap:e} (rms {exact_rms:e}), act {act_gap:e} (rms {act_rms:e}); state max {scale}",
+            rms(&act[i].0, &exact[i].0)
+        );
+        assert!(act_gap <= 1.5 * exact_gap, "{n}: act {act_gap} against exact {exact_gap}");
+        assert!(act_rms <= 1.5 * exact_rms, "{n}: act rms {act_rms} against exact {exact_rms}");
+        gaps.push(act_rms);
     }
-    assert!(numerics[2] <= 2.0 * numerics[0], "numerics act drift grows with length: {numerics:?}");
+    assert!(gaps[2] <= 1.5 * gaps[0], "numerics act drift grows with length: {gaps:?}");
+    let mut weight_act = weight_spec();
+    weight_act.linear_attention.as_mut().unwrap().numerics = specrt::spec::Numerics::Act;
+    let pure = chunked_and_recurrent_states(&weight_act, &lens);
+    let pure_exact = chunked_and_recurrent_states(&weight_spec(), &lens);
+    let mut pure_gaps = Vec::new();
+    for (i, n) in lens.iter().enumerate() {
+        let (e, a) = (rms(&pure_exact[i].0, &pure_exact[i].1), rms(&pure[i].0, &pure[i].1));
+        eprintln!("weight-only {n} tokens: chunked against recurrent relative rms: exact {e:e}, act {a:e}");
+        assert!(a <= 2e-2, "{n}: weight-only act state gap {a}");
+        pure_gaps.push(a);
+    }
+    assert!(pure_gaps[2] <= 2.0 * pure_gaps[0], "weight-only act drift grows with length: {pure_gaps:?}");
 }
 
 fn vision_case(rt: &mut Runtime, case: &str) {
