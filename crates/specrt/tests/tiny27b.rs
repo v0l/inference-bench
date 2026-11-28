@@ -349,6 +349,39 @@ fn act_numerics_delta_net_stays_inside_the_act_envelope_and_speculates_like_plai
     assert_eq!(got, want);
 }
 
+fn chunked_and_recurrent_states(s: &Spec, lens: &[usize]) -> Vec<(Vec<f32>, Vec<f32>)> {
+    let max = *lens.iter().max().unwrap();
+    let tokens: Vec<u32> = (0..max as u32).map(|i| (i.wrapping_mul(2654435761) >> 7) % s.dims.vocab as u32).collect();
+    let mut rt = Runtime::load(s, max + 64).unwrap();
+    lens.iter()
+        .map(|&n| {
+            rt.prompt_logits(&tokens[..n]).unwrap();
+            let chunked = rt.linear_states().unwrap().state;
+            rt.trace_decode(&tokens[..n]).unwrap();
+            (chunked, rt.linear_states().unwrap().state)
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn act_numerics_chunked_state_does_not_drift_from_the_recurrent_state_over_16k() {
+    let lens = [1024, 4096, 16384];
+    let exact = chunked_and_recurrent_states(&act_spec(), &lens);
+    let act = chunked_and_recurrent_states(&act_numerics_spec(), &lens);
+    let mut numerics = Vec::new();
+    for (i, n) in lens.iter().enumerate() {
+        let scale = exact[i].1.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let classes = max_abs(&act[i].0, &exact[i].0);
+        let (exact_gap, act_gap) = (max_abs(&exact[i].0, &exact[i].1), max_abs(&act[i].0, &act[i].1));
+        eprintln!("{n} tokens: chunked act against chunked exact {classes:e}; chunked against recurrent: exact {exact_gap:e}, act {act_gap:e}; state max {scale}");
+        assert!(classes <= 1e-2 * scale, "{n}: numerics act moves the state by {classes} of {scale}");
+        assert!(act_gap <= exact_gap + classes, "{n}: act {act_gap} against exact {exact_gap}");
+        numerics.push(classes);
+    }
+    assert!(numerics[2] <= 2.0 * numerics[0], "numerics act drift grows with length: {numerics:?}");
+}
+
 fn vision_case(rt: &mut Runtime, case: &str) {
     let m = meta(&format!("tiny27b-vision-{case}.json"));
     let patch_dim = m["patch_dim"].as_u64().unwrap() as usize;
