@@ -708,6 +708,7 @@ impl Gguf {
             v_heads: names.v_heads,
             fused_interleaved: false,
             gate_sigmoid: false,
+            numerics: crate::spec::Numerics::Exact,
         };
         Ok((Some(la), pattern))
     }

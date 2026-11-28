@@ -584,6 +584,20 @@ impl VHeadOrder {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Numerics {
+    #[default]
+    Exact,
+    Act,
+}
+
+impl Numerics {
+    pub fn is_exact(&self) -> bool {
+        *self == Numerics::Exact
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinearAttention {
@@ -599,6 +613,8 @@ pub struct LinearAttention {
     pub fused_interleaved: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gate_sigmoid: bool,
+    #[serde(default, skip_serializing_if = "Numerics::is_exact")]
+    pub numerics: Numerics,
 }
 
 impl LinearAttention {
@@ -2302,6 +2318,9 @@ impl Spec {
         let mut spec = Self::from_hf_config_serving(json)?;
         spec.act_quant = ActQuant::None;
         spec.mlp.act_quant = ActQuant::None;
+        if let Some(la) = spec.linear_attention.as_mut() {
+            la.numerics = Numerics::Exact;
+        }
         spec.mlp.up_act_planes = 1;
         spec.mlp.down_act_planes = 1;
         Ok(spec)
@@ -2612,6 +2631,7 @@ impl Spec {
                     v_heads: VHeadOrder::Grouped,
                     fused_interleaved: family.linear.fused_interleaved,
                     gate_sigmoid: family.linear.gate_key.as_deref().and_then(|k| value.get(k).filter(|v| !v.is_null()).or(value.get("hidden_act"))).and_then(|v| v.as_str()) == Some("sigmoid"),
+                    numerics: Numerics::Exact,
                 })
             })();
             if strict { Some(dims?) } else { dims.ok() }
@@ -2863,6 +2883,12 @@ impl Spec {
             ActQuant::None => {}
             ActQuant::Fp8 => ensure!(self.quant.is_fp8(), "act_quant = \"fp8\" needs fp8 weights (quant = \"fp8_block128\" or \"fp8_channel\")"),
             ActQuant::Fp4 => bail!("act_quant = \"fp4\" is for [mlp] only (act_quant at the top is \"none\" or \"fp8\")"),
+        }
+        if let Some(la) = &self.linear_attention {
+            ensure!(
+                la.numerics.is_exact() || self.act_quant != ActQuant::None,
+                "[linear_attention] numerics = \"act\" needs act_quant on: it rounds the chunk products to the activation quantisation envelope"
+            );
         }
         match self.mlp.act_quant {
             ActQuant::None => {}

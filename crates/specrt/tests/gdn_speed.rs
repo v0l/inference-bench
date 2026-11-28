@@ -126,22 +126,18 @@ fn gdn_recurrent_state_kernels_speed_on_27b_shaped_layers() {
 #[test]
 #[ignore = "needs a CUDA GPU with NVRTC"]
 fn gdn_chunk_kernels_speed_on_a_27b_shaped_layer() {
-    let spec = Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b.toml")).unwrap();
-    let la = spec.linear_attention.clone().unwrap();
+    let exact = Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b.toml")).unwrap();
+    let mut act = exact.clone();
+    act.linear_attention.as_mut().unwrap().numerics = specrt::spec::Numerics::Act;
+    let la = exact.linear_attention.clone().unwrap();
     let (kh, vh, d) = (la.key_heads, la.value_heads, la.key_head_dim);
     let ctx = CudaContext::new(0).unwrap();
     let jit = Jit::new(ctx.clone(), std::env::temp_dir().join(format!("specrt-gdn-speed-{}", std::process::id()))).unwrap();
     let stream = ctx.default_stream();
-    let module = Module::generate_kv(&spec, 4096, 1, &specrt::codegen::cuda_target(&ctx).unwrap()).unwrap();
-    let loaded = jit.load(&module).unwrap();
-    let prep = loaded.function("gdn_chunk_prep").unwrap();
-    let scan = loaded.function("gdn_chunk_scan").unwrap();
-    let tuning = kir::linear::LinearTuning::for_target(&specrt::codegen::cuda_target(&ctx).unwrap());
+    let target = specrt::codegen::cuda_target(&ctx).unwrap();
+    let tuning = kir::linear::LinearTuning::for_target(&target);
     let c = tuning.chunk;
     let cols = tuning.cols;
-    let smem = module.smem["gdn_chunk_prep"];
-    use cudarc::driver::sys::CUfunction_attribute as A;
-    prep.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32).unwrap();
     let conv_dim = la.conv_dim();
     let lens: Vec<usize> = std::env::var("SPECRT_GDN_TOKENS").unwrap_or("1024,4096".into()).split(',').map(|v| v.parse().unwrap()).collect();
     for tokens in lens {
@@ -152,57 +148,73 @@ fn gdn_chunk_kernels_speed_on_a_27b_shaped_layer() {
         let mix = unit(data(tokens * conv_dim, 3, 1.0));
         let g = unit(data(tokens * vh, 4, -0.1).iter().map(|v| v - 0.05).collect());
         let beta = unit(data(tokens * vh, 5, 1.0).iter().map(|v| v + 0.5).collect());
-        let w = stream.alloc_zeros::<f32>(tokens * vh * d).unwrap();
-        let u = stream.alloc_zeros::<f32>(tokens * vh * d).unwrap();
-        let o = stream.alloc_zeros::<f32>(tokens * vh * d).unwrap();
-        let aqk = stream.alloc_zeros::<f32>(chunks * vh * c * c).unwrap();
-        let qe = stream.alloc_zeros::<f32>(tokens * vh * d).unwrap();
-        let kt = stream.alloc_zeros::<f32>(tokens * vh * d).unwrap();
-        let gc = stream.alloc_zeros::<f32>(chunks * vh * c).unwrap();
-        let state = stream.alloc_zeros::<f32>(vh * d * d).unwrap();
-        let ntok = tokens as i32;
-        let slot = 0i32;
-        let time = |f: &dyn Fn()| {
-            f();
-            f();
-            let mut times = Vec::new();
-            for _ in 0..10 {
-                let e0 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).unwrap();
-                e0.record(&stream).unwrap();
+        let mut exact_out: Vec<Vec<f32>> = Vec::new();
+        for (class, spec) in [("exact", &exact), ("act", &act)] {
+            let module = Module::generate_kv(spec, 4096, 1, &target).unwrap();
+            let loaded = jit.load(&module).unwrap();
+            let prep = loaded.function("gdn_chunk_prep").unwrap();
+            let scan = loaded.function("gdn_chunk_scan").unwrap();
+            let smem = module.smem["gdn_chunk_prep"];
+            use cudarc::driver::sys::CUfunction_attribute as A;
+            prep.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32).unwrap();
+            let w = stream.alloc_zeros::<f32>(tokens * vh * d).unwrap();
+            let u = stream.alloc_zeros::<f32>(tokens * vh * d).unwrap();
+            let o = stream.alloc_zeros::<f32>(tokens * vh * d).unwrap();
+            let aqk = stream.alloc_zeros::<f32>(chunks * vh * c * c).unwrap();
+            let qe = stream.alloc_zeros::<f32>(tokens * vh * d).unwrap();
+            let kt = stream.alloc_zeros::<f32>(tokens * vh * d).unwrap();
+            let gc = stream.alloc_zeros::<f32>(chunks * vh * c).unwrap();
+            let state = stream.alloc_zeros::<f32>(vh * d * d).unwrap();
+            let ntok = tokens as i32;
+            let slot = 0i32;
+            let time = |f: &dyn Fn()| {
                 f();
-                let e1 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).unwrap();
-                e1.record(&stream).unwrap();
-                stream.synchronize().unwrap();
-                times.push(e0.elapsed_ms(&e1).unwrap());
+                f();
+                let mut times = Vec::new();
+                for _ in 0..10 {
+                    let e0 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).unwrap();
+                    e0.record(&stream).unwrap();
+                    f();
+                    let e1 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).unwrap();
+                    e1.record(&stream).unwrap();
+                    stream.synchronize().unwrap();
+                    times.push(e0.elapsed_ms(&e1).unwrap());
+                }
+                times.sort_by(f32::total_cmp);
+                (times[0], times[5])
+            };
+            let run_prep = || {
+                let mut b = stream.launch_builder(&prep);
+                b.arg(&qn).arg(&kn).arg(&mix).arg(&g).arg(&beta).arg(&w).arg(&u).arg(&aqk).arg(&gc).arg(&qe).arg(&kt).arg(&ntok);
+                let cfg = LaunchConfig { grid_dim: (vh as u32, chunks as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem };
+                unsafe { b.launch(cfg) }.unwrap();
+            };
+            let run_scan = || {
+                let mut b = stream.launch_builder(&scan);
+                b.arg(&w).arg(&qe).arg(&kt).arg(&u).arg(&aqk).arg(&gc).arg(&state).arg(&o).arg(&slot).arg(&ntok);
+                let cfg = LaunchConfig { grid_dim: (vh as u32, (d / cols) as u32, 1), block_dim: (tuning.chunk_threads(), 1, 1), shared_mem_bytes: 0 };
+                unsafe { b.launch(cfg) }.unwrap();
+            };
+            run_prep();
+            run_scan();
+            stream.synchronize().unwrap();
+            let mut line = String::new();
+            for (i, (name, buf)) in [("o", &o), ("state", &state)].into_iter().enumerate() {
+                let host = stream.clone_dtoh(buf).unwrap();
+                line += &format!(" {name}={}", check_against_baseline(tokens, &format!("{class}-{name}"), &host));
+                if class == "exact" {
+                    exact_out.push(host);
+                } else {
+                    let base = &exact_out[i];
+                    let scale = base.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                    let diff = base.iter().zip(&host).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+                    line += &format!(" (against exact {diff:.3e} of {scale:.3e})");
+                }
             }
-            times.sort_by(f32::total_cmp);
-            (times[0], times[5])
-        };
-        let run_prep = || {
-            let mut b = stream.launch_builder(&prep);
-            b.arg(&qn).arg(&kn).arg(&mix).arg(&g).arg(&beta).arg(&w).arg(&u).arg(&aqk).arg(&gc).arg(&qe).arg(&kt).arg(&ntok);
-            let cfg = LaunchConfig { grid_dim: (vh as u32, chunks as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem };
-            unsafe { b.launch(cfg) }.unwrap();
-        };
-        let run_scan = || {
-            let mut b = stream.launch_builder(&scan);
-            b.arg(&w).arg(&qe).arg(&kt).arg(&u).arg(&aqk).arg(&gc).arg(&state).arg(&o).arg(&slot).arg(&ntok);
-            let cfg = LaunchConfig { grid_dim: (vh as u32, (d / cols) as u32, 1), block_dim: ((c / 16 * 32) as u32, 1, 1), shared_mem_bytes: 0 };
-            unsafe { b.launch(cfg) }.unwrap();
-        };
-        run_prep();
-        run_scan();
-        stream.synchronize().unwrap();
-        let outputs = [("o", &o), ("state", &state)];
-        let mut line = String::new();
-        for (name, buf) in outputs {
-            let host = stream.clone_dtoh(buf).unwrap();
-            line += &format!(" {name}={}", check_against_baseline(tokens, name, &host));
+            eprintln!("gdn tokens={tokens} {class}: outputs{line}");
+            let p = time(&run_prep);
+            let s = time(&run_scan);
+            eprintln!("gdn tokens={tokens} {class}: prep min {:.3} ms median {:.3} ms; scan min {:.3} ms median {:.3} ms", p.0, p.1, s.0, s.1);
         }
-        eprintln!("gdn tokens={tokens}: outputs{line}");
-        let s0 = time(&run_scan);
-        let p = time(&run_prep);
-        let s = time(&run_scan);
-        eprintln!("gdn tokens={tokens}: prep min {:.3} ms median {:.3} ms; scan min {:.3} ms median {:.3} ms (scan first {:.3})", p.0, p.1, s.0, s.1, s0.1);
     }
 }

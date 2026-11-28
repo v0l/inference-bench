@@ -187,7 +187,7 @@ pub fn split_plane_store(n: usize, hi: &str, lo: &str, pitch: &str, row: &str, c
             "unsigned hi, lo;
 split_hi_lo({value}, hi, lo);
 {hi}[{col} * {pitch} + {row}] = (unsigned short)hi;
-{lo}[{col} * {pitch} + {row}] = (unsigned short)lo;
+if (LA_LO) {lo}[{col} * {pitch} + {row}] = (unsigned short)lo;
 "
         ),
     )
@@ -225,7 +225,7 @@ float acc[NT][4];
 }
 
 pub fn mma_planes(n: usize, k: &str, acc: &str, frag: &str, hi: &str, lo: &str, pitch: &str) -> String {
-    at(n, &format!("gdn_mma_planes<{k}, NT>({acc}, {frag}, {hi}, {lo}, {pitch}, g, t4);\n"))
+    at(n, &format!("gdn_mma_planes<{k}, NT, LA_LO>({acc}, {frag}, {hi}, {lo}, {pitch}, g, t4);\n"))
 }
 
 pub fn kernel(header: &str, body: &str) -> String {

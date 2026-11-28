@@ -27,6 +27,7 @@ pub struct LinearShape {
     pub conv_kernel: usize,
     pub tiled_value_heads: bool,
     pub gate_sigmoid: bool,
+    pub chunk_single_bf16: bool,
 }
 
 impl fmt::Debug for LinearShape {
@@ -35,6 +36,9 @@ impl fmt::Debug for LinearShape {
         d.field("key_heads", &self.key_heads).field("value_heads", &self.value_heads).field("head_dim", &self.head_dim).field("conv_kernel", &self.conv_kernel).field("tiled_value_heads", &self.tiled_value_heads);
         if self.gate_sigmoid {
             d.field("gate_sigmoid", &true);
+        }
+        if self.chunk_single_bf16 {
+            d.field("chunk_single_bf16", &true);
         }
         d.finish()
     }
@@ -226,6 +230,11 @@ pub(crate) fn constants(s: &LinearShape, u: &LinearTuning) -> String {
     let _ = writeln!(o, "constexpr int LA_KS = LA_D + 1;");
     let _ = writeln!(o, "constexpr int LA_AS = LA_CHUNK + 1;");
     let _ = writeln!(o, "constexpr int LA_COLS = {};", u.cols);
+    if s.chunk_single_bf16 {
+        let _ = writeln!(o, "constexpr bool LA_LO = false;");
+    } else {
+        let _ = writeln!(o, "constexpr bool LA_LO = true;");
+    }
     let _ = writeln!(o, "constexpr float LA_L2_EPS = 1e-6f;");
     let _ = writeln!(o, "static_assert(LA_D % LA_COLS == 0 && LA_D <= 128, \"linear head dim\");");
     let _ = writeln!(o, "static_assert(LA_VH % LA_KH == 0, \"linear head groups\");");

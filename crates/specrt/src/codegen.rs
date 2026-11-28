@@ -548,7 +548,15 @@ pub fn prelude_kernels(spec: &Spec, max_ctx: usize, target: &kir::Target) -> Res
 }
 
 pub fn linear_kernel_shape(la: &crate::spec::LinearAttention) -> kir::linear::LinearShape {
-    kir::linear::LinearShape { key_heads: la.key_heads, value_heads: la.value_heads, head_dim: la.key_head_dim, conv_kernel: la.conv_kernel, tiled_value_heads: la.v_heads == crate::spec::VHeadOrder::Tiled, gate_sigmoid: la.gate_sigmoid }
+    kir::linear::LinearShape {
+        key_heads: la.key_heads,
+        value_heads: la.value_heads,
+        head_dim: la.key_head_dim,
+        conv_kernel: la.conv_kernel,
+        tiled_value_heads: la.v_heads == crate::spec::VHeadOrder::Tiled,
+        gate_sigmoid: la.gate_sigmoid,
+        chunk_single_bf16: la.numerics == crate::spec::Numerics::Act,
+    }
 }
 
 pub fn linear_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::linear::LinearKernel>> {
@@ -556,7 +564,7 @@ pub fn linear_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::line
         if spec.speculative().is_none() {
             return Ok(Vec::new());
         }
-        let unused = kir::linear::LinearShape { key_heads: 1, value_heads: 1, head_dim: 16, conv_kernel: 2, tiled_value_heads: false, gate_sigmoid: false };
+        let unused = kir::linear::LinearShape { key_heads: 1, value_heads: 1, head_dim: 16, conv_kernel: 2, tiled_value_heads: false, gate_sigmoid: false, chunk_single_bf16: false };
         return Ok(vec![kir::linear::LinearKernel::new(target, kir::linear::Family::Draft, unused).map_err(anyhow::Error::msg)?]);
     };
     let shape = linear_kernel_shape(la);

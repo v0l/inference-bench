@@ -42,7 +42,7 @@ auto k_col = [&](int k, int n) { return ks[n * LA_KS + k]; };
 "##;
 
 const KK: &str = r##"float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-if (n0 <= m0 + 15) mma_split_tile<LA_D / 16>(acc, m0, n0, lane, k_row, k_col);
+if (n0 <= m0 + 15) mma_split_tile<LA_D / 16, LA_LO>(acc, m0, n0, lane, k_row, k_col);
 #pragma unroll
 for (int e = 0; e < 4; e++) {
     int i = m0 + g8 + (e >> 1) * 8;
@@ -58,7 +58,7 @@ int live = min(C, tokens - t0);
 
 const QK: &str = r##"float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 if (n0 <= m0 + 15)
-    mma_split_tile<LA_D / 16>(
+    mma_split_tile<LA_D / 16, LA_LO>(
         acc, m0, n0, lane, [&](int m, int k) { return m < live ? qc[(size_t)m * LA_KH * LA_D + k] : 0.0f; },
         k_col);
 #pragma unroll
@@ -67,7 +67,7 @@ for (int e = 0; e < 4; e += 2) {
     int j = n0 + 2 * t4;
     float v0 = j <= i && i < live ? acc[e] * expf(gs[i] - gs[j]) : 0.0f;
     float v1 = j + 1 <= i && i < live ? acc[e + 1] * expf(gs[i] - gs[j + 1]) : 0.0f;
-    gdn_frag_put<C / 16>((unsigned*)ac, i, j, v0, v1);
+    gdn_frag_put<C / 16, LA_LO>((unsigned*)ac, i, j, v0, v1);
 }
 "##;
 
@@ -104,11 +104,15 @@ for (int nt = warp; nt < LA_D / 8; nt += WARPS) {
             gdn_pack2(t_at(m0 + g8 + 8, k), t_at(m0 + g8 + 8, k + 1), th[1], tl[1]);
             gdn_pack2(t_at(m0 + g8, k + 8), t_at(m0 + g8, k + 9), th[2], tl[2]);
             gdn_pack2(t_at(m0 + g8 + 8, k + 8), t_at(m0 + g8 + 8, k + 9), th[3], tl[3]);
-            mma_bf16(uu[mb], tl[0], tl[1], tl[2], tl[3], uh0, uh1);
-            mma_bf16(uu[mb], th[0], th[1], th[2], th[3], ul0, ul1);
+            if (LA_LO) {
+                mma_bf16(uu[mb], tl[0], tl[1], tl[2], tl[3], uh0, uh1);
+                mma_bf16(uu[mb], th[0], th[1], th[2], th[3], ul0, ul1);
+            }
             mma_bf16(uu[mb], th[0], th[1], th[2], th[3], uh0, uh1);
-            mma_bf16(ww[mb], tl[0], tl[1], tl[2], tl[3], wh0, wh1);
-            mma_bf16(ww[mb], th[0], th[1], th[2], th[3], wl0, wl1);
+            if (LA_LO) {
+                mma_bf16(ww[mb], tl[0], tl[1], tl[2], tl[3], wh0, wh1);
+                mma_bf16(ww[mb], th[0], th[1], th[2], th[3], wl0, wl1);
+            }
             mma_bf16(ww[mb], th[0], th[1], th[2], th[3], wh0, wh1);
         }
     }
@@ -121,7 +125,7 @@ for (int nt = warp; nt < LA_D / 8; nt += WARPS) {
             size_t at = ((size_t)(t0 + i) * LA_VH + h) * LA_D + d;
             u[at] = uu[mb][e];
             u[at + 1] = uu[mb][e + 1];
-            gdn_frag_put<LA_D / 16>(wp, i, d, ww[mb][e], ww[mb][e + 1]);
+            gdn_frag_put<LA_D / 16, LA_LO>(wp, i, d, ww[mb][e], ww[mb][e + 1]);
         }
 }
 "##;
@@ -136,7 +140,7 @@ const Q_EXP: &str = r##"int m = p / (LA_D / 2);
 int k = (p % (LA_D / 2)) * 2;
 float2 q = t0 + m < tokens ? *(const float2*)(qn + ((size_t)(t0 + m) * LA_KH + kh) * LA_D + k) : make_float2(0.0f, 0.0f);
 float eg = t0 + m < tokens ? expf(gs[m]) : 0.0f;
-gdn_frag_put<LA_D / 16>(qp, m, k, q.x * eg, q.y * eg);
+gdn_frag_put<LA_D / 16, LA_LO>(qp, m, k, q.x * eg, q.y * eg);
 "##;
 
 const K_TAIL: &str = r##"int d = p % LA_D;
@@ -145,7 +149,7 @@ float v0 = ks[k * LA_KS + d] * expf(glast - gs[k]);
 float v1 = ks[(k + 1) * LA_KS + d] * expf(glast - gs[k + 1]);
 if (t0 + k >= tokens) v0 = 0.0f;
 if (t0 + k + 1 >= tokens) v1 = 0.0f;
-gdn_frag_put<C / 16>(kp, d, k, v0, v1);
+gdn_frag_put<C / 16, LA_LO>(kp, d, k, v0, v1);
 "##;
 
 pub fn body() -> String {
