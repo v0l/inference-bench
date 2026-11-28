@@ -26,7 +26,7 @@ pub fn pipeline_prologue(count: &str, stage: &str) -> String {
     )
 }
 
-pub fn batch_helpers(p: &str) -> String {
+pub fn batch_helpers(p: &str, hint: &str) -> String {
     format!(
         r#"
 __device__ __forceinline__ void {p}_cp_async8(void* smem, const void* gmem, bool valid) {{
@@ -37,10 +37,40 @@ __device__ __forceinline__ void {p}_cp_async8(void* smem, const void* gmem, bool
 
 __device__ __forceinline__ uint4 {p}_load16(const void* p) {{
     uint4 r;
-    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {{%0,%1,%2,%3}}, [%4];"
+    asm volatile("ld.global.nc.L1::no_allocate{hint}.v4.u32 {{%0,%1,%2,%3}}, [%4];"
                  : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
     return r;
 }}
+"#
+    )
+}
+
+pub const L2_PREFETCH_128: &str = ".L2::128B";
+
+pub fn bf16x2_decode(p: &str) -> String {
+    format!(
+        r#"__device__ __forceinline__ unsigned {p}_bf16x2_mul(unsigned a, unsigned b) {{
+    unsigned r;
+    asm("{{ .reg .b32 z; mov.b32 z, 0x80008000; fma.rn.bf16x2 %0, %1, %2, z; }}" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+}}
+
+__device__ __forceinline__ unsigned {p}_e2m1x2_bf16(unsigned byte, unsigned scale2) {{
+    unsigned t = byte | (byte << 12);
+    unsigned bits = ((t << 6) & 0x01C001C0u) | ((t << 12) & 0x80008000u);
+    return {p}_bf16x2_mul({p}_bf16x2_mul(bits, 0x7E807E80u), scale2);
+}}
+
+__device__ __forceinline__ unsigned {p}_e4m3x2_bf16(unsigned two) {{
+    unsigned t = (two & 0xffu) | ((two & 0xff00u) << 8);
+    return {p}_bf16x2_mul(((t << 8) & 0x80008000u) | ((t << 4) & 0x07F007F0u), 0x7B807B80u);
+}}
+
+__device__ __forceinline__ unsigned {p}_scale_bf16x2(unsigned e4m3) {{
+    unsigned h = __float_as_uint(e4m3_to_f32(e4m3)) >> 16;
+    return h | (h << 16);
+}}
+
 "#
     )
 }

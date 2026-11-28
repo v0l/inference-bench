@@ -110,6 +110,7 @@ pub fn policy(spec: &Spec) -> Policy {
             GemmSelect::Fixed => kg::Select::Fixed,
         },
         launch_bytes: 0,
+        swap: spec.runtime.swap_rows,
     }
 }
 
@@ -383,7 +384,7 @@ impl GemmSet {
     pub fn smem(&self) -> BTreeMap<&'static str, u32> {
         self.kernels
             .iter()
-            .filter(|k| k.tile().is_some() || k.batch_shape().is_some() || matches!(k.kind, kg::Kind::GgmlGemv { .. }))
+            .filter(|k| k.tile().is_some() || k.batch_shape().is_some() || k.swap_shape().is_some() || matches!(k.kind, kg::Kind::GgmlGemv { .. }))
             .map(|k| (intern(&k.name), k.smem_bytes))
             .collect()
     }
@@ -471,6 +472,11 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
                 for v in Variant::FP8_ACT {
                     set.push(KernelInstance::fp8_act(t, &format!("{linear}_f8{}", v.suffix()), shape, tuning.tile(v), scale))?;
                 }
+                if fp8_act_enabled(spec) && spec.runtime.swap_rows && kg::BATCH_LINEARS.contains(&linear) {
+                    for tokens in kg::SWAP_VARIANTS {
+                        set.push(KernelInstance::swap(t, &format!("{linear}_f8s{tokens}"), shape, WeightFormat::Fp8, Some(scale), tokens))?;
+                    }
+                }
             }
         }
         for linear in wide_of(spec, &kg::BATCH_LINEARS).into_iter().filter(|l| la || !l.starts_with("lin_")) {
@@ -500,6 +506,9 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
                 let shape = linear_shape(spec, linear);
                 for v in Variant::FP4_ACT {
                     set.push(KernelInstance::fp4_act(t, &format!("{linear}_f4a{}", v.suffix()), shape, tuning.fp4_tile(v), &tuning))?;
+                }
+                for tokens in kg::SWAP_VARIANTS.into_iter().filter(|_| spec.runtime.swap_rows) {
+                    set.push(KernelInstance::swap(t, &format!("{linear}_f4s{tokens}"), shape, WeightFormat::Fp4, None, tokens))?;
                 }
             }
         }

@@ -1,7 +1,7 @@
 {
  "date": "2026-11-25 16:54 UTC",
  "commit": "bf1bd3a1",
- "command": "crates/specrt/scripts/kernel_vs.sh /tmp/kernel-vs docs/perf/kernel-vs-tables.md",
+ "command": "crates/specrt/scripts/kernel_vs.sh /tmp/kernel-vs docs/generated/perf/kernel-vs-tables.md",
  "compile_jobs": 1,
  "card": {
   "name": "RTX PRO 6000 Blackwell Max-Q",

@@ -75,6 +75,7 @@ Every key can be set in the `[engine]` table of a server model, in the load dial
 | `runtime.unsplit` | `[]` | list | Names of fused operations to keep whole instead of splitting across the batch. |
 | `runtime.split_activations` |  | bool | Run each bf16 matrix multiply on a high and a low half of the activations, which matches an fp32 reference to 1e-3 at the cost of prefill speed. Off runs plain bf16 activations like other engines. Auto follows the model family. |
 | `runtime.chunked_scan` |  | bool | Read long prompts through recurrent mixers in tensor core chunks instead of one row at a time. Same results, faster prefill. |
+| `runtime.swap_rows` |  | bool | On specs that quantise activations, let 2 to 64 row matrix multiplies (batched decode and speculative verify) use the native fp4 or fp8 kernel with the weights as the wide operand, and quantise activations from 2 rows instead of 9. Off keeps the previous kernels. |
 | `runtime.gemm_fp32` | `false` | bool | Accumulate matrix multiplies in fp32 on the plain path. Slower, for debugging. |
 | `runtime.vision.precision` |  | fast, exact | Arithmetic of the image encoder. fast runs f16 tensor cores; exact splits every value into two halves and matches transformers in f32 at about twice the time. |
 | `runtime.vision.cache_mb` |  | int, 0 to 1048576 | Host memory for encoded images, keyed by the image bytes, so a repeated image is not encoded again. 0 turns it off. |
