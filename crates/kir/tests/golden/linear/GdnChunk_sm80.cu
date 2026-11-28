@@ -286,6 +286,15 @@ extern "C" __global__ void __launch_bounds__(256, 2) gdn_chunk_prep(const float*
         unsigned* wp = (unsigned*)w + (size_t)(c * LA_VH + h) * C * LA_D;
         for (int nt = warp; nt < LA_D / 8; nt += WARPS) {
             int n = nt * 8 + g8;
+            float vr[MB][4];
+#pragma unroll
+            for (int kk = 0; kk < MB; kk++) {
+                int k = kk * 16 + 2 * t4;
+                vr[kk][0] = k < live ? vc[(size_t)k * LA_CONV_DIM + n] : 0.0f;
+                vr[kk][1] = k + 1 < live ? vc[(size_t)(k + 1) * LA_CONV_DIM + n] : 0.0f;
+                vr[kk][2] = k + 8 < live ? vc[(size_t)(k + 8) * LA_CONV_DIM + n] : 0.0f;
+                vr[kk][3] = k + 9 < live ? vc[(size_t)(k + 9) * LA_CONV_DIM + n] : 0.0f;
+            }
             float uu[MB][4], ww[MB][4];
 #pragma unroll
             for (int mb = 0; mb < MB; mb++)
@@ -294,11 +303,10 @@ extern "C" __global__ void __launch_bounds__(256, 2) gdn_chunk_prep(const float*
 #pragma unroll
             for (int kk = 0; kk < MB; kk++) {
                 int k = kk * 16 + 2 * t4;
-                auto vb = [&](int r) { return r < live ? vc[(size_t)r * LA_CONV_DIM + n] * bs[r] : 0.0f; };
                 auto kb = [&](int r) { return ks[r * LA_KS + n] * bs[r] * expf(gs[r]); };
                 unsigned uh0, ul0, uh1, ul1, wh0, wl0, wh1, wl1;
-                gdn_pack2(vb(k), vb(k + 1), uh0, ul0);
-                gdn_pack2(vb(k + 8), vb(k + 9), uh1, ul1);
+                gdn_pack2(vr[kk][0] * bs[k], vr[kk][1] * bs[k + 1], uh0, ul0);
+                gdn_pack2(vr[kk][2] * bs[k + 8], vr[kk][3] * bs[k + 9], uh1, ul1);
                 gdn_pack2(kb(k), kb(k + 1), wh0, wl0);
                 gdn_pack2(kb(k + 8), kb(k + 9), wh1, wl1);
 #pragma unroll
