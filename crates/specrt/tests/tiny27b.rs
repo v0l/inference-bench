@@ -317,6 +317,38 @@ fn speculative_greedy_with_act_quant_equals_its_plain_greedy() {
     assert_eq!(got, want);
 }
 
+fn act_numerics_spec() -> Spec {
+    let mut s = act_spec();
+    s.linear_attention.as_mut().unwrap().numerics = specrt::spec::Numerics::Act;
+    s.validate().unwrap();
+    s
+}
+
+fn act_envelope(s: &Spec) -> (f64, f64, f64, f64) {
+    let seq = ids(&meta("tiny27b-text.json")["tokens"]);
+    let weight_only = floats("tiny27b-text.logits.bin");
+    let act_ref = floats("tiny27b-text-act.logits.bin");
+    let vocab = s.dims.vocab;
+    let ours = Runtime::load(s, 256).unwrap().prompt_logits(&seq).unwrap();
+    (mean_kl(&weight_only, &ours, vocab), top1(&weight_only, &ours, vocab), mean_kl(&weight_only, &act_ref, vocab), top1(&weight_only, &act_ref, vocab))
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn act_numerics_delta_net_stays_inside_the_act_envelope_and_speculates_like_plain_greedy() {
+    let (kl, agree, ref_kl, ref_top1) = act_envelope(&act_numerics_spec());
+    let (exact_kl, exact_agree, _, _) = act_envelope(&act_spec());
+    eprintln!("numerics act: KL {kl:e} top-1 {agree}; numerics exact: KL {exact_kl:e} top-1 {exact_agree}; act reference KL {ref_kl:e} top-1 {ref_top1}");
+    assert!(kl <= 1.5 * ref_kl + 1e-6, "KL {kl} against the act reference's {ref_kl}");
+    assert!(agree + 0.05 >= ref_top1, "top-1 {agree} against {ref_top1}");
+    let mut s = with_drafts(act_numerics_spec(), 2);
+    s.runtime.gemm_select = specrt::spec::GemmSelect::Fixed;
+    let ps = speculation_prompts();
+    let want = plain_greedy(&s, &ps);
+    let (got, _) = speculative_greedy(&s, &ps, None);
+    assert_eq!(got, want);
+}
+
 fn vision_case(rt: &mut Runtime, case: &str) {
     let m = meta(&format!("tiny27b-vision-{case}.json"));
     let patch_dim = m["patch_dim"].as_u64().unwrap() as usize;

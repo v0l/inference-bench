@@ -80,17 +80,37 @@ and the `S^T q` read in one pass, then the gated norm.
 Prefill is the chunked form, chunk 64, with the WY representation (the same algorithm as
 `torch_chunk_gated_delta_rule` and the flash-linear-attention `chunk_gated_delta_rule`):
 
-- `gdn_chunk_prep`, one block per (value head, chunk), all chunks in parallel: cumulative `g`,
-  `A = -beta_i (k_i . k_j) exp(g_i - g_j)` strictly below the diagonal, the forward substitution
-  that turns it into `T = (I - A)^-1`, then `u = T (beta v)`, `w = T (beta k exp(g))` and the masked
-  intra-chunk `q k^T exp(g_i - g_j)`.
-- `gdn_chunk_scan`, one block per (value head, 16 state columns), sequential over chunks:
+- `gdn_chunk_prep`, one block per (value head, chunk), all chunks in parallel, 256 threads, two
+  blocks per SM: cumulative `g`, `A = -beta_i (k_i . k_j) exp(g_i - g_j)` strictly below the
+  diagonal, the block-merged inverse `T = (I - A)^-1`, then `u = T (beta v)`, `w = T (beta k exp(g))`
+  and the masked intra-chunk `q k^T exp(g_i - g_j)`. The WY products give each warp one 8 column
+  slice of `u` and `w` for all 64 rows, so every `beta v` and `beta k exp(g)` operand is packed once
+  and reused by the four row blocks below the diagonal; the key tail `k exp(g_last - g)` reads the
+  keys from shared memory.
+- `gdn_chunk_scan`, one block per (value head, 32 state columns), sequential over chunks:
   `v' = u - w S`, `o = (q exp(g)) S + Aqk v'`, `S = exp(g_last) S + (k exp(g_last - g))^T v'`.
 
 Both run their matrix products on tensor cores through `mma_bf16` with the same hi/lo bf16 split
 the dense prefill GEMMs use (three MMAs per tile), so they keep about f32 accuracy. The forward
 substitution stays scalar (64 dependent rows). The state is f32 throughout, as in the checkpoint
 (`mamba_ssm_dtype = float32`).
+
+### Numerics class
+
+`[linear_attention] numerics` picks the equivalence class the chunk kernels may use
+(`docs/specrt-kir-compiler.md` section 4):
+
+| value | chunk products | allowed |
+| --- | --- | --- |
+| `"exact"` (default) | hi/lo bf16 split, three MMAs per tile, every intermediate plane stored hi and lo | always; bound by the 1e-3 of `tests/linear.rs` |
+| `"act"` | single bf16 operands with f32 accumulation (one MMA per tile, as FLA's `tl.dot`), planes stored hi only | only with `act_quant` on; the spec refuses it otherwise |
+
+The state, the gates, the cumulative sums and the inverse stay f32 in both. `act` is judged by the
+act spec gates (teacher forced top-1 and KL against vLLM in `real27b`), not by 1e-3. Checkpoint
+configs (`Spec::from_hf_config`) and the exact specs (`qwen3.8-27b-exact`,
+`qwen3.8-27b-nvfp4-exact`) are always `exact`. On the 27B shaped layer (`tests/gdn_speed.rs`, 4,096
+tokens, random inputs) `act` differs from `exact` by 3.2e-3 on the output (of 0.27) and 6.6e-4 on
+the state (of 0.14).
 
 The conv window and the delta-rule state for every linear layer of every sequence sit in two flat
 buffers beside the KV cache (`GdnBuffers` in `runtime.rs`); the KV cache now holds only the full
