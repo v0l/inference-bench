@@ -1,29 +1,21 @@
-# specrt: gated delta-net linear attention
+# Linear attention, attention and long context
 
-Issue #308. The first engine step toward Qwen3.8 27B (see `qwen3.8-27b-vllm-baseline.md`): the
-gated delta-net layers that make up 48 of its 64 layers, plus the changes the 16 full-attention
-layers need, in bf16 and proven on a tiny random-weight model against `transformers`.
+Hybrid models (Qwen3.5 and 3.8, Qwen3-Next, Kimi Linear, the Mamba hybrids) mix full attention layers with recurrent ones. This doc covers the gated delta-net layer, the attention kernels and long context. Described mixers (Mamba2, KDA) are spec only, see [kir.md](kir.md).
 
-## What a hybrid spec looks like
+## Gated delta-net
+
+Spec, for example `crates/specrt/tests/fixtures/qwen3.8-27b.toml`:
 
 ```toml
-min_engine = 2
-
 [layers]
 count = 64
 pattern = ["linear", "linear", "linear", "full"]
-
-[norm]
-kind = "rmsnorm"
-eps = 1e-6
-unit_offset = true
 
 [attention]
 kind = "gqa"
 heads = 24
 kv_heads = 4
 head_dim = 256
-qkv_bias = false
 qk_norm = true
 output_gate = true
 rotary_dim = 64
@@ -35,274 +27,66 @@ value_heads = 48
 key_head_dim = 128
 value_head_dim = 128
 conv_kernel = 4
+numerics = "exact"
 ```
 
-The full file is `crates/specrt/tests/fixtures/qwen3.8-27b.toml`. It lives in the fixtures, not in
-`specs/`, because everything in `specs/` ships to the app as a runnable model and the 27B cannot run
-until FP8 or NVFP4 weights load. `Spec::from_hf_config` reads the real `config.json` (the nested
-`text_config`, `rope_parameters`, `layer_types` reduced to its shortest repeating period).
-`SPEC_FORMAT` is now 2; older apps list a hybrid spec as "needs a newer inference-bench".
+`norm.unit_offset` stores RMSNorm weights as `w - 1`; `attention.output_gate` doubles `q_proj` to `[query, gate]` per head; `rotary_dim` rotates only part of each head. `validate` refuses value heads that are not a multiple of key heads, head dims that differ or are not a multiple of 32 up to 128, a conv kernel outside 2 to 8, and a layer count that is not a multiple of the pattern.
 
-New fields, all optional so the dense specs are unchanged on disk:
+Per token per linear layer: one `in_proj` GEMM over `[qkv | z | b | a]`; causal depthwise conv over qkv then SiLU; L2 normalised q and k (q scaled by `1/sqrt(dk)`); `g = -exp(A_log) * softplus(a + dt_bias)`, `beta = sigmoid(b)`; the delta rule on an f32 state per value head (`S = exp(g) S; S += k (beta (v - S^T k))^T; o = S^T q`); gated RMSNorm `norm_w * rmsnorm(o) * silu(z)`; `out_proj` into the residual. Kernels are in `crates/kir/src/cuda/linear/`.
 
-| field | meaning |
-| --- | --- |
-| `layers.pattern` `"linear"` / `"full"` | a gated delta-net layer, or a full GQA layer beside them (`"dense"` stays for pure dense models and cannot be mixed with `"linear"`) |
-| `norm.unit_offset` | RMSNorm weights are stored as `w - 1` (Qwen3.5 `(1 + w)`); the loader adds the 1 |
-| `attention.output_gate` | `q_proj` is twice as wide: per head `[query, gate]`; output is `attn * sigmoid(gate)` |
-| `attention.rotary_dim` | partial rotary: only the first `rotary_dim` of each head rotate (64 of 256 here) |
-| `[linear_attention]` | heads, head dims and conv kernel of the delta-net layers |
+- Decode: `gdn_conv_step`, `gdn_step` (the recurrent form, one block per value head, state slice in registers).
+- Prefill: chunk 64 in the WY form, the same algorithm as flash-linear-attention `chunk_gated_delta_rule`. `gdn_chunk_prep` (all chunks in parallel: cumulative g, the strictly lower `A`, block merged inverse `(I - A)^-1`, `u`, `w`, masked intra chunk qk) and `gdn_chunk_scan` (sequential over chunks, 32 state columns per block). Products run on tensor cores.
+- Verify and commit for MTP: [mtp.md](mtp.md).
+- `[runtime] chunked_scan` (on) reads long prompts through described recurrent mixers with tensor core chunk kernels.
 
-`validate` rejects: a linear layer without `[linear_attention]` and the reverse, value heads not a
-multiple of key heads, key and value head dims that differ or are not a multiple of 32 up to 128, a
-conv kernel outside 2..8, a layer count that is not a multiple of the pattern, and a rotary dim that
-is odd or above the head dim.
+The conv window and state live in the state pool beside the KV cache, so the KV pool holds only the full attention layers (16 of 64 on the 27B). The state is 151 MB per sequence on the 27B and is reset at the start of each sequence.
 
-## The layer, as implemented
+`[linear_attention] numerics`:
 
-Per token, for each linear layer (shapes for the 27B):
+| Value | Chunk products | Allowed |
+|---|---|---|
+| `exact` (default) | hi/lo bf16 split, three MMAs per tile | always; checkpoint configs and the exact specs are always exact |
+| `act` | single bf16 operands, f32 accumulate | only with `act_quant` on |
 
-1. `in_proj` = one GEMM over `[qkv 10240 | z 6144 | b 48 | a 48]` rows, on the normed hidden state.
-2. Causal depthwise conv over the 10240 qkv channels, kernel 4, then SiLU. The state is the last 3
-   inputs per channel.
-3. `q`, `k` L2-normalised per head (eps 1e-6), `q` scaled by `1/sqrt(128)`. Each of the 16 key heads
-   serves 3 value heads.
-4. `g = -exp(A_log) * softplus(a + dt_bias)`, `beta = sigmoid(b)`.
-5. Delta rule with a 128 x 128 f32 state per value head: `S = exp(g) S; S += k (beta (v - S^T k))^T;
-   o = S^T q`.
-6. Gated RMSNorm per head: `norm_w * rmsnorm(o) * silu(z)`, then `out_proj` (6144 to 5120) added to
-   the residual.
+`act` cuts the prefill delta-net kernels on the 27B from 112.8 to about 79 ms at 4,096 tokens but misses the vLLM gate on the NVFP4 act spec (top-1 1,207 against 1,217 of 1,280), so no checked in spec uses it (#1517).
 
-Decode (`gdn_conv_step`, `gdn_step`) is the recurrent form: one block of 512 threads per value head
-holds a column slice of the state in registers, does the decay, the `S^T k` read, the rank-1 update
-and the `S^T q` read in one pass, then the gated norm.
+The chunked state equals the recurrent state to 1.5e-5 and prefill then decode gives the logits of one long prefill to 3e-5; it is not bit identical because the two forms sum in a different order.
 
-Prefill is the chunked form, chunk 64, with the WY representation (the same algorithm as
-`torch_chunk_gated_delta_rule` and the flash-linear-attention `chunk_gated_delta_rule`):
+## Attention kernels
 
-- `gdn_chunk_prep`, one block per (value head, chunk), all chunks in parallel, 256 threads, two
-  blocks per SM: cumulative `g`, `A = -beta_i (k_i . k_j) exp(g_i - g_j)` strictly below the
-  diagonal, the block-merged inverse `T = (I - A)^-1`, then `u = T (beta v)`, `w = T (beta k exp(g))`
-  and the masked intra-chunk `q k^T exp(g_i - g_j)`. The WY products give each warp one 8 column
-  slice of `u` and `w` for all 64 rows, so every `beta v` and `beta k exp(g)` operand is packed once
-  and reused by the four row blocks below the diagonal; the key tail `k exp(g_last - g)` reads the
-  keys from shared memory.
-- `gdn_chunk_scan`, one block per (value head, 32 state columns), sequential over chunks:
-  `v' = u - w S`, `o = (q exp(g)) S + Aqk v'`, `S = exp(g_last) S + (k exp(g_last - g))^T v'`.
+`kir::attention` families ([kir.md](kir.md)): `RopeKv` (qk norm, rope, KV write in bf16 or fp8), `SplitDecode` (single stream decode), `FlashLegacy` (scalar prefill), `FlashMma` (tensor core prefill, online softmax, Q norm and rope in the kernel, 64 query rows and 16 key tiles above head dim 128 so it fits 99 KB) and `GroupedDecode` (batched decode and verify).
 
-Both run their matrix products on tensor cores through `mma_bf16` with the same hi/lo bf16 split
-the dense prefill GEMMs use (three MMAs per tile), so they keep about f32 accuracy. The forward
-substitution stays scalar (64 dependent rows). The state is f32 throughout, as in the checkpoint
-(`mamba_ssm_dtype = float32`).
+`batch_decode_attention` runs one block per (KV head, verify group, split): the group's GQA heads times its rows form one query tile, so each KV page is read once per sequence. `mma.m16n8k16` in fp16 with hi/lo Q and P keeps the result within 4e-6 of an f64 reference. K and V tiles of `DECODE_KEYS` (16) keys go through shared memory in `DECODE_STAGES` (2) cp.async stages; splits are `decode_splits(max_ctx)` chunks of `DECODE_CHUNK` (256) keys, doubling with length, at most `DECODE_MAX_SPLITS` (64). A row gives the same bits alone or in its verify group when both pick the same chunk. Constants are in `crates/kir/src/attention.rs`; 3 stages and 32 key tiles lost to occupancy and registers at head dim 256 (#617).
 
-### Numerics class
+Sliding windows, soft caps, query scales and per layer rope bases come from the spec. Variant attentions (sinks, chunked masks, MLA, DSA, compressed sparse attention) are described kernels.
 
-`[linear_attention] numerics` picks the equivalence class the chunk kernels may use
-(`docs/specrt-kir-compiler.md` section 4):
+## YaRN context extension
 
-| value | chunk products | allowed |
-| --- | --- | --- |
-| `"exact"` (default) | hi/lo bf16 split, three MMAs per tile, every intermediate plane stored hi and lo | always; bound by the 1e-3 of `tests/linear.rs` |
-| `"act"` | single bf16 operands with f32 accumulation (one MMA per tile, as FLA's `tl.dot`), planes stored hi only | only with `act_quant` on; the spec refuses it otherwise |
+`spec::yarn_inv_freq` and `Spec::rope_constants` follow transformers' `_compute_yarn_parameters` (the ramp between the `beta_fast` and `beta_slow` correction dims, the attention factor, only rotated dims, composes with interleaved mrope). The constants are baked into the kernels. A checkpoint that declares YaRN gets it from its config; others can opt in:
 
-The state, the gates, the cumulative sums and the inverse stay f32 in both. `act` is judged by the
-act spec gates (teacher forced top-1 and KL against vLLM in `real27b`), not by 1e-3. Checkpoint
-configs (`Spec::from_hf_config`) and the exact specs (`qwen3.8-27b-exact`,
-`qwen3.8-27b-nvfp4-exact`) are always `exact`. On the 27B shaped layer (`tests/gdn_speed.rs`, 4,096
-tokens, random inputs) `act` differs from `exact` by 3.2e-3 on the output (of 0.27) and 6.6e-4 on
-the state (of 0.14).
-
-#### Measured on the 27B (#1517)
-
-Cold `prefixbench <spec> long off 0 12 4096` under nsys, real 27B NVFP4, desktop GPU1, prefill
-delta-net kernels (`gdn_conv_prefill`, `gdn_conv_keep`, `gdn_qk_prep`, `gdn_gates`,
-`gdn_chunk_prep`, `gdn_chunk_scan`, `gdn_gated_norm`) summed over the 48 linear layers:
-
-| kernel | master a948be44 | branch, `exact` | branch, `act` |
-| --- | --- | --- | --- |
-| `gdn_chunk_prep` (4,096 token chunk) | 64.3 ms | 48.8 ms | 32.1 to 32.7 ms |
-| `gdn_chunk_scan` | 51.5 ms | 36.4 ms | 19.0 to 19.4 ms |
-| `gdn_conv_prefill` | 12.3 ms | 12.8 ms | 11.9 to 13.1 ms |
-| `gdn_gated_norm` | 7.2 ms | 7.8 ms | 8.4 to 8.7 ms |
-| all prefill delta-net kernels | 143.3 ms | 112.8 ms | 77.7 to 79.9 ms |
-
-The exact changes leave the outputs bit for bit identical on `tests/gdn_speed.rs` (o and state
-hashed against master at 1,024 and 4,096 tokens): WY products as one 8 column slice per warp over
-all 64 rows, two prep blocks per SM, 32 state columns per scan block, the key tail from shared
-memory, KK and QK tiles only on and below the diagonal, the WY value loads hoisted, the 16 x 16 leaf
-inverse on warp syncs.
-
-Tried and dropped, all bit identical but not faster: a grid over key heads with KK and QK kept in
-registers for the three value heads (prep 0.88 to 0.97 ms, the three inverses serialise), a warp
-specialised scan (one warp group for `v'` and the state, one for the output), an L2 bulk prefetch
-of the next chunk in the scan, the `Aqk` fragments preloaded into registers, 3 prep blocks per SM,
-16 or 64 state columns.
-
-`gdn_conv_prefill` (336 MB at 4,096 tokens, 0.21 ms at 1.6 TB/s against 0.25 ms) and
-`gdn_gated_norm` (302 MB, 0.19 ms against 0.15 to 0.16 ms, partly from L2) are at their byte
-floors; one warp per head row for the norm measured the same.
-
-`numerics = "act"` is off in every checked in spec. On `real_27b_nvfp4_agrees_with_vllm_greedy_and_logprobs`
-the act NVFP4 spec with it on gave teacher forced top-1 1,207 of 1,280 and KL mean 0.01353, against
-1,219 and 0.01327 with it off, so it misses the gate the issue set (1,217 and 0.0126). The FP8 act
-spec passes `real_27b_greedy_and_logits_match_the_fp8_reference` with it (KL 0.00109 against the
-act reference's 0.00086, top-1 0.983 against 0.990), and `tiny27b.rs` checks that the chunked state
-does not drift from the recurrent state over 16k tokens in either class.
-
-Whole prefill, `crates/specrt/scripts/prefill555.sh`, 3 interleaved rounds, cold, medians:
-
-| prompt | master | branch (`exact`) | change | master against master |
-| --- | --- | --- | --- | --- |
-| 4,096 | 5,859 tok/s | 6,139 | +4.8% | +0.1% |
-| 32,768 | 4,767 | 4,932 | +3.5% | +0.1% |
-| 131,072 | 2,838 | 2,899 | +2.1% | |
-
-The first master round ran faster than the other two (6,139 and 4,998 tok/s), so the medians are
-the fair figure; the control pair (master against a copy of master) is inside 0.2%. The branch
-misses the 5% the issue asked for at 4k and 32k because the default stays `exact`.
-
-The conv window and the delta-rule state for every linear layer of every sequence sit in two flat
-buffers beside the KV cache (`GdnBuffers` in `runtime.rs`); the KV cache now holds only the full
-attention layers, so the 27B pays KV memory for 16 layers, not 64. The recurrent state is reset at
-the start of every `generate`, `prompt_logits` and batch prefill, because unlike KV it is not keyed by
-position. Batched decode (`generate_batch`) works for hybrid specs too.
-
-## Tests and results
-
-The oracle is a tiny Qwen3.5 model: 3 layers (`linear, linear, full`), hidden 256, 2 key heads and 6
-value heads of 128 (the 27B's 1:3 ratio and head dim), full attention 4 heads of 128 with partial
-rotary 32 and the output gate, vocab 1024. Weights are random with seed 0, scaled like the real
-checkpoint (`A_log` in -5.5..-1, `dt_bias` around 2.8), stored as bf16 in
-`crates/specrt/tests/fixtures/tiny-qwen3.5/` (7 MB). `scripts/reference.py tiny <fixture> <out>`
-builds it the first time and dumps per-layer hidden states, logits and the final conv and delta
-states from `transformers` 5.15 (the `~/.venv-vllm` one; the system 4.57 has no `qwen3_5`), on CPU in
-f32.
-
-`crates/specrt/tests/linear.rs`, on the RTX PRO 6000 (shared with the live vLLM 27B), max abs:
-
-| test | per layer | logits | delta state | conv state |
-| --- | --- | --- | --- | --- |
-| decode 32 tokens, recurrent | 1.9e-6, 3.3e-6, 4.8e-6 | 2.6e-6 | 8.3e-7 | 1.5e-6 |
-| prefill 1024 tokens, chunked on tensor cores | 3.3e-5, 5.1e-5, 6.6e-5 | 4.5e-5 | 1.2e-5 | 2.1e-5 |
-| prefill 1024 then compare with 1024 recurrent decode steps | | | 1.5e-5 (state max 1.40) | 2.1e-5 |
-| prefill 1024 + decode 16 vs one 1040-token prefill | | 3.0e-5 | | |
-| whole model, 48-token prompt | | 4.0e-5, top-1 48/48 | | |
-
-Greedy decode of 64 tokens is identical to `transformers.generate`, and 4-sequence batch decode is
-identical to single-sequence greedy. The bound in every assertion is 1e-3 for activations and logits
-and 1e-4 for states.
-
-The issue asked for a bit-identical state hand-off between prefill and decode. It is not
-bit-identical and cannot be without giving up the chunked form: the chunked algorithm sums the same
-terms in a different order (and through the WY inverse) than the token-by-token recurrence, so the
-f32 results differ in the last bits. The conv window differs too, by 2e-5, because the prefill path
-gets its inputs from the tensor-core `in_proj` GEMM and the decode path from the scalar GEMV. What
-the test proves instead is that the hand-off is exact in meaning: prefill then decode gives the same
-logits as one long prefill to 3e-5, and the chunked state equals the recurrent state to 1.5e-5.
-
-The dense suites still pass unchanged: `logits` (all 8, `SPECRT_REF_DIR=/tmp/ref273`), `generate`
-(6, including batch decode and contexts over 4096), `chat`, `jit`, and the workspace tests.
-
-## Kernel times
-
-`nsys` kernel sums for the tiny model on the shared GPU (vLLM at about 95% busy beside it), so read
-them as relative numbers.
-
-Prefill 1024 tokens, per linear layer:
-
-| kernel | scalar f32 | tensor cores, 32 columns | tensor cores, 16 columns |
-| --- | --- | --- | --- |
-| `gdn_chunk_scan` | 1260 us | 316 us | 202 us |
-| `gdn_chunk_prep` | 193 us | 83 us | 80 us |
-
-For comparison the full-attention `flash_mma` layer is 138 us for the same 1024 tokens. The scan is
-latency bound on the tiny shape (6 heads x 8 column blocks = 48 CTAs on 188 SMs, 16 chunks in
-sequence); the 27B has 48 value heads, so 384 CTAs, and fills the card.
-
-Decode, per token per linear layer: `gdn_step` 5.2 us, `gdn_conv_step` 1.2 us, `lin_in_norm` 2.5 us,
-`lin_out_proj` 1.7 us (medians).
-
-## head_dim 256
-
-The 27B's full-attention layers use `head_dim = 256`. `attention_split` keeps one float4 column per
-lane and loops over `ceil(head_dim / 128)` columns, so 256 needs no extra block size.
-`flash_mma` stages Q as 128 rows x head_dim x 4 B, which is 128 KB at 256 and over the 99 KB
-per-block limit, so above 128 it runs 64 query rows and 16-key tiles (64 KB). `Module::generate`
-fails with the byte count if a shape would exceed 99 KB.
-
-The second oracle is the same tiny model with `head_dim = 256`
-(`tests/fixtures/tiny-qwen3.5-hd256/`, 8 MB, references named `tiny256-*`). Decode, prefill, logits
-and batched decode all match to the same 1e-3 as the 128 fixture (logits max abs 4.9e-5 at 1024
-tokens, 4.0e-5 over the 48-token prompt). `qwen38_27b_module_compiles_through_nvrtc` in `tests/jit.rs`
-compiles the real 27B spec.
-
-Prefill cost of the smaller tiles, nsys time of one `flash_mma` call over the same 1024-token tiny
-prefill (4 heads, one full layer): 137 us at head_dim 128, 284 us at 256. That is 2.1x for 2x the
-head dim, so per-FLOP the 64-row tiling costs close to nothing; the 27B's 16 full layers will pay
-the 2x of the wider heads, not an extra tiling penalty.
-
-Dense models are unchanged. Qwen3-0.6B (head_dim 128), before/after this change, 6 alternating
-`bench` runs, medians, GPU shared with the live vLLM:
-
-| run | prefill tok/s before | after | decode tok/s before | after |
-| --- | --- | --- | --- | --- |
-| 128 prompt / 128 new | 12629 | 12708 | 450.5 | 448.6 |
-| 1024 prompt / 128 new | 31752 | 34889 | 380.3 | 380.8 |
-
-nsys, same runs, median per call (us, before -> after): at 128 tokens `attention_split` 5.09 ->
-5.02, `attention_reduce` 2.24 -> 2.24, `flash_mma` 36.3 -> 36.4; at 1024 `attention_split` 9.92 ->
-9.73, `attention_reduce` 4.45 -> 4.38, `flash_mma` 164.1 -> 161.4. Means differ because of
-warm-up outliers on the shared card.
-
-## Regenerating every reference
-
-The tests read one folder, `SPECRT_REF_DIR` (default `crates/specrt/out`). Everything below writes
-into it. `/tmp` is deleted on reboot, so rerun this after one.
-
-```sh
-uv venv ~/.venvs/specrt-ref
-uv pip install -p ~/.venvs/specrt-ref "transformers>=5.1" torch numpy safetensors
-export SPECRT_REF_DIR=/tmp/ref273
-cd crates/specrt
-PY=~/.venvs/specrt-ref/bin/python
-for s in specs/*.toml; do $PY scripts/reference.py $s $SPECRT_REF_DIR; done
-$PY scripts/reference.py tiny tests/fixtures/tiny-qwen3.5 $SPECRT_REF_DIR
-$PY scripts/reference.py tiny tests/fixtures/tiny-qwen3.5-hd256 $SPECRT_REF_DIR 256
-cargo test --release -- --include-ignored --test-threads=1
+```toml
+[runtime]
+rope_extension = { type = "yarn", factor = 4 }
 ```
 
-The per-spec call needs the HF weights for each spec's `repo`; the `tiny` calls need only the
-fixtures and write `tiny-*` (128) and `tiny256-*` (256) files. Run the suite with
-`--test-threads=1` because the GPU is shared and `contexts_above_4096` needs most of the free memory.
+It multiplies `max_position_embeddings`, which the serving `max_model_len` check and the load dialog follow. Off by default because it changes short context numerics; refused when the model already declares rope scaling; part of the prefix cache namespace. Dynamic YaRN is not supported.
 
-`scripts/reference.py` writes `rope_parameters` (with `rope_theta` from the model's own config) for
-rope-scaled specs, so it needs transformers 5. On this machine use `PY=~/.venv-vllm/bin/python`.
+KV on the 27B per token: 64 KiB in f16, about 33 KiB in fp8; 64 and 33 GiB at 1,048,576 tokens.
 
-## What the next issue needs (FP8 and NVFP4 weights for the real 27B)
+## Measured state
 
-The 27B in bf16 is 54 GB of weights and does not fit beside vLLM; the FP8 checkpoint
-`Qwen/Qwen3.8-27B-FP8` is the next target. What it takes, from the checkpoint as it is on disk:
+27B NVFP4, desktop GPU1:
 
-- Sharded safetensors: `model.safetensors.index.json` with `layers-N.safetensors`,
-  `outside.safetensors` and `mtp.safetensors`. `find_safetensors` only finds one
-  `model.safetensors`; the loader must open every shard named in the index.
-- FP8 e4m3 block-scaled weights: `weight` is `F8_E4M3` and `weight_scale_inv` is bf16 with one scale
-  per 128 x 128 block (`weight_block_size [128, 128]`, `activation_scheme dynamic`). Every
-  projection is FP8: `in_proj_qkv`, `in_proj_z`, `out_proj`, `q/k/v/o_proj`, `gate/up/down_proj`.
-  Kept in bf16: `in_proj_a`, `in_proj_b` (48 rows each), `conv1d`, `A_log`, `dt_bias`, the norms,
-  `embed_tokens` and `lm_head`. So `in_proj` (one fused GEMM here) splits into an FP8 part (16384
-  rows) and a bf16 part (96 rows), or the 96 rows get upcast to the FP8 block layout at load.
-- An FP8 GEMM on sm_120: `mma.sync ... e4m3` with per-token dynamic activation scales and the
-  128 x 128 weight block scales applied per K block, the same way `Q8` applies its group scales in
-  `gemm_tc` now. Decode needs an FP8 GEMV with the same scales.
-- The NVFP4 checkpoint (`orcarouter/Qwen3.8-27B-Uncensored-NVFP4`, compressed-tensors
-  mixed precision) has FP4 e2m1 MLPs with group-16 scales; that is its own issue after FP8.
-- Memory at 27B: about 27 GB of FP8 weights plus 5 GB for the bf16 `embed_tokens` and `lm_head`.
-  KV for 16 layers x 4 heads x 256 x 2 (K, V) in the current f16 hi/lo pair is 128 KB per token;
-  the linear state is 48 layers x 48 heads x 128 x 128 x 4 bytes = 151 MB per sequence plus 5.9 MB
-  of conv window, independent of context.
-- The vision tower and `mtp.*` are ignored by this loader; MTP is a later issue.
-- `head_dim` 256 on the full layers: the decode `attention_split` kernel asserts `HEAD_DIM <= 128`,
-  so a 27B module does not compile yet. The tiny fixture uses 128 to stay inside it; the 27B needs
-  that kernel extended to 256, and `flash_mma` and `batch_decode_attention` checked at 256 (their
-  shared memory and register use grow with the head dim).
+| Measure | Value | Source |
+|---|---|---|
+| prefill delta-net kernels at 4,096 tokens, exact | 112.8 ms over 48 layers | #1517, 27 Nov 2026 |
+| prefill tok/s at 4k / 32k / 128k | 6,139 / 4,932 / 2,899 | #1517 |
+| `batch_decode_attention` at 12 x 32k inside the model | 85 percent of the 1,640 GB/s read ceiling | #617 |
+| decode at 1 x 128k, MTP k = 2 | 77 tok/s | #617 |
+| aggregate decode at 12 x 32k | 559 tok/s | #646 |
+
+At 12 x 32k the round is bound by weights, bf16 KV and the recurrent state: about 31 ms at 1,640 GB/s against 56 ms measured; fp8 KV halves the KV term.
+
+## Tests
+
+`crates/specrt/tests/linear.rs` (tiny Qwen3.5 fixtures against transformers: decode, chunked prefill, state hand off, 1e-3 activations and 1e-4 states), `tiny27b.rs` (chunked against recurrent over 16k), `decode_attention.rs` (the kernel against f64 across splits, lengths 1 to 16,397, verify groups, the 122B GQA 32/2 shape), `gdn_speed.rs` and `flash_speed.rs` (timing), `yarn.rs` (tables against `tests/fixtures/yarn_reference.json`, 1M positions on GPU), `real27b.rs` needle tests at 500k and 1M. References: `crates/specrt/scripts/reference.py tiny <fixture> <dir> [256]`, see [../guides/testing.md](../guides/testing.md).
