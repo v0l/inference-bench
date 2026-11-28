@@ -1,145 +1,78 @@
-# specrt kernel IR (kir)
+# kir: kernel IR
 
-`crates/kir` (package `inference-bench-kir`) describes a kernel as typed data and emits source for a backend. It has no dependency on specrt, cudarc or wgpu, and knows nothing about `Spec`. specrt maps its spec and runtime options to kir values. The crate builds and tests on CPU: `cargo test -p inference-bench-kir`.
+`crates/kir` (package `inference-bench-kir`) describes every kernel as typed data and emits CUDA or WGSL text from it. It does not depend on specrt, cudarc or wgpu and knows nothing about `Spec`: specrt maps the spec and runtime options to kir values. It builds and tests on CPU (`cargo test -p inference-bench-kir`). The pass pipeline that groups ops into kernels is in [kir-compiler.md](kir-compiler.md); the planned Metal target is in [kir-metal.md](kir-metal.md).
 
-Cargo features `cuda` and `wgsl` (both default) enable the emitters. They only produce strings.
-
-## Design reference
-
-Modelled on CUTLASS 3 and CuTe, compiled like FlashInfer. kir does not decide layouts or pipelining by itself (not Triton style): a builder picks them explicitly from the `Target`, so the result is predictable and inspectable.
-
-- **Atoms:** single target instructions (mma.sync, cp.async, ldmatrix, TMA, warp shuffle, subgroup ops, a shared-memory fallback). Each declares the target features it needs. Slice 1 has one atom family: the block sum (`BlockSum`).
-- **Collectives:** mainloop (loads plus mma over N stages) and epilogue (scale, bias, activation, residual, store). Slice 1 has the elementwise epilogue only (`GatedActivation`) and the norm reduction (`RmsNorm`).
-- **Schedule and launch:** thread count and shared memory on `Kernel`, validated against the target.
-- **Layout algebra:** `kir::layout::Layout` is a CuTe style `(shape, stride)` pair, nested and congruent. It supports `offset`, `size`, `cosize`, `coalesce`, `compose`, and `expr`, which lowers a layout to an index expression in CUDA or WGSL. Tiles, swizzles and MMA fragments are meant to be layouts, so index maths is written once for both backends. Slice 1 uses it for the gate/up interleave of the gated activation.
-- **Variants and JIT:** one compiled module per (family, config, target), keyed by the kir hash. Families needing a host side split (attention) will follow FlashInfer's plan/run: the plan writes a workspace on the host and run launches fixed shapes, so graph capture works.
+Design: CUTLASS 3 and CuTe style pieces, compiled like FlashInfer. kir does not pick layouts or pipelining on its own. A builder picks them from the `Target`, so the output is predictable and every choice is in the source.
 
 ## Target
 
-`kir::Target` describes what a kernel runs on: language (`Cuda`, `Wgsl`), compute capability, arch-specific flag, SM count, warp or subgroup size, max threads per block, shared memory limit, a feature set (`WarpShuffle`, `CpAsync`, `Mma16816`, `Tma`, `Subgroups`, `ShaderF16`), and runtime facts (`graphs`, `pdl`).
+`kir::Target` (`crates/kir/src/target.rs`) is what a kernel runs on: `Language` (`Cuda`, `Wgsl`), compute capability, SM count, warp or subgroup size, max threads, shared memory limit, max registers, a `Feature` set (`WarpShuffle`, `CpAsync`, `Mma16816`, `Tma`, `Subgroups`, `ShaderF16`, `Fp8Mma`, `BlockScaledFp4`, `CoopMatrix`) and the runtime facts `graphs` and `pdl`.
 
-specrt fills it from the live device: `codegen::cuda_target` reads the CUDA context attributes, and `DeviceLimits::target` maps the wgpu limits. Tests use fixed targets: `Target::sm_120()`, `sm_80()`, `wgpu_baseline()`, `wgpu_baseline().with_subgroups(32)`. Subgroups are not yet detected from the live wgpu adapter, so wgpu targets from the device have none.
+specrt fills it from the device: `codegen::cuda_target` reads the CUDA context, and the wgpu backend maps the adapter limits. Tests use fixed targets: `Target::sm_120()`, `sm_80()`, `wgpu_baseline()`, `wgpu_baseline().with_subgroups(32)`, and `Target::named` for the CLI. The target is part of every kernel hash.
 
-The target is an input to the builder, and it is part of every kernel's hash.
+## Kernel kinds
 
-## IR
-
-```rust
-pub struct Kernel {
-    pub name: &'static str,
-    pub target: Target,
-    pub params: Vec<Param>,
-    pub threads: u32,
-    pub smem_bytes: u32,
-    pub body: Body,
-}
-
-pub enum Body {
-    RmsNorm { width: u32, eps: f32, sum: BlockSum },
-    GatedActivation { width: u32, act: Activation },
-}
-```
-
-Params carry a scalar type, a role (weight, activation, scratch) and an access. A body declares the roles it expects and `validate` checks them.
-
-Builders (`Kernel::rmsnorm(&target, ...)`, `Kernel::gated_activation(&target, ...)`) choose the blocks and sizes from the target:
-
-| Target | `BlockSum` | Shared memory |
+| Module | Type | What it covers |
 |---|---|---|
-| CUDA | `WarpShuffle` (`__shfl_xor_sync`, 32 floats of scratch) | 128 B |
-| wgpu with subgroups | `Subgroup` (`subgroupAdd`, per-subgroup scratch) | threads * 4 B |
-| wgpu without | `SharedTree` (shared memory tree) | threads * 4 B |
+| `lib.rs` | `Kernel { name, target, params, threads, smem_bytes, body }` with `Body::{RmsNorm, RmsNormSegment, AddRmsNorm, NormAdd, Pointwise, Add, GatedActivation, Compose, Scan, Rows, Recurrence, Seq}` | light row kernels and the description bodies |
+| `gemm.rs` | `KernelInstance { name, target, kind, threads, smem_bytes }`, `Kind::{Tile, Fp8Act, Fp4Act, Batch, GgmlBatch, GgmlGemv, BatchReduce, QuantFp8, QuantFp4, Gemv, HeadNormFp4}` | every weight GEMM and batched GEMV, see [gemm.md](gemm.md) |
+| `gemv.rs` | `GemvKernel { name, target, op }` | the single row GEMVs (`linear_w`, `qkv_proj_norm`, `gate_up_act`, `lm_head_norm`, `lin_in_norm`, `lin_ba_norm`, ...) |
+| `attention.rs` | `AttentionKernel { family, target, shape }`, `Family::{RopeKv, SplitDecode, FlashLegacy, FlashMma, GroupedDecode}` | rope with qk norm and KV write, split decode, scalar flash, tensor core prefill, grouped batch decode |
+| `heavy.rs` | `Heavy { family, problem, tile, prologue, epilogue }` | GEMM and GEMV with fusable stage slots, see [kir-compiler.md](kir-compiler.md) |
+| `moe.rs`, `prims.rs`, `rope.rs`, `ggml.rs`, `conv.rs`, `vision.rs`, `mel.rs`, `duplex.rs`, `allreduce.rs`, `weight_quant.rs`, `bandwidth.rs` | per family builders | MoE route and experts, embed and sampling prims, rope tables, ggml decoders, VAE convs, vision, log mel, the duplex head, allreduce, the load time quantiser, the bandwidth probe |
 
-Thread counts are rounded down to a power of two within the target's limit.
+Each builder takes the target and a shape, picks threads, tiles, stages and splits from formulas over the target (`MmaShape::new`, `BatchShape::splits`, `attention::decode_splits`, `gemv::gemv_geometry`, `moe::route_logits_launch`), and validates the result. `Kernel::validate` refuses a non identifier name, threads that are not a power of two or exceed the target, shared memory over the limit, a block whose feature the target lacks (the error names it), a block of the other language, and params that do not match the body.
 
-## Validation
+`kir::layout::Layout` is a CuTe style `(shape, stride)` pair with `offset`, `size`, `cosize`, `coalesce`, `compose` and `expr`, which lowers an index expression to CUDA or WGSL. KV addressing (`attention::prim::kv_addr`) and the gate/up interleave come from it.
 
-`Kernel::validate` refuses: a non-identifier name, a thread count that is not a power of two or exceeds the target, shared memory above the target limit, a block whose required feature the target lacks (error names the feature), a block of the wrong language, and params that do not match the body. Both emitters call it first and also refuse a kernel of the other language.
+## Emitters and the cache key
 
-## Hash and JIT cache key
+`kir::cuda::emit_module`, `emit_gemms`, `emit_attention`, `emit_weight_quant` and `emit_bandwidth` return a `kir::KirSource`; `kir::wgsl::emit_kernel`, `emit_gemm` and `emit_op` return WGSL. Only kir can build a `KirSource`, and `Jit::load`, `compile_cubin` and `compile_ptx` take nothing else, so every kernel the engine compiles comes from a kir emitter. Tests that patch text use `KirSource::test_text`, behind kir's `test-text` feature, which only specrt's dev dependency enables. NVRTC is called only in `crates/specrt/src/jit.rs`.
 
-`Kernel::hash()` is FNV-1a over `describe()`, which includes the target. `kir::module_hash` folds the kernels in order. specrt stores it in `Module::kir_hash` and `Jit::load` adds it to the cache key options, so the key changes when the IR or the target changes.
+`Kernel::hash()` is FNV-1a over `describe()`, target included; `kir::module_hash` folds a module's kernels in order. specrt keeps it as `Module::kir_hash`, and the JIT cache key includes it.
 
-## Emitters
+What stays as `.cu` text under `crates/kir/src/cuda` is the prim library: thin wrappers over one PTX instruction or conversion (`mma.sync`, `cp.async`, `ldmatrix`, `cvt` to e4m3, e2m1 and bf16, warp and block reductions) and the `Dec*` weight decoders the GEMM templates are written against. The shared memory swizzles `swz<CPR>` (`prelude.cu`) and `gemm::prim::swizzle` are still hand written.
 
-`kir::cuda::emit_module(&[Kernel])` returns CUDA C++ (helpers once, then each kernel). `kir::wgsl::emit_kernel(&Kernel)` returns one WGSL module; `wgsl::bindings` gives the binding kinds the wgpu backend needs. Golden output is in `crates/kir/tests/golden/` per kernel, backend and target. Regenerate with `KIR_BLESS=1 cargo test -p inference-bench-kir` and review the diff.
+Guard tests in `crates/specrt/tests/codegen.rs` (`every_kernel_comes_from_kir`, `the_kernel_text_guards_catch_a_new_offender`, `moe_builders_use_shared_prims_unless_listed`, `launch_geometry_comes_from_kir_builders`) fail on an `include_str!` of `.cu`, `.cuh` or `.wgsl` outside kir, a `__global__` outside the emitters, NVRTC outside `jit.rs`, a `KirSource` built from raw text, library code reading `crates/specrt/tools/`, or a changed allowlist. Hand compiled dev benches live in `crates/specrt/tools/cuda/`.
 
-## Worked example: rmsnorm
+Goldens are under `crates/kir/tests/golden/` per kernel, family, backend and target (WGSL goldens are also validated with naga). `KIR_BLESS=1 cargo test -p inference-bench-kir` rewrites them; review the diff.
 
-```rust
-let target = Target::sm_120();
-let k = Kernel::rmsnorm(&target, 1024, 1e-6, 1024)?;
-let cuda = kir::cuda::emit_module(&[k])?;
-```
+## Kernel descriptions
 
-On `Target::wgpu_baseline()` the same call picks `SharedTree` and 256 threads, and `kir::wgsl::emit_kernel` emits the workgroup tree reduction. On `Target::wgpu_baseline().with_subgroups(32)` it picks `Subgroup` and emits `subgroupAdd`.
+A kernel description is a TOML file with `kind = "kir-kernel"` (`crates/kir/src/desc.rs`). It names a `family` and its `args`; argument values are literals or shape symbols that `codegen::kir_shape` and `attention_symbols` build from the model config and spec (`hidden`, `inter`, `vocab`, `norm_eps`, `q_dim`, `kv_dim`, `qkv_row`, `mlp_act`, `residual_scale`, `logit_scale`, `logit_softcap`, the attention and rope constants). Unknown keys, families or symbols are load errors naming the kernel, then `Kernel::validate` runs against the live target. The hash is of the resolved kernel, not the file.
 
-In specrt, `codegen::kir_kernels(spec, &target)` builds `rmsnorm` and `swiglu` from the spec. `Module::generate_kv` appends the emitted CUDA to the rendered templates, and `wgsl::generate` appends the WGSL kernels. The old `rmsnorm` and `swiglu` bodies were removed from `ops.cu` and `templates/wgsl`.
+- Level 1 families name an existing builder: `rmsnorm`, `add_rmsnorm`, `norm_add`, `rmsnorm_segment`, `add`, `pointwise`, `gated_activation` and the eight attention kernels (`build_attention`). Tests assert the description builds the same kernel and hash as the Rust builder on every target (`crates/kir/tests/desc.rs`, `crates/specrt/tests/kernel_desc.rs`).
+- `family = "compose"` is a body of stages: `tile_load`, `epilogue`, `block_sum`, `tile_store`, `gather`, `scatter`, `lookup` over the expression language in `expr.rs` (arithmetic, comparisons, `&&`, `||`, `tanh exp log rsqrt sqrt abs min max floor select softplus`, macros `sigmoid silu gelu_tanh`). rmsnorm, norm_add, swiglu, residual add, logit scale and softcap and `clear_branch` are composed bodies (`crates/kir/kernels/compose_*.toml`) whose text equals the builders byte for byte (`crates/kir/tests/compose.rs`).
+- `scan_attention` (`scan.rs`): a query row scan over paged KV with stages `epilogue`, `mask`, `online_softmax` (optional `sink`), `select_from` (keep keys named in an index buffer), split QK and V widths through `[geometry]` segments, and compressed `[blocks]` folded into the same softmax. CUDA only, scalar.
+- `rows` (`rows.rs`): `span_rope`, `state_write`, `head_matvec`, `layernorm_segment`, `block_pool`, `head_rms`.
+- `recurrence` (`recur.rs`): a per head state matrix in registers with stages `key`, `key_sum`, `scalar`, `value`, `decay`, `update`, `read`, `store`; plus `seq_conv` and `group_norm`. One kernel serves prefill and batched decode.
+- `index_topk`: index scores and top k per query row into an i32 buffer.
 
-## GEMV and GEMM families (slice 2)
+The embedded descriptions are `crates/kir/kernels/*.toml` and `crates/specrt/specs/*.toml` (the attention, MLA, DSA, Mamba, KDA, DiT, Gemma 3n and other kernels). The spec layers ship them like family specs, the auto updated copy wins (`specrt::kir_kernel::Registry`, `Spec::check` returns `Checked::Kernel`), and the binary falls back to the embedded set. See [specs.md](specs.md).
 
-`kir::gemm` holds every NVFP4, FP8 and bf16 tile GEMM and batched GEMV as a typed `KernelInstance { name, target, kind, threads, smem_bytes }`. The builders take the target and a `GemmShape { n, k, epi, bias, act }`:
+## Graph specs
 
-| Builder | Block (`Kind::block`) | Needs |
-|---|---|---|
-| `KernelInstance::gemm` on CUDA | `TileMma`: `gemm_tc` with a weight decoder (`DecBf16`, `DecQ8`, `DecFp8`, `DecGgml`, `DecFp4`), bf16 `mma.m16n8k16` | `Mma16816`, `CpAsync` |
-| `KernelInstance::gemm` on wgpu | `DequantF16`: 16x16 workgroup tile, weights dequantised to f16 in shared memory (bf16, fp8 and nvfp4 decoders) | `ShaderF16` |
-| `fp8_act` | `Fp8ActMma`: e4m3 x e4m3 `mma.m16n8k32` | `Fp8Mma` (sm_89+) |
-| `fp4_act` | `BlockScaledFp4Mma`: `mma ... kind::mxf4nvf4.block_scale` | `BlockScaledFp4` (sm_12x) |
-| `batch`, `batch_reduce` | `BatchRowsMma`, `BatchReduce`: `gemv_f4b` / `gemv_f8b` with split-K | `Mma16816`, `CpAsync` |
-| `quant_fp8`, `quant_fp4` | `QuantRowsFp8`, `QuantRowsFp4` | as the GEMM they feed |
-| `fp4_gemv`, `fp4_head_norm` | `Fp4Gemv`, `Fp4HeadGemv`: one warp per row | `WarpShuffle`, `CpAsync` |
+`crates/specrt/graphs/*.toml` (`kind = "graph"`) describe a computation: a head, one `[[block]]` per layer kind, a tail, and for decoders `[[mtp]]` and `[[mtp_head]]`. `graphs/decoder.toml` is the decoder graph; the others are the encoder, codec, speech, MeanFlow, LSD, denoiser, VAE and image pipeline graphs.
 
-`MmaShape::new(&target, tile, k, format, split)` picks `bk` and stages (NVFP4 stages from `target.smem_limit`), `BatchShape::for_tokens` the batch variant, and `BatchShape::splits(&target, n, k)` the split-K count from `target.sm_count` and `target.smem_per_sm()`. `Tuning` carries the `[runtime]` table: `tile`, `big_tile`, `fp4_tile`, `fp4_stages`. There are no `SPECRT_*` environment knobs left in codegen: the tiny tile width, `bk` and stage counts that `SPECRT_TINY_WN`, `SPECRT_FP8_BK`, `SPECRT_BK` and `SPECRT_STAGES` used to override are fixed or derived from the target.
+- A node has `op`, optional `weight`, `quant`, `in`, `out` and `phase` (`prefill`, `decode`, `verify` or `rows`). Blocks carry `layers` and `when` conditions (`plain`, `sandwich`, `tensor_core`, `legacy`, `logit_softcap`, `speculative`, `stock`, joined with `+`) and `mlp = "dense" | "sparse"`.
+- `Plan::build` lowers the graph through `graph.rs` into a flat `Vec<Op>` (`plan.rs`, which holds no block kind or op sequence code). Unknown ops, buffers and weights fail at lowering. `tests/graph.rs` checks the lowered plans for every fixture.
+- A `linear` node's `quant` is `attn`, `mlp`, `bf16`, `head` or `draft_head`; `Op::Linear` resolves it and calls `gemm::select`.
+- Spec nodes: `[[attention.node]]`, `[[attention.projection]]`, `[attention.params]`, `[attention.scratch]`, `[attention.int_scratch]` and `[[mixer.node]]` put described kernels into a layer (`Op::Kernel`), with bindings to buffers, `{ state = name }`, weights, numbers and params; `attention_nodes` in the graph expands them and the stock attention ops are guarded by `when = "stock"`.
+- State kinds: `[[state]]` tables (`crates/specrt/src/state.rs`) declare a buffer with `per = token | sequence | layer`, `layers`, `shape` over model symbols, `dtype`, `snapshot`, `prefix_share`, `rollback = positional | checkpoint` and `owner`. `family-base.toml` declares the stock `k`, `v`, `conv` and `ssm` states. The pool, snapshots, prefix cache, swap and the memory fit all read the declared states.
 
-`kir::gemm::select(&target, &policy, &request)` replaces specrt's old `select`: it returns a `Choice` with the path, the kernel name, the quantiser and reduce kernel to launch first or after, and the `KernelInstance` it dispatches. specrt's `codegen::select(spec, &target, linear, tokens, weight)` maps the spec to a `Policy` and calls it. On a target without `BlockScaledFp4` (sm_80, sm_89) an NVFP4 MLP falls back to `f4w`, which dequantises the e2m1 weights to bf16 in shared memory and runs the bf16 mma; without `Fp8Mma` FP8 weights use `DecFp8` through the same tile GEMM.
+The current spec format is `SPEC_FORMAT` in `crates/specrt/src/spec.rs`.
 
-`specrt::gemm::gemm_kernels(spec, &target)` builds every instance a module needs, so the module list, the shared memory table and dispatch come from one place; a test checks that every `Choice` the runtime can make on sm_120 and sm_80 is an instance in the module. `kir::cuda::emit_gemms` emits the shared device code once (`crates/kir/src/cuda/gemm.cu`, `fp4.cu`, `fp4_act.cu`, `fp8_act.cu`, `fp4_batch.cu`, `fp8_batch.cu`, `fp4_head.cu`, only the parts the instances use) and one `extern "C"` wrapper per instance; `kir::wgsl::emit_gemm` emits one WGSL module per instance. The emitter refuses a block the target cannot run, naming it, for example `qkv_f8b8: block BatchRowsMma has no Wgsl lowering`. On wgpu, `inference-bench kernels` lists the refused blocks after the families. The `{{MMA_KERNELS}}`, `{{F4W_KERNELS}}`, `{{F4A_SOURCE}}`, `{{F4B_KERNELS}}`, `{{F8B_KERNELS}}`, `{{HEAD_F4W_KERNELS}}`, `{{HEAD_F4_ROWS}}`, `{{F4B_KC}}` and `{{F8B_KC}}` slots are gone, with the template files that held them.
+## Tests
 
-Goldens are in `crates/kir/tests/golden/gemm/`, one per family and target (`*_sm120.cu`, `*_sm80.cu`, `*.wgsl`); the WGSL goldens are also parsed and validated with naga.
+| Test | Checks |
+|---|---|
+| `crates/kir/tests/*.rs` | goldens, desc equals builder, compose, scan, rows, layouts |
+| `crates/specrt/tests/codegen.rs` | the kir only guards |
+| `crates/specrt/tests/golden.rs`, `linear_unchanged.rs` | specrt module goldens stay byte identical |
+| `crates/specrt/tests/kernel_desc.rs`, `graph.rs`, `variants.rs`, `mamba.rs`, `v4_attention.rs` | descriptions, graph lowering, spec only variants against transformers |
+| `crates/specrt/tests/no_arch_names.rs` | no architecture names in engine Rust |
 
 ```
 inference-bench kernels --spec qwen3.8-27b-nvfp4 --target sm_120
-inference-bench kernels --spec qwen3.8-27b-nvfp4 --target sm_80
 inference-bench kernels --spec qwen3.8-27b-nvfp4 --target wgpu
 ```
-
-## Attention families (slice 4)
-
-`kir::attention` describes the attention kernels as `AttentionKernel { family, target, shape, threads, smem_bytes }` over an `AttentionShape` (heads, KV heads, head_dim, QKV row, output gate, qk-norm, eps, `RopeShape` with yarn and mrope constants, KV layers, KV planes, fp8 KV). `kir::cuda::emit_attention` emits the shared device code once (`crates/kir/src/cuda/attention/*.cu`) and the kernels of the families asked for.
-
-| Family | Kernels | Needs |
-|---|---|---|
-| `RopeKvWrite` | `qk_norm_rope`, `kv_norm_rope` (qk-norm, rope, bf16 hi/lo or fp8 KV write) | `WarpShuffle` |
-| `SplitDecode` | `attention_split`, `attention_reduce` | `WarpShuffle` |
-| `FlashScalar` | `flash_attention` | `WarpShuffle` |
-| `FlashMma` | `flash_mma` (prefill) | `Mma16816`, `CpAsync` |
-| `GroupedDecodeMma` | `batch_decode_attention`, `batch_decode_combine` (KV read once per sequence, splits grow with length) | `Mma16816`, `CpAsync` |
-
-`MAX_CTX`, `PAGES` and `BD_SPLITS` are no longer source constants. The kernels take `pages` (block-table row stride), `mm_stride` (mrope table stride) and `splits` as launch arguments, so one compiled module serves any context length (#397). The tile constants (`FM_*`, `DM_*`) come from the shape. `specrt::codegen::attention_kernels(spec, kv_planes, target)` builds the set; its hash joins the module hash. Goldens are in `crates/kir/tests/golden/attention/`.
-
-## Remaining kernels (slice 6)
-
-The template directories are gone. Every kernel is emitted by a kir builder from a typed description:
-
-| Module | Builder | Kernels |
-|---|---|---|
-| `kir::prims` | `PrimKernel { name, target, prim }` | CUDA `embed`, `splice_rows`, `rms_split`, `argmax_rows`, `sample_rows`, `argmax_advance`, `apply_mask`, `bump`, `copy_rows`, `split_rows`; WGSL `embed`, `argmax`, `bias`, `dequant` |
-| `kir::gemv` | `GemvKernel { name, target, op }` | `qkv_proj`, `o_proj`, `gate_up_proj`, `down_proj`, `lm_head`, the tiled `*_gemm`, `qkv_proj_norm`, `gate_up_act`, `lm_head_norm`, `lin_in_norm`, `lin_ba_norm`, `lin_ba_rows`, `lin_out_proj` |
-| `kir::moe` | `MoeKernel { family, target, shape }` | `Experts` (route, per-pair and grouped GEMV), `GroupedMma` (block-scaled fp4 grouped GEMM) |
-| `kir::rope` | `inv_freq_fn(dialect, kinds)` | rope frequencies for the CUDA attention kernels and the WGSL `rope` |
-| `kir::ggml` | `wgsl_decoder()` | the WGSL ggml block decoders, sized from `BLOCK_BYTES` |
-| `kir::wgsl` | `emit_op`, `emit_linear_op` | WGSL `rope`, `attention`, `linear`, `linear_t8` |
-
-Shape constants are baked from the spec (`HIDDEN`, `VOCAB`, eps and the embedding scale are literals in the prim kernels), and the Gumbel hash and the argmax reduction tree are one builder for both dialects. Each builder validates its target and shape, and its hash joins the module hash.
-
-What stays as `.cu` text under `crates/kir/src/cuda` are device libraries and kernel bodies that each family selects and parameterises (`prelude.cu` with the decoders and `linear_w`/`linear_norm`, the GEMM, attention, delta-net, GGUF, vision and MoE bodies). The test `every_kernel_comes_from_kir` in `crates/specrt/tests/codegen.rs` lists them by name: a new `.cu` or any `.wgsl` file under `crates/kir/src` fails it, so does a `__global__` in a library file, and so does text for any kernel a builder now generates. Porting those bodies to kir primitives is tracked per family in follow-up issues.
-
-## Slices
-
-1. Crate, Target, Layout, rmsnorm and gated activation.
-2. NVFP4 and FP8 GEMV and GEMM (#609, this section).
-3. Delta-net and MTP (after #418).
-4. Attention (#621, this section).
-5. GGUF and vision.
-6. Remove `render()`, the `{{SLOT}}`s and the env knobs; builders for the remaining kernels (#623, this section).

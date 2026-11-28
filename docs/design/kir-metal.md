@@ -1,6 +1,6 @@
 # A Metal target for kir
 
-Analysis for #1369, slice 1. No engine code. Everything below was read from the tree at this commit, from the Mac speed work in `docs/specrt-wgpu.md`, and from TensorFold (github.com/ashhart/TensorFold, Apache-2.0) and MLX (github.com/ml-explore/mlx, MIT) read on the web. No code from either project is copied into this repo; what is taken is ideas, re-derived below as kir descriptions.
+Plan for #1371 to #1381; none of it is built yet, so the backend file and test names below are planned names. It was read from the tree, from the Mac speed work in [wgpu.md](wgpu.md), and from TensorFold (github.com/ashhart/TensorFold, Apache-2.0) and MLX (github.com/ml-explore/mlx, MIT) read on the web. No code from either project is copied into this repo; what is taken is ideas, re-derived below as kir descriptions.
 
 Today the Mac runs kir's WGSL emitter, wgpu 30 and naga 30, which translates the WGSL to MSL inside the driver call. The plan here adds `Language::Msl`: kir writes MSL itself and a small Metal backend runs it.
 
@@ -16,8 +16,8 @@ What is worth taking:
 | Residency sets | `zig/src/metal/residency.zig` | `MTLResidencySet` (macOS 15+) holds weights and KV pages wired for a queue; refuses past 70% of RAM minus a margin | runtime piece R3, and the memory admission gate |
 | Keep warm | `zig/src/metal/keepalive.zig` | while idle, a tick commits a tiny blit that touches every residency set so the GPU and the sets stay hot (default 900 s) | runtime piece R4, measured before it is kept |
 | M5 tensor ops | `zig/kernels/metal/nax.h` | 16x32x16 `matmul2d` from `MetalPerformancePrimitives` on M5; the same fragment API over 8x8 `simdgroup_matrix` before M5 (`TF_SIMD_FRAGS`) | `Feature::NeuralAccel`, a later slice |
-| MLX affine weights | `docs/quantization.md` | 2, 3, 4, 5, 6, 8 bit, groups of 32, 64, 128, scales and biases in bf16, f16 or f32, per module overrides, read as stored | section 3 |
-| Qualification gates | `docs/quantization.md`, `CONTRIBUTING.md` | packed value checks, one row against batched, drafted against serial, prefix resume, concurrent streams, memory admission, all before a speed claim | section 5 |
+| MLX affine weights | TensorFold's `quantization.md` | 2, 3, 4, 5, 6, 8 bit, groups of 32, 64, 128, scales and biases in bf16, f16 or f32, per module overrides, read as stored | section 3 |
+| Qualification gates | TensorFold's `quantization.md`, `CONTRIBUTING.md` | packed value checks, one row against batched, drafted against serial, prefix resume, concurrent streams, memory admission, all before a speed claim | section 5 |
 
 ## 1. What lowers to WGSL today, and what naga does to it
 
@@ -75,7 +75,7 @@ What a direct emitter does not change. The #825 and #829 work found nothing wron
 
 ## 2. The emitter plan
 
-Same shape as `docs/specrt-kir-compiler.md`: typed pieces, each lowering refused with a reason when it cannot be emitted, each landed with goldens, nothing named after an architecture.
+Same shape as [kir-compiler.md](kir-compiler.md): typed pieces, each lowering refused with a reason when it cannot be emitted, each landed with goldens, nothing named after an architecture.
 
 ### Target
 
@@ -131,7 +131,7 @@ One check is not static: Metal may lower `maxTotalThreadsPerThreadgroup` below t
 Two ways to get MSL onto the GPU were read:
 
 - wgpu passthrough (`Features::PASSTHROUGH_SHADERS`, `Device::create_shader_module_passthrough` with `msl` source, wgpu-hal 30 compiles it with `newLibraryWithSource`). wgpu-types documents it as "you shouldn't expect this to work with bindings except on SPIR-V": the buffer indices wgpu assigns are not ours to choose. It also leaves ICB, residency sets and NoCopy buffers out of reach.
-- A Metal backend, `crates/specrt/src/backends/metal.rs`, behind the existing `Backend` trait (`alloc`, `upload`, `alloc_filled`, `download`, `compile`, `dispatch`, `submit`), on `objc2-metal` 0.3 (already in `Cargo.lock` through wgpu-hal), macOS only, selected by `[runtime] backend = "metal"` in the spec or server config with `wgpu` the default until the A/B says otherwise.
+- A Metal backend, a new `backends/metal.rs` in specrt, behind the existing `Backend` trait (`alloc`, `upload`, `alloc_filled`, `download`, `compile`, `dispatch`, `submit`), on `objc2-metal` 0.3 (already in `Cargo.lock` through wgpu-hal), macOS only, selected by `[runtime] backend = "metal"` in the spec or server config with `wgpu` the default until the A/B says otherwise.
 
 Decision: the Metal backend. It is about 400 lines against `backends/wgpu.rs`'s 415, it reuses `dense.rs` unchanged, and every runtime piece in section 4 needs it. Compiled libraries are cached under `[runtime] cache_dir` with `MTLBinaryArchive`, keyed by the source hash as the CUDA JIT cache is.
 
@@ -191,7 +191,7 @@ On Linux, no Mac:
 
 On the Mac (`ssh mac`, M1 Pro):
 
-5. Compile check: `crates/specrt/tests/msl.rs` (macOS, `metal` feature) builds every kernel of every fixture spec the Mac supports with `newLibraryWithSource` and `newComputePipelineStateWithFunction`, and checks `maxTotalThreadsPerThreadgroup` and `staticThreadgroupMemoryLength` against the kernel. That needs only the Metal framework. `xcrun metal -Werror` as a lint is optional: on 25 Nov the Mac answered `cannot execute tool 'metal' due to missing Metal Toolchain; use: xcodebuild -downloadComponent MetalToolchain`.
+5. Compile check: a new specrt test `msl.rs` (macOS, `metal` feature) builds every kernel of every fixture spec the Mac supports with `newLibraryWithSource` and `newComputePipelineStateWithFunction`, and checks `maxTotalThreadsPerThreadgroup` and `staticThreadgroupMemoryLength` against the kernel. That needs only the Metal framework. `xcrun metal -Werror` as a lint is optional: on 25 Nov the Mac answered `cannot execute tool 'metal' due to missing Metal Toolchain; use: xcodebuild -downloadComponent MetalToolchain`.
 6. Numerics, the `tests/wgsl.rs` set run on the Metal backend: dequant bit exact against the CPU for Q4_K, Q5_K, Q6_K, Q8_0, bf16 and every MLX affine bits and group; rmsnorm, swiglu, rope with qk norm and KV write, causal attention over several query blocks, linear against a CPU matmul at 1 and many tokens, argmax and seeded gumbel; then the same kernel on the Metal and wgpu backends on one Mac, identical for elementwise ops and within the reduction tolerance otherwise.
 7. Model: greedy text equal to CUDA and to llama.cpp on Qwen3-0.6B bf16, Qwen3-0.6B Q4_K_M and Qwen2.5-7B Q4_K_M (the gate wgpu work 3 to 8 used), and KL inside the existing `compare_with_cuda` bounds.
 
@@ -206,7 +206,7 @@ TensorFold's gates, mapped to tests that exist (CUDA) and run on the Metal backe
 | concurrent streams | `serving.rs` `the_serving_core_streams_concurrent_jobs_and_cancels_within_a_step`, `four_requests_share_a_pool_of_one_and_a_half_max_model_lens_and_match_single_sequence` | with the scheduler on the Mac |
 | memory admission | `serving.rs` `auto_sized_pool_admits_and_decodes_more_slots_than_the_old_resident_cap` | admission against `recommendedMaxWorkingSetSize`, refused before allocation, tested with a lowered limit |
 
-Speed, the method of `docs/specrt-wgpu.md`: `mac_vs_llama.sh`, 3 alternating rounds, medians, quiet Mac (load average and gcad job recorded). First a control, wgpu against wgpu, then Metal against wgpu in the same binary (`[runtime] backend`), and the per kernel timers (`linear_coop_time_per_dispatch`, `linear_sg_time_per_dispatch`) for the MSL kernels. A change is kept at 5% or better on its target and no worse than the control's spread elsewhere; llama.cpp Metal stays the reference column.
+Speed, the method of [wgpu.md](wgpu.md): `mac_vs_llama.sh`, 3 alternating rounds, medians, quiet Mac (load average and gcad job recorded). First a control, wgpu against wgpu, then Metal against wgpu in the same binary (`[runtime] backend`), and the per kernel timers (`linear_coop_time_per_dispatch`, `linear_sg_time_per_dispatch`) for the MSL kernels. A change is kept at 5% or better on its target and no worse than the control's spread elsewhere; llama.cpp Metal stays the reference column.
 
 ## 6. Follow-up slices
 

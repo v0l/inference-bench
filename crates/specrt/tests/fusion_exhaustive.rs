@@ -123,11 +123,11 @@ fn all_rows(order: Order) -> Vec<Row> {
     rows
 }
 
-const SECTION: &str = "## 10. Greedy versus exhaustive";
+const SECTION: &str = "## Greedy gap table";
 
 fn recorded() -> BTreeMap<(String, String), [f64; 2]> {
-    let doc = std::fs::read_to_string(root().join("../../docs/specrt-kir-compiler.md")).unwrap();
-    let start = doc.find(SECTION).unwrap_or_else(|| panic!("docs/specrt-kir-compiler.md has no {SECTION:?}"));
+    let doc = std::fs::read_to_string(root().join("../../docs/design/kir-compiler.md")).unwrap();
+    let start = doc.find(SECTION).unwrap_or_else(|| panic!("docs/design/kir-compiler.md has no {SECTION:?}"));
     let body = &doc[start + SECTION.len()..];
     let body = &body[..body.find("\n## ").unwrap_or(body.len())];
     let mut out = BTreeMap::new();
@@ -188,7 +188,7 @@ fn greedy_stays_within_the_recorded_gap_of_the_exhaustive_pick() {
         assert!(rows.iter().any(|r| r.plan.starts_with(name)), "{name} was not searched");
     }
     let bad = over_recorded(&rows, &recorded());
-    assert!(bad.is_empty(), "greedy fell further behind the exhaustive pick than docs/specrt-kir-compiler.md records:\n{}", bad.join("\n"));
+    assert!(bad.is_empty(), "greedy fell further behind the exhaustive pick than docs/design/kir-compiler.md records:\n{}", bad.join("\n"));
 }
 
 #[test]
