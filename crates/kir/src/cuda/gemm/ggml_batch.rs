@@ -2,7 +2,7 @@ use super::prim;
 
 pub fn body() -> String {
     [
-        prim::batch_helpers("ggr"),
+        prim::batch_helpers("ggr", ""),
         r##"
 __device__ __forceinline__ unsigned ggr_pack(float lo, float hi) {
     unsigned r;

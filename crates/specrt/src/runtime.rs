@@ -924,6 +924,11 @@ struct Fp4Act {
     scales: CudaSlice<u8>,
 }
 
+enum SwapScales<'a> {
+    Fp4(&'a CudaSlice<u8>),
+    Fp8(&'a CudaSlice<f32>),
+}
+
 struct PrefillBuffers {
     tokens: CudaSlice<i32>,
     x: CudaSlice<f32>,
@@ -1937,6 +1942,14 @@ impl Runtime {
             (GemmPath::F4a, _, Some(fa)) => return self.tc_fp4(fa, choice, w, x, out, rows, tokens),
             (GemmPath::F8b, _, _) => return self.tc_f8b(choice, w, bias, x, out, rows, tokens),
             (GemmPath::F4b, _, _) => return self.tc_f4b(choice, w, x, out, rows, tokens),
+            (GemmPath::F4s, _, Some(fa)) => {
+                self.quant_fp4(fa, choice, w, x, rows, tokens)?;
+                return self.tc_swap(choice, w, None, (&fa.q, SwapScales::Fp4(&fa.scales)), out, rows, tokens);
+            }
+            (GemmPath::F8s, Some(fa), _) => {
+                self.quant_fp8(fa, choice, w, x, rows, tokens)?;
+                return self.tc_swap(choice, w, bias, (&fa.q, SwapScales::Fp8(&fa.scale)), out, rows, tokens);
+            }
             (GemmPath::Rows, _, _) => return self.tc_rows(choice, w, x, out, rows, tokens),
             (GemmPath::Ggr, _, _) => return self.tc_ggr(choice, w, bias, x, out, rows, tokens),
             (GemmPath::Ggv, _, _) => return self.tc_ggv(choice, w, bias, x, out, rows),
@@ -2203,6 +2216,100 @@ impl Runtime {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn tc_swap(
+        &self,
+        choice: &crate::codegen::KernelChoice,
+        w: &DeviceMatrix,
+        bias: Option<&CudaSlice<f32>>,
+        xq: (&CudaSlice<u8>, SwapScales),
+        out: GemmOut,
+        rows: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        use crate::codegen::BATCH_REDUCE_BLOCK;
+        let fp4 = matches!(w, DeviceMatrix::Fp4 { .. });
+        let width = match w {
+            DeviceMatrix::Fp4 { packed, .. } => packed.len() * 2 / rows,
+            DeviceMatrix::Fp8 { values, .. } => values.len() / rows,
+            _ => unreachable!("tc_swap takes FP8 or NVFP4 weights"),
+        };
+        let shape = choice.kernel.as_ref().and_then(|k| k.swap_shape()).expect("a swapped rows kernel");
+        let splits = shape.splits(&self.target, rows, width);
+        let (n, s) = (tokens as i32, splits as i32);
+        let part = if fp4 { &self.f4b_part } else { &self.f8b_part };
+        let mut b = self.launcher(self.kernel(&choice.name));
+        w.args(&mut b, &self.buf.dummy);
+        if !fp4 {
+            b.arg(bias.unwrap_or(&self.buf.dummy));
+        }
+        b.arg(xq.0);
+        match xq.1 {
+            SwapScales::Fp4(sc) => b.arg(sc),
+            SwapScales::Fp8(sc) => b.arg(sc),
+        };
+        match out {
+            GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
+            GemmOut::Planes(p) => b.arg(&self.buf.dummy).arg(&p.hi).arg(&p.lo),
+        };
+        b.arg(part).arg(&n).arg(&s);
+        let config = LaunchConfig { grid_dim: (grid(rows, shape.rows()), splits as u32, 1), block_dim: (shape.threads(), 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(config) }?;
+        if splits == 1 {
+            return Ok(());
+        }
+        let reduce = choice.reduce.as_deref().expect("swapped rows have a reduce kernel");
+        let mut b = self.launcher(self.kernel(reduce));
+        b.arg(part);
+        if !fp4 {
+            b.arg(bias.unwrap_or(&self.buf.dummy));
+        }
+        match out {
+            GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
+            GemmOut::Planes(p) => b.arg(&self.buf.dummy).arg(&p.hi).arg(&p.lo),
+        };
+        let outs = match out {
+            GemmOut::Planes(_) => tokens * self.spec.gate_up_out(rows),
+            GemmOut::F32(_) => tokens * rows,
+        };
+        b.arg(&n).arg(&s);
+        unsafe { b.launch(cfg(grid(outs, BATCH_REDUCE_BLOCK), BATCH_REDUCE_BLOCK as u32)) }?;
+        Ok(())
+    }
+
+    fn quant_fp4(&self, fa: &Fp4Act, choice: &crate::codegen::KernelChoice, w: &DeviceMatrix, x: (CudaView<u16>, CudaView<u16>), rows: usize, tokens: usize) -> Result<()> {
+        let DeviceMatrix::Fp4 { packed, scales, .. } = w else { unreachable!("quant_fp4 takes NVFP4 weights") };
+        let width = packed.len() * 2 / rows;
+        let width_i = width as i32;
+        let groups = width / crate::nvfp4::GROUP;
+        let mut b = self.launcher(self.kernel(choice.quant.expect("the path quantises its input")));
+        b.arg(&x.0).arg(&x.1).arg(scales).arg(&fa.q).arg(&fa.scales).arg(&width_i);
+        let config = LaunchConfig { grid_dim: (grid(groups, 128), tokens as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    fn quant_fp8(&self, fa: &Fp8Act, choice: &crate::codegen::KernelChoice, w: &DeviceMatrix, x: (CudaView<u16>, CudaView<u16>), rows: usize, tokens: usize) -> Result<()> {
+        let width = match w {
+            DeviceMatrix::Fp8 { values, .. } => values.len() / rows,
+            _ => unreachable!("quant_fp8 takes FP8 weights"),
+        };
+        let width_i = width as i32;
+        let mut b = self.launcher(self.kernel(choice.quant.expect("the path quantises its input")));
+        b.arg(&x.0).arg(&x.1).arg(&fa.q).arg(&fa.scale).arg(&width_i);
+        let config = if fa.per_token {
+            LaunchConfig { grid_dim: (tokens as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }
+        } else {
+            LaunchConfig {
+                grid_dim: ((width / crate::codegen::FP8_BLOCK) as u32, tokens as u32, 1),
+                block_dim: ((crate::codegen::FP8_BLOCK / 2) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            }
+        };
+        unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn tc_fp4(
         &self,
         fa: &Fp4Act,
@@ -2214,17 +2321,7 @@ impl Runtime {
         tokens: usize,
     ) -> Result<()> {
         let DeviceMatrix::Fp4 { packed, scales, .. } = w else { unreachable!("tc_fp4 takes NVFP4 weights") };
-        let width = packed.len() * 2 / rows;
-        let width_i = width as i32;
-        let groups = width / crate::nvfp4::GROUP;
-        let mut b = self.launcher(self.kernel(choice.quant.expect("f4a quantises its input")));
-        b.arg(&x.0).arg(&x.1).arg(scales).arg(&fa.q).arg(&fa.scales).arg(&width_i);
-        let config = LaunchConfig {
-            grid_dim: (grid(groups, 128), tokens as u32, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe { b.launch(config) }?;
+        self.quant_fp4(fa, choice, w, x, rows, tokens)?;
         let (kernel, tile) = (choice.name.as_str(), choice.tile);
         let mut b = self.launcher(self.kernel(kernel));
         b.arg(packed).arg(scales).arg(&fa.q).arg(&fa.scales);
@@ -2255,23 +2352,7 @@ impl Runtime {
         rows: usize,
         tokens: usize,
     ) -> Result<()> {
-        let width = match w {
-            DeviceMatrix::Fp8 { values, .. } => values.len() / rows,
-            _ => unreachable!("tc_fp8 takes FP8 weights"),
-        };
-        let width_i = width as i32;
-        let mut b = self.launcher(self.kernel(choice.quant.expect("f8 quantises its input")));
-        b.arg(&x.0).arg(&x.1).arg(&fa.q).arg(&fa.scale).arg(&width_i);
-        let config = if fa.per_token {
-            LaunchConfig { grid_dim: (tokens as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }
-        } else {
-            LaunchConfig {
-                grid_dim: ((width / crate::codegen::FP8_BLOCK) as u32, tokens as u32, 1),
-                block_dim: ((crate::codegen::FP8_BLOCK / 2) as u32, 1, 1),
-                shared_mem_bytes: 0,
-            }
-        };
-        unsafe { b.launch(config) }?;
+        self.quant_fp8(fa, choice, w, x, rows, tokens)?;
         let (kernel, tile) = (choice.name.as_str(), choice.tile);
         let mut b = self.launcher(self.kernel(kernel));
         w.args(&mut b, &self.buf.dummy);

@@ -408,6 +408,13 @@ impl Lower<'_> {
                 Geometry { col_blocks: n.div_ceil(rows) * splits, rows_block: b.tokens.min(tokens), owner, smem: b.smem() as u64, regs: acc_regs(b.tokens * rows, b.threads()), k_tile: None }
             }
             GemmPath::Rows => Geometry { col_blocks: n, rows_block: tokens, owner: Owner::Tile { cols: 1 }, smem: 0, regs: BASE_REGS + tokens as u32, k_tile: None },
+            GemmPath::F8s | GemmPath::F4s => {
+                let s = choice.kernel.as_ref()?.swap_shape()?;
+                let splits = s.splits(t, n, k);
+                let rows = s.rows();
+                let owner = if splits > 1 { Owner::Split { serial: splits } } else { Owner::Tile { cols: rows } };
+                Geometry { col_blocks: n.div_ceil(rows) * splits, rows_block: s.tokens.min(tokens), owner, smem: 0, regs: acc_regs(s.tokens * rows * s.depth, s.threads()), k_tile: None }
+            }
             GemmPath::Ggv => {
                 let per = GGML_GEMV_THREADS as usize / 32 * ggml_gemv_rows(n);
                 Geometry { col_blocks: n.div_ceil(per), rows_block: 1, owner: Owner::Tile { cols: per }, smem: 0, regs: BASE_REGS, k_tile: None }
@@ -437,8 +444,8 @@ impl Lower<'_> {
         };
         let mut reads: Vec<Tensor> = sig.reads.iter().filter(|t| !(residual && t.place == out.place)).cloned().collect();
         let quantised = match path {
-            GemmPath::F4a => Some((Form::Weight(Quant::Nvfp4G16), FP4_ACT_GROUP)),
-            GemmPath::F8a => Some(match gemm::policy(self.spec).fp8_weights {
+            GemmPath::F4a | GemmPath::F4s => Some((Form::Weight(Quant::Nvfp4G16), FP4_ACT_GROUP)),
+            GemmPath::F8a | GemmPath::F8s => Some(match gemm::policy(self.spec).fp8_weights {
                 Some(kir::gemm::Fp8Scale::Block) => (Form::Weight(Quant::Fp8Block128), kir::gemm::FP8_BLOCK),
                 _ => (Form::Weight(Quant::Fp8Channel), s.k),
             }),

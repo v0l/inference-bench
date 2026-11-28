@@ -1167,6 +1167,7 @@ fn linear_launches(spec: &Spec, weight: Weight, quant: crate::plan::QuantSource,
     let s = crate::gemm::linear_shape(spec, weight.name());
     let unsplit = match choice.path {
         GemmPath::F8b | GemmPath::F4b => choice.kernel.as_ref().and_then(|k| k.batch_shape()).unwrap_or(BatchShape::for_tokens(tokens)).splits(target, s.n, s.k) == 1,
+        GemmPath::F8s | GemmPath::F4s => choice.kernel.as_ref().and_then(|k| k.swap_shape()).is_some_and(|w| w.splits(target, s.n, s.k) == 1),
         GemmPath::Ggr => BatchShape::for_ggml(tokens).ggml_splits(target, s.n, s.k) == 1,
         _ => false,
     };

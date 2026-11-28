@@ -5,8 +5,9 @@ use cudarc::driver::sys::CUevent_flags;
 use std::path::{Path, PathBuf};
 
 pub const TUNE_FILE: &str = "gemm-select.tsv";
-const TUNE_REPS: usize = 5;
+const TUNE_REPS: usize = 7;
 const TUNE_CHAIN: usize = 16;
+const TUNE_WARM_CHAINS: usize = 3;
 const TUNE_MARGIN: f64 = 0.03;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -90,7 +91,7 @@ impl Runtime {
             Ok(e)
         };
         let run = |i: usize| self.tc_choice(choice, ws[i % ws.len()], None, x.all(), out_again(&out), rows, tokens);
-        for i in 0..ws.len().min(TUNE_CHAIN) {
+        for i in 0..TUNE_CHAIN * TUNE_WARM_CHAINS {
             run(i)?;
         }
         self.stream.synchronize()?;
@@ -106,7 +107,7 @@ impl Runtime {
             t.push(a.elapsed_ms(&b)? as f64 * 1e3 / TUNE_CHAIN as f64);
         }
         t.sort_by(f64::total_cmp);
-        Ok(t[0])
+        Ok(t[TUNE_REPS / 2])
     }
 
     pub fn tune_gemms(&self) -> Result<Vec<TunedPick>> {

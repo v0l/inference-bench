@@ -139,7 +139,7 @@ fn sm120_gets_the_block_scaled_fp4_mma_and_sm80_does_not() {
 }
 
 fn policy(fp8: bool, fp4: bool) -> Policy {
-    Policy { tuning: Tuning::default(), fp8_weights: fp8.then_some(Fp8Scale::Channel), fp8_act: fp8, fp4_act: fp4, ..Policy::default() }
+    Policy { tuning: Tuning::default(), fp8_weights: fp8.then_some(Fp8Scale::Channel), fp8_act: fp8, fp4_act: fp4, swap: true, ..Policy::default() }
 }
 
 fn req(linear: &str, shape: GemmShape, tokens: usize, weight: WeightFormat) -> Request<'_> {
@@ -186,19 +186,22 @@ fn lin_in() -> GemmShape {
 }
 
 #[test]
-fn the_formula_takes_the_act_quant_tile_at_twelve_rows_where_the_fixed_rule_took_the_16_row_gemv() {
+fn the_formula_takes_the_swapped_act_quant_rows_where_the_fixed_rule_took_the_batched_gemv() {
     let t = Target::sm_120();
     let fixed = policy(true, true);
     let formula = Policy { select: Select::Formula, ..fixed };
     let r = req("lin_in", lin_in(), 12, WeightFormat::Fp8);
     assert_eq!(select(&t, &fixed, &r).unwrap().name, "lin_in_f8b16");
     let c = select(&t, &formula, &r).unwrap();
-    assert_eq!((c.path, c.quant), (GemmPath::F8a, Some("quant_rows_fp8_token")), "{}", c.name);
-    assert_eq!(select(&t, &formula, &req("lin_in", lin_in(), 4, WeightFormat::Fp8)).unwrap().name, "lin_in_f8b8");
+    assert_eq!((c.name.as_str(), c.path, c.quant), ("lin_in_f8s16", GemmPath::F8s, Some("quant_rows_fp8_token")));
+    assert_eq!(select(&t, &formula, &req("lin_in", lin_in(), 4, WeightFormat::Fp8)).unwrap().name, "lin_in_f8s8");
+    assert_eq!(select(&t, &formula, &req("lin_in", lin_in(), 1, WeightFormat::Fp8)).unwrap().name, "lin_in_f8b8");
+    let g = select(&t, &formula, &req("gate_up", gate_up(), 3, WeightFormat::Fp4)).unwrap();
+    assert_eq!((g.name.as_str(), g.quant, g.reduce.as_deref()), ("gate_up_f4s8", Some("quant_rows_fp4"), Some("gate_up_f4b_reduce")));
 }
 
 #[test]
-fn act_quant_paths_are_never_candidates_without_act_quant_or_at_eight_rows_or_fewer() {
+fn act_quant_paths_are_never_candidates_without_act_quant_or_at_one_row() {
     let t = Target::sm_120();
     let exact = Policy { fp8_act: false, fp4_act: false, ..policy(true, false) };
     for n in [1, 4, 9, 24, 64] {
@@ -207,10 +210,22 @@ fn act_quant_paths_are_never_candidates_without_act_quant_or_at_eight_rows_or_fe
         }
     }
     let act = policy(true, true);
-    for n in 1..=8 {
-        assert!(eligible(&t, &act, &req("qkv", qkv(), n, WeightFormat::Fp8)).iter().all(|c| c.quant.is_none()), "{n}");
+    assert!(eligible(&t, &act, &req("qkv", qkv(), 1, WeightFormat::Fp8)).iter().all(|c| c.quant.is_none()));
+    for n in [2, 9] {
+        assert!(eligible(&t, &act, &req("qkv", qkv(), n, WeightFormat::Fp8)).iter().any(|c| c.path.swapped()), "{n}");
     }
-    assert!(eligible(&t, &act, &req("qkv", qkv(), 9, WeightFormat::Fp8)).iter().any(|c| c.quant.is_some()));
+}
+
+#[test]
+fn swapped_rows_cover_every_row_count_up_to_their_limit_with_one_bucket() {
+    let t = Target::sm_120();
+    let act = policy(true, true);
+    for n in 2..=kir::gemm::SWAP_MAX_TOKENS {
+        let swaps: Vec<String> = eligible(&t, &act, &req("gate_up", gate_up(), n, WeightFormat::Fp4)).into_iter().filter(|c| c.path.swapped()).map(|c| c.name).collect();
+        let bucket = kir::gemm::SwapShape::for_tokens(n);
+        assert!(bucket.tokens >= n && swaps.contains(&format!("gate_up_f4s{}", bucket.tokens)), "{n}: {swaps:?}");
+    }
+    assert!(eligible(&t, &act, &req("gate_up", gate_up(), kir::gemm::SWAP_MAX_TOKENS + 1, WeightFormat::Fp4)).iter().all(|c| !c.path.swapped()));
 }
 
 #[test]
