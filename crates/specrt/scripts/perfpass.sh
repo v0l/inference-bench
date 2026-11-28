@@ -40,29 +40,31 @@ while [ $# -gt 0 ]; do
 done
 
 issue=${ISSUE:-803}
+board=$repo/docs/generated/perf/scoreboard.md
+reports=$repo/out/perf
 case $host in
     local) ;;
     spark)
         ssh spark "mkdir -p ~/ib-gates/$issue/src"
-        rsync -az --delete --exclude target --exclude .git --exclude out --exclude docs/perf "$repo/" spark:ib-gates/$issue/src/
+        rsync -az --delete --exclude target --exclude .git --exclude out "$repo/" spark:ib-gates/$issue/src/
         args="$family --rounds $rounds --lens $lens"
         [ -n "$only" ] && args="$args --only $only"
         [ -n "$model" ] && args="$args --model $model"
         ssh spark "cd ~/ib-gates/$issue/src && ISSUE=$issue MIN_AVAIL_GB=${MIN_AVAIL_GB:-40} COMMIT=$(git -C "$repo" rev-parse --short HEAD) HOST_LABEL=spark ./crates/specrt/scripts/perfpass.sh $args"
         rc=$?
-        mkdir -p "$repo/docs/perf"
-        rsync -az --exclude scoreboard.md spark:ib-gates/$issue/src/docs/perf/ "$repo/docs/perf/"
+        mkdir -p "$reports"
+        rsync -az spark:ib-gates/$issue/src/out/perf/ "$reports/"
         if [ "$only" = sglang ]; then
-            rsync -az spark:ib-gates/$issue/raw/sglang-$family.json "$repo/docs/perf/$family/sglang.json" && python3 "$here/perfpass_report.py" sglang "$repo/docs/perf/scoreboard.md" "$family" "$repo/docs/perf/$family/sglang.json" "${ATTN:-flashinfer}"
+            rsync -az spark:ib-gates/$issue/raw/sglang-$family.json "$reports/$family/sglang.json" && python3 "$here/perfpass_report.py" sglang "$board" "$family" "$reports/$family/sglang.json" "${ATTN:-flashinfer}"
             exit "$rc"
         fi
-        for row in "$repo"/docs/perf/"$family"/*.row; do
-            [ -f "$row" ] && python3 "$here/perfpass_report.py" merge "$repo/docs/perf/scoreboard.md" "$row"
+        for row in "$reports/$family"/*.row; do
+            [ -f "$row" ] && python3 "$here/perfpass_report.py" merge "$board" "$row"
         done
         exit "$rc"
         ;;
     desktop)
-        echo "the desktop cards serve the user's models: run this by hand in a supervisor window, see docs/perf-pass.md"
+        echo "the desktop cards serve the user's models: run this by hand in a supervisor window, see docs/guides/perf-pass.md"
         exit 1
         ;;
     mac)
@@ -87,7 +89,7 @@ new=${NEW:-128}
 vllm_util=${VLLM_UTIL:-0.12}
 sglang_py=${SGLANG_PY:-$HOME/.venv-sglang/bin/python}
 date=$(date +%F)
-out=$repo/docs/perf/$family
+out=$reports/$family
 raw=$work/raw/$family-$date
 mkdir -p "$out" "$raw"
 
@@ -115,7 +117,7 @@ pick_model() {
 
 [ -n "$model" ] || model=$(pick_model "$family")
 if [ "$mode" = family ] && { [ -z "$model" ] || [ ! -e "$model" ]; }; then
-    echo "no model for $family ($model): download it first, see docs/perf-pass.md"
+    echo "no model for $family ($model): download it first, see docs/guides/perf-pass.md"
     exit 1
 fi
 
@@ -138,7 +140,7 @@ if [ "$only" = sglang ]; then
     esac
     sg_util=${SGLANG_UTIL:-$vllm_util}
     run -p MemoryMax=40G --setenv=PATH="$(dirname "$sglang_py"):/usr/local/cuda/bin:/usr/bin:/bin" --setenv=XDG_CACHE_HOME=$work/xdg "$sglang_py" "$here/sglang_perf.py" "$ckpt" --lens "$lens" --new "$new" --batch "$batch" --rounds "$rounds" --util "$sg_util" ${ATTN:+--attn $ATTN} --out "$work/raw/sglang-$family.json" || exit 1
-    python3 "$here/perfpass_report.py" sglang "$repo/docs/perf/scoreboard.md" "$family" "$work/raw/sglang-$family.json" "${ATTN:-flashinfer}"
+    python3 "$here/perfpass_report.py" sglang "$board" "$family" "$work/raw/sglang-$family.json" "${ATTN:-flashinfer}"
     exit 0
 fi
 
@@ -229,4 +231,4 @@ else
 fi
 
 python3 "$here/perfpass_report.py" family "$family" "$model" "$raw" "$out" "$commit" "$roof" "$batch" "$lens" \
-    "crates/specrt/scripts/perfpass.sh $family --model $model --host ${HOST_LABEL:-local}"
+    "crates/specrt/scripts/perfpass.sh $family --model $model --host ${HOST_LABEL:-local}" "$board"

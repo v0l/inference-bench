@@ -4,7 +4,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
 bin=${BIN:-${CARGO_TARGET_DIR:-/mnt/data/cargo-target/inference-bench-1520}/release/inference-bench}
 spec=${SPEC:-$here/../tests/fixtures/qwen3.8-27b-nvfp4.toml}
-out=${OUT:-$root/docs/qwen27-run}
+out=${OUT:-$root/docs/generated/qwen27-run}
 port=${PORT:-18520}
 model=qwen3.8-27b
 kvs=${KVS:-fp8 f16}
@@ -137,4 +137,4 @@ for kv in $kvs; do
         sleep 10
     done
 done
-"$py" "$here/baseline_report.py" "$out" --update-doc "$root/docs/qwen3.8-27b-vllm-baseline.md"
+"$py" "$here/baseline_report.py" "$out" --update-doc "$root/docs/generated/qwen27-baseline.md"

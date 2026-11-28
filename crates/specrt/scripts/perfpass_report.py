@@ -88,7 +88,7 @@ def kernels(csv_path, top=8):
     return total, short
 
 
-def family_report(family, model, raw, out, commit, roof, batch, lens, command):
+def family_report(family, model, raw, out, commit, roof, batch, lens, command, board):
     raw, out = Path(raw), Path(out)
     roof = float(roof)
     batch = int(batch)
@@ -163,7 +163,7 @@ def family_report(family, model, raw, out, commit, roof, batch, lens, command):
     (out / f"{today}.row").write_text(row + "\n")
     print("\n".join(lines))
     print(row)
-    merge(Path(out).parent / "scoreboard.md", out / f"{today}.row")
+    merge(board, out / f"{today}.row")
 
 
 SG_MARK = "## SGLang"
@@ -254,7 +254,7 @@ def ab(log):
 if __name__ == "__main__":
     cmd = sys.argv[1]
     if cmd == "family":
-        family_report(*sys.argv[2:11])
+        family_report(*sys.argv[2:12])
     elif cmd == "merge":
         merge(sys.argv[2], sys.argv[3])
     elif cmd == "sglang":

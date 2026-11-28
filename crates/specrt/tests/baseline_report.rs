@@ -35,7 +35,7 @@ fn grouped(n: u64) -> String {
 
 #[test]
 fn the_report_prints_every_committed_vllm_point_for_both_modes() {
-    let dir = root().join("docs/qwen27-run");
+    let dir = root().join("docs/generated/qwen27-run");
     let text = report(&dir);
     for mode in ["mtp", "nomtp"] {
         let single = text.split(&format!("### Single stream, 128 output tokens, {mode}")).nth(1).unwrap();
@@ -63,7 +63,7 @@ fn the_report_prints_every_committed_vllm_point_for_both_modes() {
 fn a_specrt_point_beside_vllm_gets_its_ratio() {
     let dir = std::env::temp_dir().join(format!("baseline-report-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::copy(root().join("docs/qwen27-run/concurrent-mtp.json"), dir.join("concurrent-mtp.json")).unwrap();
+    std::fs::copy(root().join("docs/generated/qwen27-run/concurrent-mtp.json"), dir.join("concurrent-mtp.json")).unwrap();
     let ours = serde_json::json!({"label": "specrt-mtp", "suite": "concurrent", "points": [{"concurrent": 8, "aggregate_decode_tok_s": 409.3, "median_ttft_s": 0.5}]});
     std::fs::write(dir.join("specrt-concurrent-mtp.json"), ours.to_string()).unwrap();
     let text = report(&dir);

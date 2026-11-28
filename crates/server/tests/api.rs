@@ -36,7 +36,7 @@ fn a_served_name_from_server_toml_resolves_to_its_model_and_is_not_listed() {
 }
 
 fn chat_tab_loop_body() -> Value {
-    let fixture: Value = serde_json::from_str(include_str!("../../../docs/fixtures/chat-tab-thinking-off-loop.json")).unwrap();
+    let fixture: Value = serde_json::from_str(include_str!("fixtures/chat-tab-thinking-off-loop.json")).unwrap();
     let mut body = json!({"model": "m", "max_tokens": 2, "stream": false});
     for key in ["chat_template_kwargs", "tools", "messages"] {
         body[key] = fixture[key].clone();

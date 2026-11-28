@@ -68,7 +68,7 @@ fn selection_on_sm120_is_pinned_for_the_27b_4b_and_0_6b() {
         std::fs::write(&path, &got).unwrap();
     }
     let want = std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("{} is missing, run with GOLDEN_UPDATE=1", path.display()));
-    assert_eq!(want, got, "the sm_120 gemm selection changed; check docs/perf/gemm-select.md and rerun with GOLDEN_UPDATE=1");
+    assert_eq!(want, got, "the sm_120 gemm selection changed; check docs/design/quantisation.md and rerun with GOLDEN_UPDATE=1");
 }
 
 #[test]
@@ -114,7 +114,7 @@ fn fixed_keeps_the_old_thresholds() {
 }
 
 fn sweep() -> BTreeMap<(String, String, String, usize), BTreeMap<String, f64>> {
-    let text = std::fs::read_to_string(root().join("../../docs/perf/gemm-select/sweep-sm120.tsv")).unwrap();
+    let text = std::fs::read_to_string(root().join("../../docs/generated/perf/gemm-select-sweep-sm120.tsv")).unwrap();
     let mut out: BTreeMap<_, BTreeMap<String, f64>> = BTreeMap::new();
     for line in text.lines().skip(1) {
         let p: Vec<&str> = line.split('\t').collect();
@@ -127,7 +127,7 @@ fn sweep() -> BTreeMap<(String, String, String, usize), BTreeMap<String, f64>> {
 }
 
 fn sweep_targets() -> PathBuf {
-    root().join("../../docs/perf/gemm-select/sweep-sm120.tsv")
+    root().join("../../docs/generated/perf/gemm-select-sweep-sm120.tsv")
 }
 
 #[test]

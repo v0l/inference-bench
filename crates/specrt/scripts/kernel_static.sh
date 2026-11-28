@@ -2,7 +2,7 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")/../../.." && pwd)
 out=${1:-/tmp/kernel-static}
-doc=${2:-$here/docs/perf/kernel-static-tables.md}
+doc=${2:-$here/docs/generated/perf/kernel-static-tables.md}
 gpus=${KERNEL_STATIC_GPUS:-sm_120,sm_121,sm_75}
 venv=${VENV:-$HOME/.venv-vllm}
 target=${CARGO_TARGET_DIR:-/mnt/data/cargo-target/inference-bench-kernel-static}

@@ -2,7 +2,7 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")/../../.." && pwd)
 out=${1:-/tmp/kernel-vs}
-doc=${2:-$here/docs/perf/kernel-vs-tables.md}
+doc=${2:-$here/docs/generated/perf/kernel-vs-tables.md}
 only=${KERNEL_VS_ONLY:-}
 iters=${KERNEL_VS_ITERS:-200}
 venv=${VENV:-$HOME/.venv-vllm}

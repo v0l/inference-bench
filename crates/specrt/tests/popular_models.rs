@@ -1214,7 +1214,7 @@ fn the_quantised_table_lists_rows_that_move_with_their_tiers() {
 
 #[test]
 fn the_committed_doc_has_the_quantised_table_the_planner_gives_now() {
-    let committed = std::fs::read_to_string(root().join("../../docs/specrt-model-coverage.md")).unwrap();
+    let committed = std::fs::read_to_string(root().join("../../docs/generated/model-coverage.md")).unwrap();
     let now = report().doc;
     assert_eq!(section(&committed, "Would load if quantised"), section(&now, "Would load if quantised"), "rerun crates/specrt/scripts/model_coverage.sh and commit the new doc");
 }
@@ -1318,7 +1318,7 @@ fn popular_model_coverage_report() {
     let r = report();
     if std::env::var_os("POPULAR_WRITE").is_some() {
         std::fs::write(popular().join("classes.tsv"), &r.tsv).unwrap();
-        std::fs::write(root().join("../../docs/specrt-model-coverage.md"), &r.doc).unwrap();
+        std::fs::write(root().join("../../docs/generated/model-coverage.md"), &r.doc).unwrap();
         std::fs::write(cache().join("gaps.json"), serde_json::to_string_pretty(&r.gaps).unwrap()).unwrap();
     }
     print!("{}", r.doc);
