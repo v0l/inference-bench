@@ -171,6 +171,9 @@ pub fn shared_prompt(words: usize, salt: u64, prefixes: usize, share: f64) -> St
         out.push_str(WORDS[(rng.next() % WORDS.len() as u64) as usize]);
         out.push(' ');
     }
+    if shared >= words {
+        return out;
+    }
     out.push('\n');
     out.push_str(&prompt(words - shared, salt));
     out
@@ -629,5 +632,7 @@ mod tests {
         assert!(common(&a, &c) < 40);
         assert_ne!(a, shared_prompt(4000, 11, 4, 0.8));
         assert_eq!(shared_prompt(100, 3, 0, 0.8), prompt(100, 3));
+        let whole = shared_prompt(3000, 9, 4, 1.0);
+        assert!(whole.starts_with(&shared_prompt(1000, 5, 4, 1.0)));
     }
 }
