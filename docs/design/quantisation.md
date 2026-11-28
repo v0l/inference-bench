@@ -1,128 +1,87 @@
-# Quantise at load (#1417)
+# Quantisation
 
-`[runtime] quantize` in the model spec or the server config turns a bf16 checkpoint into a lower bit one while it streams in, so no quantised copy is stored and the bf16 model never sits in host memory whole.
+Weight formats, activation quantisation, the KV cache dtype, requantise and quantise at load, and quantcheck recipes. The kernels that run each format are in [gemm.md](gemm.md); GGUF quants are in [gguf.md](gguf.md).
 
-```toml
-[runtime]
-quantize = "nvfp4_g16"   # or "fp8_channel", "auto" (nvfp4_g16), "off" (default)
-```
+## Weight formats
 
-## What gets quantised
+`Quant` (`crates/specrt/src/spec.rs`): `bf16`, `q8`, `fp8_block128`, `fp8_channel`, `nvfp4_g16`, `gguf`. The spec sets `quant` for the projections and `[mlp] quant` with `quant_until` for the MLPs, so `Spec::mlp_quant(layer)` can differ per layer. `Spec::from_hf_config` derives this from a compressed-tensors `quantization_config.config_groups` (format, type, bits, strategy, group size, targets mapped to layer and module) and refuses anything else; ModelOpt mixed precision is mapped per module too (see [../models/glm5.md](../models/glm5.md)).
 
-- `nvfp4_g16`: every attention `qkv` and `o`, delta-net `in_proj` and `out_proj`, dense `gate_up` and `down`, and the routed and shared expert stacks. A linear is quantised when its input width is a multiple of 128 and its output a multiple of 16; any other linear stays bf16. Dense MLPs also need the shapes `dense_fp4_fits` asks for.
-- `fp8_channel`: the whole checkpoint is served as `quant = "fp8_channel"` with one scale per output row. Mixture-of-experts is refused for now (use nvfp4_g16).
-- The keep list stays bf16. It is data in `specs/family-base.toml` `[quantization.keep]`: the first and last two layers, `embed_tokens`, `lm_head`, norms, MoE routers and gates, and any tensor a family lists under `sensitive`. The delta-net `b` and `a` gates and every vector stay bf16 as well.
-- A pipeline stage counts the keep list in whole model layers.
-- The option needs the tensor core path (`gemm_fp32 = false`) and is not on wgpu yet.
-
-## How the scales are chosen
-
-Round to nearest, with the scale chosen by a small search instead of taken from the absolute maximum (`crates/specrt/src/quantize.rs`):
-
-- nvfp4_g16: per group of 16, the e4m3 scale code from the max and the codes 1 to 4 steps below and 1 above; the one with the lowest squared error wins.
-- fp8_channel: per row, the max over 448 times 1.0, 0.969, 0.938, 0.906 and 0.875.
-
-The CPU search is bit exact against `scripts/quant_search_reference.py` (`tests/quant_search.rs`). The same search as kir kernels (`kir::weight_quant::ScaleSearch`) is bit exact against the CPU one (`tests/quant_search_gpu.rs`, GPU).
-
-## What a load reports
-
-`runtime loaded` logs `quantize`, `quantize_secs` (time spent in the search, summed over loader threads), `quantize_tensors`, `quantize_bf16_bytes` and `bytes_read` next to `load_secs`. `Runtime::quantized` and `Runtime::bytes_read` carry the same numbers.
-
-## Measured so far
-
-Tiny fixtures on GPU1, all layers quantised (keep list edges set to 0), mean KL of the prompt logits against the bf16 load over 4 prompts of 96 tokens (`tests/quantize_gpu.rs`):
-
-| fixture | format | mean KL | weights on device |
-|---|---|---|---|
-| tiny-qwen3.5 | fp8_channel | 0.0018 | 4.4 MB against 7.4 MB |
-| tiny-qwen3.5 | nvfp4_g16 | 0.020 | 2.9 MB against 7.4 MB |
-| tiny-qwen3.5-moe | nvfp4_g16 | 0.035 | 5.5 MB against 16.7 MB |
-
-The tiny fixtures have random weights, so these figures only show the path works.
-
-### Qwen3-0.6B, the bound per format
-
-`tests/quantize_qwen3.rs` (GPU1, ignored by default) loads the real Qwen3-0.6B with each format and with the default keep list (first and last two layers, embedding and the tied head stay bf16), runs the fixed prompt set `crates/specrt/quantcheck/prompts.toml` (4 prompts, 13 to 189 tokens, 353 positions; the same set `quantcheck` will use) and compares every position's logits against the bf16 load.
-
-| prompt | tokens | fp8_channel mean / max KL, top-1 | nvfp4_g16 mean / max KL, top-1 |
-|---|---|---|---|
-| short | 13 | 0.0071 / 0.047, 100% | 0.070 / 0.36, 76.9% |
-| code | 49 | 0.0040 / 0.052, 98.0% | 0.051 / 0.50, 87.8% |
-| science | 102 | 0.0255 / 0.150, 93.1% | 0.143 / 0.77, 74.5% |
-| story | 189 | 0.0124 / 0.088, 94.7% | 0.163 / 6.19, 79.4% |
-| all | 353 | 0.0148 / 0.150, 94.9% | 0.138 / 6.19, 79.0% |
-
-The bounds are named constants in `crates/specrt/src/quantize.rs` and the test asserts them:
-
-| format | `*_MEAN_KL_BOUND` | `*_TOP1_FLOOR` |
+| Format | Stored as | Value |
 |---|---|---|
-| fp8_channel | 0.02 (measured 0.0148) | 0.92 (measured 0.949) |
-| nvfp4_g16 | 0.155 (measured 0.138) | 0.72 (measured 0.790) |
+| `fp8_channel` | e4m3 weights, one bf16 scale per output row | `w = e4m3(q) * scale[r]` |
+| `fp8_block128` | e4m3 weights, `weight_scale_inv` on a 128 x 128 grid | per block scale |
+| `nvfp4_g16` | packed e2m1 (byte b of a row holds columns 2b low nibble, 2b+1 high), e4m3 scale per 16 columns, f32 `weight_global_scale` and `input_global_scale` | `w = e2m1(q) * e4m3(s[r, c/16]) / weight_global_scale` |
 
-Plain round to nearest from the max (no scale search) gives 0.0149 mean KL for fp8_channel, so the search makes no measurable difference there, and 0.166 for nvfp4_g16, which is over the nvfp4 bound: the search is worth about 17 percent of the nvfp4 KL and the test fails without it. A 0.6B model is the hard case for weight only 4 bit (small matrices, little redundancy), so nvfp4_g16 on every layer is not a safe blanket default here; that is what the per layer `quantcheck` recipe is for.
+`crates/specrt/src/nvfp4.rs` holds the NVFP4 decode, round to nearest, gate/up interleave and CPU dequant. On the device an `Fp4` scale buffer is a 16 byte header (`1 / weight_global_scale`, `input_global_scale`) then the raw group scales. `e2m1 * e4m3` is exact in bf16, so the weight only path is exact to the dequantised weights. `crates/specrt/tests/nvfp4.rs` matches the real 27B dequant bit for bit against compressed-tensors (`reference.py nvfp4-dequant`).
 
-Load on GPU1 (warm page cache, one run after a warm up load):
+## Activation quantisation
 
-| quantize | load_secs | search secs (summed over loader threads) | tensors | bytes read | weights on device |
-|---|---|---|---|---|---|
-| off | 0.27 | 0 | 0 | 1.19 GB | 1.50 GB |
-| fp8_channel | 1.40 | 4.61 | 112 | 1.19 GB | 1.08 GB |
-| nvfp4_g16 | 1.16 | 3.69 | 96 | 1.19 GB | 0.96 GB |
+Spec options, each a declared numerics change (see the pass contract in [kir-compiler.md](kir-compiler.md)):
 
-The bytes read are the same with the option on and off: the bf16 checkpoint is read once either way. The device bytes include the bf16 embedding table (0.31 GB) and the four kept layers. On a cold JIT cache the first quantised load took 4.5 s.
+- `act_quant = "fp8"`: FP8 projection inputs quantised per token (`quant_rows_fp8_token`), or per 128 columns for block-128 checkpoints, into the `Fp8Act` GEMM.
+- `[mlp] act_quant = "fp4"`: NVFP4 MLP inputs quantised per 16 columns like vLLM's `scaled_fp4_quant` (`sx = e4m3(input_global_scale * amax / 6)`), into the `Fp4Act` GEMM with `alpha = 1 / (input_global_scale * weight_global_scale)`.
 
-## quantcheck: a per layer recipe
+Both apply only above 8 rows (`kir::gemm::act_rows`). The shipped 27B specs set both for serving; the `*-exact.toml` specs are weight only and back the exact reference tests.
+
+## Output head
+
+`head_quant` (`bf16` default, `fp8_channel`, `nvfp4_g16`) quantises the bf16 head at load. `fp8_channel` needs hidden a multiple of 128, `nvfp4_g16` a multiple of 64 and the tensor core path. A tied head quantises only its output copy. On the 27B NVFP4 `fp8_channel` stays inside the vLLM gate (teacher forced top-1 96.6 percent, KL 0.0095) and `nvfp4_g16` does not (95.8 percent, 0.0136), so the default is `bf16` (#363).
+
+The MTP draft head (`speculative.head_quant`, default `nvfp4_g16`, `bf16` under `gemm_fp32`) is a separate copy used only for drafts: on the 27B it costs 0.014 accepted tokens per step and gains 8.5 percent at batch 1 (#415). See [mtp.md](mtp.md).
+
+## KV cache dtype
+
+`[runtime] kv_dtype`: `f16` (default) or `fp8`.
+
+- fp8 layout: per K or V plane, e4m3 rows then one f32 scale per head per token row (`amax / 448`, quantised as the token is appended in `norm_rope_head`, never rewritten). `kv_planes` is 1. All four attention families dequantise in registers; the decode kernel and `flash_mma` load raw bytes and scales with cp.async and convert into the mma fragments.
+- `kv_f16_layers`: the first N attention layers stay f16. Unset, `Spec::for_kv_context` keeps half the attention layers in f16 up to `FP8_KV_VERIFIED_CONTEXT` (32,768 tokens) and three quarters above it; `kv_context_note` warns when an explicit value is lower. With the long context default, KV per token is 0.86x of f16.
+- A prefix cache entry or snapshot written with one dtype never matches another.
+
+Why f16 stays the default: on the 27B NVFP4 the loss sits in the early full attention layers, both K and V, and comes from the e4m3 mantissa, not from the kernels (emulated fp8 in the f16 store gives the same KL). With 8 of 16 layers f16 the drift reaches max KL 14 at 64k on agentic text; 12 of 16 stays under 0.031 to 160k (#763). int8 with a per row scale drifts the same way and was not merged (#796, branch `issue-796-int8-kv-code`).
+
+| Measured, 27B NVFP4, GPU1, 18 to 22 Nov 2026 | f16 | fp8 (default f16 layers) |
+|---|---|---|
+| KV per token | 1.00x | 0.86x above 32k, 0.75x below |
+| batch 8 decode at 8k | 299.5 to 299.9 tok/s | 298.9 to 299.1 |
+| batch 8 decode at 32k | 223.0 to 223.2 | 220.8 to 220.9 |
+| KL against f16 at 160k, 12 f16 layers | | mean 0.00083, max 0.029 |
+
+Gate command: `crates/specrt/scripts/kvgate27b.sh <out> <bin dir> [kl|needle|speed|mtp|all]` (`src/bin/kvgate.rs`, which also has `kvgate loop` for the 150k loop check).
+
+## Requantise at load
+
+`[runtime.requant]` reformats a tensor class of an FP8 checkpoint as it is read; the checkpoint format is the default. Classes `lin_in`, `lin_out`, `qkv`, `o`, `mlp_tail` take `nvfp4_g16` or `fp8_channel`; `lm_head` takes `bf16`, `fp8_channel` or `nvfp4_g16`. A requantised matrix has no input scale, so it runs the weight only NVFP4 kernels, never the FP4 activation path. The CPU quantiser feeds on dequantised FP8 rows (`tests/requant.rs` checks bytes).
+
+On the 27B NVFP4 only `mlp_tail = nvfp4_g16` (KL 0.0030, top-1 97.5 percent, 1.0 GB less) and `lm_head = fp8_channel` (KL 0.00056, 1.2 GB less) pass the gate (KL under 0.01, top-1 at least 97 percent); the low memory profile sets `mlp_tail`. Together they are flat at batch 1, +3 percent at batch 4 and -4 percent at batch 8, so max performance sets neither (#605).
+
+## Quantise at load
+
+`[runtime] quantize`: `off` (default), `auto` (nvfp4_g16), `nvfp4_g16`, `fp8_channel`, `recipe`. A bf16 checkpoint is quantised as it streams in (`crates/specrt/src/quantize.rs`); nothing is stored unless `quantize_cache` is on.
+
+- `nvfp4_g16` covers attention `qkv` and `o`, delta-net `in_proj` and `out_proj`, dense `gate_up` and `down` and the expert stacks, for linears whose input width is a multiple of 128 and output a multiple of 16.
+- `fp8_channel` serves the whole checkpoint as `fp8_channel`; MoE is refused.
+- The keep list (`crates/specrt/specs/family-base.toml` `[quantization.keep]`) stays bf16: the first and last two layers, `embed_tokens`, `lm_head`, norms, routers and gates, a family's `sensitive` tensors, the delta-net `a` and `b` gates and every vector. A stage counts it in whole model layers.
+- Scales come from a small search instead of the max: per 16 group the e4m3 code from the max and the codes 4 below and 1 above, lowest squared error wins; per FP8 row the max over 448 times 1.0 to 0.875. The CPU search is bit exact against `scripts/quant_search_reference.py`, the kir kernels (`kir::weight_quant::ScaleSearch`) against the CPU.
+- Needs the tensor core path; not on wgpu.
+
+Bounds asserted on Qwen3-0.6B (`crates/specrt/tests/quantize_qwen3.rs`, prompt set `crates/specrt/quantcheck/prompts.toml`, 353 positions):
+
+| Format | Mean KL bound (measured) | Top-1 floor (measured) |
+|---|---|---|
+| fp8_channel | 0.02 (0.0148) | 0.92 (0.949) |
+| nvfp4_g16 | 0.155 (0.138) | 0.72 (0.790) |
+
+Plain rounding gives 0.166 on nvfp4_g16, over the bound, so the search is required.
+
+## quantcheck recipes
 
 ```bash
 inference-bench quantcheck <model> [--formats nvfp4,fp8] [--kl 0.02[,0.05,...]] [--budget-gb N] [--out PATH] [--max-ctx 512]
 ```
 
-It loads the bf16 model once on one GPU with the kernels for every format it tries planned in (`quant_plan.kernels`), runs the shipped prompt set (`quantcheck/prompts.toml`) once for the reference logits, then for each layer and each format, with search and with plain rounding, swaps that one layer in place (`Runtime::requantize_layer`, which re-reads the layer from the checkpoint) and measures mean KL, max KL and top-1 of every position against bf16. A swapped layer gives the same logits and bytes as a fresh load of that plan, bit for bit (`tests/quantcheck_gpu.rs`).
+It loads the bf16 model once, then for each layer, format and rounding swaps that layer in place (`Runtime::requantize_layer`, bit identical to a fresh load) and measures KL and top-1 against bf16. Per layer it keeps the rounding with the lower `mean KL + 0.01 * max KL`; greedy then raises the most damaging layer one format (nvfp4, fp8, bf16) until the summed KL fits the budget, and checks the result with one whole model run, rescaling up to 4 rounds. Edge layers are measured like any other; named and sensitive tensors stay bf16. A model must fit one GPU.
 
-Choosing:
-
-- Per layer and format it keeps the rounding with the lower `mean KL + 0.01 * max KL` (`MAX_KL_WEIGHT`). This is what finding 2 of slice 1d asked for: the scale search lowers squared weight error, and on 6 of 28 layers of Qwen3-0.6B at KL 0.1 the measured logits preferred plain rounding (layer 0 nvfp4: search 0.0184 mean and 0.70 max, plain 0.0153 and 0.34).
-- Greedy: every layer starts at its lowest bit format; the layer with the largest score moves up one format (nvfp4, fp8, bf16) until the summed per layer mean KL is inside the budget, or the next move would pass `--budget-gb`.
-- The per layer KLs do not add up exactly, so the chosen recipe is checked by one whole model run against bf16. If that is over the budget the target is scaled down and greedy runs again (up to 4 rounds). On Qwen3-0.6B the sum was slightly pessimistic every time (estimated 0.0977, measured 0.0912 at budget 0.1), so one round was enough.
-- The keep list's edge layers (first and last two) are not forced to bf16 under a recipe: quantcheck measures them like any other layer. The named and sensitive tensors (embeddings, head, norms, routers, `sensitive`) still stay bf16.
-
-The recipe, `<model>.quantrecipe.toml`, is about 4 KB for 28 layers: recipe version, model, engine commit, `FORMAT_VERSION`, prompt set hash, positions, budgets, total and bf16 bytes, the estimated and checked KL, and per layer the format, search or plain, its own mean and max KL and its bytes. `Recipe::plan()` turns it into a `quant_plan`, the spec field the loader reads per layer. A model of `n` layers with `f` formats costs `2fn` probes; each probe is one layer re-read and one pass over 353 positions.
-
-For a model that does not fit one card, quantcheck still needs every layer resident: run it on a stage, or wait for the streaming variant; `requantize_layer` refuses offloaded or tensor parallel runtimes.
-
-Spec changes: `quant_plan` with `layers` (format and `search` per layer) and `kernels` (formats to plan kernels for even where no layer uses them yet). A plan needs a bf16 checkpoint and `quantize = "off"`. fp8_channel layers beside bf16 layers get their own kernel names (`<linear>_f8w*` tiles and `_f8b*` batch kernels) so they do not collide with the bf16 `_mma` tiles; the single stream gemv path refuses a mixed fp8 layer and the plan path runs it.
-
-### Qwen3-0.6B
-
-`inference-bench quantcheck crates/specrt/specs/qwen3-0.6b.toml --kl 0.01,0.02,0.05,0.1` on GPU1, 36 s for 112 probes. Weights are the device bytes of all weights, including the 0.31 GB bf16 embedding (tied head); bf16 is 1.503 GB.
-
-| choice | layers | weights | mean KL | max KL | top-1 |
-|---|---|---|---|---|---|
-| recipe KL 0.01 | 5 bf16, 23 fp8 | 1.154 GB | 0.0092 | 0.079 | 95.8% |
-| recipe KL 0.02 | 26 fp8, 2 nvfp4 | 1.063 GB | 0.0174 | 0.121 | 94.1% |
-| recipe KL 0.05 | 17 fp8, 11 nvfp4 | 0.996 GB | 0.0475 | 0.310 | 87.3% |
-| recipe KL 0.1 | 8 fp8, 20 nvfp4 | 0.930 GB | 0.0912 | 0.857 | 85.6% |
-| blanket fp8_channel, edges bf16 | 4 bf16, 24 fp8 | 1.139 GB | 0.0107 | 0.132 | 96.0% |
-| blanket nvfp4_g16, edges bf16 | 4 bf16, 24 nvfp4 | 0.961 GB | 0.1384 | 6.19 | 79.0% |
-
-The KL 0.1 recipe is 3% smaller than blanket nvfp4 with 6.6 points more top-1, a third less mean KL and a seventh of the worst position (`tests/quantize_qwen3.rs`, `a_quantcheck_recipe_beats_blanket_nvfp4_*`, which also checks a fresh load of the recipe reproduces the recorded KL exactly and batch decode equals single). The KL 0.02 recipe beats blanket fp8 on size (1.063 against 1.139 GB) at the same KL class. The damaging layers are the last one (nvfp4 max KL 2.1) and the first three; quantising the last layer in fp8 and the middle in nvfp4 is what the recipe buys over the fixed keep list.
-
-Speed at this size does not move (single run each, GPU1, prompt 1024 for prefill, 128 plus 255 tokens for decode):
-
-| weights | prefill tok/s | decode b1 | decode b8 |
-|---|---|---|---|
-| bf16 | 3275 | 388 | 3078 |
-| fp8_channel | 3174 | 387 | 3065 |
-| nvfp4_g16 | 3236 | 393 | 3118 |
-| recipe KL 0.1 | 3249 | 396 | 3139 |
-
-All inside 3%: a 0.6B model is launch bound, so the win here is memory only. The 27B class numbers are the next measurement (needs a supervisor window).
-
-## Trade off
-
-Quantising on the fly reads the full bf16 model from disk on every start, against a stored NVFP4 copy that reads a quarter of that. It saves disk and costs load time. `quantize_cache` stores the result next to the model for the second start.
-
-## Loading a recipe
+The recipe (`<model>.quantrecipe.toml`, a few KB) carries the model, engine commit, `FORMAT_VERSION`, prompt hash and per layer format, rounding, KL and bytes. Load it with:
 
 ```toml
 [runtime]
@@ -130,31 +89,25 @@ quantize = "recipe"
 quantize_recipe = "Qwen3-0.6B.quantrecipe.toml"
 ```
 
-The same two keys are server and app options (`runtime.quantize`, `runtime.quantize_recipe`). A relative path in a spec file is read beside the spec. At load (`Spec::resolve_recipe`, called from `Runtime::load_inner` and `apply_quantize`) the recipe becomes the spec's `quant_plan` and the loader quantises each layer as it streams in, so nothing quantised is stored and only the few KB recipe is kept. The recipe is checked against the model first:
+A relative path is read beside the spec. A different model, `format_version` or layer count is refused; a different engine commit or prompt set loads with a warning. The recipe becomes the spec's `quant_plan` (per layer format and `search`, plus `kernels` to plan); fp8 layers beside bf16 ones get `_f8w*` and `_f8b*` kernel names.
 
-- refused: a different model (`model`, compared by its last path part, case insensitive), a different `format_version` ("run quantcheck again"), a different layer count, or layers not numbered 0 to n-1. The error names the recipe file and both values.
-- warned and loaded: a different engine commit or prompt set hash; the KL figures in the file may then be stale or not comparable, but the plan is still valid.
+## Quantised weight cache
 
-On Qwen3-0.6B a load from the KL 0.1 recipe file gives mean KL 0.0912 and top-1 85.6%, exactly the check quantcheck recorded, and 929,694,976 weight bytes, exactly its count (`a_quantcheck_recipe_beats_blanket_nvfp4_*`, which now loads through the file). The tiny fixture test does the same on the tiny model (`quantcheck_gpu.rs`), and `quantcheck.rs` covers the refusals and warnings on CPU.
+`[runtime] quantize_cache` (off) writes the converted matrices on first load and reads them on the next: under `<hub>/models--<org>--<name>/specrt-quant/<key>/` for a hub model, `<cache_dir>/quant/<model>/<key>/` otherwise. The key hashes the cache version, `FORMAT_VERSION`, the search candidates, the spec without serving options and each source file's blob hash or size and mtime. Writes go to a `.partial` folder renamed at the end. Not used by pipeline stages and tensor parallel ranks.
 
-## The quantised weight cache
+## Measured state
 
-`[runtime] quantize_cache = true` (off by default) writes what the load converted and reads it back on the next start, so the conversion and most of the bf16 read are skipped.
+Qwen3-0.6B, desktop GPU1, Nov 2026 (#1417):
 
-- Where: for a model in the HF cache, `<hub>/models--<org>--<name>/specrt-quant/<key>/`, next to `snapshots/` and `blobs/`, never inside a snapshot and never beside the user's own files. A checkpoint outside the hub caches under `<cache_dir>/quant/<model>/<key>/` (`[runtime] cache_dir`, default the user cache folder).
-- Key: sha256 of the cache version, `FORMAT_VERSION`, the scale search candidates, the spec with serving options cleared (so the plan, keep list, quant and tensor names count but KV, graphs and batch do not) and each source file's blob hash (from the hub symlink) or its size and mtime. A new recipe, a new spec or new weights is a new folder.
-- What: one safetensors file per load group with each quantised matrix (nvfp4 packed, scales and the two globals; fp8 values and row scales), and `quant.toml` with the key, model, bytes and the source tensors it covers. A hit drops those tensors from the read plan; norms, embeddings, the head and kept bf16 layers are still read from the checkpoint. It is written to a `.partial` folder and renamed when the load finishes, so a crash leaves nothing a later start would read. A failed write is a warning and the start goes on.
-- Not covered yet: pipeline stages and tensor parallel ranks convert at load as before.
-- Reported: `runtime loaded` logs `quantize_cache = (dir, bytes, read|written)`, and `Runtime::quant_cache` carries it.
+| Weights | Device bytes | Mean KL | Top-1 | Decode b1 tok/s |
+|---|---|---|---|---|
+| bf16 | 1.503 GB | 0 | 100% | 388 |
+| fp8_channel, edges bf16 | 1.139 GB | 0.0107 | 96.0% | 387 |
+| nvfp4_g16, edges bf16 | 0.961 GB | 0.1384 | 79.0% | 393 |
+| recipe KL 0.1 | 0.930 GB | 0.0912 | 85.6% | 396 |
 
-Qwen3-0.6B, a plan of 10 fp8_channel and 18 nvfp4_g16 layers, GPU1 (`quantize_cache_load_time_on_qwen3_0_6b`; cold means the page cache of the source and cache files was dropped with `posix_fadvise` first):
+With `quantize_cache` a cold start of a mixed plan drops from 1.28 s to 0.46 s for 0.32 GB of disk.
 
-| start | load | weights | conversion (thread seconds) | source bytes read | cache on disk |
-|---|---|---|---|---|---|
-| cold, no cache | 1.28 s | 0.89 s | 3.13 s | 1.19 GB | none |
-| cold, first start writes the cache | 1.27 s | 0.88 s | 2.98 s | 1.19 GB | 0.32 GB written |
-| cold, cache read | 0.46 s | 0.09 s | 0 | 0.31 GB | 0.32 GB |
-| warm, no cache | 1.29 s | 0.91 s | 3.15 s | 1.19 GB | none |
-| warm, cache read | 0.47 s | 0.10 s | 0 | 0.31 GB | 0.32 GB |
+## Tests
 
-The cache costs 0.32 GB of disk here (about a quarter of the 1.19 GB checkpoint) and cuts the load by 0.8 s; writing it costs nothing measurable. The 0.31 GB still read is the bf16 embedding and norms. Logits from a cached start equal a converting start bit for bit (`quantize_cache.rs`: CPU on the tiny dense and MoE fixtures, matrix by matrix, plus the GPU test on logits).
+`crates/specrt/tests/quant_search.rs`, `quantize_load.rs`, `quantcheck.rs`, `quantize_cache.rs`, `kv_dtype.rs`, `requant.rs` (CPU); `quant_search_gpu.rs`, `quantize_gpu.rs`, `quantcheck_gpu.rs`, `quantize_qwen3.rs`, `head_quant.rs`, `nvfp4.rs`, `nvfp4_quant.rs`, `requant27b.rs` (GPU).

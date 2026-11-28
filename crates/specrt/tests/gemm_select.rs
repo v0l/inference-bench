@@ -68,7 +68,7 @@ fn selection_on_sm120_is_pinned_for_the_27b_4b_and_0_6b() {
         std::fs::write(&path, &got).unwrap();
     }
     let want = std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("{} is missing, run with GOLDEN_UPDATE=1", path.display()));
-    assert_eq!(want, got, "the sm_120 gemm selection changed; check docs/design/quantisation.md and rerun with GOLDEN_UPDATE=1");
+    assert_eq!(want, got, "the sm_120 gemm selection changed; check docs/design/gemm.md and rerun with GOLDEN_UPDATE=1");
 }
 
 #[test]
