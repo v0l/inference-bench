@@ -5,8 +5,9 @@ use cudarc::driver::sys::CUevent_flags;
 use std::path::{Path, PathBuf};
 
 pub const TUNE_FILE: &str = "gemm-select.tsv";
-const TUNE_REPS: usize = 3;
-const TUNE_CHAIN: usize = 6;
+const TUNE_REPS: usize = 5;
+const TUNE_CHAIN: usize = 16;
+const TUNE_MARGIN: f64 = 0.03;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TunedPick {
@@ -26,7 +27,8 @@ pub fn load_picks(path: &Path) -> usize {
     let Ok(text) = std::fs::read_to_string(path) else { return 0 };
     let mut n = 0;
     for line in text.lines() {
-        if let Some((key, suffix)) = line.split_once('\t') {
+        let mut parts = line.splitn(3, '\t');
+        if let (Some(key), Some(suffix)) = (parts.next(), parts.next()) {
             kir::gemm::record_pick(key.to_string(), suffix.to_string());
             n += 1;
         }
@@ -34,14 +36,14 @@ pub fn load_picks(path: &Path) -> usize {
     n
 }
 
-fn append_picks(path: &Path, rows: &[(String, String)]) -> Result<()> {
+fn append_picks(path: &Path, rows: &[(String, String, String)]) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
     use std::io::Write as _;
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).with_context(|| path.display().to_string())?;
-    for (k, v) in rows {
-        writeln!(f, "{k}\t{v}")?;
+    for (k, v, times) in rows {
+        writeln!(f, "{k}\t{v}\t{times}")?;
     }
     Ok(())
 }
@@ -158,17 +160,18 @@ impl Runtime {
                 if !room {
                     continue;
                 }
-                let mut best: Option<(f64, &KernelChoice)> = None;
+                let mut timed: Vec<(f64, &KernelChoice)> = Vec::with_capacity(all.len());
                 for c in &all {
-                    let us = self.time_choice(c, &ws, out_buf(), planes, n, bucket)?;
-                    if best.is_none_or(|(b, _)| us < b) {
-                        best = Some((us, c));
-                    }
+                    timed.push((self.time_choice(c, &ws, out_buf(), planes, n, bucket)?, c));
                 }
+                let cold = kir::gemm::select(t, &kir::gemm::Policy { select: kir::gemm::Select::Formula, ..policy }, &r).ok().map(|c| c.name);
+                let fastest = timed.iter().map(|x| x.0).fold(f64::INFINITY, f64::min);
+                let best = timed.iter().find(|(us, c)| Some(&c.name) == cold.as_ref() && *us <= fastest * (1.0 + TUNE_MARGIN)).or_else(|| timed.iter().find(|(us, _)| *us == fastest)).copied();
                 let Some((us, c)) = best else { continue };
                 let suffix = kir::gemm::pick_suffix(&r, &c.name).to_string();
                 kir::gemm::record_pick(key.clone(), suffix.clone());
-                fresh.push((key, suffix));
+                let times = timed.iter().map(|(us, c)| format!("{}={us:.1}", kir::gemm::pick_suffix(&r, &c.name))).collect::<Vec<_>>().join(" ");
+                fresh.push((key, suffix, times));
                 out.push(TunedPick { linear, weight: kind, rows: bucket, kernel: c.name.clone(), micros: us, cached: false });
             }
         }
