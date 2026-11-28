@@ -112,6 +112,55 @@ configs (`Spec::from_hf_config`) and the exact specs (`qwen3.8-27b-exact`,
 tokens, random inputs) `act` differs from `exact` by 3.2e-3 on the output (of 0.27) and 6.6e-4 on
 the state (of 0.14).
 
+#### Measured on the 27B (#1517)
+
+Cold `prefixbench <spec> long off 0 12 4096` under nsys, real 27B NVFP4, desktop GPU1, prefill
+delta-net kernels (`gdn_conv_prefill`, `gdn_conv_keep`, `gdn_qk_prep`, `gdn_gates`,
+`gdn_chunk_prep`, `gdn_chunk_scan`, `gdn_gated_norm`) summed over the 48 linear layers:
+
+| kernel | master a948be44 | branch, `exact` | branch, `act` |
+| --- | --- | --- | --- |
+| `gdn_chunk_prep` (4,096 token chunk) | 64.3 ms | 48.8 ms | 32.1 to 32.7 ms |
+| `gdn_chunk_scan` | 51.5 ms | 36.4 ms | 19.0 to 19.4 ms |
+| `gdn_conv_prefill` | 12.3 ms | 12.8 ms | 11.9 to 13.1 ms |
+| `gdn_gated_norm` | 7.2 ms | 7.8 ms | 8.4 to 8.7 ms |
+| all prefill delta-net kernels | 143.3 ms | 112.8 ms | 77.7 to 79.9 ms |
+
+The exact changes leave the outputs bit for bit identical on `tests/gdn_speed.rs` (o and state
+hashed against master at 1,024 and 4,096 tokens): WY products as one 8 column slice per warp over
+all 64 rows, two prep blocks per SM, 32 state columns per scan block, the key tail from shared
+memory, KK and QK tiles only on and below the diagonal, the WY value loads hoisted, the 16 x 16 leaf
+inverse on warp syncs.
+
+Tried and dropped, all bit identical but not faster: a grid over key heads with KK and QK kept in
+registers for the three value heads (prep 0.88 to 0.97 ms, the three inverses serialise), a warp
+specialised scan (one warp group for `v'` and the state, one for the output), an L2 bulk prefetch
+of the next chunk in the scan, the `Aqk` fragments preloaded into registers, 3 prep blocks per SM,
+16 or 64 state columns.
+
+`gdn_conv_prefill` (336 MB at 4,096 tokens, 0.21 ms at 1.6 TB/s against 0.25 ms) and
+`gdn_gated_norm` (302 MB, 0.19 ms against 0.15 to 0.16 ms, partly from L2) are at their byte
+floors; one warp per head row for the norm measured the same.
+
+`numerics = "act"` is off in every checked in spec. On `real_27b_nvfp4_agrees_with_vllm_greedy_and_logprobs`
+the act NVFP4 spec with it on gave teacher forced top-1 1,207 of 1,280 and KL mean 0.01353, against
+1,219 and 0.01327 with it off, so it misses the gate the issue set (1,217 and 0.0126). The FP8 act
+spec passes `real_27b_greedy_and_logits_match_the_fp8_reference` with it (KL 0.00109 against the
+act reference's 0.00086, top-1 0.983 against 0.990), and `tiny27b.rs` checks that the chunked state
+does not drift from the recurrent state over 16k tokens in either class.
+
+Whole prefill, `crates/specrt/scripts/prefill555.sh`, 3 interleaved rounds, cold, medians:
+
+| prompt | master | branch (`exact`) | change | master against master |
+| --- | --- | --- | --- | --- |
+| 4,096 | 5,859 tok/s | 6,139 | +4.8% | +0.1% |
+| 32,768 | 4,767 | 4,932 | +3.5% | +0.1% |
+| 131,072 | 2,838 | 2,899 | +2.1% | |
+
+The first master round ran faster than the other two (6,139 and 4,998 tok/s), so the medians are
+the fair figure; the control pair (master against a copy of master) is inside 0.2%. The branch
+misses the 5% the issue asked for at 4k and 32k because the default stays `exact`.
+
 The conv window and the delta-rule state for every linear layer of every sequence sit in two flat
 buffers beside the KV cache (`GdnBuffers` in `runtime.rs`); the KV cache now holds only the full
 attention layers, so the 27B pays KV memory for 16 layers, not 64. The recurrent state is reset at
