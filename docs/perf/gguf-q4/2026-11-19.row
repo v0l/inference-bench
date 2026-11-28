@@ -1,1 +1,0 @@
-| gguf-q4 | `unsloth/Qwen3-0.6B-GGUF` | 233.2 | 22223.3 | 1544.3 | llama.cpp | 331.6 | 21276.5 | 1462.5 | 0.70 | 1.04 | 1.06 | 2026-11-19 | 3f76803 | `crates/specrt/scripts/perfpass.sh gguf-q4 --model /home/kieran/.cache/huggingface/hub/models--unsloth--Qwen3-0.6B-GGUF/snapshots/50968a4468ef4233ed78cd7c3de230dd1d61a56b/Qwen3-0.6B-Q4_K_M.gguf --host spark` |

@@ -1,1 +1,0 @@
-| qwen3_next | `Qwen3-Next-80B-A3B-Instruct-NVFP4` | 38.3 | 2045.0 | 141.9 | vLLM and SGLang: not run, the 80B doesn't fit beside the resident vLLM on the Spark | n/a | n/a | n/a | n/a | n/a | n/a | 2026-11-19 | 895 | `crates/specrt/scripts/perfpass.sh qwen3_next --model /home/kieran/ib-gates/817/models/Qwen3-Next-80B-A3B-Instruct-NVFP4 --host spark` |
