@@ -48,12 +48,12 @@ Kernel time, from the Mac docs (M1 Pro, quiet machine, paired runs):
 
 | Kernel | Ours today | Reference | Source |
 |---|---|---|---|
-| `linear_coop`, m=4096 n=512 k=14336 | bf16 2.81, Q4_K 2.74, Q6_K 2.63 TFLOP/s | `kernel_mul_mm` f16 4.19, bf16 3.53, q4_K 3.56, q6_K 3.48; hand MSL, same tiles, no dequant: f32 64x32 3.25, half 64x32 3.56, half 64x64 3.77 | wgpu work 3 and 8 |
-| `linear_coop` ceilings | no dequant 3.17, no dequant and no x load 3.70 | | wgpu work 8, table 2 |
-| `linear_sg` GEMV, 7B shapes | bf16 177, Q4_K 77 to 82, Q6_K 96 GB/s of weights | about 200 GB/s DRAM | wgpu work 4 |
-| `flash_coop` | 39% of prefill at 1,024 and 79% at 4,096 on Qwen3-0.6B before #835, then 20 to 40% faster at 4,096 | | wgpu work 8 and 9 |
-| `rmsnorm`, `rope`, `swiglu` decode glue | skipping all three: 116.8 to 140.3 tok/s (before #828) | | wgpu work 6 |
-| whole model, `mac_vs_llama.sh` | prefill 0.56 to 0.72, decode 0.70 to 0.83 of llama.cpp | | wgpu work 8 |
+| `linear_coop`, m=4096 n=512 k=14336 | bf16 2.81, Q4_K 2.74, Q6_K 2.63 TFLOP/s | `kernel_mul_mm` f16 4.19, bf16 3.53, q4_K 3.56, q6_K 3.48; hand MSL, same tiles, no dequant: f32 64x32 3.25, half 64x32 3.56, half 64x64 3.77 | #818 and #829 |
+| `linear_coop` ceilings | no dequant 3.17, no dequant and no x load 3.70 | | #829, table 2 |
+| `linear_sg` GEMV, 7B shapes | bf16 177, Q4_K 77 to 82, Q6_K 96 GB/s of weights | about 200 GB/s DRAM | #823 |
+| `flash_coop` | 39% of prefill at 1,024 and 79% at 4,096 on Qwen3-0.6B before #835, then 20 to 40% faster at 4,096 | | #829 and #835 |
+| `rmsnorm`, `rope`, `swiglu` decode glue | skipping all three: 116.8 to 140.3 tok/s (before #828) | | #827 |
+| whole model, `mac_vs_llama.sh` | prefill 0.56 to 0.72, decode 0.70 to 0.83 of llama.cpp | | #829 |
 
 What a direct emitter changes, piece by piece:
 
@@ -175,7 +175,7 @@ Counts for Qwen3-0.6B Q4_K_M decode, one token, from the #828 trace: 57 `rmsnorm
 | R1 | One command buffer per step, committed without waiting; the next step is encoded while this one runs, reading the token id from the device `tokens` buffer that `argmax` writes | the host wait per token before the next encode | Metal backend | the host encode time per token (177 dispatches); #828's bind group cache alone was worth 24%, about 8 us per dispatch |
 | R2 | Indirect command buffer for the decode step: the 177 dispatches encoded once per batch shape and slot set, replayed with `executeCommandsInBuffer`; per step only the params buffer (position, lengths) is written | 177 x (pipeline, 4 to 6 buffers, dispatch) encoder calls, about 1,200, become 1 | pipelines made with `supportIndirectCommandBuffers` | host cost only; GPU dispatches stay 177 |
 | R2b | Concurrent dispatch with barriers placed from the typed op signatures (`signature.rs` reads and writes), as TensorFold's `setBarrier` and llama.cpp's `(concurrent)` marks | serial waits between independent dispatches | R2 or a concurrent encoder | small at batch 1 on a dense decoder (almost every op reads the previous one); larger with `lin_in` and `lin_ba` style siblings |
-| R3 | Weights as `newBufferWithBytesNoCopy` over the page aligned GGUF or safetensors mmap, held in an `MTLResidencySet` | the 5.4 s first touch copy measured in wgpu work 4 (2.5 s with `madvise`) | macOS 15+ (the Mac is on 26) | load time; 0 dispatches |
+| R3 | Weights as `newBufferWithBytesNoCopy` over the page aligned GGUF or safetensors mmap, held in an `MTLResidencySet` | the 5.4 s first touch copy measured in #823 (2.5 s with `madvise`) | macOS 15+ (the Mac is on 26) | load time; 0 dispatches |
 | R4 | Keep warm: an idle tick that commits a tiny blit touching the residency sets, as `keepalive.zig` does | the clock ramp and residency loss on the first request after idle | R3 | time to first token after idle; 0 dispatches. `[runtime] keep_warm_s`, default 0 until measured |
 
 Fewer GPU dispatches come from the compiler, not the runtime: the M3 slots give `Gemv::Norm` and the act epilogue to the Mac when the cost model accepts them (it rejected the norm fold for wgpu, 8.4 MB of rereads against a 1 MB saving), and `store_epilogue` removes `clear_branch` where a spec has branches.
@@ -193,7 +193,7 @@ On the Mac (`ssh mac`, M1 Pro):
 
 5. Compile check: a new specrt test `msl.rs` (macOS, `metal` feature) builds every kernel of every fixture spec the Mac supports with `newLibraryWithSource` and `newComputePipelineStateWithFunction`, and checks `maxTotalThreadsPerThreadgroup` and `staticThreadgroupMemoryLength` against the kernel. That needs only the Metal framework. `xcrun metal -Werror` as a lint is optional: on 25 Nov the Mac answered `cannot execute tool 'metal' due to missing Metal Toolchain; use: xcodebuild -downloadComponent MetalToolchain`.
 6. Numerics, the `tests/wgsl.rs` set run on the Metal backend: dequant bit exact against the CPU for Q4_K, Q5_K, Q6_K, Q8_0, bf16 and every MLX affine bits and group; rmsnorm, swiglu, rope with qk norm and KV write, causal attention over several query blocks, linear against a CPU matmul at 1 and many tokens, argmax and seeded gumbel; then the same kernel on the Metal and wgpu backends on one Mac, identical for elementwise ops and within the reduction tolerance otherwise.
-7. Model: greedy text equal to CUDA and to llama.cpp on Qwen3-0.6B bf16, Qwen3-0.6B Q4_K_M and Qwen2.5-7B Q4_K_M (the gate wgpu work 3 to 8 used), and KL inside the existing `compare_with_cuda` bounds.
+7. Model: greedy text equal to CUDA and to llama.cpp on Qwen3-0.6B bf16, Qwen3-0.6B Q4_K_M and Qwen2.5-7B Q4_K_M (the gate #818 to 8 used), and KL inside the existing `compare_with_cuda` bounds.
 
 TensorFold's gates, mapped to tests that exist (CUDA) and run on the Metal backend once it serves them:
 

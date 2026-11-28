@@ -242,7 +242,7 @@ The model has no tools, and its text stream is **its own words**, not a transcri
 - **Barge in**: the bridge sends `interrupt` when the user speaks for more than about 400 ms while the queue is not empty; the engine drops the rest of the queue and reports how much was said, which the bridge passes to the supervisor as the part the user heard.
 - **Card**: a fixed card for the supervisor voice (name, calm persona, "relays answers from an assistant", relationship and situation) and a voice reference the user records once. It is set when the session starts.
 
-Whether constrained text keeps the speech intelligible is unmeasured: the D slice measures it on the real model (Whisper word error rate of the produced audio against the queued text). If it fails, the fallback is the existing text to speech path for supervisor replies with Haru muted to `relay` for turn taking and backchannels.
+Constrained text does not keep the speech intelligible: on the real model 9 of 20 queued sentences were spoken to the end and the reference package does as badly ([../guides/haru-validation.md](../guides/haru-validation.md)). So supervisor replies go through the text to speech path, with Haru in `relay` for turn taking and backchannels.
 
 Echo: headphones first. With speakers the model hears itself, which a full duplex model treats as the user talking; an echo canceller in the client is its own slice (agentbench #1405 slice 2).
 

@@ -2,7 +2,7 @@
 
 Generated from `specrt::options::schema()` by `crates/specrt/tests/options_doc.rs`; do not edit by hand. Rewrite with `OPTIONS_WRITE=1 cargo test -p inference-bench-specrt --test options_doc`.
 
-Every key can be set in the `[engine]` table of a server model, in the load dialog, or in a spec TOML under the section named by its prefix (`serve.`, `speculative.`, `runtime.`, `prefix_cache.`, `loader.`). An empty default means unset: the engine picks a value at load.
+Every key can be set in the `[engine]` table of a server model, in the load dialog, or in a spec TOML under the section named by its prefix (`serve.`, `speculative.`, `runtime.`, `prefix_cache.`, `loader.`). An empty default means the schema holds no value: the engine, the spec or the profile decides at load. The design docs give those effective defaults (for example `runtime.gemm_select` is `measured`, `runtime.chunked_scan` is on, `runtime.store_epilogue` is off).
 
 ## basic
 
