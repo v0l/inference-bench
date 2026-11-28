@@ -4,7 +4,7 @@ Model specs are the TOML files in `crates/specrt/specs`. The app keeps a copy of
 directory and refreshes it from GitHub, so a model added to the repository after you installed
 shows up and runs without reinstalling.
 
-![spec provenance and settings](gui/spec-updates.png)
+![spec provenance and settings](../img/app/spec-updates.png)
 
 ## Where specs come from
 

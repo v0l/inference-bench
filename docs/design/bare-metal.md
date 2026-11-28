@@ -1,6 +1,6 @@
-# Bare-metal inference-bench
+# Bare metal inference-bench (plan)
 
-Issue #1523. The owner wants a tiny OS or microkernel that runs inference-bench straight on the hardware. This doc compares the real options, says which one to build, and lists the slices. It is analysis only: no code changed. The QEMU numbers below come from a throwaway spike in `/tmp`, run on this desktop with no GPU and nothing installed.
+The plan behind #1525 to #1532: a tiny OS or microkernel that runs inference-bench straight on the hardware. It compares the options, says which one to build, and lists the slices; none is built yet. The QEMU numbers come from a throwaway spike with no GPU.
 
 ## 1. The constraint
 
@@ -14,7 +14,7 @@ specrt reaches the GPU like this (versions as on this desktop, 27 Nov 2026):
 | `libnvrtc.so` (115 MB) | CUDA C++ to PTX or cubin | user space | CUDA EULA, listed as redistributable |
 | `inference-bench-server` (35 MB, static Rust, links only libc, libm, libgcc_s) | our code | user space | ours |
 
-specrt loads `libcuda` and `libnvrtc` at run time through cudarc's `dynamic-loading` feature (`crates/specrt/Cargo.toml`). It compiles kir's CUDA source with NVRTC to PTX or cubin (`crates/specrt/src/jit.rs`, `compile_cubin`, `load_uncached`) and launches through `cuModuleLoad` and `cuLaunchKernel`. The RDMA cluster path dlopens `libibverbs.so.1` and registers device memory as dma-buf (`crates/specrt/src/rdma.rs`, `docs/specrt-gpu-direct.md`). The NVMe tier reads with `O_DIRECT` (`crates/specrt/src/diskio.rs`, `loader.rs`). Host memory comes from `/proc/meminfo` (`hardware.rs`, `serve.rs`).
+specrt loads `libcuda` and `libnvrtc` at run time through cudarc's `dynamic-loading` feature (`crates/specrt/Cargo.toml`). It compiles kir's CUDA source with NVRTC to PTX or cubin (`crates/specrt/src/jit.rs`, `compile_cubin`, `load_uncached`) and launches through `cuModuleLoad` and `cuLaunchKernel`. The RDMA cluster path dlopens `libibverbs.so.1` and registers device memory as dma-buf (`crates/specrt/src/rdma.rs`, `docs/design/distributed.md`). The NVMe tier reads with `O_DIRECT` (`crates/specrt/src/diskio.rs`, `loader.rs`). Host memory comes from `/proc/meminfo` (`hardware.rs`, `serve.rs`).
 
 On Turing and later the kernel module is a thin client: almost every GPU operation is an RPC to the GSP firmware. In the 595 sources (`src/nvidia/inc/kernel/vgpu/rpc_global_enums.h`) there are 219 RM RPC functions, and the control calls they carry are spread over 2,365 `NV*_CTRL_CMD_*` defines and 315 class headers in `src/common/sdk/nvidia/inc`. The open module tree is about 2.2 million lines of C and headers (`/usr/src/nvidia-595.112.07`: `src/nvidia` 1.40 M, `src/common` 0.47 M, `kernel-open` 0.22 M). `libcuda` talks to that kernel interface through ioctls whose layout is private and changes with each driver release. Nothing about `libcuda` is portable to a kernel that is not Linux or Windows.
 
@@ -75,7 +75,7 @@ The spike shows the software side is under half a second to a listening server. 
 | UKI load from NVMe or USB | under 1 s; PXE over 1 GbE for 200 MB about 2 s, over 10 GbE well under 1 s | us, by image size |
 | Kernel to init | 0.2 to 0.4 s (spike) | us |
 | `nvidia.ko` load and GSP boot | estimated 1 to 3 s per card (firmware upload and GSP init); not measured here because GPU0 is in use, slice 3 measures it | NVIDIA |
-| Model load | bound by NVMe: 10 GB/s on the Samsung 9100 (`docs/specrt-offload.md`), so 3 s for the 27B NVFP4 weights, plus the JIT cache (warm) | us |
+| Model load | bound by NVMe: 10 GB/s on the Samsung 9100 (`docs/design/moe-offload.md`), so 3 s for the 27B NVFP4 weights, plus the JIT cache (warm) | us |
 
 Against a Debian server boot the win is the 10 to 30 s of distro init and the lack of drift, not the POST.
 
@@ -126,7 +126,7 @@ On Turing and later the path is through the GSP:
 
 - **nova (nova-core and nova-drm), in Linux mainline since 6.15:** Rust, GSP only, Turing and later. As of the LPC 2026 talk (5 Oct 2026) "the GSP boots with its firmware on Turing through Blackwell hardware, with basic functionality coming online", and it is "not yet in a state for end users". The nova-core task list still has MMU and page table management, a VRAM allocator, instance memory, the FIFO engine (channels) and the client and device RPC interfaces open. NVIDIA says the long term plan is for nova to replace its own out-of-tree Open RM, with no timeline, and its user space "will need adapting" because nova is not ABI compatible with the current ioctls. Getting "Vulkan Compute and CUDA apps running on Nova" is listed as future work. vGPU starts landing in Linux 7.5.
 - **nouveau plus GSP:** nouveau boots GSP firmware 535.113.01 on Turing and later and gives NVK a channel and memory model.
-- **NVK (Mesa):** a conformant Vulkan 1.4 driver for Kepler through Ada and consumer Blackwell, on top of nouveau, with compute shaders. specrt already has a wgpu backend that runs on Vulkan (`docs/specrt-wgpu.md`), so wgpu on NVK on nouveau is a fully open stack that runs our dense kernels today, on Linux. It has no NVFP4 or FP8 tensor cores through Vulkan, no delta-net layers on wgpu yet, and none of the CUDA fast paths.
+- **NVK (Mesa):** a conformant Vulkan 1.4 driver for Kepler through Ada and consumer Blackwell, on top of nouveau, with compute shaders. specrt already has a wgpu backend that runs on Vulkan (`docs/design/wgpu.md`), so wgpu on NVK on nouveau is a fully open stack that runs our dense kernels today, on Linux. It has no NVFP4 or FP8 tensor cores through Vulkan, no delta-net layers on wgpu yet, and none of the CUDA fast paths.
 
 ### Can CUDA user space or our own PTX run on top
 

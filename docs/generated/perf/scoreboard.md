@@ -40,7 +40,7 @@ Indicative only: SGLang ran with the radix cache off at batch 8, median of 3, wh
 
 ## Paired A/B claims
 
-The single list of current keep/drop claims. Each row has its command, date, card state and verdict. Retract a claim in place (verdict `retracted`, with the reason). Speeds in older docs (`docs/specrt-mtp.md` and the other `docs/specrt-*.md`) are single runs or medians of 6 on a shared card and are indicative until a row here replaces them. `perfpass_report.py` leaves this section untouched.
+The single list of current keep/drop claims. Each row has its command, date, card state and verdict. Retract a claim in place (verdict `retracted`, with the reason). `perfpass_report.py` leaves this section untouched.
 
 Use `bench --ab` for every keep/drop decision:
 

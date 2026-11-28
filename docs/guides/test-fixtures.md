@@ -1,7 +1,6 @@
-# Stand-ins for the 27B: tiny fixture and the 4B benchmark (#635)
+# Stand ins for the 27B: tiny fixture and the 4B benchmark
 
-Two cheaper tiers that cover the 27B code paths without stopping the user's app. `docs/testing.md` (#634) lists the
-tiers; these are the entries to put in the "any GPU, seconds" and "mid-size, minutes" tiers.
+Two cheaper tiers that cover the 27B code paths without the real model. [testing.md](testing.md) lists all the tiers; these are tier 2 (any GPU, seconds) and tier 4 (mid size, minutes).
 
 ## Tiny Qwen3.5 fixture, `tests/fixtures/tiny-qwen3.5-27b`
 
@@ -29,7 +28,7 @@ weight-only logits and greedy tokens, the same with the activation quantisation 
 8 prefix lengths, and vision embeddings plus full multimodal logits for one image and two images.
 
 Tests (`cargo test --release -p inference-bench-specrt --test tiny27b -- --include-ignored`, about 100 s of
-which most is the first JIT, under `flock /tmp/gpu27.lock`):
+which most is the first JIT, under `~/.agents/bin/gpu-run 1 --min-free 2000 --`):
 
 | test | gate |
 |---|---|
@@ -50,7 +49,7 @@ below, not from the fixture.
 NVFP4 group 16 with calibrated input scales (the prompts of `spec_prompts.txt`), projections and the last 4 MLPs in
 FP8 per channel, vision tower, MTP head and bf16 embeddings kept as is. Our own quantiser, no llm-compressor. 4.9 GB on
 disk, 7.1 GB on the device, about 45 seconds on one card. `bench4b.sh` makes it on first use into
-`~/.cache/specrt-models/Qwen3.5-4B-NVFP4`, then runs the bench binary under `flock /tmp/gpu27.lock`.
+`~/.cache/specrt-models/Qwen3.5-4B-NVFP4`, then runs the bench binary (wrap it in `~/.agents/bin/gpu-run 1 --`).
 
 Baseline, RTX PRO 6000 Max-Q, vLLM on the other card, 3 runs each, median (commit 1655db2):
 

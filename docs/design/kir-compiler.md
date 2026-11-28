@@ -173,4 +173,16 @@ Gap in percent of the best saving, sm_120 then sm_80 (decode 1 token, prefill 51
 
 ## Open structural gaps
 
-From the static and timed kernel comparison against FlashInfer, Triton and vLLM ([../generated/perf/kernel-static-tables.md](../generated/perf/kernel-static-tables.md), [../generated/perf/kernel-vs-tables.md](../generated/perf/kernel-vs-tables.md)): 32 bit loads in norm, add norm, swiglu and rope where competitors load 128 (#1161); NVFP4 prefill GEMM on cp.async with 2 stages against TMA, 3 stages and warp specialisation (#1162); no sm_75 plan for the Qwen3.5 and 27B specs (#1163); `--split-compile` makes spills at 255 registers depend on unrelated kernels (#1164).
+From the static and timed kernel comparison against FlashInfer, vLLM, CUTLASS, cuBLAS and Triton on GPU1 (`crates/specrt/scripts/kernel_static.sh`, `kernel_vs.sh`; tables with every number in [../generated/perf/kernel-static-tables.md](../generated/perf/kernel-static-tables.md) and [../generated/perf/kernel-vs-tables.md](../generated/perf/kernel-vs-tables.md), 25 Nov 2026, commit bf1bd3a1). Our time over theirs, cold:
+
+| Kernel | Ours over best competitor | Issue |
+|---|---|---|
+| 27B batch decode attention, 8 seqs, 1k / 32k | 0.46 / 0.91 | |
+| 122B `attention_split` (hd256, group 16), 1k / 32k | 0.38 / 0.15 | #1421 |
+| NVFP4 prefill GEMM `gate_up_f4a_big` | 0.49 to 0.57 of CUTLASS | #1162 |
+| `flash_mma` prefill, 27B, 1k / 16k | 0.54 / 0.92 | #1423 |
+| rmsnorm and add_rmsnorm, 4096 rows | 0.32 to 0.49 (f32 rows move twice the bytes) | #1161 |
+| bf16 GEMM, 4B gate_up | 0.79 to 0.84 of cuBLAS | #1422 |
+| `down_proj_f4` at batch 1 | 855 GB/s cold, 48 percent of DRAM (no competitor) | #1424 |
+
+Also open: no sm_75 plan for the Qwen3.5 and 27B specs (#1163), and `--split-compile=8` gives different binaries from run to run, costing up to 22 percent on `flash_mma` in a bad build (#1164).

@@ -1,4 +1,4 @@
-# Haru-4B against the reference implementation (#1489)
+# Haru-4B against the reference implementation
 
 The specrt duplex engine checked tensor by tensor against the reference package `haru-inference` (github.com/higurashi-ai/Haru at `7fe6b766`, torch 2.11 CUDA, transformers 5.24) on the real checkpoint `~/models/Haru-4B` (bf16 weights). Everything ran on GPU1.
 
@@ -6,7 +6,7 @@ Verdict: the engine is a faithful implementation. Fed the reference's own tokens
 
 ## Inputs
 
-- User clip: the 19.8 s recording of `specrt-haru.md` section 13 (three Kokoro Zoey sentences with pauses), 149 frames.
+- User clip: a 19.8 s recording of three Kokoro Zoey sentences with pauses, 149 frames.
 - Voice: the 13.8 s Kokoro Harper reference.
 - Card: the English `chat` card from the reference package (`haru/assets/cards/en.json`, rendered).
 - Seed 1489 unless named. Temperature 0.7, top k 25, guidance 1.5, DRY on, as in both engines' defaults.
@@ -98,7 +98,7 @@ Whisper on the engine's audio gives speech in all 16 runs ("Hi, my name is Haru.
 | reference, bf16 | 10 | 1.27 | 1.22 | 1.04 | 0.09, 0.18, 0.20 |
 | reference, f32 | 10 | 2.57 | 1.05 | 0.62 | 0.09, 0.18, 0.25 |
 
-The reference with forced text is as poor as the engine (the 3.07 of `specrt-haru.md` was an earlier engine run, before the voice tail fix below; both numbers are dominated by a few stalled sentences, which is why the medians are given). In both, the model stalls on PAD and EOP for most sentences and wraps the words it does say in its own sounds. This is the model, not the implementation, so the fallback of `specrt-haru.md` section 10 (text to speech for supervisor replies) stands.
+The reference with forced text is as poor as the engine (both numbers are dominated by a few stalled sentences, which is why the medians are given). In both, the model stalls on PAD and EOP for most sentences and wraps the words it does say in its own sounds. This is the model, not the implementation, so the fallback of `specrt-haru.md` section 10 (text to speech for supervisor replies) stands.
 
 ## Divergences found and fixed
 

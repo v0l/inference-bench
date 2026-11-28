@@ -34,7 +34,7 @@ INFERENCE_BENCH_API_KEYS=sk-local ./target/release/inference-bench-server \
 | `GET /metrics` | Prometheus text. Open unless `protect_metrics = true` |
 | `POST /load`, `POST /unload` | Load the default model (or `?model=ID`); unload it to give the GPU back. Unload is 409 while a request is running, `?wait=1` waits for them to finish |
 | `GET /admin/models`, `POST /admin/models/{id}/load`, `POST /admin/models/{id}/unload` | Model management (needs the API key when auth is on) |
-| `GET /admin/specs` | Spec sources, the last update check and where each spec came from. See `docs/specs-update.md` |
+| `GET /admin/specs` | Spec sources, the last update check and where each spec came from. See `docs/guides/specs-update.md` |
 
 Chat requests apply the model's chat template and stop at the end-of-turn ids from generation_config. Replies stream in chunks of up to 16 decode steps. The engine runs on its own thread: a CUDA error or out of memory fails that request, and a panic unloads the model and fails the request, so the server keeps running.
 
@@ -76,7 +76,7 @@ vram_bytes = 4000000000              # used for the budget until the measured va
 preload = true
 served_names = ["qwen3.8-27b"]       # extra names a request may use, like vLLM's --served-model-name
 
-[specs]                              # spec updates from GitHub, see docs/specs-update.md
+[specs]                              # spec updates from GitHub, see docs/guides/specs-update.md
 auto_update = true
 repo = "v0l/inference-bench"
 branch = "master"
@@ -202,11 +202,7 @@ docker run --rm --gpus all -v specrt-cache:/cache --entrypoint inference-bench <
 docker run --gpus all -v specrt-cache:/cache -p 8080:8080 <image> --model <spec>
 ```
 
-Pass the same `--max-ctx` and `--slots` the server runs with (`--max-model-len`, `--max-num-seqs`). A different layout is a different cache key and compiles again. Verified on the desktop with `XDG_CACHE_HOME` set to a temp dir: `warmup` wrote `$XDG_CACHE_HOME/specrt/<key>.cubin` and the next load hit it (see docs/specrt-27b.md, CUBIN cache).
-
-## Spark run (Qwen3-0.6B, specrt, GB10)
-
-16 concurrent `openai` python clients, 64 new tokens each, `max_concurrent = 1`: 16/16 ok, 143.2 tokens/s aggregate, p50 3.5 s, p95 6.5 s (requests queue behind the one engine; latency is queue wait). A streamed reply arrives as 9 chunks, first at 0.03 s and last at 0.73 s. Loaded model VRAM reads 3.9 GB, device used 99 GB.
+Pass the same `--max-ctx` and `--slots` the server runs with (`--max-model-len`, `--max-num-seqs`). A different layout is a different cache key and compiles again ([../design/engine.md](../design/engine.md), kernel cache).
 
 ## Request fields
 
@@ -214,21 +210,13 @@ Pass the same `--max-ctx` and `--slots` the server runs with (`--max-model-len`,
 
 `logprobs: true` with `top_logprobs` up to 20 (chat) or `logprobs: N` (completions) return per-token log probabilities, streamed or not, computed on the host from the sampled row's logits. `n` up to 16 runs that many sequences on the batched engine; usage sums their completion tokens. Both need the batched engine (`max_num_seqs` above 1, or more than one parallel request in the app) and return 400 saying so otherwise. A `developer` message is templated as `system`, and a chat template error from client input is a 400.
 
-A field the server does not handle returns 400 naming it: `response_format` other than `text` (structured output is #591), non-zero `frequency_penalty` or `presence_penalty`, named or `required` `tool_choice`, and any unknown top-level key. `user`, `parallel_tool_calls`, `store` and `metadata` are accepted and ignored.
+A field the server does not handle returns 400 naming it: non-zero `frequency_penalty` or `presence_penalty`, and any unknown top-level key. `response_format` (`json_object`, `json_schema`) and `tool_choice` `required` or named compile a grammar ([../design/scheduler.md](../design/scheduler.md)); the two cannot be combined. `user`, `parallel_tool_calls`, `store` and `metadata` are accepted and ignored.
 
-A request without `temperature` samples at the server config's `temperature`, else at the model's `generation_config.json` (`do_sample: false` is greedy), else greedy. A request without `seed` draws a new one, so the same body can give a different reply; `seed` makes it repeatable, and with `n` choice i uses `seed + i`. Before #1469 an unset temperature was greedy and an unset seed was 0, so an agent whose tool kept failing got the identical prompt and sent the identical call every turn (`docs/fixtures/chat-tab-thinking-off-loop.json`, the inference-bench Chat tab on the 27B with thinking off).
+A request without `temperature` samples at the server config's `temperature`, else at the model's `generation_config.json` (`do_sample: false` is greedy), else greedy. A request without `seed` draws a new one, so the same body can give a different reply; `seed` makes it repeatable, and with `n` choice i uses `seed + i` (#1469; `crates/server/tests/fixtures/chat-tab-thinking-off-loop.json` is the request that looped when an unset seed was 0).
 
-## Tool loop parity with vLLM (Qwen3.8-27B)
+## Tool clients
 
-`crates/server/scripts/tool_parity.py URL MODEL OUT` sends 20 temperature 0 turns (one prior tool exchange, then a user turn, with `get_weather` and `add`) through the `openai` client, plus a 3 turn loop with canned tool results. specrt ran with `tool_parser = "xml_function"`, `reasoning_parser = "think_tags"`, `reasoning_effort = "medium"`; the reference was the vLLM server on port 8001.
-
-| Check | Result |
-|---|---|
-| 20 single turns, tool name, arguments and finish reason | 20 identical |
-| 3 turn loop (two calls in one reply, then a final answer) | identical |
-| `n=2` through the client | 2 choices (since #585) |
-
-Qwen3-0.6B with the hermes parser ran the same client loop (call, tool result, answer) correctly.
+`crates/server/scripts/tool_parity.py URL MODEL OUT` sends 20 temperature 0 turns (one prior tool exchange, then a user turn, with `get_weather` and `add`) plus a 3 turn loop with canned tool results through the `openai` client, against any OpenAI compatible server; on the 27B with `tool_parser = "xml_function"`, `reasoning_parser = "think_tags"` all 20 turns and the loop matched vLLM.
 
 ## Thinking levels and tool-call recovery
 
@@ -238,27 +226,4 @@ Every chat dialect takes `reasoning_effort` (`none|low|medium|high`), `reasoning
 
 The tool parser only emits declared tools. It also recovers `<parameter=...>` without a function, JSON inside `<tool_call>`, a `<function=...>` without `<tool_call>`, several calls in one block and a missing `</function>`; repairs trailing commas, single quotes and `True/False/None` in array and object arguments; and maps collapsed namespace names (`mcp_a_b` for `mcp__a__b`) when unambiguous. Anything else stays text. Repairs are counted in `inference_tool_call_repairs_total{kind}`.
 
-## Real client check (Qwen3-0.6B, specrt, hermes parser)
-
-Server: `tool_parser = "hermes"`, `reasoning_parser = "think_tags"`, one model on `crates/specrt/specs/qwen3-0.6b.toml`.
-
-Claude Code (`ANTHROPIC_BASE_URL=http://127.0.0.1:18629 claude -p "Read the file note.txt with the Read tool and tell me what it says." --allowedTools Read`):
-
-```
-assistant thinking  "Okay, let's see. The user wants me to read the file note.txt ... I should use the Read tool ..."
-assistant tool_use  {"name": "Read", "input": {"file_path": "/tmp/t629/work/notes/notes.txt"}}
-user      tool_result "File does not exist. Note: your current working directory is /tmp/t629/work." (is_error)
-assistant thinking  "... the file doesn't exist ..."
-assistant text      "The file `notes.txt` does not exist in your current working directory ..."
-result    completed
-```
-
-Codex CLI (`wire_api = "responses"`, `codex exec`, shell tool):
-
-```
-command_execution  /bin/bash -lc cat   (function_call item from /v1/responses, executed, output sent back as function_call_output)
-agent_message      "The note file has been successfully accessed. ..."
-turn.completed     input_tokens 22413, output_tokens 342
-```
-
-The 0.6B model picks a wrong path or drops an argument, so the answers are poor; the check is that both clients complete the tool round trip over the new endpoints. The ignored test `qwen3_0_6b_serves_a_tool_turn_over_messages_and_responses` asserts a correct `get_weather` call on both APIs.
+Claude Code (`ANTHROPIC_BASE_URL=<server> claude -p ...`, `/v1/messages`) and the Codex CLI (`wire_api = "responses"`, `/v1/responses`) complete a tool round trip against the server; the ignored test `qwen3_0_6b_serves_a_tool_turn_over_messages_and_responses` asserts a correct `get_weather` call on both APIs.
