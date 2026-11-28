@@ -881,6 +881,15 @@ impl Runtime {
         }
         let m = self.mtp();
         m.syncs.set(m.syncs.get() + 1);
+        if self.gdn.is_some() {
+            for r in rows {
+                m.deferred[r.slot].set(true);
+            }
+            if !self.spec.mtp.as_ref().is_some_and(|s| s.defer_commit) {
+                self.settle(rows.iter().map(|r| r.slot))?;
+            }
+        }
+        let m = self.mtp();
         let res = self.stream.clone_dtoh(&m.res.slice(..m.pcap + n * k1))?;
         let accepted = &res[..live];
         let out = &res[m.pcap..];
@@ -890,11 +899,6 @@ impl Runtime {
         let m = self.mtp.as_mut().expect("an MTP spec");
         for r in rows {
             m.drafted[r.slot] = m.k;
-        }
-        if self.gdn.is_some() {
-            for r in rows {
-                m.deferred[r.slot].set(true);
-            }
         }
         m.stats.steps += 1;
         m.stats.rows += live as u64;

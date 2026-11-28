@@ -22,6 +22,7 @@ draft_tokens = 2      # k, 1 to 3
 speculate = true
 max_batch = 8         # optional: plain decode when more sequences decode at once
 graph = false         # optional: capture the whole speculative round in a CUDA graph (needs [runtime] graphs)
+defer_commit = true   # fold the delta-net state commit into the next round's verify (false: commit every round)
 ```
 
 ```toml

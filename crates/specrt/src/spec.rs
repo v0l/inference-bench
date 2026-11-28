@@ -1716,6 +1716,8 @@ pub struct Mtp {
     pub head_quant: Option<Quant>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout: Option<MtpLayout>,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub defer_commit: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1790,7 +1792,7 @@ fn default_true() -> bool {
 
 impl Mtp {
     pub fn new(layers: usize) -> Mtp {
-        Mtp { layers, draft_tokens: default_draft_tokens(), speculate: true, max_batch: None, graph: false, head_quant: None, layout: None }
+        Mtp { layers, draft_tokens: default_draft_tokens(), speculate: true, max_batch: None, graph: false, head_quant: None, layout: None, defer_commit: true }
     }
 }
 

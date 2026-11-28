@@ -662,7 +662,14 @@ fn a_snapshot_taken_right_after_a_speculative_round_holds_the_committed_state() 
 #[test]
 #[ignore = "needs a CUDA GPU"]
 fn plain_decode_after_speculation_in_the_same_slot_matches_plain_greedy() {
-    let s = spec(2);
+    for defer in [true, false] {
+        plain_decode_after_speculation(defer);
+    }
+}
+
+fn plain_decode_after_speculation(defer: bool) {
+    let mut s = spec(2);
+    s.mtp.as_mut().unwrap().defer_commit = defer;
     let ps: Vec<Vec<u32>> = prompts().into_iter().take(6).collect();
     let want = plain_greedy(&s, &ps);
     let mut rt = Runtime::load_layout(&s, layout(3)).unwrap();
@@ -692,7 +699,7 @@ fn plain_decode_after_speculation_in_the_same_slot_matches_plain_greedy() {
         for o in &mut out {
             o.truncate(NEW);
         }
-        check(&format!("group {g}"), &out, ws);
+        check(&format!("group {g}, defer {defer}"), &out, ws);
     }
 }
 
