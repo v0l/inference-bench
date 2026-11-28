@@ -1,5 +1,7 @@
 # Family specs
 
+How a checkpoint becomes a `Spec`. The kernel side of a spec (graph nodes, `[[state]]`, kernel descriptions) is in [kir.md](kir.md); spec delivery is [../guides/specs-update.md](../guides/specs-update.md); per model notes are under [../models/](../models/).
+
 A family spec is a TOML file that says how one architecture family turns a `config.json` (or GGUF
 metadata) into a `Spec`. The Rust mapper in `crates/specrt/src/family.rs` has no architecture names:
 everything per family is data. Families ship in `crates/specrt/specs/family-*.toml`, are embedded in
@@ -52,12 +54,6 @@ What stays in Rust is the schema: the `Quant`, `ActQuant`, `Activation` and `Rop
 the arithmetic of each scaling kind, and the layout rules (one MLP quant for the first layers, the
 projection quant after them). A new architecture whose config uses these pieces needs only a TOML.
 
-## Strict and describe modes
-
-Strict (`from_hf_config*`) needs a matching family and refuses unknown activations, dtypes, rope
-types and quantisations. Describe (`describe_hf_config`) uses the `generic` family, falls back to
-its `lenient_default` activation, and ignores quantisation and rope errors.
-
 ## Example
 
 ```toml
@@ -79,7 +75,7 @@ swish_glu = "swiglu"
 hidden_size = ["n_embd"]
 ```
 
-## Dense families (#638)
+## Dense families
 
 Mistral Small 3 (`mistral`, sliding window off), Phi-4 and Phi-3 (`phi3`), SmolLM3 (`smollm3`),
 OLMo 2 (`olmo2`) and Granite 3 (`granite`) run from a family file each, with no per-architecture
@@ -102,7 +98,7 @@ families (`uses_branch`) turn off the fused prefill-plus-decode step, which only
 
 Real checks: Phi-4-mini (partial rotary 0.75 plus longrope), Phi-3-mini, OLMo-2-1B, Granite-3.3-2B, SmolLM3-3B, and Mistral-Small-24B-Instruct-2501 FP8 (`RedHatAI/...-FP8-dynamic`, all 40 layers) against transformers.
 
-## Two attention shapes per layer kind (#1194, Gemma 4)
+## Two attention shapes per layer kind (Gemma 4)
 
 Gemma 4 sliding layers use `head_dim` and `num_key_value_heads`, full layers use `global_head_dim` and `num_global_key_value_heads`, and with `attention_k_eq_v` the full layers have no `v_proj` (keys are the values). `family-gemma4.toml` extends `gemma3` and describes this with data only:
 
@@ -113,7 +109,7 @@ Gemma 4 sliding layers use `head_dim` and `num_key_value_heads`, full layers use
 | `[[attention.o_cols_by]]` | o_proj columns per layer kind; narrower layers are zero padded to `o_cols`. |
 | `[[state]] blocks` | A per token state kept only for these layer kinds, so each kind's KV holds its own width. Kernels bind `layer = "kind_layer"` (index among layers of that kind). |
 | `[norm] layer_scale` | A per layer scalar tensor that multiplies the layer output. Folded at load into the post norms as `1 / prod(earlier scalars)`, so the residual runs unscaled until the final norm, which is scale invariant. |
-| `[[refuse]]` | `when` is an expression over config keys; a hit refuses the strict spec with `message`. Gemma 4 still uses it for the MoE blocks (#1238); per-layer inputs, KV sharing and the double wide MLP are served (#1239). |
+| `[[refuse]]` | `when` is an expression over config keys; a hit refuses the strict spec with `message` (used by Gemma 3n, Kimi K3, Haru, Whisper and Phonon). Gemma 4 has none left: MoE (26B-A4B, see [moe-offload.md](moe-offload.md)), per-layer inputs, KV sharing and the double wide MLP all serve. |
 | `[[attention.projection]] kv_owner` | The projection exists only on layers that own a cache. With `[blocks] shared_tail_key` set, the last N layers have no k/v projections or norms and read the cache of the last earlier layer of the same kind. |
 | `[blocks] shared_tail_key` | Names the config key holding the count of trailing layers that reuse an earlier layer's KV. `Spec::shares_kv`, `kv_source`, `kv_index` and `kind_index` map a layer to its source; KV state sizes and byte counts cover only the owners. Plan blocks come in two variants (`kv_owner` nodes run on owners, `kv_reader` nodes on consumers). |
 | `[mlp] shared_tail_wide_key` | A bool config key: the shared layers run `gate_up` and `down` at twice `intermediate_size` (`Weight::GateUpWide`, `Weight::DownWide` and the `_wide` gemm shapes). Other layers keep byte identical kernels (`tests/linear_unchanged.rs`, `tests/golden`). |
@@ -123,9 +119,9 @@ The kernels are kir descriptions (`specs/g4_*.toml`): `head_rms` with an optiona
 
 Tests: `tests/gemma4.rs` (31B and 12B mapping, the E2B and E4B configs mapping their shared tail, wide MLP and per-layer inputs, per kind KV bytes, every kernel builds, and on GPU1 tiny-gemma4 and tiny-gemma4-e logits, greedy and per-layer states against transformers from `scripts/tiny_gemma4.py <dir>` with `G4_FIXTURE` and `G4_STYLE=e`: max abs 4.6e-4 and 2.0e-4 on logits). The E fixture is 6 layers with per layer input 16, 2 shared KV layers and the double wide MLP; its KV bytes are smaller than a spec with no sharing.
 
-## A prelude before chosen layers, partial refusals (#1280, Qwen3.8-Flash-Next)
+## A prelude before chosen layers, partial refusals (Qwen3.8-Flash-Next)
 
-`family-qwen4_exp.toml` extends `qwen3_5` and adds three tables, all data: `[gated_residual]` (four streams with a low rank gate, #1277), the QSA indexer as `[[attention.node]]` (#1278) and the PLE as a `[prelude]` (#1279). Details in [specrt-qwen4exp.md](specrt-qwen4exp.md).
+`family-qwen4_exp.toml` extends `qwen3_5` and adds three tables, all data: `[gated_residual]` (four streams with a low rank gate, #1277), the QSA indexer as `[[attention.node]]` (#1278) and the PLE as a `[prelude]` (#1279). Details in [../models/qwen4exp.md](../models/qwen4exp.md).
 
 | Field | What it does |
 |---|---|
@@ -138,7 +134,7 @@ Tests: `tests/gemma4.rs` (31B and 12B mapping, the E2B and E4B configs mapping t
 
 The gated residual runs prefill and decode as separate steps (no fused prefill plus decode, no single row plan).
 
-## Kimi K3 (#1340)
+## Kimi K3
 
 `family-kimi_k3.toml` extends `kimi_linear` for `kimi_k3` and `kimi_k31`. The reference is the checkpoint's own `modeling_kimi_linear.py` (moonshotai/Kimi-K3 at c7945ea0, sha256 pinned in `scripts/tiny_kimi_k3.py`), run with `fla` stubbed by the torch fallbacks of transformers' `kimi_linear`. The stub reproduces transformers on `tiny-kimi-linear` (prefill 5.3e-5, decode 4.0e-5) before it builds `tests/fixtures/tiny-kimi-k3` (6 layers, all six pieces).
 
