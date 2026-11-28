@@ -1,0 +1,91 @@
+{
+ "label": "specrt-nomtp",
+ "suite": "prefix",
+ "tokens_per_word": 1.0,
+ "points": [
+  {
+   "prompt_len": 8192,
+   "cold": {
+    "prompt_tokens": 8184,
+    "completion_tokens": 16,
+    "cached_tokens": 0,
+    "ttft_s": 1.4760521809803322,
+    "prefill_tok_s": 5544.519431938056,
+    "decode_tok_s": 40.71822994379871,
+    "total_s": 1.8444375459803268
+   },
+   "warm": [
+    {
+     "prompt_tokens": 8775,
+     "completion_tokens": 16,
+     "cached_tokens": 6144,
+     "ttft_s": 0.5699811659869738,
+     "prefill_tok_s": 15395.24553378057,
+     "decode_tok_s": 40.629761955907426,
+     "total_s": 0.939168660028372
+    },
+    {
+     "prompt_tokens": 8775,
+     "completion_tokens": 16,
+     "cached_tokens": 6144,
+     "ttft_s": 0.5707597499713302,
+     "prefill_tok_s": 15374.244593177387,
+     "decode_tok_s": 40.62218377029755,
+     "total_s": 0.9400161170051433
+    },
+    {
+     "prompt_tokens": 8775,
+     "completion_tokens": 16,
+     "cached_tokens": 6144,
+     "ttft_s": 0.5744232350261882,
+     "prefill_tok_s": 15276.19264843969,
+     "decode_tok_s": 40.58910749627795,
+     "total_s": 0.9439805109868757
+    }
+   ],
+   "median_warm_ttft_s": 0.5707597499713302
+  },
+  {
+   "prompt_len": 131072,
+   "cold": {
+    "prompt_tokens": 131064,
+    "completion_tokens": 16,
+    "cached_tokens": 0,
+    "ttft_s": 53.487081544008106,
+    "prefill_tok_s": 2450.386078592887,
+    "decode_tok_s": 17.791843635167417,
+    "total_s": 54.330164493003394
+   },
+   "warm": [
+    {
+     "prompt_tokens": 131655,
+     "completion_tokens": 16,
+     "cached_tokens": 129024,
+     "ttft_s": 2.212211191013921,
+     "prefill_tok_s": 59512.853264094854,
+     "decode_tok_s": 16.07539931558996,
+     "total_s": 3.1453139840159565
+    },
+    {
+     "prompt_tokens": 131655,
+     "completion_tokens": 16,
+     "cached_tokens": 129024,
+     "ttft_s": 2.30565925501287,
+     "prefill_tok_s": 57100.80520951268,
+     "decode_tok_s": 16.056680493294376,
+     "total_s": 3.239849856006913
+    },
+    {
+     "prompt_tokens": 131655,
+     "completion_tokens": 16,
+     "cached_tokens": 129024,
+     "ttft_s": 2.23890948103508,
+     "prefill_tok_s": 58803.18124301033,
+     "decode_tok_s": 16.06494552879159,
+     "total_s": 3.172619463002775
+    }
+   ],
+   "median_warm_ttft_s": 2.23890948103508
+  }
+ ]
+}

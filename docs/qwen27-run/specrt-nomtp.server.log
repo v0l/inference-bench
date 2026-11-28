@@ -1,0 +1,2 @@
+2026-11-28T00:13:45.611552Z  WARN specrt::serve: fp8 KV: 0 of 16 attention layers keep f16 KV, 0.51x the size of f16. Past 32768 tokens fewer than 12 f16 layers drift from f16 and can derail long generations; leave f16 kv layers on auto or use f16 (docs/specrt-kv-quant.md). spec=qwen3.8-27b-nvfp4
+2026-11-28T00:13:56.678356Z  WARN inference_bench_core::specs: spec update failed error=https://api.github.com/repos/v0l/inference-bench/contents/crates/specrt/specs/family-gpt_oss.toml?ref=2bc21c2d4272865aca0f1b58851bf8e4af462b0e answered 403 source=v0l/inference-bench@master

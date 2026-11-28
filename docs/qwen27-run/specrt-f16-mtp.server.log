@@ -1,0 +1,1 @@
+2026-11-27T23:43:59.837369Z  WARN inference_bench_core::specs: spec update failed error=https://api.github.com/repos/v0l/inference-bench/commits/refs/heads/master answered 403 source=v0l/inference-bench@master
