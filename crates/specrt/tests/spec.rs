@@ -391,6 +391,29 @@ fn act_quant_fields_default_to_none_round_trip_and_match_the_act_fixtures() {
 }
 
 #[test]
+fn linear_numerics_defaults_to_exact_round_trips_and_needs_act_quant() {
+    use specrt::spec::Numerics;
+    let plain = Spec::parse(&nvfp4_text()).unwrap();
+    assert_eq!(plain.linear_attention.as_ref().unwrap().numerics, Numerics::Exact);
+    assert!(!plain.to_toml().unwrap().contains("numerics"));
+    let with = |text: &str, v: &str| text.replace("conv_kernel = 4\n", &format!("conv_kernel = 4\nnumerics = {v:?}\n"));
+    let e = format!("{:#}", Spec::parse(&with(&nvfp4_text(), "act")).unwrap_err());
+    assert!(e.contains("numerics") && e.contains("act_quant"), "{e}");
+    let e = format!("{:#}", Spec::parse(&with(&nvfp4_text(), "fast")).unwrap_err());
+    assert!(e.contains("fast"), "{e}");
+    let act_text = std::fs::read_to_string(root().join("tests/fixtures/qwen3.8-27b-nvfp4.toml")).unwrap();
+    let act = Spec::parse(&with(&act_text, "act")).unwrap();
+    assert_eq!(act.linear_attention.as_ref().unwrap().numerics, Numerics::Act);
+    assert_eq!(Spec::parse(&act.to_toml().unwrap()).unwrap(), act);
+    for exact in ["qwen3.8-27b-exact", "qwen3.8-27b-nvfp4-exact"] {
+        let s = Spec::load(&root().join(format!("tests/fixtures/{exact}.toml"))).unwrap();
+        assert_eq!(s.linear_attention.unwrap().numerics, Numerics::Exact, "{exact}");
+    }
+    let derived = derived("qwen3.8-27b.config.json");
+    assert_eq!(derived.linear_attention.unwrap().numerics, Numerics::Exact);
+}
+
+#[test]
 fn act_quant_rejects_unknown_values_and_formats_the_weights_cannot_take() {
     let text = nvfp4_text();
     let top = |v: &str| text.replace("quant = \"fp8_channel\"\n", &format!("quant = \"fp8_channel\"\nact_quant = {v:?}\n"));
