@@ -193,7 +193,7 @@ fn qwen3_iq_native_kernels_match_the_same_weights_dequantised_to_bf16() {
 #[test]
 #[ignore = "needs a CUDA GPU, Qwen3-0.6B-IQ*.gguf (llama-quantize with an imatrix) and llama.cpp reference logits q3-IQ*.logits.bin in ~/.cache/specrt-gguf"]
 fn qwen3_iq_gguf_logits_stay_within_the_kl_bound_of_llama_cpp() {
-    // Bounds are 1.5x the mean and max KL measured against llama.cpp (Qwen3-0.6B, llama-quantize --pure with an imatrix, token embedding and output at q8_0), see docs/specrt-gguf.md.
+    // Bounds are 1.5x the mean and max KL measured against llama.cpp (Qwen3-0.6B, llama-quantize --pure with an imatrix, token embedding and output at q8_0), see docs/design/gguf.md.
     let bounds = [
         ("IQ4_NL", 1.5e-2, 2.2e-1),
         ("IQ4_XS", 3.1e-2, 3.2e-1),
