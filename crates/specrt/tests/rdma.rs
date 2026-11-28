@@ -61,14 +61,20 @@ impl Drop for Held {
 
 fn setup() -> Option<(String, Held)> {
     let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    if Verbs::load(specrt::rdma::DEFAULT_LIBRARY).is_err() {
+    let Ok(verbs) = Verbs::load(specrt::rdma::DEFAULT_LIBRARY) else {
         skip("libibverbs is not installed");
         return None;
-    }
+    };
     let Some(ip) = rdma_ip() else {
         skip("no RoCE device with a routable IPv4 address (set SPECRT_RDMA_TEST_IP)");
         return None;
     };
+    let usable = ip.parse().ok().and_then(|addr| specrt::rdma::Endpoint::open(verbs, addr).ok());
+    if usable.is_none() {
+        skip("no active RoCE port with an IPv4 address");
+        return None;
+    }
+    drop(usable);
     let server = StageServer::start_with(&format!("{ip}:0"), KEY, Arc::new(Echo), link(Transport::Rdma)).unwrap();
     let addr = format!("{ip}:{}", server.addr().port());
     Some((addr, Held { _server: server, _guard: guard }))
