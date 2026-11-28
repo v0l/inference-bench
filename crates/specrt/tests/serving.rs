@@ -249,7 +249,7 @@ fn scheduled_spec_matches_single(s: &Spec) {
     let want: Vec<Vec<u32>> =
         prompts.iter().zip(&new).map(|(p, &n)| single.generate(p, n, Sampling::GREEDY).unwrap().tokens).collect();
     drop(single);
-    let layout = Layout { max_ctx: 512, slots: 16, kv_blocks: 120, prefill_chunk: 256, kv_planes: 1, kv_headroom: 0, state_on_demand: true };
+    let layout = Layout { max_ctx: 512, slots: 16, kv_blocks: 48, prefill_chunk: 256, kv_planes: 1, kv_headroom: 0, state_on_demand: true };
     let exec = GpuExecutor::new(Runtime::load_layout(&s, layout).unwrap()).unwrap();
     let cfg = Config { max_num_seqs: 16, max_batched_tokens: 300, reserve_blocks: Some(1), ..Config::default() };
     let mut sched = Scheduler::new(exec, cfg);
@@ -269,7 +269,7 @@ fn scheduled_spec_matches_single(s: &Spec) {
             }
         }
     }
-    assert!(sched.preemptions() > 0, "the pool of 120 blocks was meant to run out");
+    assert!(sched.preemptions() > 0, "the pool of 48 blocks was meant to run out");
     assert!(most > 8, "decode batches stayed at {most} rows");
     assert_eq!(sched.blocks_used(), 0);
     assert_eq!(sched.exec.rt.state_live_slots(), 1);
