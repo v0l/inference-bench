@@ -265,18 +265,21 @@ pub fn tri_leaf(n: usize) -> String {
     at(
         n,
         "constexpr int LEAF = 16;
-for (int i = 1; i < LEAF; i++) {
-    int b = (tid / LEAF) * LEAF;
-    int j = tid % LEAF;
-    float next = 0.0f;
-    if (tid < C && j < i) {
-        next = A[(b + i) * LA_AS + b + j];
-        for (int m = j + 1; m < i; m++) next += A[(b + i) * LA_AS + b + m] * A[(b + m) * LA_AS + b + j];
+if (tid < C) {
+    for (int i = 1; i < LEAF; i++) {
+        int b = (tid / LEAF) * LEAF;
+        int j = tid % LEAF;
+        float next = 0.0f;
+        if (j < i) {
+            next = A[(b + i) * LA_AS + b + j];
+            for (int m = j + 1; m < i; m++) next += A[(b + i) * LA_AS + b + m] * A[(b + m) * LA_AS + b + j];
+        }
+        __syncwarp();
+        if (j < i) A[(b + i) * LA_AS + b + j] = next;
+        __syncwarp();
     }
-    __syncthreads();
-    if (tid < C && j < i) A[(b + i) * LA_AS + b + j] = next;
-    __syncthreads();
 }
+__syncthreads();
 ",
     )
 }
