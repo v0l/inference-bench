@@ -1,7 +1,7 @@
 # Gemma 3
 
 Gemma 3 text runs from `specs/family-gemma3.toml` and the graph in `graphs/decoder.toml`: no Gemma code in Rust.
-Both the language model and the SigLIP image path are covered here, with the commands and the last results.
+Both the language model and the SigLIP image path are covered here, with the commands and the current results. Gemma 4 is described in [../design/specs.md](../design/specs.md).
 
 ## Text
 
@@ -40,7 +40,7 @@ Pan and scan is off by default. With it on, each crop adds 256 tokens and the pr
 
 ## Tests and commands
 
-All GPU runs go under `flock /tmp/gpu27.lock` and `systemd-run --user --wait --collect -P -q -p MemoryMax=16G -p MemorySwapMax=0`.
+GPU runs go under `~/.agents/bin/gpu-run 1 --` and `systemd-run --user --wait --collect -P -q -p MemoryMax=16G -p MemorySwapMax=0` (see [../guides/testing.md](../guides/testing.md)).
 
 | What | Command | Reference |
 |---|---|---|
@@ -55,7 +55,7 @@ and stops it on exit. It never touches `local-llm.service`.
 
 ## Results
 
-Measured on the RTX PRO 6000 beside other jobs; none of these are speed numbers.
+Desktop RTX PRO 6000, accuracy only; none of these are speed numbers.
 
 | Check | Result |
 |---|---|
@@ -67,30 +67,4 @@ Measured on the RTX PRO 6000 beside other jobs; none of these are speed numbers.
 | Tiny SigLIP fixture, square and 4-tile | embeddings 2e-4, logits KL under 2e-5 on every row that predicts a token |
 | 27B FP8 (RedHatAI) against vLLM, 9 prompts including a 3,630 token one past the window | top-1 419 of 432, mean KL 0.0037, max 0.11 |
 
-## The image-token rows of the tiny fixture
-
-An earlier version of the tiny test left out the rows of the image tokens, because their logits were 0.04 to 0.05
-KL from the reference while their hidden states agreed. The cause was the reference, not the engine:
-`Gemma3ForConditionalGeneration` in transformers 5.22 does not apply `final_logit_softcapping` (only
-`Gemma3ForCausalLM` does), so its logits are uncapped. The fixture sets a cap of 30, which the text-only model
-and this engine apply.
-
-| Row group | After final norm, ours against `hidden_states[-1]` | Logits against HF, uncapped | Logits against HF with the cap applied |
-|---|---|---|---|
-| text rows | relative up to 6e-4 | KL 1e-6 to 2e-5 | KL below 1e-8 |
-| image rows (4) | relative 7e-4 to 1.3e-3 | KL 3.7e-2 to 5.3e-2 | KL 4e-7 to 5e-6 |
-
-The head itself is the same on every row: our kernel logits equal the head applied to our own hidden state to
-5e-5. `scripts/tiny_gemma3_vision.py` now applies the cap to the reference, and the test checks every row with a
-bound of 1e-4. The real 4B and 27B configs set no final soft-cap, so they never saw this.
-
-## Causal prefill speed
-
-The bidirectional image-block option (`BIDI`) is compiled out for models without it. `flash_speed` at 2048 tokens,
-27B shapes, three rounds alternating master and this branch, min kernel time:
-
-| Context before the chunk | master | branch |
-|---|---|---|
-| 0 | 0.476 to 0.477 ms | 0.475 to 0.477 ms |
-| 16,384 | 4.766 to 4.778 ms | 4.766 to 4.778 ms |
-| 30,720 | 8.733 to 8.747 ms | 8.733 to 8.745 ms |
+The tiny vision fixture's reference applies `final_logit_softcapping` itself, because `Gemma3ForConditionalGeneration` in transformers 5.22 does not (only `Gemma3ForCausalLM` does); the engine applies the cap the config sets, and every row is checked at 1e-4. The bidirectional image block option (`BIDI`) is compiled out for models without it, so causal prefill is unchanged.

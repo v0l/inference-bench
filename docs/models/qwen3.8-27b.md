@@ -1,370 +1,69 @@
-# specrt on the real Qwen3.8 27B (FP8)
+# Qwen3.8 27B
 
-Issue #320. The checkpoint is `Qwen/Qwen3.8-27B-FP8` from the HF cache (68 shards: `layers-N`,
-`outside`, `mtp`). The spec is `crates/specrt/tests/fixtures/qwen3.8-27b.toml` with
-`quant = "fp8_block128"`. `Spec::from_hf_config` derives that quant from the config's
-`quantization_config` (`fp8`, `e4m3`, `weight_block_size [128, 128]`) and refuses any other scheme.
+The model the project is measured on. Two checkpoints: `Qwen/Qwen3.8-27B-FP8` (block FP8) and `orcarouter/Qwen3.8-27B-Uncensored-NVFP4` (compressed-tensors mixed precision, the one the user's vLLM served). 64 layers, hidden 5120, MLP 17408, vocab 248,320, 262,144 positions; 48 gated delta-net layers and 16 full attention layers (one in four, 24 query and 4 KV heads of 256, output gate, qk norm, partial rotary 64); one MTP layer; a vision tower. How each part runs is in the design docs: [linear-attention.md](../design/linear-attention.md), [quantisation.md](../design/quantisation.md), [mtp.md](../design/mtp.md), [vision.md](../design/vision.md).
 
-## What is in place
+## Specs
 
-- **Sharded loader** (`weights.rs`, `Checkpoint`). It reads `model.safetensors.index.json` (or
-  one `model.safetensors`), mmaps every shard and reads only the headers up front. The runtime
-  then pulls one layer at a time, uploads it, synchronises and calls `madvise(DONTNEED)` on the
-  maps, so host memory holds one fused layer at most. bf16 tensors are borrowed straight from
-  the map with no copy. `Runtime` reports `load_secs`, `weight_secs`, `weight_bytes`,
-  `device_bytes` and `peak_host_rss_bytes` (VmHWM), and `bench` prints them.
-- **FP8 weights.** Every projection is e4m3 with one bf16 `weight_scale_inv` per 128 x 128 block:
-  `q/k/v/o_proj`, `in_proj_qkv`, `in_proj_z`, `out_proj`, `gate/up/down_proj`. These stay bf16:
-  `in_proj_a`, `in_proj_b` (48 rows each), the conv, norms, `embed_tokens` and `lm_head`. The
-  96 gate rows are now their own bf16 linear (`lin_ba`) for every quant, so the FP8 `in_proj` is
-  a clean 16384-row matrix. Scales stay as the checkpoint's 128 x 128 grid (f32 on the device).
-  Each FP8 matrix's scale buffer starts with one u32 per fused row, the offset of that row's grid
-  row, so head splitting, gate/up interleaving and qkv fusion only remap rows (#334). On the 27B
-  that is 15.6 MB of map plus 5.9 MB of grid, 21.5 MB in all, down from 0.76 GB of per-row
-  expanded scales.
-- **Decode GEMV** (`row_dot<WF_FP8>`, `linear_fp8`). Each lane streams 16 bytes of weight
-  (`ld.global.nc.L1::no_allocate`), decodes e4m3 in registers with two integer ops and one
-  multiply, and applies the block scale once per 128 columns.
-- **Prefill GEMM, two paths.**
-  - Default: `gemm_tc` with FP8 weight tiles in shared memory, converted to bf16 per fragment and
-    run through `mma.m16n8k16.bf16` against the hi/lo split activations. The block scale is
-    applied per 64-wide k tile. Activations stay effectively fp32, so this is exact to the
-    dequantised weights.
-  - `act_quant = "fp8"`: `gemm_fp8`, a native `mma.sync.m16n8k32.e4m3.e4m3.f32` kernel. A
-    `quant_rows_fp8` pass quantises each activation row per 128-column block (dynamic, the
-    checkpoint's own `activation_scheme`), and the kernel applies activation scale x weight
-    scale per 128-wide k block. NVRTC compiles it for `compute_120`.
-
-## Correctness
-
-| check | fixture | result |
+| Spec | Checkpoint | Use |
 |---|---|---|
-| tiny FP8, 4 shards, block scales (`tiny-qwen3.5-fp8`, built by `reference.py tiny-fp8` from the head_dim 256 fixture) | decode 32 tokens, per layer | max abs 3e-6 vs transformers on the dequantised weights |
-| same | chunked prefill 1024 tokens | layers 7e-5, logits 5e-5, state 1.3e-5 |
-| same | logits + 64 greedy tokens | 4e-5, greedy identical |
-| same | batch 4 decode vs single | identical |
-| real 27B, first 4 layers (`reference.py real-slice`, real FP8 shards, vocab cut to 32768 rows that hold the prompt) | 64-token prefill, per layer | max error / max abs 3e-6, logits 5e-6, top-1 64/64 |
-| same | 64 recurrent decode steps | logits 6e-7 relative |
-| native FP8 mma (`act_quant = "fp8"`), tiny FP8 | prefill logits vs weight-only reference | 0.30, against a 0.29 gap between the weight-only and activation-quantised references, so it stays inside the envelope that FP8 activations cost |
+| `crates/specrt/tests/fixtures/qwen3.8-27b.toml` | FP8, `quant = "fp8_block128"`, `act_quant = "fp8"` | serving |
+| `crates/specrt/tests/fixtures/qwen3.8-27b-nvfp4.toml` | NVFP4, `quant = "fp8_channel"`, `act_quant = "fp8"`, `[mlp] quant = "nvfp4_g16"` with `quant_until = 56`, `[mlp] act_quant = "fp4"` | serving, the default for benches |
+| `qwen3.8-27b-exact.toml`, `qwen3.8-27b-nvfp4-exact.toml` | the same, weight only | the exact reference tests (`SPECRT_27B_SPEC` defaults to them) |
+| `qwen3.8-27b-nvfp4-head-fp8.toml`, `-head-nvfp4.toml` | quantised output heads | head tests |
 
-A mutation check: doubling the e4m3 exponent bias in the kernel fails all three FP8 reference
-tests.
+They live in the fixtures, not `crates/specrt/specs/`, because specs there ship to the app as runnable models. `Spec::from_hf_config` derives the same quant from each checkpoint's `quantization_config` and `Spec::from_hf_config_serving` adds the activation quant from compressed-tensors `input_activations`; TOML specs are completed from the snapshot's `config.json` at load.
 
-The whole-model results are under "Real-model run" below.
+## Checkpoint layouts
 
-The full-model oracle is `reference.py real-full`. It runs the whole 27B on the CPU one layer at a
-time from the FP8 shards, dequantised to f32, for all five prompts at once. It takes 108 s on 24
-threads. Peak anonymous RSS is 3.7 GB; VmHWM shows 33 GB, but that is page cache from the shard
-mmaps, which the kernel can drop. It writes the full-sequence logits, a per-layer trace of prompt
-0 and the reference argmax. Run with `act` it also quantises every projection input per 128
-block, the way vLLM's dynamic FP8 does. The gap between the two runs is the tolerance envelope.
+FP8: every projection is e4m3 with a bf16 `weight_scale_inv` per 128 x 128 block; `in_proj_a`, `in_proj_b`, the conv, norms, `embed_tokens` and `lm_head` stay bf16 (the 96 gate rows are their own bf16 linear, `lin_ba`). On the device the grid stays as stored, with one u32 per fused row giving the offset of its grid row (21.5 MB for the model), so head splits, gate/up interleave and qkv fusion only remap rows.
 
-Tolerance rule (`tests/real27b.rs`, `real_27b_greedy_and_logits_match_the_fp8_reference`):
-specrt's logits error against the weight-only FP8 reference must be no larger than the error
-dynamic FP8 activations themselves introduce, and greedy tokens must be identical for 32 tokens
-on all 5 prompts. "bf16 transformers" here means the FP8 checkpoint dequantised to f32. The bf16
-checkpoint is not in the cache and is 54 GB.
+NVFP4 (`quantization_config.config_groups`):
 
-## Memory budget (RTX PRO 6000, 96 GB)
-
-From the checkpoint headers and the allocation code in `runtime.rs`:
-
-| item | size | notes |
+| Group | Format | Targets |
 |---|---|---|
-| FP8 projection weights | 24.33 GB | 64 layers |
-| FP8 block scales: grid plus row map | 0.02 GB | 5.9 MB grid, 15.6 MB map; was 0.76 GB per-row before #334 |
-| `embed_tokens` + `lm_head` bf16 | 5.09 GB | 248,320 x 5120 each |
-| norms, conv, `in_proj_a/b`, A, dt | 0.05 GB | |
-| **weights on the device** | **29.5 GB** | MTP (0.48 GB) and vision (0.92 GB) are not loaded |
-| linear-attention state per sequence | 151 MB + 5.9 MB conv | 48 layers x 48 heads x 128 x 128 x f32; independent of context |
-| KV per token, specrt today (f16 hi/lo pair) | 128 KiB | 16 layers x 4 heads x 256 x (K, V) x 2 planes x 2 bytes; the serving layout (#335, `docs/specrt-scheduler.md`) stores one f16 plane, 64 KiB |
-| KV per token in bf16 / fp8 | 64 KiB / 32 KiB | what vLLM's `--kv-cache-dtype fp8` stores |
-| decode scratch | 3 MB | |
-| prefill scratch | 0.24 / 0.06 / 0.02 GB at 8k / 32k / 128k | the chunk shrinks as context grows (`SCORE_BUDGET_FLOATS`) |
-| attention score buffer | 0.27 GB | above 4096 context |
-| CUDA graph, context, JIT module | about 0.5 GB | measured as `device_bytes` minus the rest on the slice |
+| `group_0` | e4m3 weights per channel, e4m3 activations per token, dynamic | attention q, k, v, o; delta-net `in_proj_qkv`, `in_proj_z`, `out_proj`; the MLPs of layers 56 to 63 |
+| `group_1` | NVFP4: e2m1 packed, e4m3 scales per 16, global weight and input scales | the MLPs of layers 0 to 55 |
 
-| context | KV specrt (hi/lo) | KV if bf16 | KV if fp8 | total specrt, one sequence |
-|---|---|---|---|---|
-| 8,192 | 1.07 GB | 0.54 GB | 0.27 GB | about 31.8 GB |
-| 32,768 | 4.29 GB | 2.15 GB | 1.07 GB | about 34.8 GB |
-| 131,072 | 17.18 GB | 8.59 GB | 4.29 GB | about 47.7 GB |
+Not quantised: the vision tower, `lm_head`, `in_proj_a`, `in_proj_b`, the gated norms and convs, everything under `mtp.`. Shards: `model-00001` to `00005` plus `model-extra-00001-of-00001.safetensors` (MTP, bf16). Device weights 23.2 GB (MTP and vision not loaded), 24.8 GB with the NVFP4 draft head; decode reads about 20 GB per token.
 
-Beside the live vLLM (58.2 GB used after its KV was trimmed to 14 GB) 38.9 GB are free. That is
-enough for the 29.5 GB of weights plus 8k of context, and that is how the real-model run below
-was done, with max context capped at 8,192. Longer contexts beside vLLM would need fp8 KV.
+## Memory on one RTX PRO 6000
 
-### Context limit (#580)
-
-The maximum context is the model's own `max_position_embeddings` (`text_config` first, then the top level of `config.json`; the GGUF `<arch>.context_length` for GGUF files). There is no engine constant: a configured context above it is refused at load with the value named. 262,144 for the 27B. `max_model_len` defaults to that, `max_tokens` defaults to `generation_config.json` `max_new_tokens`/`max_length` or else until the context is full.
-
-What was checked above 131,072: the `seq_table` stride (`PAGES` = ctx / 16 = 16,384 pages per slot) and `mm_table` offsets are `size_t`; the KV slot index is `size_t`; the block table is `(slots + 1) * pages` ints; flash and decode attention use no score buffer sized by context (`SCORE_BUDGET_FLOATS` is not in the tree); rope is computed per position in float, not from a table; prefill chunk is fixed by `prefill_chunk`. Nothing breaks. `engine::tests::kv_paging_and_flat_offsets_do_not_overflow_i32_at_262144` pins the index arithmetic.
-
-GPU run, NVFP4 27B, `--max-model-len 262144 --kv-cache-gb 17`, one sequence (device 45.2 GB, beside the live vLLM): a 153,055 token prompt with the code word at the start answered `PELICAN-4471` correctly, ttft 114 s, decode 33.6 tok/s, request sent without `max_tokens`.
-
-### Scale grid and row map (#334)
-
-The kernels read a row's scales as `scales[map[row] + k / 128]`. `gemm_tc` and `gemm_fp8` load
-the map entry once per column before the k loop; `row_dot` loads it once per row. Kernel
-medians from `nsys` on the full 27B, 1,024-token prompt, old and new binaries alternated, min of
-3 runs each (vLLM serving beside it):
-
-| kernel | per-row scales | grid + map | ratio |
-|---|---|---|---|
-| `gate_up_act` decode GEMV | 137 us | 138 us | 1.009 |
-| `lin_in_norm` decode GEMV | 76 us | 77 us | 1.009 |
-| `qkv_proj_norm` decode GEMV | 69.8 us | 69.8 us | 0.999 |
-| `down_proj` decode GEMV | 66.5 us | 62.5 us | 0.94 |
-| `o_proj` decode GEMV | 25.2 us | 23.7 us | 0.94 |
-| `lin_out_proj` decode GEMV | 25.5 us | 24.5 us | 0.96 |
-| `gate_up` prefill GEMM | 10.9 ms | 10.8 ms | 0.99 |
-| `down` prefill GEMM | 5.33 ms | 5.19 ms | 0.97 |
-| `lin_in` prefill GEMM | 4.70 ms | 4.62 ms | 0.98 |
-
-The real 27B check still passes on the default path: logits 1.98e-4 of the largest logit and
-greedy identical for 32 tokens on all 5 prompts. The greedy tokens are the same as before the
-change. The tiny FP8 tests give the same errors as before on both paths (default logits 4.3e-5,
-`act_quant = "fp8"` 0.299).
-
-## Prefill GEMM: dequant-to-bf16 against native FP8 mma
-
-Measured on the real 4-layer slice (`bench out/qwen3.8-27b-slice`, vLLM running beside it at
-97% GPU use, so absolute numbers are low and noisy). These are medians of 6, two rounds each:
-
-| prompt | dequant to bf16 (default) | native e4m3 mma (`act_quant = "fp8"`) |
-|---|---|---|
-| 128 | 8,700 to 11,000 tok/s | 11,100 to 17,300 tok/s |
-| 1,024 | 10,400 to 10,500 | 17,400 to 20,400 |
-| 4,096 | 10,000 to 10,300 | 20,600 to 21,000 |
-
-On this slice the GEMMs are 87% of prefill time (`nsys`: `gate_up` 42%, `down` 21%, `lin_in`
-13%, `lin_out` 6%). The native path roughly doubles prefill at 1k and 4k tokens. It is opt-in
-because it adds the activation-quantisation error, which is as large as the whole FP8
-envelope. The weight-only default is exact to the dequantised checkpoint. Running the default
-path without the hi/lo activation split (`[runtime] unsplit = [...]`) reaches about 13,600 tok/s but
-fails the 1e-3 reference bound.
-
-Decode is the same on both paths (single-token GEMVs): about 360 tok/s for 4 layers, which
-works out to about 22 tok/s for 64 layers if the whole model scales the same. Measured bandwidth
-of the decode GEMVs here is about 700 GB/s, against 825 GB/s for a plain read on this card
-under the same load (the card sits at its 300 W limit with vLLM running).
-
-## Real-model run
-
-Run on 8 Nov 2026 next to the live vLLM (`local-llm.service` serving agents, about 100% busy,
-KV trimmed to 14 GB so 38.9 GB of the card was free). Max context was capped at 8,192 for
-every specrt run. The service was not touched; its journal logged no errors during the runs,
-and free memory went back to 38,953 MiB after each process exited.
-
-### Load
-
-| | |
+| Item | Size |
 |---|---|
-| weights on the device | 30.24 GB, uploaded in 5.6 s from the page cache |
-| device memory, 8k context | 31.7 GB (`bench`), 32.0 GB in the greedy test |
-| whole load (JIT cache warm) | 5.8 s; 11.6 s on the first run |
-| peak host RSS | 5.3 to 5.5 GB |
+| weights, NVFP4 checkpoint | 24.8 GB |
+| weights, FP8 checkpoint | 29.5 GB |
+| delta-net and conv state per sequence | 157 MB |
+| KV per token, f16 one plane | 64 KiB (64 GiB at 1M tokens) |
+| KV per token, fp8 | 33 KiB |
 
-The peak host RSS is VmHWM, so it includes the mapped shard pages of the layer being uploaded
-and the 2.5 GB `lm_head`, which the fused bf16 head copies once. Nothing close to the 25 GB
-limit.
+The context limit is the model's `max_position_embeddings` (262,144) and nothing in the engine caps it lower (`engine::tests::kv_paging_and_flat_offsets_do_not_overflow_i32_at_262144`); YaRN factor 4 opens 1,048,576. A 153,055 token prompt with a code word at its start was answered correctly (#580).
 
-### Correctness, whole model
+## Measured state
 
-`tests/real27b.rs`, 5 prompts of 64 tokens (prose, Python, science, a letter, a word problem),
-32 greedy tokens each, then the logits of all 96 positions against the CPU oracle:
+NVFP4 spec with MTP k = 2, server defaults, desktop GPU1 with the card otherwise idle, 27 to 28 Nov 2026, commits 0810eb2e and cdb6353e, against vLLM on the same harness (`crates/specrt/scripts/specrt_baseline.sh`; every number with its window and card state is in [../generated/qwen27-baseline.md](../generated/qwen27-baseline.md)):
 
-| path | logits max error / max abs logit vs its own reference | vs weight-only reference | greedy, 32 tokens x 5 |
-|---|---|---|---|
-| default (dequant to bf16 tiles, fp32 activations) | 2.0e-4 | 2.0e-4 | identical on all 5 |
-| `act_quant = "fp8"` (native e4m3 mma, dynamic per-token activations) | 0.087 against the activation-quantised reference | 0.32 | 3 of 5 identical; the other two flip at a near tie (0.10 and 0.17 logit margin in the reference) |
-
-The envelope is the gap between the activation-quantised and weight-only references: 0.33 of
-the largest logit. Both paths are inside it. The default path is 1600 times inside it and is the
-one that meets "greedy identical for 32 tokens on 5 prompts". The native path's own error
-against a reference that quantises activations the same way is 0.087. Its greedy test passes
-only where the reference itself is within 0.25 logits of a tie (`NEAR_TIE`). The 0.087 is not
-explained further here: on the tiny fixture the same kernel lands inside the envelope too, and a
-per-layer trace of prompt 0 (`real27b-ref-act.layers.bin`) is there to dig into it.
-
-Sample continuations (default path): "...the cost of a book fell" continues " the cost of paper
-fell, the number of books printed in Europe rose from a few million..."; the Python prompt
-continues with the correct `out.append(b[j])` and `out.extend(a[i:])`; the word problem
-continues "...The first train has a head start of 1.5".
-
-### Speed: shared GPU, vLLM serving, indicative only
-
-`scripts/bench27b.sh`: 3 rounds alternating the two paths, 2 runs per round, so 6 runs per
-mode, single stream, 128 new tokens. All of these tok/s figures are from a shared GPU with vLLM
-serving and are indicative only. The clean comparison is #307's window.
-
-| prompt | prefill, default | prefill, native FP8 | decode, default | decode, native FP8 |
-|---|---|---|---|---|
-| 128 | 553 tok/s (489 to 584) | 1,062 (1,014 to 1,112) | 21.6 (20.6 to 24.4) | 23.8 (22.5 to 24.7) |
-| 1,024 | 611 (542 to 652) | 1,308 (1,105 to 1,333) | 23.4 (20.4 to 24.2) | 22.1 (20.3 to 23.7) |
-| 4,096 | 558 (527 to 615) | 1,081 (1,069 to 1,269) | 22.3 (19.8 to 22.9) | 21.4 (19.8 to 23.1) |
-
-Kernel times per call from `nsys` (1,024-token prompt, 64 new tokens). These per-call times are
-more robust than wall clock under sharing:
-
-| kernel | default | native FP8 | rate |
-|---|---|---|---|
-| `gate_up` prefill GEMM, 1024 x 34816 x 5120 | 11.0 ms | 5.0 ms | 33 vs 72 TFLOP/s |
-| `down` prefill GEMM, 1024 x 5120 x 17408 | 5.2 ms | 2.0 ms | 35 vs 90 TFLOP/s |
-| `lin_in` prefill GEMM, 1024 x 16384 x 5120 | 4.3 ms | 1.5 ms | 40 vs 111 TFLOP/s |
-| `gate_up_act` decode GEMV (178 MB FP8) | 265 us | same | 672 GB/s |
-| `down_proj` decode GEMV (89 MB) | 126 us | same | 709 GB/s |
-| `lin_in_norm` decode GEMV (84 MB) | 145 us | same | 581 GB/s |
-| `lm_head_norm` decode GEMV (2.5 GB bf16) | 3.4 ms | same | 744 GB/s |
-
-Decode reads 26.9 GB per token. At the 825 GB/s this card reaches for a plain read under the
-same load, the ceiling is 30.6 tok/s. specrt runs at 21 to 24 tok/s, about 75% of it. The bf16
-`lm_head` is 2.5 GB of the 26.9 GB, about 10% of decode time.
-
-### Against vLLM
-
-vLLM serves the NVFP4 build of this model (MLPs in 4-bit, so about 17 GB of weights read per
-token, against specrt's 27 GB) with MTP speculative decoding at 2.8 tokens per step. Its
-single-stream median is 162.5 tok/s (`docs/qwen3.8-27b-vllm-baseline.md`). specrt's 22 tok/s
-under sharing is about 7x lower. The gap has three parts, roughly multiplicative:
-
-- MTP: about 2.8x, the measured acceptance length. specrt has no MTP yet.
-- Bytes per token: NVFP4 MLPs read about 1.6x fewer bytes than FP8. The NVFP4 issue covers it.
-- Sharing: these numbers ran beside vLLM at 100% load and the 300 W cap, so the clean number
-  will be higher. #307 measures it.
-
-Without MTP the same vLLM deployment would be about 162.5 / 2.8 = 58 tok/s; with NVFP4's
-byte count, specrt's 75%-of-bandwidth decode would land at about 35 to 40 tok/s on a free GPU.
-This is an estimate, not a measurement.
-
-Prefill: vLLM's logged median is 1,782 tok/s on mixed short prompts. specrt's native FP8 path
-reaches 1,062 to 1,308 tok/s here under sharing, and the default path about half of that.
-
-### Commands
-
-```
-cd crates/specrt
-python scripts/reference.py real-prompts Qwen/Qwen3.8-27B-FP8 out
-cargo test --release --test real27b real_27b_generates_greedy_and_dumps_logits -- --ignored --nocapture
-SPECRT_27B_SPEC=qwen3.8-27b-act cargo test --release --test real27b real_27b_generates_greedy_and_dumps_logits -- --ignored --nocapture
-python scripts/reference.py real-full Qwen/Qwen3.8-27B-FP8 out out/real27b-specrt-weight.json
-python scripts/reference.py real-full Qwen/Qwen3.8-27B-FP8 out out/real27b-specrt-weight.json act
-cargo test --release --test real27b real_27b_greedy_and_logits_match -- --ignored --nocapture
-./scripts/bench27b.sh
-```
-
-The GPU steps need about 32 GB free (the bench script stops below 36 GB, and if vLLM logs an
-error). The CPU references take about 95 s each on 24 threads, with 3.7 GB of anonymous RSS.
-
-## Fast weight loading (#583)
-
-Technique review of InstantTensor for a single-GPU Rust loader. Used: O_DIRECT reads into aligned buffers, large chunks with several reads in flight, read-ahead so later groups are read while earlier ones convert and upload, and copies on their own streams. Not used: GPUDirect Storage (cuFile needs libcufile and a supporting filesystem; neither is installed here) and multi-rank distribution (single GPU).
-
-How it works (`crates/specrt/src/loader.rs`, `load_weights` in `crates/specrt/src/runtime.rs`):
-
-- The weights are split into groups, each read, converted, uploaded and released on its own: the head (final norm, `lm_head`, and the NVFP4 MTP draft head made from it), the first half of the layers, the embedding, the MTP layer, then the rest of the layers. The head goes first because its conversion is the slowest single group; the embedding and MTP layer sit in the middle so that the big buffers are spread out instead of being in memory at once.
-- A host budget (`host_budget_mb`, 3584) caps the bytes held by groups in flight. A read or a conversion waits for its lease until earlier groups finish, except that a group larger than the whole budget still runs on its own. This is what keeps peak host RSS at the old mmap baseline.
-- A reader thread reads each group's tensors with `readers` threads doing `chunk_mb` O_DIRECT `pread`s into one aligned host buffer, at most `ahead` groups ahead of the workers. O_DIRECT falls back to buffered reads when the filesystem refuses (tested on /dev/shm).
-- `workers` threads each take the next group, convert it on the host (fp8 scales, bf16, NVFP4 repacking, gate/up interleave) straight from the read buffer, and copy it with `cuMemcpyHtoDAsync` on that worker's own stream. Each worker records an event after its copies and waits on it before the buffer goes back to the pool, so a buffer is never reused while a copy still reads it. Conversion stays on the host: it is byte-identical to the mmap path (tested on the bf16 and fp8 tiny fixtures), it runs in parallel across groups, and the NVFP4 head and global-scale passes are split across threads.
-- If at least 80% of the checkpoint is already in the page cache (`mincore`), the reader is skipped and the workers convert straight from the mmap. Reading through O_DIRECT again would only copy memory that is already there. Pages are released per group after upload.
-
-Knobs, `[runtime.loader]` in the spec or server config: `enabled` (true), `direct` (true), `chunk_mb` (32), `readers` (8), `ahead` (2), `workers` (4), `lanes` (1, reader threads that read different groups at once), `skip_cached` (true), `pinned` (false), `host_budget_mb` (3584).
-
-Disk ceiling: `dd iflag=direct bs=16M` reads 12.1 to 12.5 GB/s from one file. All six 27B shards read in parallel with `dd iflag=direct` take 2.40 s for 24.7 GB (10.3 GB/s). Cold means each file was evicted first (`dd iflag=nocache count=0`); warm means `cat` of every shard first. With O_DIRECT a cold load leaves the page cache cold. Measured with `bench`, RTX PRO 6000 beside the live vLLM, kernel cache warm. Before and after were alternated. The table gives the median of three.
-
-| model | path | cache | weight_secs | GB/s | load_secs | peak host RSS |
-|---|---|---|---|---|---|---|
-| Qwen3-0.6B (1.50 GB) | mmap (before) | cold | 0.56 | 2.7 | 0.83 | 0.52 GB |
-| Qwen3-0.6B | mmap (before) | warm | 0.24 | 6.3 | 0.52 | 0.52 GB |
-| Qwen3-0.6B | fast (after) | cold | 0.17 | 8.8 | 0.45 | 0.72 GB |
-| Qwen3-0.6B | fast (after) | warm | 0.15 | 10.0 | 0.43 | 0.66 GB |
-| 27B NVFP4 (24.78 GB uploaded) | mmap (before) | cold | 9.86 | 2.5 | 10.25 | 5.30 GB |
-| 27B NVFP4 | mmap (before) | warm | 5.07 | 4.9 | 5.71 | 5.31 GB |
-| 27B NVFP4 | fast, one head group, no budget | cold | 3.17 | 7.8 | 3.48 | 9.42 GB |
-| 27B NVFP4 | fast, one head group, no budget | warm | 2.23 | 11.1 | 2.45 | 8.88 GB |
-| 27B NVFP4 | fast (after, split groups, 3.5 GB budget) | cold | 2.85 | 8.7 | 3.16 | 5.10 GB |
-| 27B NVFP4 | fast (after, split groups, 3.5 GB budget) | warm | 2.34 | 10.6 | 2.64 | 4.89 GB |
-
-The machine was busier during this run than in earlier ones (load average 8 to 12 from other sessions' builds and tests), so the mmap baseline is slower here than the 9.0 s and 4.1 s measured before. The two fast rows were alternated in the same window. Splitting the head group and adding the budget brings peak RSS from 8.9-9.4 GB to 4.9-5.1 GB, below the 5.3 GB mmap baseline. Cold is 0.3 s faster (the big head conversion no longer holds back the reads) and warm 0.1 s slower. Against the mmap path, the 27B now loads 3.5x faster cold and 2.2x faster warm, at the same memory.
-
-What limits each case, from per-group timers:
-
-- Warm: conversion and copy. The head group (2.5 GB bf16 `lm_head` plus quantizing the NVFP4 draft head) takes 0.8 s on one worker, and the four workers together spend about 6.3 s converting and copying the 67 groups. More workers go faster (6 workers: 2.25-2.38 s) but peak at 5.9-6.0 GB, above the baseline. Moving the NVFP4 draft-head quantize to the GPU would take most of the head group's time off the host; that is tracked separately.
-- Cold: the read. 24.7 GB in about 2.8 s is 8.8 GB/s, against 2.40 s (10.3 GB/s) for six parallel `dd iflag=direct`. Reading several groups at once (`lanes` = 2 or 4) was slower (3.5 to 3.75 s) and used 12 to 14 GB. More readers or larger chunks (16 x 16 MB, 8 x 64 MB) changed nothing.
-- Budget sweep (27B, 4 workers, cold / warm weight_secs, peak RSS): 3072 MB: 3.34 / 2.70 s, 4.5 GB; 3584 MB: 2.69-2.79 / 2.43-2.62 s, 4.9-5.2 GB; 4096 MB: 2.93-3.07 / 2.37-2.49 s, 4.8-5.5 GB; 6144 MB: 2.80-2.84 / 2.30-2.37 s, 5.1-5.5 GB. 3584 MB is the largest that stays under 5.3 GB.
-- Pinned buffers (`pinned = true`, `cuMemHostAlloc`) made cold loads slower: 3.30 to 3.42 s, against 2.92 s with aligned heap buffers. Each 256 to 384 MB allocation took 30 to 90 ms, and the copy from pageable memory is not the bottleneck. So pinned buffers are off by default and stay as an option.
-- The page-cache check uses 80%: right after `cat` of all 24.7 GB the cache held 93.8% of it (the rest was evicted under the 62 GB RAM with vLLM running), which missed the earlier 95% cut-off and sent the warm load through O_DIRECT at 4.8 s.
-
-Progress: `specrt::progress` reports stages (compiling kernels, reading weights with bytes done and total, allocating KV cache) through a thread-local sink. `Engine::load_with_progress` and `ServeOptions::progress` set the sink, and the load workers inherit it. Core turns it into `EngineEvent::LoadProgress`. The UI model bar, chat page and status bar show it (screenshot `docs/gui/load-progress.png`), and the server reports `loading` in `/health` and `/admin/models`.
-
-## Cold start (#396)
-
-`runtime loaded` and `bench` now print `jit_compile_secs` (NVRTC, 0 on a PTX cache hit) and `jit_module_secs` (`load_module`, driver PTX to SASS). `bench --cold` loads the serving layout, sends the same 128-token prompt 11 times and prints the first TTFT against the median of the other ten, then the decode graph capture seconds for rows 1, 2, 4, 8, 16, 32 (also logged as `decode graph captured`).
-
-Measured on GPU 1 of the desktop (RTX PRO 6000, vLLM on the other card). `crates/specrt/scripts/coldstart.sh` runs the five states (a priming run, then both warm, PTX cold with a fresh `[runtime] cache_dir`, driver cold with `CUDA_CACHE_PATH` on an empty temp dir, both cold). Commands:
-
-```bash
-~/.agents/bin/gpu-run 1 -- crates/specrt/scripts/coldstart.sh $CARGO_TARGET_DIR/release/bench crates/specrt/tests/fixtures/qwen3.8-27b.toml 128 64
-~/.agents/bin/gpu-run 1 -- crates/specrt/scripts/coldstart.sh $CARGO_TARGET_DIR/release/bench crates/specrt/tests/fixtures/qwen3.8-27b-nvfp4.toml 128 64
-~/.agents/bin/gpu-run 1 -- crates/specrt/scripts/coldstart.sh $CARGO_TARGET_DIR/release/bench crates/specrt/specs/qwen3-0.6b.toml 128 64
-```
-
-| model | state | load | NVRTC | load_module | weights |
+| Prompt tokens | vLLM decode | specrt decode, fp8 KV | specrt decode, f16 KV | vLLM prefill | specrt prefill, fp8 KV |
 |---|---|---|---|---|---|
-| 27B FP8 | both warm | 5.10 s | 0.00 s | 0.01 s | 4.97 s |
-| 27B FP8 | PTX cold | 4.21 s | 0.24 s | 0.01 s | 3.84 s |
-| 27B FP8 | driver cold | 10.90 s | 0.00 s | 5.46 s | 5.29 s |
-| 27B FP8 | both cold | 16.60 s | 7.07 s | 5.39 s | 4.02 s |
-| 27B NVFP4 | both warm | 2.95 s | 0.00 s | 0.02 s | 2.81 s |
-| 27B NVFP4 | PTX cold | 3.34 s | 0.30 s | 0.01 s | 2.90 s |
-| 27B NVFP4 | driver cold | 10.59 s | 0.00 s | 6.76 s | 3.72 s |
-| 27B NVFP4 | both cold | 19.73 s | 9.04 s | 6.81 s | 3.73 s |
-| qwen3-0.6b | both warm | 0.33 s | 0.00 s | 0.00 s | 0.21 s |
-| qwen3-0.6b | PTX cold | 0.47 s | 0.12 s | 0.00 s | 0.23 s |
-| qwen3-0.6b | driver cold | 1.60 s | 0.00 s | 1.30 s | 0.19 s |
-| qwen3-0.6b | both cold | 3.48 s | 1.89 s | 1.30 s | 0.19 s |
+| 128 | 112.0 | 99.6 | 108.1 | 2,195 | 1,760 |
+| 1,024 | 105.6 | 89.0 | 108.0 | 7,912 | 4,496 |
+| 4,096 | 118.2 | 80.2 | 92.0 | 8,781 | 5,441 |
+| 32,768 | 106.0 | 64.3 | | 6,849 | 4,288 |
+| 131,072 | 98.7 | 30.2 | | 3,764 | 2,346 |
 
-- A truly cold start splits about 57% NVRTC and 43% driver: 7 to 9 s of NVRTC and 5.4 to 6.8 s of `load_module` on the 27B.
-- The driver share alone is 5.4 to 6.8 s on the 27B and 1.3 s on 0.6B, and a warm driver cache removes it. The NVRTC share is only large when the driver cache is also cold: a fresh PTX dir with a warm driver cache compiles in 0.1 to 0.3 s, so NVRTC output appears to be cached under the driver cache path as well. A new `max_ctx` changes the source, so it misses both.
-- Decode graph capture is 2 to 5 ms per size (1 to 32) in every state. It is not a cold-start cost.
-- First request TTFT (prompt 128): 27B FP8 43 ms against 47 to 49 ms for the next ten; NVFP4 38 ms against 42 ms; 0.6B 5 ms against 5 ms. There is no first-request penalty once the load has finished.
-- The weight seconds vary with the page cache (3.8 to 5.3 s on FP8) and are not part of the JIT split.
+Load: NVFP4 weights in 2.85 s cold and 2.34 s warm, a both caches cold start in 8.4 s ([engine.md](../design/engine.md)).
 
-### CUBIN cache (#398)
+Accuracy gates (`crates/specrt/tests/real27b.rs`):
 
-`Jit::load` now compiles to a CUBIN for the exact `sm_XX` through `nvrtcGetCUBIN`, stores `<key>.cubin` and loads it with `Ptx::from_binary`, so the driver never JITs PTX to SASS (the 5.4 to 6.8 s driver share). PTX stays as the fallback when NVRTC cannot emit a CUBIN or the driver rejects it. The key now includes the NVRTC and driver versions. `[runtime] cache_max_bytes` (default 4 GB) deletes the oldest `.ptx`, `.cubin` and `.wgsl` files by mtime after each write; a hit refreshes the mtime. `[runtime] compile_jobs` sets `--split-compile` (default CPU count, at most 8).
+| Test | Gate | Measured |
+|---|---|---|
+| `real_27b_greedy_and_logits_match_the_fp8_reference` (FP8, against a f32 CPU oracle, 5 prompts) | weight only: greedy identical for 32 tokens; act spec: KL within 1.5x of the act reference's own gap | logits 2.0e-4 of max, 32 of 32; act KL 0.00108 against 0.00086 |
+| `real_27b_nvfp4_agrees_with_vllm_greedy_and_logprobs` (20 prompts, 64 tokens, teacher forced on vLLM's tokens) | top-1 at least 90 percent, mean KL at most 0.05 | top-1 1,219 of 1,280, mean KL 0.0133 |
+| `real_27b_per_layer_trace_matches_the_cpu_oracle` | every layer under 1e-3 | 7.6e-7 to 1.4e-5 |
+| `real_27b_mtp_acceptance_on_vllms_own_greedy_tokens` | | acceptance length 2.34 |
+| `real_27b_finds_a_needle_at_500k_with_yarn_extension`, `_at_1m_` | found | needs the whole card |
 
-27B FP8 on GPU 1, `coldstart.sh`, both caches cold: NVRTC with `compile_jobs = 1` 11.6 to 12.3 s (load 16.3 to 17.1 s) against 5.0 s with `compile_jobs = 8` (load 8.0 to 9.4 s). The CUBIN compile includes the SASS generation that `load_module` did before, so `jit_load_module` is 0.00 s in every state and the PTX-cold and driver-cold states cost 0.25 s and nothing. Split compile cuts the cold compile by 58%, so it stays on.
+Greedy against the served vLLM cannot reach 90 percent token agreement: vLLM disagrees with itself at that level (MTP and batch dependent kernels), and every specrt divergence is at a near tie in vLLM's own distribution, so the gate is teacher forced.
 
-Pre-build kernels without loading weights, for a Docker build or a first start:
+## Tests and references
 
-```bash
-inference-bench warmup --spec qwen3.8-27b-nvfp4 --max-ctx 32768 --slots 8
-```
-
-The image has no GPU at build time, so mount the cache dir (`[runtime] cache_dir`) as a volume and run `warmup` once on the target host (recipe in docs/server.md, Packaging).
-
-#### Warmup proves a real start loads from cache (#1013)
-
-27B NVFP4 (`tests/fixtures/qwen3.8-27b-nvfp4.toml`), GPU 1, empty `[runtime] cache_dir`, empty `CUDA_CACHE_PATH`, `--max-ctx 8192 --slots 8`. `warmup` then `inference-bench serve --max-model-len 8192 --max-num-seqs 8 --kv-cache-gb 2` and `POST /load`:
-
-| Step | jit_cache_hit | jit_compile_secs | jit_module_secs | load_secs |
-| --- | --- | --- | --- | --- |
-| `warmup` | false (compiled) | 6.95 | 0.00 | n/a |
-| server load after `warmup` | true | 0.001 | 0.003 | 5.84 |
-| server load, no `warmup` (same empty caches) | false | 6.39 | 0.001 | 10.50 |
-
-The first run of this test missed: `warmup` read the spec TOML as is, the server completes it from the checkpoint config (`engine::complete_spec`), so the module differed. `warmup` now uses `runtime::warmup_spec` (complete, then rope extension). Tests: `jit.rs` `warmup_resolves_the_spec_the_server_loads` and `draft_tokens_do_not_change_the_module`. `max_ctx`, `slots` and `kv_planes` (one plane unless the model needs two, same as `Layout::serving`) already matched, and `--chunk` is not part of the key.
-
-#### NVFP4 27B cold start rows (#1013)
-
-`coldstart.sh` on `tests/fixtures/qwen3.8-27b-nvfp4.toml`, GPU 1, same card state, `bench --cold --kv-gb 2`, prompt 128. Before is master before the #398 merge (`8ac5740^1`), after is this branch.
-
-| State | before load | before jit_compile | before jit_load_module | after load | after jit_compile | after jit_load_module |
-| --- | --- | --- | --- | --- | --- | --- |
-| both caches warm | 3.97 s | 0.00 s | 0.02 s | 3.58 s | 0.00 s | 0.00 s |
-| specrt cache cold | 4.18 s | 0.31 s | 0.01 s | 4.44 s | 0.35 s | 0.00 s |
-| driver cache cold | 9.62 s | 0.00 s | 6.54 s | 3.87 s | 0.00 s | 0.00 s |
-| both cold | 18.98 s | 8.74 s | 6.63 s | 8.41 s | 5.29 s | 0.00 s |
-
-A first run of the cold start (prime, both cold, 19.12 s before and 9.58 s after) agrees. NVRTC fell from 8.5 to 8.7 s to 5.3 to 6.2 s with split compile, and the 6.6 s driver SASS step is gone, so a full cold start is 2.3x faster and a driver cache wipe costs nothing.
+References: `crates/specrt/scripts/reference.py real-full | real-prompts | real-slice | real-mtp | nvfp4-dequant`, `vllm_logprobs.py`, `vllm_mtp_dump.py`, `vllm_vision.py`, kept in `~/.cache/specrt-ref-375`. Run one test at a time on GPU1 ([../guides/testing.md](../guides/testing.md), tier 5). The tiny stand in with every 27B code path is `tests/fixtures/tiny-qwen3.5-27b` ([../guides/test-fixtures.md](../guides/test-fixtures.md)). Scripts: `crates/specrt/scripts/specrt_baseline.sh`, `kvgate27b.sh`, `spec27b.sh`, `bench27b-nvfp4.sh`, `serve27b.sh`, `coldstart.sh`, `vllm27b_serve.sh` (a vLLM on port 8011 with the service's flags, for references).
