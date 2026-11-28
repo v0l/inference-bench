@@ -1,471 +1,71 @@
-# Speech in the engine: Whisper and text to speech (#1474)
+# Speech: transcription, text to speech and duplex
 
-Analysis and slice plan. CPU only, no engine code. Read on 26 Nov from:
+Three audio paths, all spec data over graph TOML and kir kernels, with no Rust naming a model: Whisper transcription, Phonon text to speech, and Haru full duplex speech (model facts in [../models/haru-4b.md](../models/haru-4b.md)). The codec and flow head machinery is shared with [diffusion.md](diffusion.md).
 
-- transformers 5.23 `models/whisper/` (`modeling_whisper.py`, `feature_extraction_whisper.py`, `generation_whisper.py`) and `generation/logits_process.py`, run on the CPU;
-- `openai/whisper-tiny.en` (config, generation config, safetensors header), `openai/whisper-base` and `openai/whisper-large-v3-turbo` (config and generation config);
-- agentbench `crates/agent-voice` (`speech/whisper.rs`, `transcriber.rs`, `voicer.rs`, `speaker.rs`, `phonon/*`, `speak/*`), `crates/server/src/{api.rs,speech.rs,voice.rs}`, `crates/app/src/voice/{native.rs,reader.rs}`, `crates/app/src/client.rs`, the workspace `Cargo.toml`, `.github/workflows/release.yml`, `packaging/android/build.sh`;
-- `gradium/phonon-31m-en` at the revision agentbench pins (`8c64b55e`, the checkpoint in `~/.local/share/agentbench/models/phonon`) and the hub revision `92741c5b` that carries the transformers config, plus a voice file;
-- model cards and configs of Kokoro-82M, Orpheus 3B, Pocket TTS, VibeVoice-Realtime-0.5B (config and the safetensors header by HTTP range, no weights) and SNAC 24 kHz.
+## Whisper
 
-Fixture and test: `crates/specrt/tests/fixtures/speech/` and `crates/specrt/tests/speech.rs` (section 6).
+`specs/family-whisper.toml` and `graphs/speech.toml`; `Spec::from_hf_config_speech` loads it and `[[refuse]] part = "text"` keeps it out of text chat.
 
-## 1. What runs today
+- Front end (`[[front]]`): `kir::mel::LogMel` built from `preprocessor_config.json` (window, DFT table, slaney mel bank), the DFT and bank as constant line conv GEMMs, `kir::cuda::emit_mel` for framing, power, log, the global max clamp and the scale. Conv stem (`[[stem]]`) over `kir::conv` with GELU fused in the epilogue.
+- Encoder (`[[encoder]]`, `kind = "encoder-graph"`): a denoiser IR graph with `layer_norm`, linears with bias (`unbiased = ["self_attn.k_proj"]`), bidirectional attention and the position `table_add`.
+- Decoder: `graphs/decoder.toml` with `[norm] kind = "layer_norm"`, `[attention] k_bias = false`, `[mlp] bias = true`, `[embedding] positions`, `[rope] nope_all` and the tied head; the `cross_attention` block runs self attention, cross attention over the per sequence `[[state]] cross_kv` (written once per window by `Plan::window`), then the MLP. `[remap]` and `[tensors]` map config and checkpoint names.
+- Decoding (`speech::decode::Rules`, `[speech.decode]`): forced prefix, suppress and begin suppress, language detection (one step on SOT), timestamps (pairs, monotonic, `max_initial_timestamp_index`, the summed timestamp rule), no speech, compression ratio (zlib, byte equal to Python), average log probability and temperature fallback, with OpenAI's thresholds and temperatures as defaults; ids and lists come from `generation_config.json`. Row plans run on the GPU through the duplex `duplex_edit_logits` and `duplex_allow` kernels. Long audio (`speech::transcribe`) seeks by the last timestamp pair and conditions on previous text below `condition_below`.
+- Engines: `speech::gpu::GpuEngine` (every kernel from kir; both attentions are `vis_flash_kv_rows`) and the host engine (`speech::host`, `speech::decoder::HostDecoder`) walk the same lowered plans. Weights are f32 (F16 checkpoints read exactly).
 
-agentbench `agent-voice` (feature `speech`, 6,460 lines under `src/speech`, through candle 0.11 with the `v0l/candle` fork at `a3ebb4c8` patched in the workspace manifest so CUDA loads at run time):
+## Phonon text to speech
 
-| Part | Files | Model | What it does |
-|---|---|---|---|
-| Speech to text | `whisper.rs` 212, `transcriber.rs` 79, `melfilters*.bytes` | 13 Whisper checkpoints (`voice/models.rs`), default `whisper-base.en` | `candle_transformers::models::whisper`; 30 s windows cut back to back with no overlap, zero padded; prefix SOT, `<\|en\|>` on multilingual models, transcribe, no timestamps; greedy, `suppress_tokens` only (no begin suppress), stops at EOT or `max_target_positions / 2`; no language detection, no fallback, no timestamps |
-| Text to speech, current | `phonon/*` 3,700, `voicer.rs` 105 | `gradium/phonon-31m-en`, 102 voices in `gradium/phonon-voices` (`Harper`, default `Hadley`) | flow LM plus Mimi decoder, frame by frame, sentence chunks; seed 4242424242424242, temperature 0.3 |
-| Text to speech, older | `speak/*` 1,880, `speaker.rs` 89 | `hexgrad/Kokoro-82M` | still compiled; only the `say` example and `Speaker` use it, the server speaks with Phonon |
+`specs/family-gradium_phonon_tts.toml`, `graphs/lsd.toml` and the `mimi-decoder` codec in `graphs/codec.toml`; `Spec::from_hf_config_tts`.
 
-The server routes are `POST /v1/audio/transcriptions`, `POST /v1/audio/speech`, `GET /v1/audio/voices`, `GET /v1/audio/models`, `GET /v1/audio/status` (section 4).
+- Flow LM: `graphs/decoder.toml` with LayerNorm, `fused_qkv`, `[rope] interleaved`, a mapped GELU MLP and a named one row EOS head (`[embedding] head`). Inputs are `[[inputs.node]]` `group_map` descriptions: `stream_replace` puts `input_linear(previous latent) + conditions` at the latent placeholder (the learnt BOS latent first), `stream_replace_unbiased` puts `speaker_proj(voice frame)` at each voice placeholder. Default conditions are folded at load from `[tts.condition]`.
+- LSD flow head (`graphs/lsd.toml`, bound by `[head]`): timestep embedders from the stored `freqs` table, RMS norm with `alpha`, LayerNorm modulate res blocks with a gated residual (folded into fc2 by the fusion pass), the step `z + h_step * u` as an expression, so `lsd_decode_steps` sets the step count; outputs the normalised latent and the codec input.
+- Mimi decoder: the output projection as a k1 conv, a depthwise `conv_up` (lowered to a 2 tap form per channel), two 200 Hz transformer layers with an `attention` node over a ring KV of `transformer_context` steps per session, then SEANet with ELU as a conv input prologue (`kir::expr` `elu`). 1920 samples a frame; streaming is per session and batched like the Haru codec.
+- Sampling and text (`[tts.params]`, `[tts.tokens]`): EOS threshold from the config, frames after EOS (1, or 3 for short chunks), temperature 0.3, 50 tokens a chunk, frame budget `ceil((tokens / 3 + 2) * frame_rate)`; `speech::tts::text` normalises numbers, currency, dates, times and URLs and `speech::tts::plan` splits sentences. Frame noise is `flow_head::frame_noise` (seeded), so audio is statistically, not sample, equal to other implementations.
+- Voices: `[tts.voices]` names the catalogue repo, file and default (`gradium/phonon-voices`, `voices.jsonl`, `Hadley`); `speech::tts::voices::Catalogue` looks in the model folder, then the hub cache, then fetches. A voice is prefilled once per speaker and its KV kept.
+- `speech::tts::service::Speaker` runs the flow LM on the host decoder and the LSD head and Mimi through kir kernels on the GPU (or all on the host), handing each frame to the caller as it is made.
 
-inference-bench: no speech to text, no text to speech. `crates/core/src/library.rs` `is_text_generation` lists `Whisper`, `TTS`, `Speech`, `ASR` as non text; `Spec::from_hf_config` refuses `model_type whisper` ("model_type whisper is not supported", checked by `speech.rs`).
+## Routes
 
-## 2. Whisper
+In `api_routes()` (`crates/server/src/audio.rs`) behind the same auth, `x-request-id`, access log and `inference_requests_total` as chat. They accept agentbench's clients unchanged.
 
-### 2.1 The model
-
-`WhisperForConditionalGeneration` is an encoder and a decoder, all f32 in the releases, `proj_out` tied to `model.decoder.embed_tokens` (absent from the checkpoint).
-
-```
-mel [80 or 128, 3000]
-conv1 k3 p1 + bias, gelu (erf)             [d, 3000]
-conv2 k3 s2 p1 + bias, gelu                [d, 1500]
-+ embed_positions [1500, d] (sinusoids at init, stored as a learned table)
-N x { x += out(attn(ln1(x)))  x += fc2(gelu(fc1(ln2(x)))) }   bidirectional, LayerNorm with bias
-layer_norm                                  encoder states [1500, d]
-
-tokens -> embed_tokens + embed_positions[448]  (learned)
-M x { x += self_attn(ln1(x)) causal with KV cache
-      x += cross_attn(ln2(x), encoder states)
-      x += fc2(gelu(fc1(ln3(x)))) }
-layer_norm, logits = x @ embed_tokens.T
-```
-
-Attention: q, v and out projections have a bias, k does not; scale `head_dim ** -0.5`; no rope anywhere. Sizes:
-
-| | d | enc / dec layers | heads | mel bins | vocab |
-|---|---|---|---|---|---|
-| tiny.en | 384 | 4 / 4 | 6 | 80 | 51,864 |
-| base | 512 | 6 / 6 | 8 | 80 | 51,865 |
-| large-v3-turbo | 1280 | 32 / 4 | 20 | 128 | 51,866 |
-
-The turbo model is 32 encoder layers and 4 decoder layers: the encoder is most of the work.
-
-### 2.2 Front end
-
-`WhisperFeatureExtractor`: pad or cut to 30 s at 16 kHz (480,000 samples), `torch.stft(n_fft 400, hop 160, hann periodic, center reflect)`, drop the last frame (3000 frames), power `|X|^2`, slaney mel bank 201 x n (0 to 8 kHz, slaney norm), `log10(max(m, 1e-10))`, `max(v, global max - 8)`, `(v + 4) / 4`. The clamp is over the whole window, so the front end is a reduction over all frames, not a per frame map.
-
-### 2.3 Token logic (`generation_whisper.py`)
-
-- Prefix: `<|startoftranscript|>`, language (multilingual only), task (`transcribe` or `translate`), `<|notimestamps|>` unless timestamps are asked for. English only models have no language or task tokens in the prefix (`forced_decoder_ids [[1, 50362]]`).
-- Language detection: one decoder step on SOT alone, argmax over the 99 language token logits.
-- `suppress_tokens` every step, `begin_suppress_tokens` (space and EOT) on the first sampled step.
-- Timestamps (`WhisperTimeStampLogitsProcessor`): timestamp tokens come in pairs, the first is at most `max_initial_timestamp_index` (50, 1 s), timestamps never go back, and if the summed probability of all timestamps beats the best text token, a timestamp is forced.
-- No speech: `WhisperNoSpeechDetection` keeps the probability of `<|nospeech|>` at the SOT position; a window is skipped when it is above `no_speech_threshold` (OpenAI 0.6) and the average log probability is under `logprob_threshold`.
-- Temperature fallback: given a list of temperatures (OpenAI's defaults, which transformers leaves to the caller: 0.0, 0.2, ... 1.0), a window is redone at the next temperature when its compression ratio (token ids as little endian bytes, raw length over `zlib.compress` length) is above `compression_ratio_threshold` (OpenAI 2.4) or its average log probability is under `logprob_threshold` (OpenAI -1.0).
-- Long audio: seek through the audio by 30 s windows; with timestamps, the next window starts at the last complete timestamp; with `condition_on_prev_tokens`, the previous window's text goes in after `<|startofprev|>`.
-
-### 2.4 Gap list against specrt
-
-Printed by `cargo test -p inference-bench-specrt --test speech -- --nocapture the_engine_refuses`; each "exists" line is checked against the engine source, so a rename breaks the test instead of the list going stale.
-
-| Piece | In specrt | Kind | Slice |
-|---|---|---|---|
-| Log-mel front end (STFT, mel bank, log10, global clamp, scale, 30 s pad) | landed (#1477): `kir::mel::LogMel` (window, the DFT table and slaney bank built from `preprocessor_config.json`), `graphs/speech.toml` `[[front]]`, the DFT and the bank as constant line conv GEMMs, `kir::cuda::emit_mel` for framing, power, log, the global max and the scale; host `speech::host`, CUDA `speech::cuda` | op | a |
-| Conv stem, k3 p1 and k3 s2 p1 with GELU | landed (#1477): `graphs/speech.toml` `[[stem]]` nodes over `kir::conv` with `ConvShape::padded` (causal convs keep `PAD -1`), GELU fused into the conv epilogue by the fusion engine | graph entry | a |
-| Exact GELU | `kir::expr` macro `gelu` | exists | |
-| Learned position tables added to rows | landed (#1478): `table_add` in the `[[encoder]]` graph, `position_add` in the decoder graph from `[embedding] positions` | op | b |
-| LayerNorm with bias | landed (#1478): `layer_norm` nodes in the encoder graph, `[norm] kind = "layer_norm"` (with `eps`) for the decoder | op | b |
-| Linear with bias, k without | landed (#1478): `unbiased = ["self_attn.k_proj"]` on an encoder linear, `[attention] k_bias = false` and `[mlp] bias = true` for the decoder | op | b |
-| Bidirectional encoder attention | landed (#1478): `graphs/speech.toml` `[[encoder]]`, a denoiser IR graph (`pack` with no norms, `attention`) | op | b |
-| **Cross attention** | landed (#1478): decoder graph ops `cross_attention` (prefill, `vis_flash_kv` family) and `cross_attention_rows` (decode, one row per sequence: `vis_flash_kv_rows`, emitted beside `vis_flash_kv` in the joint vision module) | op | b |
-| Cross K and V once per window, kept per sequence | landed (#1478): the decoder graph's `[[window]]` section runs `cross_kv` once per window; the family's `[cross]` names the per sequence `[[state]] cross_kv` (`2 x cross_rows x hidden` f32 per layer, tiny 51 KB) that every decode step reads | state | b |
-| Decoder self attention with a KV cache, no rope | paged KV and `nope_all` (Nemotron-H) | exists | b |
-| Tied head | `tie_word_embeddings` | exists | |
-| Suppress, begin suppress, forced prefix | landed (#1479): `speech::decode::Rules::row` gives duplex `RowPlan { edits, allow }` rows, run on GPU1 by the duplex `duplex_edit_logits` and `duplex_allow` kernels (`speech::cuda::CudaRowPlans`) bit identical to the host; lists and ids read from `generation_config.json` through `[speech.decode]` | done | c |
-| Language detection | landed (#1479): `Rules::detect`, one decoder step on SOT through the language allow row | done | c |
-| Timestamps, no speech, temperature fallback, compression ratio, average log probability | landed (#1479): `Rules::row` (pairs, monotonic, `max_initial_timestamp_index`), `Rules::timestamp_rule` (summed timestamp probability), `no_speech_prob`, `compression_ratio` (zlib through `flate2` on the system zlib, byte equal to Python's `zlib.compress`), `avg_logprob`, `decide`; defaults in `[speech.decode]` | done | c |
-| Long audio seek and previous text prompt | landed (#1479): `speech::transcribe::HostTranscriber::transcribe_mel` (windows of `mel.frames`, seek by the last timestamp pair, `<\|startofprev\|>` plus the last `max_target_positions / 2 - 1` tokens, conditioning dropped above `condition_below`) | done | c |
-
-So two new ops (the mel front end, the decoder cross attention), one new state kind (cross KV), a new graph file and family for the encoder and decoder, and host decoding rules. Everything else is an op the denoiser IR already runs on CUDA (`denoiser_cuda.rs`) and on the host (`denoiser_host.rs`).
-
-Where it lives. The encoder is a whole window at once with no state, which is the denoiser IR's shape (`DenoiserGraph`, `[[block.node]]` lists of `linear`, `layer_norm`, `attention`, `table_add`, `map`). The decoder is a token loop with a KV cache and needs the scheduler. The plan: `graphs/speech.toml` with an `encoder` graph in the denoiser node vocabulary plus the two new nodes (`log_mel`, `conv`), and a `family-whisper.toml` whose decoder uses `graphs/decoder.toml` with a `layer_norm` norm kind, biases, learned positions and the new `cross_attention` node. No Rust names the architecture (`no_arch_names` stays green); `model_type = "whisper"` appears only in the TOML.
-
-What slice b built (#1478):
-
-- Encoder: `graphs/speech.toml` `[[encoder]]` (`kind = "encoder-graph"`, `classes = ["whisper"]`), run by the host denoiser (`speech::host::HostEncoder`, `HostDenoiser::run` with named inputs and output). `encoder.out` within 9.9e-7 relative.
-- Decoder: `specs/family-whisper.toml` maps the config onto the decoder names with `[remap]`, the checkpoint onto them with `[tensors]`, and declares `[norm] kind = "layer_norm"`, `[attention] k_bias = false`, `[mlp] bias = true` with the mapped GELU, `[embedding] positions`, `[rope] nope_all` and the tied head. `[[refuse]] part = "text"` keeps Whisper out of text chat; `Spec::from_hf_config_speech` loads it. The decoder graph block `cross_attention` (when `cross`) runs self attention, then `cross_attn_layernorm`, `cross_q`, cross attention and `cross_o`, then the dense MLP.
-- Cross state: `[cross] source, rows, state`; the `[[state]] cross_kv` is per sequence; `Plan::window` holds the ops run once per audio window (`cross_kv`), so no decode step recomputes cross K and V.
-- Host runner: `speech::decoder::HostDecoder` walks the lowered prefill and decode plans with per sequence self KV and `cross_kv`. Tiny fixture: `prefix.logits` 1.4e-6 and `greedy.logits` 1.5e-6 relative in f32 (bf16 weights 5.3e-3 and 9.5e-3), the 12 greedy tokens identical, two sequences batched bit identical to each alone.
-- CUDA: `vis_flash_kv_rows` (one block per head and sequence, keys and values read straight from each sequence's `cross_kv`), `speech::cuda::CudaCrossRows`; on GPU1 within 2.1e-7 of the host for two sequences, a batched sequence bit identical to it alone. The token runtime (`Runtime::load`) refuses a spec with `[cross]` by name; running the whole Whisper decoder on CUDA through the scheduler is slice c onwards.
-
-### 2.5 Accuracy bar
-
-- Tiny fixture, CPU and GPU1: mel within 1e-4 absolute of `reference/mel.*` (the test's f64 reference DFT gets 8.3e-6), encoder states within 1e-4 relative of `encoder.out`, prefix and greedy logits within 1e-3 relative (bf16 weights: 2e-2) of `prefix.logits` and `greedy.logits`, the 12 greedy tokens and the detected language identical.
-- Real models: word error rate against transformers `generate` (same model, f32, greedy, no timestamps) on a fixed clip set: LibriSpeech test-clean, the first 200 utterances (about 25 minutes, CC BY 4.0), plus 5 long clips over 30 s from the same set joined, normalised with `EnglishTextNormalizer` from the transformers whisper folder. Gate: WER within 0.3 points absolute of transformers on `whisper-base.en` and `whisper-large-v3-turbo`, and at least 98% of utterances with an identical transcript. The same clips through agentbench's candle path give the parity line for slice h. Met (#1480, section 2.7): gap 0.00 and 205/205 identical on both models.
-
-### 2.6 Decoding rules (#1479)
-
-`specs/family-whisper.toml` `[speech.decode]` holds what is not in the checkpoint: `time_precision` 0.02, `top_k` 50 (transformers' sampling default), `condition_below` 0.5, OpenAI's temperatures and thresholds as defaults, the names of the `generation_config.json` keys (`suppress_tokens`, `begin_suppress_tokens`, `lang_to_id`, `task_to_id`, `forced_decoder_ids`, `is_multilingual`) and `[speech.decode.params]` for the token ids (`no_speech = no_timestamps_token_id - 1`, `timestamp_begin = no_timestamps_token_id + 1`, `prev_cutoff = floor(max_target_positions / 2) - 1`). `speech::decode::Rules` merges config and generation config; `Options::from_rules` gives the family defaults, a request overrides them.
-
-Order of a step, as transformers applies its processors: the row plan (suppress, begin suppress, timestamp masks) as logit edits plus an allow range, then the summed timestamp probability rule, then temperature and top k. Greedy picks the argmax; sampling draws from `sampler::uniform` (seeded splitmix), so sampled tokens are not torch's, and the fallback test feeds the sampled tokens transformers drew and checks that our rules allow each one.
-
-Tiny fixture, CPU, f32 host decoder: greedy `generate` (12 tokens), the timestamp run with language detection (2 windows, 122 tokens, segments and times), the 1.5 s two window clip with previous text (seek 78, the second prompt starts with `<|startofprev|>`), and the fallback run (temperatures 0, 0.4, 0.8: a window redone and kept at 0.4, a window skipped as silence) are token identical to transformers, every compression ratio equal, average log probability within 2e-3 when we decode (1e-5 on the recorded scores), and every fallback and skip decision identical.
-
-### 2.7 Real models (#1480)
-
-The engine runs Whisper on GPU1 through `speech::gpu::GpuEngine`, with every kernel from kir: the log-mel front end and conv stem (`emit_mel`, `emit_line`), each linear of the encoder graph and the decoder plan as a `line_conv` GEMM with the bias, residual or GELU in its epilogue, LayerNorm as the `layernorm_segment` rows family, the position add as `Kernel::add`, and both attentions (encoder self attention, decoder self attention over its KV, cross attention over `cross_kv`) as `vis_flash_kv_rows`. Weights are f32 (`Checkpoint` now reads F16 exactly, so the turbo checkpoint loads as stored). The GPU engine walks the same lowered plans as the host decoder (`HostDecoder::decode`, the encoder graph plan), and `speech::transcribe::Transcriber` drives the host and GPU engines with the same decoding rules. On the tiny fixture it gives `encoder.out` within 9.6e-7, `prefix.logits` 7.5e-7 and `greedy.logits` 7.8e-7 relative, and the greedy, timestamp, long and fallback runs token for token (`the_gpu_transcriber_matches_transformers_and_the_host_on_every_tiny_run`).
-
-Clip set (`crates/specrt/tests/fixtures/speech/librispeech-clips.json`, made by `whisper_wer.py clips`): LibriSpeech test-clean (CC BY 4.0), the first 200 utterances in speaker, chapter, utterance order, plus 5 long clips of consecutive utterances of one chapter after the first 200, joined with 0.5 s of silence until past 30 s (30.6 to 36.2 s). 1357.3 s of audio in all. Each clip is transcribed greedy with no timestamps; a clip over 30 s is decoded long form (timestamps on, no previous text conditioning, temperature 0) by both transformers and the engine, since transformers refuses long form without timestamps. Language `en` and task `transcribe` on the multilingual turbo. Words scored after `EnglishTextNormalizer` with the model's `normalizer.json`, against the LibriSpeech transcripts; "identical" compares the decoded text before normalising.
-
-| model | run | WER all % | WER 200 short % | WER 5 long % | gap to transformers | identical transcripts | time for 1357 s |
-|---|---|---|---|---|---|---|---|
-| whisper-base.en | transformers 5.23, CPU f32 | 6.08 | 6.39 | 3.61 | | | 77 s (16 threads) |
-| whisper-base.en | engine, GPU1 f32 | 6.08 | 6.39 | 3.61 | +0.00 | 205/205 (100%) | 17.7 s |
-| whisper-base.en | agentbench candle `hear`, GPU1 | 14.39 | 8.48 | 61.45 | +8.31 | 120/205 (58.5%) | 105 s |
-| whisper-large-v3-turbo | transformers 5.23, CPU f32 | 2.26 | 2.39 | 1.20 | | | 519 s (16 threads) |
-| whisper-large-v3-turbo | engine, GPU1 f32 | 2.26 | 2.39 | 1.20 | +0.00 | 205/205 (100%) | 170 s |
-| whisper-large-v3-turbo | agentbench candle `hear`, GPU1 | 2.39 | 2.54 | 1.20 | +0.13 | 128/205 (62.4%) | 155 s |
-
-The gate of 2.5 holds on both models: engine word error rate equal to transformers (gap 0.00, bar 0.3) and every transcript identical (bar 98%). Engine times are decode only, the model loaded once (base.en 0.3 GB, turbo 3.5 GB of f32 weights); the engine decodes one token per launch chain at batch 1, f32, so the turbo is slower than its size suggests. Candle times include a model load per clip (`hear` loads once per WAV).
-
-Parity line for slice h, from the candle rows: on short clips candle is 0.15 (turbo) to 2.09 (base.en) points behind transformers (its decoding differs: `suppress_tokens` only, no begin suppress, its own mel), and on the long clips base.en candle loses most of the text (61.45%): it cuts 30 s windows back to back with no seek by timestamp, and three of the five base.en long transcripts keep 4 to 22 of 79 to 96 words. Moving agentbench to the engine is a gain on both models.
-
-Rerun (CPU references under `MemoryMax=16G`, engine and candle on GPU1):
-
-```
-D=/mnt/data/tmp/speech-1480; S=crates/specrt/scripts/whisper_wer.py; PY=~/.venv-vllm/bin/python
-curl -sSL https://www.openslr.org/resources/12/test-clean.tar.gz | tar xz -C $D
-$PY $S clips $D/LibriSpeech/test-clean $D/clips
-M=$(ls -d ~/.cache/huggingface/hub/models--openai--whisper-base.en/snapshots/*)
-systemd-run --user --wait --collect -P -q -p MemoryMax=16G -p MemorySwapMax=0 -E CUDA_VISIBLE_DEVICES= -E HF_HUB_OFFLINE=1 --working-directory=$PWD $PY $S reference $M $D/clips/manifest.jsonl $D/ref.jsonl --threads 16
-cargo build --release -p inference-bench-specrt --bin whisper
-~/.agents/bin/gpu-run 1 --min-free 8000 -- systemd-run --user --wait --collect -P -q -p MemoryMax=16G -p MemorySwapMax=0 -E CUDA_VISIBLE_DEVICES=1 -E CUDA_DEVICE_ORDER=PCI_BUS_ID $CARGO_TARGET_DIR/release/whisper $M $D/clips/manifest.jsonl $D/engine.jsonl
-(cd ~/git/agentbench && cargo build --release -p agent-voice --features speech-cuda --example hear)
-$PY $S candle <target>/release/examples/hear ~/.local/share/agentbench/models whisper-base.en $D/clips/manifest.jsonl $D/candle.jsonl --prefix "$HOME/.agents/bin/gpu-run 1 --min-free 8000 --"
-$PY $S score $M $D/clips/manifest.jsonl $D/ref.jsonl engine=$D/engine.jsonl candle=$D/candle.jsonl
-```
-
-## 3. Text to speech
-
-### 3.1 Phonon, what agentbench runs
-
-`gradium/phonon-31m-en`, Apache 2.0, 41,096,035 parameters (31M without the codec), English, 24 kHz mono, 12.5 frames a second. Builds on Kyutai's Pocket TTS and Mimi. The card's English (US) table (Elo from 468 raters, 8,290 votes): phonon-31m-en 2098 Elo, 1.5% hard set LLM WER, 0.51% Seed-TTS LLM WER; Kokoro 2043, 3.5%, 0.45%; NeuTTS 2034, 8.7%, 0.62%. transformers 5.23 ships it as `gradium_phonon_tts` (a `pocket_tts` subclass), so a CPU reference exists for the language model; the codec is `transformers.models.mimi`.
-
-| Part | Tensors | Parameters | dtype |
-|---|---|---|---|
-| Flow LM backbone, 6 layers, d 512, 8 heads of 64, MLP 2048 GELU, LayerNorm with bias, packed `in_proj` qkv, rope pairs, no biases | `flow_lm.transformer.*` | 18,886,656 | bf16 |
-| Text conditioner (4001 x 512 table) and the fixed condition vectors | `flow_lm.condition_provider.*` | 2,386,944 | bf16 |
-| LSD flow head: `input_proj`, `cond_embed`, two timestep embedders (sinusoid 256, MLP, RMS var norm, `alpha`), 6 adaLN res blocks (LayerNorm, SiLU MLP, gated residual), final adaLN layer | `flow_lm.flow_net.*` | 9,496,864 | bf16 |
-| EOS head, out norm, input linear, latent mean and std, BOS | | 18,017 | bf16 |
-| Mimi decoder transformer, 2 layers, d 512, layer scale, sliding context 250 | `mimi.decoder_transformer.*` | 6,297,600 | f32 |
-| Mimi SEANet decoder: conv k7, 3 x (ELU, transposed conv ratio 6, 5, 4, one residual block with k3 and k1 convs), ELU, conv k3 | `mimi.decoder.*` | 3,974,945 | f32 |
-| Mimi 12.5 Hz to 200 Hz depthwise transposed conv (kernel 32, stride 16, groups 512, no bias), quantizer output projection 32 to 512 | `mimi.upsample.*`, `mimi.quantizer.output_proj` | 32,768 | f32 |
-
-There are no RVQ codebooks in use: the flow LM emits a continuous 32 wide latent per frame that goes straight to `quantizer.output_proj`. A voice is a `speaker_wavs` tensor `[1, 512, 125]` (10 s of the speaker Mimi encoder's output, a different 8 layer Mimi listed under `speaker_mimi` in the config) passed through `speaker_proj` and prefilled ahead of the text.
-
-One frame: input linear of the previous latent (BOS first) plus the summed default conditions, one backbone position, out norm, EOS logit (`> eos_threshold 4.0` starts the end count), one flow head step from noise `N(0, temperature)` (`lsd_decode_steps = 1`), denormalise, Mimi decode to 1920 samples. Text is normalised, split into chunks of at most `MAX_TOKENS_PER_CHUNK` sentencepiece tokens, and each chunk is a fresh state primed with the voice.
-
-### 3.2 Gap list against specrt
-
-| Piece | In specrt (Haru) | Kind | Slice |
-|---|---|---|---|
-| Causal convs k7, k3 and k1 with constant pad and a streaming tail | `graphs/codec.toml` `conv` (causal, stride, depthwise), `kir::conv` line and rows families, double buffered tail per session | exists; **ELU** is a new `kir::expr` macro (`select(x > 0, x, exp(x) - 1)`), and a dilation attribute on `conv` (Phonon's `dilation_base 2` with one residual layer gives dilation 1, so not needed for this checkpoint) | e |
-| Transposed conv with an overlap tail (ratios 6, 5, 4, kernel 2s) | `conv_up` lowered to a 2 tap causal conv plus interleave | exists | e |
-| Depthwise transposed conv k32 s16, no bias | `conv_up` is dense only | **new**: a depthwise flag on `conv_up` (the lowering is the same 2 tap form per channel) | e |
-| Mimi decoder transformer (LayerNorm, layer scale, rope pairs, a 250 frame window, Mimi's interleaved qkv packing) | the codec stack has no attention | **new graph**: the codec macro graph gains an `attention` node over a ring KV of `transformer_context` frames per session, or the stack is split and the transformer runs as decoder graph layers | e |
-| Flow LM backbone: LayerNorm, packed qkv, rope pairs, dense GELU MLP, no bias | landed (#1483): `family-gradium_phonon_tts.toml` with `[norm] kind = "layer_norm"`, `fused_qkv`, `[rope] interleaved`, the mapped GELU MLP, a named one row EOS head (3.2.2) | spec | f |
-| LSD flow head | landed (#1483): `graphs/lsd.toml` with the new `rms_norm`, table `timestep`, LayerNorm modulate with weight and bias and the biased rows GEMV | graph | f |
-| EOS head and frames after EOS | landed (#1483): `[embedding] head`, `speech::tts::plan::Eos` from `[tts.params]` | rule | f |
-| Voice prefill (`speaker_proj` of 125 frames) | landed (#1483): `[[inputs.node]]` `stream_replace_unbiased` on the voice stream | input node | f |
-| Text normalisation, sentence chunking, sentencepiece | landed (#1483): `speech::tts::text` and `speech::tts::plan`, ported | host code | f |
-| Frame noise from a seed | `sampler::noise` (splitmix64 Box-Muller) | exists; numbers differ from `rand` `StdRng`, so audio is not bit identical to the candle path, only statistically | f |
-
-What is reusable from Haru: the causal conv and transposed conv lowering, the streaming tail state, the codec batching over sessions, the flow head machinery and its hoisting, the input node prefill, the frame loop shape of `specrt::duplex`. What differs: Mimi's 200 Hz inner transformer with a 250 step window, ELU instead of ConvNeXt blocks, LayerNorm everywhere, and the 12.5 Hz frame (80 ms) against Haru's 7.5 Hz (133 ms).
-
-### 3.2.1 The Mimi decoder, landed (#1482)
-
-`graphs/codec.toml` `[[codec]] mimi-decoder` (`model_types = ["gradium_phonon_tts"]`, `section = "mimi"`, no encoder) is the TTS codec as graph TOML over the codec ops, with no Rust naming it:
-
-- `quantizer.output_proj` as a k1 conv with `bias = "false"`, then `conv_up` with `groups = "dimension"` (depthwise, k 32, stride 16, no bias). A depthwise `conv_up` lowers to the same 2 tap form per channel (`host::lower_dw_up`, the `line_dwup` kernel) with the previous input column as its state.
-- Two transformer layers at 200 Hz: `layer_norm` nodes (weight and bias, the `line_layernorm` kernel), an `attention` node (`layout = "blocks"`, Mimi's in_proj as q, k and v blocks per position, `rope = "pairs"`, rope on dimensions 2i and 2i+1 as the checkpoint stores it), and the layer scales as `scale_add`. The attention node lowers to a qkv line GEMM, `line_rope`, `line_ring_attention`, `line_ring_store`, `line_advance` and the out GEMM with the layer scale residual in its epilogue. Its state per session is `[position, K ring, V ring]` of `transformer_context` steps (250: 256,001 values a layer), so a step attends to its last 250 keys, the ones still in this call first and the ring for the rest.
-- SEANet: conv k7, then per ratio (6, 5, 4) ELU and `conv_up`, one residual block (ELU, conv k3, ELU, conv k1, `add` into x), and ELU then the final conv k3. ELU is the `kir::expr` macro `elu` (`select(x > 0, x, exp(x) - 1)`), lowered into the conv input load as `Prologue::Act` (the line kernels' `line_act`), so it costs no launch; a prologue activation must map 0 to 0, since the zero pad and the stored tail skip it. The `add` folds into the k1 conv's residual epilogue. Phonon's `dilation_base 2` with one residual layer gives dilation 1; a `dilation` other than 1 is refused by name.
-
-The real Phonon config plans exactly the 44 `mimi.*` tensors of the checkpoint (10,305,313 parameters). A frame is 1920 samples; `inference-bench kernels --spec phonon-31m-en.hub-92741c5.config.json --plan --graph codec --tokens 4` prints 42 launches a frame at 4 sessions, 66.4 MB read (41.3 MB of f32 weights), 2.17 GFLOP, 517,506 state values per session. Streaming is per session and batched over sessions as for the Haru codec (`codec::cuda::Sessions`).
-
-Fixture: `tests/fixtures/speech/tiny-mimi/` (212 KB, `scripts/tiny_mimi.py`, CPU, seeded, regenerates byte identical): the checkpoint's own `mimi.*` names and tensor kinds at d 32, 2 heads, ratios 6, 5, 4, `transformer_context` 20, so the 96 steps of the 6 frame clip pass the ring. The reference is transformers 5.23 `PocketTTSAudioTokenizerModel.decode` (the `transformers.models.mimi` decoder with `latent_proj`), eager attention, with the q and k rows permuted from rope pairs to rotate half as transformers' own conversion does. Results: host 2.2e-6 relative, GPU1 2.9e-6 (1.4e-6 against the host), frame by frame equal to the whole clip (0.0 on both), two sessions batched equal to each alone (0.0). A ring 4 steps short gives 0.62 relative and dropping the ELUs 16, so both are seen by the 1e-4 bar.
-
-```
-cargo test -p inference-bench-specrt --test speech mimi
-B=$(cargo test -p inference-bench-specrt --test speech --no-run 2>&1 | grep -o '/[^ ]*speech-[0-9a-f]*')
-~/.agents/bin/gpu-run 1 --min-free 2000 -- $B --ignored mimi --test-threads=1
-```
-
-### 3.2.2 The flow LM, LSD head and sampling, landed (#1483)
-
-The Phonon model is spec data over the existing graphs, with no Rust naming it:
-
-- `specs/family-gradium_phonon_tts.toml`: the 6 layer flow LM on `graphs/decoder.toml` with `[norm] kind = "layer_norm"` (`layer_norm_eps` read as the norm eps), `[attention] fused_qkv` (the packed `in_proj` read as `self_attn.qkv_proj`), `[rope] interleaved` (pairs 2i and 2i+1, as the checkpoint stores q and k), the mapped GELU dense MLP with no bias, and `[tensors]` renaming the `flow_lm.*` checkpoint onto the decoder names. `[[refuse]] part = "text"` keeps it out of text chat; `Spec::from_hf_config_tts` loads it.
-- The EOS head is a named `[embedding] head` (`eos_head`, one row, with bias): `Weight::LmHead` reads it, so the decoder tail emits the one EOS logit instead of vocab logits, and the normed hidden state is the flow head's condition.
-- Inputs are two `[[inputs.node]]` kir `group_map` descriptions. `stream_replace` puts `input_linear(previous latent) + conditions` in place of the latent placeholder token (the learnt BOS latent at the BOS position), and `stream_replace_unbiased` puts `speaker_proj(voice frame)` in place of each voice placeholder, so a voice (`speaker_wavs` `[1, 512, 125]`, channels first) is prefilled ahead of the text. The summed default conditions (the `num_speakers` table row through its projection plus the sinusoid of `duration_delta`) are folded once at load from `[tts.condition]` into the `conditions` vector the node adds. `kir::group::GroupMap::eval` runs the same descriptions on the host.
-- `graphs/lsd.toml`, a flow head graph beside `meanflow.toml`, bound by `[head]`: the two timestep embedders read their stored `freqs` table (`timestep` with `table`, kernel `dit_timestep_table`), a biased MLP with SiLU, and the RMS norm with `alpha` (`rms_norm`, kernel `dit_rms_norm`; transformers' `TimestepNorm` is the plain mean square, the `rms` of the pinned config); the average of the two goes into `silu(cond + (s + t) / 2)`. Res blocks are `modulate` with `norm = "layer"` and the block's LayerNorm weight and bias (kernel `dit_layer_modulate_w`), a biased SiLU MLP and the gated residual; the final layer is the plain LayerNorm modulate (`dit_layer_modulate`). Every head linear has its bias in the rows GEMV epilogue (`acc + b`, and `old + g * (acc + b)` when the fusion pass folds the gated add into fc2). The scalars `s = step / num_steps`, `t = (step + 1) / num_steps` and the step `z + h_step * u` are expressions, so `lsd_decode_steps` from the config sets the step count. The head has two outputs: the normalised `latent` (fed back) and `codec = z * latent_std + latent_mean`, the codec's input; `latent_mean` and `latent_std` are vector constants (`[head.tensors]` renames `flow_lm.emb_mean` and `emb_std`).
-- Sampling: `[tts.params]` holds `eos_threshold` (from the config), frames after EOS (1, or 3 for a chunk of at most 4 words, the processor's numbers), `min_frames_before_eos`, temperature 0.3, 50 tokens a chunk and `frame_budget = "ceil((tokens / 3 + 2) * frame_rate)"` (`ceil` is a new `kir::expr` function). `speech::tts::plan::Eos` is the end rule of transformers' `PocketTTSEosThresholdCriteria`: the first logit above the threshold starts a countdown of the frames after EOS, and those frames are kept. `[tts.tokens]` names the prompt, BOS and latent placeholder ids from the config.
-- Host text code: `speech::tts::text` (normalisation and the rewrite rules for numbers, currency, dates, times, phones, emails, URLs, abbreviations) and `speech::tts::plan` (prepare, sentence chunks, budgets), ported from agentbench `phonon/text` and `plan.rs` with their 26 tests; the language comes from `[tts] language`. Text is tokenised with the checkpoint's `tokenizer.json`.
-- `speech::tts::HostTts` runs it all on the CPU: prompt (voice placeholders, text, BOS), prefill, then per frame the flow head on the last hidden state with the frame noise, the EOS rule, and one decode step on the new latent. The codec latents go to slice e's `codec::HostCodec`.
-
-Fixture: `tests/fixtures/speech/tiny-phonon/` (190 KB, `scripts/tiny_phonon.py`, CPU, seeded, regenerates byte identical): the checkpoint's own `flow_lm.*` names and tensor kinds in bf16 at d 32, 2 layers, 2 heads, a 2 block head of 48, latent 8, prompt width 16, a 75 piece Unigram tokenizer of the real format, a 5 frame f32 voice, and the `tiny-mimi` codec. The reference is transformers 5.23 `GradiumPhononTTSForConditionalGeneration.from_pretrained` on the folder (its own weight conversion, so the rope permutation and the renames are transformers'), eager attention, f32: the prefill hidden states, 10 frames of hidden state, EOS logit and latent with recorded noise, a two step head run, `generate` with the same noise (EOS crosses at frame 3, 6 frames kept), and the audio of those latents through the tiny Mimi decoder.
-
-| Check (tiny fixture, CPU f32) | Bar | Result |
-|---|---|---|
-| summed default conditions | | 3.2e-8 |
-| prefill hidden states over 17 positions (5 voice, 11 text, BOS) | 1e-3 | 1.0e-6 |
-| flow LM hidden state, 10 frames fed the reference latents | 1e-3 | 1.0e-6 |
-| EOS logits, same 10 frames | 1e-3 | 2.8e-7 |
-| flow head latent with the recorded noise, one step | 1e-4 | 5.1e-7 (8.8e-7 inside the frame loop) |
-| flow head latent, two steps | 1e-4 | 1.8e-7 |
-| free running: frames kept by the EOS rule | equal to `generate` | 6 of 6 |
-| free running codec latents | | 5.1e-6 |
-| end to end audio through the Mimi codec (11,520 samples) | 1e-3 | 3.8e-6 |
-| GPU1 LSD head against transformers and the host, fused and not (22 and 24 launches a frame) | 1e-4 | 7.0e-6 and 6.9e-6 |
-| GPU1 LSD head, two steps | 1e-4 | 2.1e-6 |
-
-Rotate half rope in place of pairs gives 1.3 relative on the prefill, and leaving the BOS position as its token embedding gives 0.85 at the last position, so both are seen by the bar (`neox_rope_or_a_dropped_bos_latent_misses_the_reference`); a shifted voice moves the prefill by more than 1e-2.
-
-The flow LM runs on the CPU host decoder only, and `Runtime::load` refuses a `[tts]` spec by name. The CUDA flow LM, the speech route and serving are slice g, and the real checkpoint and quality run are slice f2. The LSD head and both input kernels compile for sm_120 from the real config (`every_lsd_head_and_input_kernel_of_the_real_config_compiles_with_nvrtc`).
-
-```
-cargo test -p inference-bench-specrt --test speech phonon
-cargo test -p inference-bench-specrt --lib speech::tts
-B=$(cargo test -p inference-bench-specrt --test speech --no-run 2>&1 | grep -o '/[^ ]*speech-[0-9a-f]*')
-~/.agents/bin/gpu-run 1 --min-free 2000 -- $B --ignored lsd --test-threads=1
-```
-
-### 3.3 Alternatives, from the cards
-
-| Model | Licence | Size | Quality, from the card | Fit |
-|---|---|---|---|---|
-| `hexgrad/Kokoro-82M` | Apache 2.0 | 82M | "comparable quality to larger models"; Phonon's card puts it at 2043 Elo, 3.5% hard set WER against Phonon's 2098 and 1.5% | StyleTTS 2 plus ISTFTNet, a non autoregressive duration and pitch predictor, an LSTM text encoder, AdaIN 1D conv decoder, inverse STFT; needs G2P (agentbench `speak/g2p.rs`). None of it is in specrt (LSTM, AdaIN, iSTFT, alignment expansion); poor fit, and the quality is below Phonon |
-| `canopylabs/orpheus-3b-0.1-ft` | Apache 2.0 (HF metadata), Llama 3.2 3B base | 3.3B, "4B params" F32 in the metadata | "~200ms streaming latency"; no numbers | The LM is plain Llama, which specrt already runs; audio is SNAC 24 kHz (19.8M, 3 codebooks at 12, 23, 47 Hz, 7 tokens per frame, licence not stated on its card), a small conv decoder. Good engine fit, but 40 times Phonon's size for a voice reader, and the SNAC decoder is new work anyway |
-| `kyutai/pocket-tts` | not stated on the card, gated, with a prohibited use policy and per voice licences | 100M | "~200ms to get the first audio chunk", voice cloning from a wav | Phonon is built on it: same flow LM and Mimi. No gain over Phonon, and an unclear licence |
-| `microsoft/VibeVoice-Realtime-0.5B` | MIT, but "limited to research purposes" and "We do not recommend using VibeVoice in commercial or real-world applications" | 1.02B in the safetensors (Qwen2.5-0.5B, 4 plus 20 layers) | LibriSpeech test-clean WER 2.00, SEED test-en 2.05, "~300 ms" first audible; English only | Its acoustic decoder **is the Haru codec decoder** tensor for tensor (276 tensors, 343,695,969 parameters, same strides and stages, `speech.rs` maps one onto the other), and the LM is Qwen2, which specrt runs. The best engine fit of all. But: no acoustic encoder is shipped ("Removed acoustic tokenizer to avoid users creating embedding on their own"), voices are a fixed embedded set, an audible AI disclaimer and a watermark are added in their pipeline, the DDPM head needs 20 steps a frame, and the card says research only |
-
-### 3.4 Recommendation
-
-Port **Phonon** (slices e and f), in the engine, as spec data.
-
-- It is what agentbench speaks with today, so every voice the user picked (`Hadley`, `Harper` and the other 100) keeps working, and the parity gate in slice h compares like with like.
-- Its card scores best of the open models it lists (2098 Elo, 1.5% hard set WER), Apache 2.0, 41M parameters. By the shapes in 3.1, a second of speech is about 7 GFLOP (flow LM and head 0.7 at 12.5 Hz, Mimi transformer 2.5 at 200 Hz, SEANet 4.0): real time on any card and on a CPU.
-- Of the ten rows in 3.2, three exist outright in specrt from Haru and the diffusion work (causal codec convs with state, the transposed conv lowering, seeded noise) and three are close (the flow head IR, input node prefill, packed qkv and rope pairs); the new ones (LayerNorm kind, dense GELU MLP, ELU, depthwise `conv_up`, a windowed attention node in the codec graph, an EOS rule) are general ops the kir compiler rule wants anyway, not per model code.
-- VibeVoice-Realtime would reuse the most engine code (its codec is already running in specrt), but its card restricts it to research, it cannot clone a voice, and it adds an audible disclaimer to every clip: wrong for a desktop app's voice. Kokoro and Orpheus need more new engine work than Phonon for less (Kokoro) or are far larger than the job needs (Orpheus).
-
-### 3.5 Accuracy bar
-
-- Tiny fixture (slice e and f make it from `transformers.models.gradium_phonon_tts` and `transformers.models.mimi` on the CPU, random weights, the real tensor kinds): flow LM hidden states and EOS logits within 1e-3 relative, the flow head latent within 1e-4 for recorded noise, Mimi decode within 1e-4, frame by frame equal to whole clip within 1e-5, as the Haru codec tests do.
-- Real checkpoint: fed the reference's previous latent and noise each step (the `every_step_matches_ptts_when_fed_the_same_input` test in agentbench does this for candle against `ptts`), latents and audio within 1e-3 relative of the transformers reference for 50 frames.
-- Speech quality: a fixed sentence set (the 20 sentences of `fixtures/haru/say_sentences.txt`, which holds 20, not the 30 first planned, plus 20 from LibriSpeech test-clean transcripts) spoken in Harper and Hadley by the engine and by the candle path, each transcribed by `whisper-large-v3-turbo` through the engine: WER of the engine's audio within 0.5 points of the candle path's, and no sentence cut short (duration within 10% of the candle one). Met (#1484, section 3.6): gap 0.00, durations within 4.5% shorter to 6.3% longer.
-
-### 3.6 Real Phonon (#1484)
-
-Checkpoint: `gradium/phonon-31m-en` `model.safetensors` (sha256 `8a04cf83...`, the same blob at `8c64b55e` and `92741c5b`) and `tokenizer.json` from `~/.local/share/agentbench/models/phonon`, with the hub config of `92741c5b` (`tests/fixtures/speech/phonon-31m-en.hub-92741c5.config.json`; the pinned `8c64b55e` config is the original runtime format with no `model_type`, which neither transformers nor the family match reads). Voices from `gradium/phonon-voices`: Harper `4SZHfMpw-p46Ywgs`, Hadley `bXwrkHhURL1VFJdG`.
-
-Step match (`every_real_phonon_step_matches_transformers_when_fed_its_latent_and_noise`, GPU1): `scripts/phonon_reference.py` runs transformers 5.23 on the CPU in f32 (eager) for a 38 token sentence after the voice, 50 frames, each step fed the reference's previous latent and seeded noise at temperature 0.3, and decodes the codec latents with `PocketTTSAudioTokenizerModel`. The engine runs the flow LM on the host decoder, the LSD head and the Mimi decoder through kir kernels on GPU1 (head fused, codec frame by frame), each step fed the same latent and noise.
-
-| Check, 50 frames (bar 1e-3) | Harper | Hadley |
-|---|---|---|
-| summed conditions | 0.0 | 0.0 |
-| flow LM hidden state | 2.6e-6 | 2.5e-6 |
-| EOS logit | 5.2e-7 | 3.1e-7 |
-| latent, host head | 2.5e-5 | 6.5e-6 |
-| latent, GPU1 head | 2.2e-5 | 8.7e-6 |
-| codec latent, GPU1 head | 2.0e-5 | 7.7e-6 |
-| audio, host Mimi on the reference latents (96,000 samples) | 2.2e-6 | 3.3e-6 |
-| audio, GPU1 head and GPU1 Mimi frame by frame | 8.6e-5 | 1.4e-4 |
-
-Quality run: 40 sentences (the 20 of `say_sentences.txt` and 20 LibriSpeech test-clean transcripts of 8 to 30 words, evenly spaced over the 200 short clips of 2.7, sentence cased with a full stop) in Harper and Hadley, 80 clips a run. The engine (`src/bin/phonon.rs`: text normalisation, sentence chunks, host flow LM, GPU1 LSD head and Mimi, `flow_head::frame_noise` with seed 1484) and agentbench's candle path (`agent-voice` example `phonon_say` with `DEVICE=cuda` on GPU1, its own `StdRng` noise, seed 4242424242424242), each resampled to 16 kHz by ffmpeg and transcribed greedy by the engine's `whisper-large-v3-turbo` (2.7), scored with `EnglishTextNormalizer`. The noise streams differ, so the audio is not sample identical, only alike.
-
-| run | WER all % | Harper | Hadley | say set | LibriSpeech set | exact transcripts | audio |
-|---|---|---|---|---|---|---|---|
-| engine, GPU1 | 1.70 | 1.61 | 1.79 | 0.47 | 2.44 | 63/80 | 361.0 s |
-| candle `phonon_say`, GPU1 | 1.70 | 1.79 | 1.61 | 0.47 | 2.44 | 64/80 | 355.4 s |
-
-Gap 0.00 (bar 0.5). Duration engine over candle per clip: 0.955 to 1.063, none outside 10%. Every error on both paths is a name Whisper spells its own way (Fitzooth, Phronsie, Gamewell, Warrenton) or "nine thirty" heard as "9.30", plus one "asked" heard as "Ask" in the engine's Hadley clip and one "ascertain" heard as "assert" in candle's Harper clip. The engine takes 452.7 s for the 361 s of audio, since its flow LM still runs on the host decoder (the CUDA flow LM is slice g); candle takes 151.7 s including a model load per clip.
-
-Rerun (paths as used; the model folder is the checkpoint with the hub config):
-
-```
-D=/mnt/data/tmp/speech-1484; P=~/.local/share/agentbench/models/phonon; S=crates/specrt/scripts; PY=~/.venv-vllm/bin/python
-mkdir -p $D/phonon && cp crates/specrt/tests/fixtures/speech/phonon-31m-en.hub-92741c5.config.json $D/phonon/config.json && ln -s $P/model.safetensors $P/tokenizer.json $D/phonon/
-systemd-run --user --wait --collect -P -q -p MemoryMax=16G -p MemorySwapMax=0 -E CUDA_VISIBLE_DEVICES= --working-directory=$PWD/$S $PY phonon_reference.py $P $P/voices/4SZHfMpw-p46Ywgs.safetensors $D/ref-harper
-B=$(cargo test -p inference-bench-specrt --test speech --no-run 2>&1 | grep -o '/[^ ]*speech-[0-9a-f]*')
-~/.agents/bin/gpu-run 1 --min-free 2000 -- env PHONON_DIR=$D/phonon PHONON_REF=$D/ref-harper $B --ignored every_real_phonon --nocapture
-cargo build --release -p inference-bench-specrt --bin phonon --bin whisper
-$PY $S/phonon_quality.py sentences /mnt/data/tmp/speech-1480/clips/manifest.jsonl $P/voices $D/sentences.jsonl
-~/.agents/bin/gpu-run 1 --min-free 2000 -- $CARGO_TARGET_DIR/release/phonon $D/phonon $D/sentences.jsonl $D/engine 1484
-(cd ~/git/agentbench && cargo build --release -p agent-voice --features speech-cuda --example phonon_say)
-$PY $S/phonon_quality.py candle <target>/release/examples/phonon_say $D/phonon $D/sentences.jsonl $D/candle --prefix "$HOME/.agents/bin/gpu-run 1 --min-free 2000 --"
-W=$(ls -d ~/.cache/huggingface/hub/models--openai--whisper-large-v3-turbo/snapshots/*)
-for r in engine candle; do $PY $S/phonon_quality.py to16k $D/$r/$r.jsonl $D/$r; ~/.agents/bin/gpu-run 1 --min-free 8000 -- systemd-run --user --wait --collect -P -q -p MemoryMax=16G -p MemorySwapMax=0 -E CUDA_VISIBLE_DEVICES=1 -E CUDA_DEVICE_ORDER=PCI_BUS_ID $CARGO_TARGET_DIR/release/whisper $W $D/$r/manifest16.jsonl $D/$r/whisper.jsonl; done
-$PY $S/phonon_quality.py score $W $D/sentences.jsonl engine=$D/engine/engine.jsonl,$D/engine/whisper.jsonl candle=$D/candle/candle.jsonl,$D/candle/whisper.jsonl
-```
-
-## 4. Serving: compatibility with agentbench's routes
-
-The inference-bench server adds these routes in `crates/server/src/app.rs` `api_routes()`, so they get the same `auth` middleware (bearer key), `request_scope` (the `x-request-id` header, generated when missing, echoed back), the access log line and `inference_requests_total{endpoint, status}` as chat. `endpoint_label` gains `audio_transcriptions`, `audio_speech`, `audio_voices`, `audio_models`.
-
-What agentbench's clients send and read today, which the new routes must accept unchanged:
-
-| Route | agentbench server today (`api.rs`) | Clients | inference-bench must |
-|---|---|---|---|
-| `POST /v1/audio/transcriptions` | multipart; reads `file` (WAV, any rate, resampled to 16 kHz by `agent_voice::voice::audio`) and `model`; ignores other fields; answers `{"text"}`; errors `{"error": "..."}` with 400 or 500 | desktop `voice/native.rs` (reqwest multipart `file`, `model`, `response_format=json`), `agent-voice` `Client::transcribe` (hand built multipart, same three fields, model `whisper-1` when empty), Android through the same app code | accept `file`, `model`, `response_format` (`json` default, `text` answers the plain string, `verbose_json` adds `language`, `duration`, `segments`), `language` (ISO code, skips detection), `prompt` (previous text), `temperature`; ignore unknown fields; WAV PCM16 and f32 at any rate, mono or stereo downmixed; answer `{"text"}` for `json`; `model` `whisper-1` or an unknown id picks the loaded Whisper model, as agentbench's `Speech::pick` does |
-| `POST /v1/audio/speech` | JSON `input` (required, at most 20,000 chars, 400 when empty or longer), `voice` (Phonon voice name, case insensitive; unknown names such as `alloy` get the default `Hadley`), `response_format`: `pcm` streams raw PCM16 LE mono as frames are made with `content-type: audio/L16`, `x-sample-rate: 24000`, `cache-control: no-store`; anything else is one `audio/wav`. `model` is ignored | `app/voice/reader.rs` posts `{"model": "kokoro", "input", "response_format": "pcm", "voice"?}` and reads the stream with the rate from `x-sample-rate`; 404 or 405 means "cannot read aloud yet", 401 "refused the token"; `Client::speak` posts `{"model": "kokoro", "input", "voice"?}` and reads a WAV | the same fields, limits, defaults, headers and status codes; `model` `kokoro`, `tts-1` or unknown picks the loaded speech model; `response_format` `wav` (default), `pcm` (streamed), and additively `mp3`/`opus` only if cheap (not needed by any client); `speed` accepted and ignored at first |
-| `GET /v1/audio/voices` | `{"voices": [{"id", "label", "installed"}]}`, fetching the catalogue first | `app/client.rs` `voices()` | the same shape, from the voice catalogue the engine has; `label` as `Voice::label` makes it (`Hadley, American`) |
-| `GET /v1/audio/models` | `{"object": "list", "data": [{"id", "object": "model", "label", "size_mb", "installed", "default"}]}` of Whisper models | `app/client.rs` `speech_models()` | the same shape for the speech to text models the library has |
-| `GET /v1/audio/status` | `AudioStatus { device, reading_on, speaking_on }` | app settings | the same, `device` from the placement |
-| `GET /v1/models` | (agentbench has none for speech) | | add `"type": "transcription"` and `"type": "speech"` to `ModelKind` labels (additive: `ModelKind` gains two variants, the existing `text`, `image`, `video`, `duplex` are unchanged) |
-
-Admission and queueing follow the media job pattern (`specrt::media`, #1285): a speech job holds a slot, a full queue answers 429 with `Retry-After`, and `/v1/capabilities` lists the fields above per route. Body limit: a 30 minute WAV at 16 kHz PCM16 is 57.6 MB, so the transcription route needs its own `[media] max_audio_bytes` (default 64 MB) in the server config rather than the chat limit.
-
-### 4.1 Transcription, landed (#1481)
-
-`POST /v1/audio/transcriptions`, `GET /v1/audio/models` and `GET /v1/audio/status` are in `api_routes()` (`crates/server/src/audio.rs`), behind the same auth, `x-request-id`, access log line and `inference_requests_total{endpoint="audio_transcriptions"}` as chat. `ModelKind::Transcription` labels a Whisper folder `type: "transcription"` in `/v1/models`, from disk before it loads and from the engine after. The engine side is `speech::service`: `resolve_dir` and `is_speech_config` are the support check (`Spec::from_hf_config_speech` plus a `[speech.decode]` section, no model names), `Service` runs one `Transcriber` on its own thread (the kir GPU engine, the host engine when no CUDA device opens), resamples to the plan's rate, decodes text with the checkpoint's `tokenizer.json`, and decodes long form with timestamps past one window. A request `prompt` becomes the first window's `<|startofprev|>` context (`Options::prompt`). The library reports Whisper as runnable from the same check ("speech to text, whisper family, served on /v1/audio/transcriptions"). Jobs take the media gate's slots and queue (`[images] jobs_per_gpu`, `queue_depth`): a full queue is a 429 with `Retry-After`. `[media] max_audio_bytes` is the route's own body limit (413 above it); `/v1/capabilities` lists the six form fields and the limit.
-
-Tests: `crates/server/tests/audio.rs` (CPU) posts the exact multipart bodies of agentbench's `voice/native.rs` (reqwest: `file`, `model`, `response_format=json`) and `agent-voice` `Client::transcribe` (hand built, `model=whisper-1`, `response_format`, then `file`) and gets `{"text"}`, checks 401 without the key, the request id, access log and metrics lines, every field and unknown ones, 48 kHz stereo downmixed and resampled, 413, 429 with `Retry-After`, and the agentbench shapes of `/v1/audio/models` and `/v1/audio/status`; `the_tiny_whisper_fixture_served_end_to_end_on_the_host_engine_gives_the_greedy_tokens` posts the fixture's 1 s chirp as a float WAV and gets the 12 greedy tokens. `crates/server/tests/audio_gpu.rs` (GPU1) sends the #1480 clips through the route: whisper-base.en 205/205 transcripts identical to the engine run of 2.7 (all 200 short clips and the 5 long ones, 18 s), whisper-large-v3-turbo 25/25 (20 short, the 5 long).
-
-```
-B=$(cargo test --release -p inference-bench-server --test audio_gpu --no-run 2>&1 | grep -o '/[^ ]*audio_gpu-[0-9a-f]*')
-~/.agents/bin/gpu-run 1 --min-free 8000 -- systemd-run --user --wait --collect -P -q -p MemoryMax=16G -p MemorySwapMax=0 -E CUDA_VISIBLE_DEVICES=1 -E CUDA_DEVICE_ORDER=PCI_BUS_ID -E HOME=$HOME -E SPEECH_COUNT=200 --working-directory=$PWD/crates/server $B --ignored --nocapture
-```
-
-`SPEECH_REPO=openai/whisper-large-v3-turbo SPEECH_ENGINE=/mnt/data/tmp/speech-1480/engine-whisper-large-v3-turbo.jsonl` runs the turbo.
-
-### 4.2 Speech, landed (#1485)
-
-`POST /v1/audio/speech` and `GET /v1/audio/voices` are in `api_routes()` (`crates/server/src/audio.rs`) behind the same auth, `x-request-id`, access log and `inference_requests_total{endpoint="audio_speech"}` as chat, plus `inference_speech_total{model}` and its audio and time seconds. `ModelKind::Speech` labels a Phonon folder `type: "speech"` in `/v1/models`, from disk before it loads (`speech::tts::service::resolve_dir`, the `from_hf_config_tts` check) and from the engine after; `/v1/audio/status` fills `speaking_on`; `/v1/capabilities` lists `input`, `voice`, `model`, `response_format`, `seed` and `speed` (ignored) for the route.
-
-The engine side is `speech::tts::service`. `Speaker` runs the text normalisation and sentence chunks, the host flow LM, and the LSD head and Mimi decoder through kir kernels on the GPU (or both on the host when no CUDA device opens), and hands each 1920 sample frame to the caller as it is made; a `false` from the caller stops the work after that frame. A voice is prefilled once and its KV kept, so each chunk prefills only its text (bit identical to a whole prefill, 0.0 on the tiny fixture). `Service` holds one `Speaker` on its own thread; a job takes the media slots like a transcription. The `pcm` route answers its headers with the first frame, then streams PCM16 frames; any other format collects them into one WAV. Samples are rounded to PCM16 by `duplex::wav::f32_to_pcm16`, the same rounding the WAV writer uses. `bin/phonon` (the f2 quality run) now calls the same `Speaker`.
-
-Voices come from spec data, not Rust: the family's `[tts.voices]` names the catalogue repo, file and default voice (`gradium/phonon-voices`, `voices.jsonl`, `Hadley`). `speech::tts::voices::Catalogue` looks in the model folder, then the hub snapshots of that repo, and fetches the catalogue or a voice file into the hub cache when missing. It keeps the voices of the model's `[tts] language` with a real accent (`en-*`) and safe file names, as agentbench's `parse_catalog` does; `pick` is case insensitive with the default as fallback; labels are agentbench's `Voice::label`.
-
-Tests: `crates/server/tests/speech.rs` (CPU) posts exactly agentbench's bodies, `app/voice/reader.rs` (`{"model": "kokoro", "input", "response_format": "pcm", "voice"?}` with `accept-encoding: identity`, reading the rate from `x-sample-rate`) and `agent-voice` `Client::speak` (`{"model": "kokoro", "input", "voice"?}`, reading a WAV), through a fake speaker, and checks the reader's 401 and 404 messages, every header, the request id, access log and metrics, the bytes against the fake's samples rounded to PCM16, voice picking (`alloy`, `ZOEY`, empty, a French voice), `tts-1` and unknown models, `speed`, `seed`, the 400s, that the first frame is read while the second is held back, and that a client hanging up stops a 5000 frame job after 2 frames. `the_tiny_phonon_fixture_served_on_the_host_engine_streams_the_speaker_samples_rounded_to_pcm16` serves the tiny Phonon and Mimi fixtures end to end and gets the `Speaker`'s samples byte for byte, streamed and as WAV. `tests/speech.rs` (specrt) checks the `Speaker` against `HostTts::generate` plus a whole clip Mimi decode (0.0) and the stop after the frame in hand.
-
-`crates/server/tests/speech_gpu.rs` (GPU1) serves the real Phonon and posts the f2 sentences with seed 1484: streamed PCM and the WAV answer are byte equal to the #1484 engine WAVs for 3 Harper and 3 Hadley clips. Headers (the first frame) come after 0.4 s once a voice is prefilled (3.7 s for the first request in a voice, which prefills its 125 frames on the host); an 8 sentence paragraph of 464 characters gives its first frame after 1.26 s and 25.7 s of audio in 14.1 s.
-
-```
-B=$(cargo test --release -p inference-bench-server --test speech_gpu --no-run 2>&1 | grep -o '/[^ ]*speech_gpu-[0-9a-f]*')
-~/.agents/bin/gpu-run 1 --min-free 2000 -- systemd-run --user --wait --collect -P -q -p MemoryMax=16G -p MemorySwapMax=0 -E CUDA_VISIBLE_DEVICES=1 -E CUDA_DEVICE_ORDER=PCI_BUS_ID -E HOME=$HOME -E PHONON_DIR=/mnt/data/tmp/speech-1484/phonon -E F2_SENTENCES=/mnt/data/tmp/speech-1484/sentences.jsonl -E F2_ENGINE=/mnt/data/tmp/speech-1484/engine --working-directory=$PWD/crates/server $B --ignored --nocapture
-```
-
-## 5. Migration of agentbench
-
-The managed engine child from agentbench #1473 serves duplex (Haru), transcription (Whisper) and speech (Phonon) from one process. agentbench's own `/v1/audio/*` routes become a proxy to the child when it is running, so the desktop app, the Android app and the web build change nothing: they already talk to the server endpoints, never to candle directly (Android builds `--features local-speech`, but `build.rs` turns `local_speech` off on Android, so the phone already only records and posts).
-
-Order:
-
-1. Slices a to g land in inference-bench; the engine passes the WER and quality gates of 2.5 and 3.5.
-2. Slice h: agentbench's server routes `/v1/audio/*` to the engine child, and the desktop app's local reading (`voice/native.rs` `local_speech` path) posts to its own server instead of loading candle. The candle path stays behind a setting `speech.backend = "candle"` as the fallback for one release while the parity run is repeated on the user's machine.
-3. When parity holds on the same clips, delete the candle code.
-
-What the deletion removes:
-
-| What | Where |
+| Route | Behaviour |
 |---|---|
-| `agent-voice/src/speech/` except `download.rs`, `phonon/voices.rs`, `phonon/text` (moved or kept for the catalogue and the voice picker), about 6,000 lines including Kokoro (`speak/`, `speaker.rs`) and both mel filter files | `crates/agent-voice` |
-| Features `speech`, `speech-cuda`, `speech-metal`, and the optional deps `candle-core`, `candle-nn`, `candle-transformers`, `tokenizers`, `byteorder`, `rand`, `rand_distr`; the six examples that need `speech` (`say`, `hear`, `phonon_match`, `phonon_normalize`, `phonon_say`, `voicer`) | `crates/agent-voice/Cargo.toml` |
-| `[patch.crates-io]` for `candle-core`, `candle-kernels`, `candle-nn`, `candle-transformers` at `v0l/candle` `a3ebb4c8` | workspace `Cargo.toml` |
-| `local-speech`, `cuda`, `metal` features of `agentbench` (app) and `cuda`, `metal` of `agentbench_server`, and `default = ["cuda"]` on both | `crates/app/Cargo.toml`, `crates/server/Cargo.toml`, `crates/app/build.rs` (`local_speech` cfg) |
-| The CUDA toolkit install (`cuda: '12.8.1'`) and `--features cuda` on the x86_64 Linux and Windows release jobs, `--features metal` on macOS, `--features agentbench/local-speech` on aarch64 Linux: all become plain builds, and the Windows 2022 pin for nvcc can go | `.github/workflows/release.yml` |
-| `--features local-speech` in the Android build (a no op there already) | `packaging/android/build.sh` |
-| `--features local-speech` in the wasm build line (the speech module is already `cfg(not(target_arch = "wasm32"))`) | agentbench `README.md` |
-| `Speech` (`speech.rs`) and `Voice` (`voice.rs`) as model holders; they become thin clients of the engine | `crates/server/src` |
+| `POST /v1/audio/transcriptions` | multipart `file` (WAV PCM16 or f32, any rate, stereo downmixed), `model` (`whisper-1` or unknown picks the loaded Whisper), `response_format` (`json`, `text`, `verbose_json` with language, duration, segments), `language`, `prompt`, `temperature`; body limit `[media] max_audio_bytes` (64 MB, 413 above) |
+| `POST /v1/audio/speech` | JSON `input` (1 to 20,000 chars), `voice` (case insensitive, unknown names get the default), `model` (`kokoro`, `tts-1` or unknown pick the loaded speech model), `response_format` `pcm` (streamed PCM16, `content-type: audio/L16`, `x-sample-rate: 24000`) or WAV, `seed`, `speed` (ignored) |
+| `GET /v1/audio/voices`, `/v1/audio/models`, `/v1/audio/status` | the agentbench shapes |
+| `/v1/models` | `type: "transcription"`, `"speech"`, `"duplex"` |
 
-What stays in agentbench: `agent-voice::voice` (audio helpers, WAV, resampling, the OpenAI style client, the model and voice lists the pickers show) and the Android app code, unchanged.
+Jobs take the media gate's slots (`[images] jobs_per_gpu`, `queue_depth`); a full queue is a 429 with `Retry-After`. `/v1/capabilities` lists every field.
 
-### 5.1 Landed (#1486)
+## Duplex sessions
 
-agentbench branch `issue-1486-speech-through-engine`. Step 2 is its commit `85983b4`, kept as the branch `issue-1486-candle-fallback` (candle behind `[speech] backend = "candle"`); step 3 (`5c62428` and after) deletes everything in the table above. `speech.backend = "candle"` is now refused with a message saying to remove the line.
+`specrt::duplex` runs sessions of a duplex model: one 133 ms user frame in, one model frame out, batched over sessions. Everything model specific is in the family's `[duplex]`: frame and latent sizes from the config, noise divisor, PAD, EOP and EOS ids, the card template (`[duplex.card]`), declared session state (`kv`, `recurrent`, `codec`, `sampler`, `frame`), `max_frames` (27,000), `window_frames` (0, off) and `[duplex.sampling]` (temperature 0.7, top k 25, `eop_bias` 0, one forced text frame, f32 PAD and EOP logits, DRY 0.8, 1.75, 1, 1024, 32, 32). `Spec::from_hf_config_duplex` reads it.
 
-- `agent_voice::engine` is the child manager from agentbench #1473, moved out of the app and made general: any list of `duplex`, `transcription` and `speech` models, a memory need per plan, and a CPU fallback (`Host::Fallback`) when no card has room. The hands free child and the speech child are both instances of it.
-- The agentbench server (`crates/server/src/engine.rs`, `audio.rs`) starts its own child on the first speech request, listing every Whisper in `models/` and Phonon in `models/phonon`, none preloaded, with `[images] jobs_per_gpu = 4` so a reading and a transcription do not queue behind each other. `[speech]` in `agentbench.toml`: `gpu`, `cpu`, `program`, `idle_secs` (600). It fetches the Whisper `generation_config.json` and `preprocessor_config.json` the engine reads, and Phonon at the hub revision `92741c5b` (an old runtime config is kept as `config.json.old`).
-- Transcription: the take is resampled to 16 kHz once and posted as f32 samples, `verbose_json`; the `no_speech_prob` and `avg_logprob` the hands free noise filter reads are made from the segments the way candle made them (lowest window, token weighted mean). Speech: the body is passed on with `model`, `voice`, `response_format` and an optional `seed`, and the engine's headers and PCM stream come back untouched.
-- The desktop window's "this device" voice input posts to the agentbench server on this machine (`Settings::resolved_with`), so it is offered in every desktop build; the phone and the web build are unchanged.
-
-Parity, on this machine through agentbench's own routes (`scripts/agentbench_speech.py`), engine child on GPU1, candle through agentbench with `backend = "candle"` on GPU1:
-
-| set | run | WER % | identical | note |
-|---|---|---|---|---|
-| c2, whisper-base.en, 205 clips | agentbench to engine | 6.08 (short 6.39, long 3.61) | 205/205 to transformers | equal to 2.7's engine row |
-| c2, whisper-base.en | agentbench candle | 14.39 (short 8.48, long 61.45) | 120/205 | equal to 2.7's candle row |
-| c2, whisper-large-v3-turbo | agentbench to engine | 2.26 (short 2.39, long 1.20) | 205/205 to transformers | equal to 2.7 |
-| c2, whisper-large-v3-turbo | agentbench candle | 2.39 | 128/205 | equal to 2.7 |
-| f2, 80 Phonon clips, seed 1484, streamed `pcm` | agentbench to engine | 1.70 (Harper 1.61, Hadley 1.79) | 80/80 byte equal to the #1484 engine WAVs | |
-| f2 | agentbench candle | 1.70 (Harper 1.79, Hadley 1.61) | | durations engine over candle 0.955 to 1.063, none outside 10% |
-
-The accuracy bar holds: through agentbench the engine gives the transformers transcripts on both Whisper models (better than candle, which loses the long clips on base.en) and the same Phonon audio and word error rate as section 3.6.
-
-The real app, in a private headless sway with ALSA pointed at a file microphone (`ask.wav` in pink noise) and a file speaker: SPEAK put "What is running right now?" in the draft at 1280x800 and at 392x844; SEND gave the reply, and read aloud played 3.9 s that the engine's turbo hears as "I started two workers just now. They are still running.", the reply word for word. `nvidia-smi --query-compute-apps` showed the child `inference-bench-server` on GPU1 only (4.6 GB), and stopping the agentbench server took it down. Settings, speech: "this device" offered, "runs on" reads read aloud on GPU, voice input on GPU.
-
-![dictated](img/speech-1486/05-heard.png) ![reply](img/speech-1486/06-sent.png) ![phone](img/speech-1486/09-phone-dictated.png) ![settings phone](img/speech-1486/12-speech-phone.png) ![settings](img/speech-1486/13-speech-desktop.png)
-
-Rerun (agentbench release build in `$A`, engine in `$E`, a home whose `agentbench.toml` has `[speech] gpu = 1` and `program = "$E"`):
-
-```
-~/.agents/bin/gpu-run 1 --min-free 8000 -- env AGENTBENCH_HOME=$H $A/agentbench-server serve &
-T=$($A/agentbench-server --home $H token); S=crates/specrt/scripts; D=/mnt/data/tmp/speech-1486
-for m in whisper-base.en whisper-large-v3-turbo; do python3 $S/agentbench_speech.py hear http://127.0.0.1:7461 $T $m /mnt/data/tmp/speech-1480/clips/manifest.jsonl $D/agentbench-engine-$m.jsonl; done
-python3 $S/agentbench_speech.py say http://127.0.0.1:7461 $T /mnt/data/tmp/speech-1484/sentences.jsonl $D/f2 --stream
-python3 $S/agentbench_speech.py same /mnt/data/tmp/speech-1484/sentences.jsonl $D/f2/wav /mnt/data/tmp/speech-1484/engine/wav
-```
-
-The agentbench tests: `crates/server/tests/speech_engine.rs` serves the routes against a fake engine child (the app's multipart body, the default model, extra form fields, 401 never starting the child, the streamed bytes and headers, WAV and seed, lists, status, an engine error); `crates/app/tests/voice.rs` and `duplex.rs` run the real Whisper and Phonon through the child with `AGENTBENCH_REAL_ENGINE` and `AGENTBENCH_SPEECH_GPU=1` (27 passed on GPU1), and `a_spoken_take_reaches_the_supervisor_and_its_reply_is_spoken_back` checks the engine log for both routes.
-
-## 6. Fixture and test
-
-`crates/specrt/tests/fixtures/speech/` (1.99 MB of the 2 MB cap the test sets, with `tiny-mimi` and `tiny-phonon`; the Haru fixture is under 3 MB and the diffusion ones under 20 MB, there is no shared cap across fixtures beyond each test's own):
-
-- `tiny-whisper/`: a `WhisperForConditionalGeneration` with random weights (`init_std 0.2`, LayerNorm weights around 1), d 64, 2 encoder and 2 decoder layers, 2 heads, 80 mel bins, a 1 s window (50 encoder positions), vocab 589 laid out like the multilingual one (512 text tokens, EOT, SOT, 4 languages, translate, transcribe, startoflm, startofprev, nospeech, notimestamps, 64 timestamps), the real tensor kinds of `whisper-tiny.en` and its tied head. `generation_config.json` and `preprocessor_config.json` in the real format.
-- `tiny-whisper/reference/`: a 1 s chirp in noise and a 0.6 s cut of it, the mel bank, both log-mel inputs, the conv stem output, the encoder states, the language logits at SOT, the prefix logits, the 12 greedy step logits with suppress lists applied, and in `reference.json` the greedy tokens, `generate`'s tokens (equal) and the detected language. #1479 adds a 1.5 s gated chirp (`audio.long`, `mel.long`, two windows) and `runs`: `timestamps` (detection, timestamps), `long` (two windows, previous text) and `fallback` (temperatures 0, 0.4, 0.8 with thresholds that make one redo and one skip), each with every window's seek, decoder prompt and attempts (tokens, compression ratio, average log probability, no speech probability, decision), and the scores of the sampled attempt as sparse rows.
-- Real model data, no weights: `whisper-tiny.en`, `whisper-base`, `whisper-large-v3-turbo` configs and generation configs, the `whisper-tiny.en` safetensors header; Phonon's config at the pinned revision and at the hub revision, its header and a voice header; VibeVoice-Realtime's config and its header without the acoustic encoder.
-
-Regenerate (CPU, 4 s, transformers 5.23, torch 2.14):
-
-```
-systemd-run --user --wait --collect -P -q -p MemoryMax=8G -p MemorySwapMax=0 -E CUDA_VISIBLE_DEVICES= --working-directory=$PWD \
-  ~/.venv-vllm/bin/python crates/specrt/scripts/tiny_whisper.py all --phonon ~/.local/share/agentbench/models/phonon
-```
-
-The weights are seeded and come out bit identical.
-
-`tests/speech.rs` (CPU, 0.2 s):
-
-| Test | Checks |
+| Piece | Where |
 |---|---|
-| `the_engine_refuses_whisper_and_says_which_ops_are_missing` | the four Whisper configs are refused by `from_hf_config`, `from_hf_config_duplex` and `describe_hf_config`; every "exists" row of the gap list still has its engine source (a rename breaks it); prints the Whisper and Phonon gap lists and the 9 pieces with no engine counterpart |
-| `whisper_configs_have_the_shape_the_gap_list_assumes` | GELU, no embed scale, equal heads, 80 or 128 bins, turbo's 32 and 4 layers, English only against multilingual generation configs, 99 languages |
-| `the_tiny_fixture_keeps_every_real_tensor_kind` | the fixture's tensor kinds equal `whisper-tiny.en`'s, the tied head, no `k_proj.bias`, the stem and table shapes |
-| `the_log_mel_front_end_is_specified_exactly_by_the_reference` | a plain f64 DFT front end written from section 2.2 gives transformers' log-mel within 8.3e-6 for the full and the short clip (gate 2e-4): the spec of slice a's op |
-| `the_token_logic_reproduces_transformers_generate_from_its_logits` | suppress and begin suppress applied to the recorded logits give the greedy tokens and `generate`'s tokens; language detection is the argmax over language tokens |
-| `phonon_tensors_match_the_gap_list` | Phonon's parameter split, the depthwise upsample, no RVQ codebooks, packed qkv, LayerNorm with bias, layer scale, ratios, context 250, one LSD step, the voice shape |
-| `the_vibevoice_acoustic_decoder_is_the_haru_codec_decoder_tensor_for_tensor` | the renamed VibeVoice decoder equals Haru's `codec.decoder` in all 276 shapes, 343,695,969 parameters |
-| `the_speech_fixture_stays_under_2_mb` | size |
-| `the_gpu_transcriber_matches_transformers_and_the_host_on_every_tiny_run` | GPU1: the kir GPU engine against the reference and the host, every tiny run token for token |
+| Prompt: card, voice reference (trimmed at -45 dBFS, at most 180 s, encoded and noised), `speak_first`, forced first text | `duplex::prompt`, `Engine::start` |
+| Frame step: encode, noise, sum the streams, backbone decode rows, logit edits and allow list, sampling, MeanFlow head, decode; one CUDA graph per padded batch size | `Engine::step` |
+| Text controls: say queue (only PAD, EOP and the next queued token), `relay` (only PAD and EOP) and `free`, `interrupt` | `duplex::sampling::TextState` |
+| Clock: fixed tick per session, silence for a missing frame, late steps marked, backlog cut | `duplex::clock::run` |
+| Window: prompt pages kept as a sink plus the last W frames, positions keep counting | `Engine::window` |
+| Snapshots: KV blocks, delta-net state, codec, sampler and frame counter in the session store | `Engine::snapshot`, `park`, `resume` |
+| Service: one clock thread per model, sessions through its event queue | `duplex::service::Service` |
 
-## 7. Slices
+Codec convs pick the `kir::conv` `Rows` family when a conv has few output rows and a long reduction (69.5 to 11.0 ms a frame on Haru).
 
-Each follows `docs/specrt-kir-compiler.md`: new ops are typed signature entries with kir descriptions, models are graph and family TOML, no Rust names an architecture. GPU work is GPU1 only, through `~/.agents/bin/gpu-run 1 --min-free 2000 -- <binary>`, compiled first, never GPU0, never the Spark. Real model downloads and real model GPU runs are their own slices.
+Server (`crates/server/src/duplex.rs`): `GET /v1/duplex` (native), `GET /v1/realtime` (OpenAI Realtime subset: `session.update`, `input_audio_buffer.append`, `response.output_audio.delta` and transcript deltas; turn events get an error saying why), `POST /v1/duplex/voices`. The client sends `start` (`model`, `card`, `voice`, `speak_first`, `guidance`, `temperature`, `mode`, `seed`, `resume`), then binary PCM16 frames of 3200 samples at 24 kHz; the server answers `ready`, one binary frame per tick with a `frame` event naming the user frame it answers, `text`, `late`, `end`; controls `say`, `mode`, `interrupt`, `stop`. `[duplex]` server config: `sessions_per_gpu`, `queue_depth` (full answers `code: "full"`), `keep_idle_secs` (snapshot a dropped socket for resume), `max_voice_seconds` (60), `allow_replay` (test hook). CLI: `inference-bench duplex --wav in.wav --out out.wav [--card --voice --realtime --events]`.
 
-| | Slice | Depends on |
+## Measured state
+
+| Case | Value | Source |
 |---|---|---|
-| a | Log-mel front end op and the conv stem on the tiny fixture (CPU host and CUDA) | |
-| b | Encoder graph and decoder family with cross attention and cross KV state, tiny fixture logits | a |
-| c | Decoding rules and long audio, tiny fixture tokens | b |
-| c2 | Real Whisper models: download, WER run against transformers on GPU1 | c |
-| d | `/v1/audio/transcriptions`, `/v1/audio/models`, `/v1/models` type `transcription` | c |
-| e | TTS codec: Mimi decoder graph reusing the Haru codec ops | |
-| f | TTS model graph and sampling: Phonon flow LM, LSD head, EOS, voices, chunking, tiny fixture | e |
-| f2 | Real Phonon: download, step match against transformers and the quality run on GPU1 | f |
-| g | `/v1/audio/speech` with streaming PCM, `/v1/audio/voices`, `/v1/models` type `speech` | f |
-| h | agentbench: speech through the engine child, candle kept as fallback, then removed (landed, 5.1) | d, g, c2, f2, agentbench #1473 |
+| whisper-base.en, 205 LibriSpeech test-clean clips, engine on GPU1 | WER 6.08, equal to transformers, 205 of 205 transcripts identical, 17.7 s for 1,357 s of audio | #1480 |
+| whisper-large-v3-turbo, same clips | WER 2.26, equal to transformers, 205 of 205 identical, 170 s | #1480 |
+| Phonon, 80 clips (40 sentences, Harper and Hadley), engine audio transcribed by the engine's turbo | WER 1.70, equal to the candle path; durations 0.955 to 1.063 of candle | #1484 |
+| Phonon step match against transformers, 50 frames | audio within 1.4e-4 | #1484 |
+| Haru-4B frame step, bf16, GPU1, 1 / 4 / 16 sessions | 20.3 / 30.2 / 54.5 ms against a 133 ms frame | #1430 |
+
+The Phonon flow LM still runs on the host decoder, so speech is slower than real time on long text (452.7 s for 361 s of audio in the quality run). The say queue on Haru finished 9 of 20 sentences, so supervisor replies go through text to speech with Haru in `relay` (#1430).
+
+## Tests
+
+`crates/specrt/tests/speech.rs` (CPU and GPU1: refusals, tiny Whisper, Mimi and Phonon fixtures against transformers, decoding rules, the LSD head, the GPU transcriber), the `speech::tts` unit tests, `crates/specrt/tests/haru*.rs` (codec, head, backbone, duplex sessions, the real model against traces), `crates/server/tests/audio.rs`, `speech.rs`, `duplex.rs` (CPU, agentbench's exact bodies) and `audio_gpu.rs`, `speech_gpu.rs`, `duplex_gpu.rs` (GPU1). Fixtures: `tests/fixtures/speech/` (`scripts/tiny_whisper.py`, `tiny_mimi.py`, `tiny_phonon.py`), `tests/fixtures/haru/` (`scripts/tiny_haru.py`). Real model runs: `scripts/whisper_wer.py`, `phonon_reference.py`, `phonon_quality.py`, `agentbench_speech.py`; validation of Haru against its reference: [../guides/haru-validation.md](../guides/haru-validation.md).

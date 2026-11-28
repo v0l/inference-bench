@@ -1,8 +1,6 @@
-# Haru-4B: full duplex speech to speech on specrt (#1344)
+# Haru-4B
 
-Analysis only, no engine code. Read on 25 Nov from `higurashi-ai/Haru-4B` (`config.json`, `tokenizer.json`, the 111,704 byte safetensors header fetched with an HTTP range, no weights) and the reference code `github.com/higurashi-ai/Haru` at commit `7fe6b766` (`haru/haru/models/*.py`, `session.py`, `prompt.py`, `sampling.py`, `server.py`). The card's facts hold; the numbers below are from the files.
-
-Fixture and test: `crates/specrt/tests/fixtures/haru/` and `crates/specrt/tests/haru.rs` (section 7).
+Full duplex speech to speech: `higurashi-ai/Haru-4B` and its reference code `github.com/higurashi-ai/Haru` at commit `7fe6b766`. How the engine runs it (sessions, the frame clock, the websocket, measured step times) is in [../design/speech.md](../design/speech.md); validation against the reference is [../guides/haru-validation.md](../guides/haru-validation.md). Fixture and tests: `crates/specrt/tests/fixtures/haru/`, `crates/specrt/tests/haru.rs` and the `haru_*_gpu.rs` suites.
 
 ## 1. What it is
 
@@ -171,20 +169,6 @@ user:      none (masked)     none (masked)             user audio
 
 The card cannot change mid session: it sits at position 0. A new card means a new session.
 
-## 6. What maps onto existing specrt pieces
-
-| Piece | Status |
-|---|---|
-| Backbone, `lm.*` | **specrt** (#1427): `family-haru.toml` extends `family-qwen3_5`, reads `lm` as the text config (`text_config = "lm"`) and maps the `lm.` root to `model.` through `[tensors]`. The family stays refused until #1430 |
-| Tied logits, top k, top p, temperature | **specrt** sampler |
-| DRY penalty, f32 PAD and EOP logits, `eop_bias`, forced text | **specrt** (#1430): `[duplex.sampling]` in the family, host plans per row (`duplex::sampling`) applied by the `kir::duplex` kernels inside the frame graph |
-| Input sum with projectors | **specrt** (#1427): `[inputs]` in the family declares the streams and masks; six `[[inputs.node]]` plan ops (`Op::Input`, typed signatures, kir `group_map` descriptions) add `mask * fc2(rmsnorm(fc1((raw + latent_bias) * latent_scale)))` into `x` after the token gather, for prefill rows and decode rows alike (`Runtime::set_inputs`) |
-| MeanFlow head | **specrt** (#1428): `graphs/meanflow.toml` and `[head]`, `specrt::flow_head` (plan, hoist, report, host) and `flow_head_cuda` |
-| Codec 1D convs | partly from #1283: `kir::conv` implicit GEMM (the 1x1 `fc1` and `fc2` are its 1x1 case or the tile GEMM), the per pixel channel RMS norm (`VaeOp::RmsNorm`), the causal frame cache of the Wan VAE as streaming state, one latent frame per call. **new**: strided causal 1D conv (down), the transposed conv (lowers to a 2 tap causal conv to s x Cout channels plus an interleave, the generalisation of Wan's `time_up`, with the previous input column as state instead of the overlap tail), depthwise k 7 conv (a per channel stencil, a compose or rows kernel, not a GEMM), exact GELU (`erf` is not in the `Expr` unary table, `kir/src/expr.rs:69`) |
-| Session KV and state | **specrt** (#1430): paged KV for the 8 full layers, delta net state for the 24 linear layers, codec state, sampler state and the frame counter, declared as `[duplex] state`; snapshots through the #326 store with three extra sections |
-| Frame clock scheduler | **specrt** (#1430): `duplex::clock`, a fixed 133 ms tick per session, silence for a missing input frame, late frames sent and marked, the input backlog cut so latency comes back |
-| Audio websocket | **new** (axum is built without its `ws` feature today) |
-
 ## 7. Fixture
 
 `crates/specrt/scripts/tiny_haru.py` builds the fixture on CPU in about 2 seconds with the reference package itself (`haru` at `7fe6b766`, torch 2.15 CPU, transformers 5.24, in a private venv). Deterministic: two runs give identical bytes.
@@ -262,135 +246,3 @@ Whether constrained text keeps the speech intelligible is unmeasured: the D slic
 
 Echo: headphones first. With speakers the model hears itself, which a full duplex model treats as the user talking; an echo canceller in the client is its own slice (agentbench #1405 slice 2).
 
-## 11. Gap list
-
-Each slice follows `docs/specrt-kir-compiler.md`: new ops are typed signature entries with kir descriptions, new state is declared in the spec, and nothing in Rust names the architecture.
-
-| Slice | What | Reuses | Issue |
-|---|---|---|---|
-| A | Haru family file, `lm` weight root, the multi stream input embedding (projectors, masks, latent scale and bias as data), a decode step fed by an embedding row, prompt prefill with masks | `family-qwen3_5`, `Op::Splice` / `add_rows` | #1427 |
-| B | MeanFlow head as a plan section: RMS modulate, gated add, SwiGLU, sinusoid embeddings hoisted per guidance, the step rule as an `Expr` | #1282 and #1284 ops, H1 hoist | #1428 (after A) |
-| C | Streaming codec encoder and decoder: strided causal conv, transposed conv as a 2 tap causal conv plus interleave, depthwise k 7 stencil, exact GELU (`erf` in `Expr`), channel RMS norm, per layer state declared in the spec | #1283 conv family, frame cache, channel RMS norm | #1429 (parallel to A and B) |
-| D | Duplex sessions: the frame step (encode, sum, backbone, text and head, decode) batched over sessions, sampler options (DRY, f32 silence logits, `eop_bias`, the say queue and modes), session state and snapshots, `max_frames` and the optional window, real model checks on GPU1 | scheduler, #326 store | #1430 (after A, B, C) |
-| E | Audio API: a websocket per session (PCM16 24 kHz frames in, frames and text out), session start with card and voice reference, `say`, `mode`, `interrupt`; the OpenAI Realtime subset if cheap; `/v1/models` type `duplex` (additive); a CLI client; the model library and load dialog report it from the engine | server, media job pattern from #1285 | #1431 (after D) |
-| F | App: hands free conversation mode and the supervisor bridge client | `crates/app/src/voice`, `agent-voice` | agentbench, after #1431 and agentbench #1405 slices 1 and 2; body in section 12 |
-
-The diffusion chain covers most of B (modulation, gated residual, SwiGLU, sinusoid, the step as an expression, hoisting) and the conv core and streaming cache of C. A, D and E are new: diffusion has no token loop, no per session state and no streaming transport.
-
-The OpenAI Realtime API sends PCM16 at 24 kHz, the codec's own rate, so `input_audio_buffer.append` and `response.output_audio.delta` map directly onto frames. Its turn events (`response.create`, `conversation.item.*`) do not fit a model that never takes turns, so E builds the native stream first and offers the Realtime shape as a subset: audio in, audio and transcript deltas out, `session.update` with `instructions` as the card.
-
-## 12. App issue (agentbench, goal g3, backlog)
-
-To be filed in agentbench (this session had no permission to file there), depending on inference-bench #1431 and agentbench #1405, whose slices 1 and 2 (hands free mode with the headphones check, and the echo canceller) stay there; this is its slice 3 made concrete.
-
-**Title:** Hands free conversation with the Haru duplex engine and the supervisor bridge
-
-- Hands free conversation mode with a `duplex model` setting naming the server and model: the microphone stays open, 133 ms frames stream as they fill, reply frames play as they arrive through a jitter buffer of two frames (silence when a frame is late, never a growing delay), reconnect with backoff. Reuse `crates/app/src/voice` (capture, devices, band and hang logic) and `agent-voice` (audio helpers, resampling to 24 kHz).
-- Talk indicator in the chat header: listening, model speaking, supervisor thinking, at 1280 and 390 wide.
-- Echo: headphones first (the #1405 slice 1 refusal); speakers only once the #1405 slice 2 canceller is on.
-- The bridge of section 10: Whisper on the same microphone frames turns each user utterance into a supervisor text turn; supervisor replies go to the engine as `say` in short sentences (from `Converse`) with the session in `relay` mode; a barge in sends `interrupt` and passes the `said` part back as what the user heard. A fixed supervisor card and a voice clip the user records once, kept in settings.
-- Fallback: with no duplex model set, hands free uses today's speech to text, supervisor, text to speech path.
-- Tests with the app's own hooks (`voice_test_*`) against a fake duplex server: frames go out every 133 ms at 6400 bytes, replies play in order, a late frame plays silence, an utterance becomes a supervisor turn, a reply becomes `say` messages, a barge in sends `interrupt`. Pictures of the indicator at 1280 and 390. The real conversation with the real model is the user's check.
-
-## 13. Duplex sessions in specrt (#1430)
-
-`specrt::duplex` runs Haru sessions on the engine: one user frame in, one model frame out, batched over sessions. Everything that is model specific is data in `family-haru.toml` under `[duplex]`: frame and latent sizes read from the config, the user noise divisor (0.8), the PAD, EOP and EOS ids, the ChatML card template, the declared session state (`kv`, `recurrent`, `codec`, `sampler`, `frame`), `max_frames` (27,000), `window_frames` (0, off) and `[duplex.sampling]` (temperature 0.7, top k 25, top p 1, `eop_bias` 0, one forced text frame with PAD, EOP and EOS banned, f32 PAD and EOP logits, and DRY 0.8, 1.75, 1, 1024, 32, 32 with PAD, EOP and EOS exempt). `Spec::from_hf_config_duplex` reads it; the text serving path stays refused (`[[refuse]] part = "text"`) until the audio API of #1431.
-
-| Piece | Where |
-|---|---|
-| Prompt: card, voice reference (trimmed at -45 dBFS with 0.2 s margin, at most 180 s, encoded and noised with one scale for the clip), `speak_first` grid with room tone and silence, forced first text | `duplex::prompt`, `Engine::start` |
-| Prefill in chunks of `prefill_chunk` with per position masks, first frame from the last hidden state and the prompt logits | `Engine::start_prompt` |
-| Frame step: encode user PCM, noise the mean, sum the streams, one backbone position for every session as decode rows, exact PAD and EOP logits from the joined f32 hidden state, logit edits, allow list, sampling, MeanFlow head, decode | `Engine::step`, one CUDA graph per padded batch size (1, 2, 4, 8, 16, 32) |
-| Text controls: DRY history, `eop_bias`, forced text, say queue (only PAD, EOP and the next queued token), `relay` (only PAD and EOP) and `free`, `interrupt` (drops the queue, returns said and unsaid tokens) | `duplex::sampling::TextState`, host plans uploaded per frame, applied by `duplex_edit_logits` and `duplex_allow` |
-| Frame clock: 133 ms tick per session, silence for a missing frame, a late step is sent and marked late, the input side never waits, the backlog is cut by as many frames as the step was late | `duplex::clock::run` over the `FrameEngine` trait |
-| Codec state per session in a pool, moved into the batch before the graph and back after it | `duplex_state_move`, `CudaCodec::launch_frame` with fixed parity sessions |
-| `window_frames`: keep the prompt pages as a sink and the last W frames; the oldest page past the sink is reused for the newest positions, the rope position keeps counting through the mrope offset | `Engine::window`, `Runtime::set_position_offset` |
-| Snapshots: KV blocks in use, delta net state, codec state, sampler state and frame counter, seven sections in the #326 `SessionStore` | `Engine::snapshot`, `restore`, `park`, `resume` |
-
-The codec convs now pick a third `kir::conv` family, `Rows`, when the conv has few output rows and a long reduction (the 2048 wide blocks and the first and last up and down convs of a frame): one block per output channel, the reduction split over the block, eight rows at a time. On the real model this took the codec from 69.5 ms to 11.0 ms per frame at one session; the tile and direct families stay for long clips.
-
-### Tiny fixture on GPU1
-
-`tests/haru_duplex_gpu.rs` (`~/.agents/bin/gpu-run 1 --min-free 2000 -- <haru_duplex_gpu binary> --ignored --test-threads=1`, 4 s):
-
-- The six frame greedy session from the fixture prompt and `session.user_audio` with the recorded noise gives `session.token` exactly on all seven frames, eager and through the frame graph, and a second session on the same slot repeats it.
-- Fed the reference feedback each frame (its token and latent), the engine gives `session.user_latent` within 1.3e-6, `session.hidden` within 1.7e-4, `session.latent` within 1.8e-4 (per frame 2.3e-4, 6e-5, 1.8e-4, 1.8e-5, 2.2e-5, 2.9e-5, 2.1e-5) and `session.audio` within 2.4e-3, and its audio is bit identical to a fresh decode of the latents it emits. The codec alone gives `session.audio` within 8.5e-7 from `session.latent` (`haru_gpu.rs`).
-- Free running, the latent error grows from 2.3e-4 to 3.2e-2 over six frames: the bf16 backbone floor (3e-4 relative, the same as the text only control in `haru_backbone_gpu.rs`) is fed back through the model's own latent. The issue's 1e-4 bound on `session.latent` and `session.audio` sits below that floor, so the test holds tokens exactly, the latent and user stream at the backbone bound with reference feedback, and the decode exactly.
-- Two sessions batched in one step each give the same tokens and match the same session alone within 1e-5, with one captured graph for the batch of two.
-- A snapshot after three frames, written to the store, resumed in a fresh engine, gives the same next three tokens, frame indices, latents and audio (within 1e-6).
-- `relay` with an empty queue gives only PAD and EOP; a queued list comes out in order with only PAD and EOP between; `interrupt` returns what was said and what was not.
-- `max_frames` 5 ends the session on frame 4 and refuses another step; `window_frames` 32 with a 64 position context runs 120 frames with finite audio and keeps at most 64 positions.
-
-### Real Haru-4B on GPU1 (bf16, quiet GPU1, the user's app on GPU0)
-
-Frame step time, `haru bench <dir> --batches 1,4,16 --frames 60`, every session fed silence after a card prompt:
-
-| Sessions | Median ms | p95 ms | Budget ms |
-|---|---|---|---|
-| 1 | 20.3 | 20.4 | 133.3 |
-| 4 | 30.2 | 30.2 | 133.3 |
-| 16 | 54.5 | 54.7 | 133.3 |
-
-At one session nsys gives 20.3 ms of kernel time per frame: backbone 7.6 ms (325 launches, close to the 8 ms estimate), codec 11.0 ms (344 launches), head 1.0 ms, duplex glue 0.7 ms. The codec is the remaining gap to the 8 ms of section 8; its largest kernels are the direct and rows convs of the 2048 wide blocks. Sixteen sessions fit in 41% of the frame.
-
-Offline run of a recorded user clip (19.8 s, three TTS sentences with pauses, Kokoro Zoey), the English chat card from the reference package and a 13.8 s voice reference (Kokoro Harper), 149 frames each, through `haru run` and through the reference `haru-inference` (commit 7fe6b766, torch 2.11 CUDA in a private venv, `MemoryMax=16G`); Whisper large v3 turbo transcripts and RMS envelope metrics (100 ms windows, voiced above -40 dBFS) from `scripts/haru_eval.py`:
-
-| Run | Whisper transcript | Voiced | Voiced over the user |
-|---|---|---|---|
-| specrt, sampled | Hi, I'm Haru. I'm doing great. How about you? Oh, that sounds wonderful. Did you hike? Yes, I have done it. It's very fun. | 34% | 2% |
-| reference, sampled | Hello. I'm doing well, thank you. How are you? How was ba- How was ba- | 19% | 0% |
-| specrt, greedy text | Hi there, I'm Haru. I'm doing great. How are you? | 17% | 2% |
-| reference, greedy text | Hi, I'm Heru. I'm doing well, thank you. How are you? No, I haven't. What was it like? | 27% | 2% |
-
-Both engines greet, answer the question in the user's pause and keep quiet while the user talks. The RMS envelope correlation between specrt and the reference is 0.32 sampled and 0.44 greedy, against 0.48 between the reference's own sampled and greedy runs: the audio noise stream differs between the engines, so frame for frame identity is not expected and the two engines differ about as much as one engine with two sampling settings.
-
-Say queue, `haru say <dir> --sentences tests/fixtures/haru/say_sentences.txt --card card.txt --voice voice.wav`: 20 sentences, each queued after 8 frames of a relay session fed silence, up to 600 frames per sentence, Whisper on the produced audio:
-
-- 9 of 20 queues were spoken to the end; in the other 11 the model kept choosing PAD and EOP, which the queue allows, and said 0 to 8 of the queued tokens in 600 frames (80 s).
-- Word error rate over all 20 against the queued text: 3.07 (one sentence where the model laughed through 450 frames gives 44.5); median 1.0. Over the 9 completed: median 0.67, best 0.09 ("I set a reminder to call your sister on a Sunday. Evening.") and 0.18.
-- The words that come out are the queued words, but the model wraps them in its own sounds ("Oh, God.", laughter, "Thank you." repeated in long silences).
-
-So constrained text alone does not keep supervisor speech intelligible: the fallback of section 10 holds (text to speech for supervisor replies, Haru in `relay` for turn taking and backchannels) until the say path gets a stronger control, for example `eop_bias` while the queue is not empty or a card that tells the model it relays an assistant.
-
-## 14. Audio API (#1431)
-
-The text routes keep refusing Haru (`[[refuse]] part = "text"`); the engine serves it as a duplex model instead. `Spec::from_hf_config_duplex` is the support check, so the library shows Haru as runnable ("full duplex speech, served on /v1/duplex"), the load dialog for it is its own page, and `/v1/models` lists it with `type: "duplex"` (`ModelKind::Duplex`, additive, no API bump).
-
-| Piece | Where |
-|---|---|
-| One clock thread per loaded model owns the engine; sessions start, take control messages, end or park through its event queue, and each session gets its own frame channel | `duplex::service::Service`, `duplex::clock::run` (`Event::Start`, `Control`, `Park`) |
-| Card as text or as fields; the field names, headers and option labels are data in `[duplex.card]` of `family-haru.toml` | `spec::CardTemplate::render` |
-| `GET /v1/duplex`, `POST /v1/duplex/voices`, `GET /v1/realtime`; auth, request id, access log line with frame counts, and metrics as for chat | `crates/server/src/duplex.rs` |
-| Gate: `duplex.sessions_per_gpu` (also the engine's slots) plus `duplex.queue_depth`, refused with an `error` event `code: "full"` | `[duplex]` in the server config |
-| A dropped socket ends the session and frees its slot; with `duplex.keep_idle_secs` it is snapshotted instead and `start` with `resume: <token from ready>` restores it | `Engine::park`, `resume` |
-| CLI client | `inference-bench duplex --wav in.wav --out out.wav [--card --voice --realtime --events]` (`core::duplex_client`) |
-| App | the load page picks the GPU with the most free memory, shows weights, per session memory and the fit; the Chat tab becomes Voice with the websocket address and the CLI line |
-
-Protocol on `/v1/duplex`: the client sends `{"type": "start", "model", "card", "voice", "speak_first", "guidance", "temperature", "mode", "seed"}`, then binary frames of PCM16 mono at 24 kHz, 3200 samples (6400 bytes) each. The server answers `ready` (session id, rate, frame size, resume token), then one binary frame per tick, a `frame` event naming the user frame it answers, `text` for frames with words, `late`, and `end` at `max_frames`. Control messages: `say` (answered with `queued` and the token count), `mode`, `interrupt` (answered with `said` and the unsaid token count), `stop`. The Realtime subset takes `session.update` (instructions become the card, fixed once audio starts) and `input_audio_buffer.append`, and sends `response.output_audio.delta` and `response.output_audio_transcript.delta`; `response.create`, `conversation.item.*` and the buffer commit events get an error that says why, and `/v1/capabilities` lists the same.
-
-### Tiny fixture through the websocket (GPU1)
-
-`crates/server/tests/duplex_gpu.rs` serves the tiny fixture with `NativeFactory` and replays the fixture session through the socket (`replay`, a test hook behind `duplex.allow_replay`, carries the fixture's prompt and recorded noise). Each of the 7 frames matches the engine fed the same PCM16 rounded user audio with max relative error 0.0, and the greedy tokens are the fixture's `[92, 397, 207, 212, 8, 435, 502]`. Against the fixture's float session the audio differs by 6.4e-2 relative, the free running backbone drift of section 13 from feeding PCM16 rounded user audio, not the transport. CPU tests with a scripted frame engine (`crates/server/tests/duplex.rs`) cover the frames both ways, text events, say, mode, interrupt, stop, the gate, auth, park and resume, `max_frames`, uploaded voices, the Realtime subset and the capabilities.
-
-### Real Haru-4B (bf16, GPU1)
-
-Served by `inference-bench serve` (`sessions_per_gpu = 4`, `max_ctx = 8192`), the recorded 19.8 s user clip of section 13 sent in real time by `inference-bench duplex` with the chat card and the 13.8 s voice: 149 frames in, 154 out, none late, and the reply WAV answers the user ("Hi, I'm Haru. I'm doing great. How about you? Oh, that sounds wonderful. Did you hike?"). The server held 15.7 GB on GPU1 (`nvidia-smi`, 4 slots of 8192 frames).
-
-Per frame latency is the time from sending user frame i to receiving the model frame that consumed it (the `frame` event names it). It is the step time plus the wait for the next 133 ms tick, so it depends on where in the tick the client's frames land and is fixed for a session:
-
-| Run | Frames | p50 ms | p95 ms |
-|---|---|---|---|
-| native, 6 sessions one after another | 916 | 60.6 | 157.9 |
-| native, sessions 3 to 6 of those | 611 | 59.2 | 63.3 |
-| native, through the app's server (below) | 152 | 151.2 | 155.4 |
-| Realtime subset (base64 JSON both ways) | 153 | 208.6 | 212.7 |
-
-The floor is the frame step (20 ms at one session, section 13); the rest is tick phase. A client that wants the floor sends each frame just before the server's tick, which the `frame` events let it find.
-
-### Through the app (headless sway, GPU1 lock held)
-
-Models, search `haru`, the Haru-4B card shows RUNS HERE, Load opens the speech load page with GPU 1 picked (95.5 GB free, 4 sessions, 8192 frames, 18 minute longest call), load model: the rail tab becomes Voice and the status line reads "Haru-4B loaded in 4.0 s, running on GPU 1 (15.3 GB)". `nvidia-smi --query-compute-apps` showed the app holding 15,700 MiB on GPU1 and 233 MiB on GPU0 (its startup device probe, as in section 7d of `specrt-diffusion.md`). Server tab, start server, then the CLI against the app's port gave a 154 frame reply WAV. The same walk at 392x844 fits without sideways scroll. Screenshots: `docs/shots/duplex/` (`load-1280x800.png`, `voice-1280x800.png`, `load-390x844.png`, `voice-390x844.png`).
-
-The load page in these screenshots estimated 12.0 GB against the measured 15.3 GB. The codec runs in f32, which the estimate now counts (1.37 GB more for the 687M codec parameters, `duplex::service::footprint`). That still leaves the estimate about 2 GB under the measured 15.3 GB: CUDA context, captured graphs and activations are not counted yet (#1468).
-
-Auth: `/v1/duplex`, `/v1/realtime` and `POST /v1/duplex/voices` sit behind the same API key check as chat, and each has a test that fails without the key. A voice reference, uploaded or sent in `start`, is refused past `duplex.max_voice_seconds` (default 60) because every session prefills it.
