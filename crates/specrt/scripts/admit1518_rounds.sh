@@ -9,6 +9,7 @@ for r in $(seq "$rounds"); do
             -E CUDA_VISIBLE_DEVICES=1 -E CUDA_DEVICE_ORDER=PCI_BUS_ID -E HOME="$HOME" -E PATH="$PATH" -E BIN="$b" -E TAG="$arm$r" \
             -E OUT="${OUT:-/tmp/ib1518}" -E REQUESTS="${REQUESTS:-60}" -E RATE="${RATE:-0.5}" -E CLIENTS="${CLIENTS:-10}" -E SEED="${SEED:-5}" \
             -E MIX="${MIX:-0.8:1k-8k,0.2:15k-30k}" -E OUTPUT="${OUTPUT:-128-384}" -E PREFIXES="${PREFIXES:-8}" -E SHARE="${SHARE:-0.85}" \
+            -E MAX_CONCURRENT="${MAX_CONCURRENT:-1}" -E LONG="${LONG:-4}" -E KV_GB="${KV_GB:-26}" \
             --working-directory="$PWD" "$here/admit1518.sh"
     done
 done

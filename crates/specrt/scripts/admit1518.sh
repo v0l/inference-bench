@@ -11,8 +11,8 @@ spec=$out/admit1518.toml
 cp "$here/../tests/fixtures/qwen3.8-27b-nvfp4.toml" "$spec"
 printf '\n[runtime.prefix_cache]\nenabled = true\n' >>"$spec"
 model=admit1518
-"$bin" --log-format json serve --bind 127.0.0.1:$port --model "$spec" --max-num-seqs 8 --max-model-len 40960 --kv-cache-gb 26 \
-    ${SERVE_ARGS:-} >"$out/$tag.server.log" 2>&1 &
+"$bin" --log-format json serve --bind 127.0.0.1:$port --model "$spec" --max-num-seqs 8 --max-model-len 40960 --kv-cache-gb ${KV_GB:-26} \
+    --max-concurrent ${MAX_CONCURRENT:-1} --max-long-in-flight ${LONG:-4} ${SERVE_ARGS:-} >"$out/$tag.server.log" 2>&1 &
 server=$!
 trap 'kill $server 2>/dev/null; wait $server 2>/dev/null || true' EXIT
 for _ in $(seq 300); do
