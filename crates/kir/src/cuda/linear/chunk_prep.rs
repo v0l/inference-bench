@@ -141,9 +141,10 @@ gdn_frag_put<LA_D / 16>(qp, m, k, q.x * eg, q.y * eg);
 
 const K_TAIL: &str = r##"int d = p % LA_D;
 int k = (p / LA_D) * 2;
-float v0 = 0.0f, v1 = 0.0f;
-if (t0 + k < tokens) v0 = kn[((size_t)(t0 + k) * LA_KH + kh) * LA_D + d] * expf(glast - gs[k]);
-if (t0 + k + 1 < tokens) v1 = kn[((size_t)(t0 + k + 1) * LA_KH + kh) * LA_D + d] * expf(glast - gs[k + 1]);
+float v0 = ks[k * LA_KS + d] * expf(glast - gs[k]);
+float v1 = ks[(k + 1) * LA_KS + d] * expf(glast - gs[k + 1]);
+if (t0 + k >= tokens) v0 = 0.0f;
+if (t0 + k + 1 >= tokens) v1 = 0.0f;
 gdn_frag_put<C / 16>(kp, d, k, v0, v1);
 "##;
 
