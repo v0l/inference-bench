@@ -11,7 +11,7 @@ fn traces() -> PathBuf {
 }
 
 fn trace(name: &str) -> Trace {
-    Trace::open(&traces().join(name)).unwrap_or_else(|e| panic!("{e:#}: record it with crates/specrt/scripts/haru_trace.py (docs/haru-validation.md)"))
+    Trace::open(&traces().join(name)).unwrap_or_else(|e| panic!("{e:#}: record it with crates/specrt/scripts/haru_trace.py (docs/guides/haru-validation.md)"))
 }
 
 fn engine(layers: Vec<usize>) -> Engine {

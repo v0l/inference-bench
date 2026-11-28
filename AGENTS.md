@@ -18,13 +18,21 @@ cargo test -p inference-bench-specrt
 - Everything configurable lives in the model spec TOML or the server config. Env vars are deprecated dev overrides.
 - No code comments. Commit subjects are short, no trailers.
 
+## Docs
+
+`docs/README.md` indexes every doc with the code it describes: `design/` (how each area works now), `models/`, `guides/` (testing, perf pass, server, specs update), `generated/` (written or read by scripts and tests), `img/`.
+
+- Update the area doc in the same change as the code; docs describe the current code only. For how a doc or a default got here, use `git log -p -- docs/<file>` and the issue.
+- No dated logs, run output or measurement diaries in docs: results go in the issue and the commit message; a doc keeps one current measured table with its date and commit.
+- No new doc without an index line in `docs/README.md`; `crates/kir/tests/docs_links.rs` fails on an unindexed file, a broken link or a named path that does not exist.
+
 ## Testing
 
-Read `docs/testing.md`. It has the tiers, every test file, the exact commands, reference data and speed measurement rules.
+Read `docs/guides/testing.md`. It has the tiers, every test file, the exact commands, reference data and speed measurement rules.
 
 ## Perf passes
 
-The standard per-architecture speed loop is `docs/perf-pass.md` (`crates/specrt/scripts/perfpass.sh <family> --host spark`); results land in `docs/perf/scoreboard.md`.
+The standard per-architecture speed loop is `docs/guides/perf-pass.md` (`crates/specrt/scripts/perfpass.sh <family>`); results land in `docs/generated/perf/scoreboard.md`.
 
 ## GPUs
 

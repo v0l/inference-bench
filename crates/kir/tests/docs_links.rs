@@ -79,6 +79,15 @@ fn docs() -> Vec<PathBuf> {
     files_under(&repo().join("docs")).into_iter().filter(|p| p.extension().is_some_and(|e| e == "md")).collect()
 }
 
+fn ignored_roots() -> Vec<String> {
+    let text = std::fs::read_to_string(repo().join(".gitignore")).unwrap_or_default();
+    text.lines().filter_map(|l| l.trim().strip_prefix('/')).map(|l| l.trim_end_matches('/').to_string()).collect()
+}
+
+fn exists(p: &str) -> bool {
+    repo().join(p).exists() || ignored_roots().iter().any(|r| p == r || p.starts_with(&format!("{r}/")))
+}
+
 fn index_entries() -> BTreeSet<String> {
     let text = std::fs::read_to_string(repo().join("docs/README.md")).unwrap();
     links(&text).into_iter().filter(|l| !l.contains("://")).map(|l| l.split('#').next().unwrap().to_string()).collect()
@@ -114,6 +123,22 @@ fn every_file_in_docs_is_in_the_index() {
 }
 
 #[test]
+fn no_reference_doc_grows_past_400_lines() {
+    let mut long = Vec::new();
+    for f in docs() {
+        let r = rel(&f);
+        if r.starts_with("docs/generated/") {
+            continue;
+        }
+        let n = std::fs::read_to_string(&f).unwrap().lines().count();
+        if n > 400 {
+            long.push(format!("{r}: {n} lines"));
+        }
+    }
+    assert!(long.is_empty(), "split these by subtopic:\n{}", long.join("\n"));
+}
+
+#[test]
 fn every_relative_link_in_the_docs_resolves() {
     let mut files = docs();
     files.push(repo().join("README.md"));
@@ -144,7 +169,7 @@ fn every_path_a_doc_describes_exists() {
         let text = std::fs::read_to_string(&f).unwrap();
         for prefix in ["crates/", "docs/"] {
             for p in named_paths(&text, prefix) {
-                if !repo().join(&p).exists() {
+                if !exists(&p) {
                     gone.push(format!("{}: {p}", rel(&f)));
                 }
             }
@@ -190,4 +215,5 @@ fn the_path_scanner_sees_paths_and_skips_templates() {
     assert_eq!(named_paths(t, "docs/"), vec!["docs/design/kir.md".to_string()]);
     assert_eq!(named_paths(t, "crates/"), vec!["crates/kir/src/lib.rs".to_string()]);
     assert_eq!(links("a [b](c.md#d) e [f](g/)"), vec!["c.md#d".to_string(), "g/".to_string()]);
+    assert!(exists("crates/specrt/out/x.bin") && !exists("crates/specrt/nothing-here"));
 }

@@ -20,7 +20,7 @@ Comparing our speed with llama.cpp or vLLM on the same model and hardware is dev
 feature: it lives in the `inference-bench bench`, `batch` and `matrix` commands below and has no
 screen. The app never talks to another engine.
 
-The name `specrt` is kept on purpose, even though it is the only engine the app runs. It names the spec-driven design and appears in saved results and docs/spark-matrix.md, so renaming would break result history for no visible gain. Revisit only if the engine stops being spec-driven; the plan then is crate `inference-bench-engine` and `specrt` accepted as an alias in stored results.
+The name `specrt` is kept on purpose, even though it is the only engine the app runs. It names the spec-driven design and appears in saved results, so renaming would break result history for no visible gain. Revisit only if the engine stops being spec-driven; the plan then is crate `inference-bench-engine` and `specrt` accepted as an alias in stored results.
 
 ## Command line (dev tooling)
 
@@ -42,9 +42,9 @@ Results are saved as JSON in the data directory (`INFERENCE_BENCH_DIR` to move i
 ## Window
 
 `inference-bench-ui` follows the LM Studio flow: pick a model, load it with per-load options, then
-chat with it or serve it. A rail of four pages; every slow call (disk scan, Hugging Face, model load,
-generation, GPU poll) runs off the UI thread. The design and its reasons are in
-`docs/gui/redesign.md`.
+chat with it or serve it. A rail of five pages; every slow call (disk scan, Hugging Face, model load,
+generation, GPU poll) runs off the UI thread. The design is in
+`docs/design/app.md`; every doc is listed in `docs/README.md`.
 
 - Models: everything found in the Hugging Face cache, GGUF folders and the spec files, with size,
   architecture, quant, context length and whether the engine runs it. A search field filters the list
@@ -70,19 +70,19 @@ Model specs (`crates/specrt/specs/*.toml`) update themselves from this repositor
 model added here after you installed shows up and runs without reinstalling. Every build carries a
 snapshot of the specs, so a first run offline works too. `inference-bench specs status`, `specs
 update` and `specs rollback` manage them from the command line. How it works, the settings and what
-goes over the network: `docs/specs-update.md`.
+goes over the network: `docs/guides/specs-update.md`.
 
-![models](docs/gui/models.png)
-![load dialog](docs/gui/load-dialog.png)
-![chat](docs/gui/chat.png)
-![server](docs/gui/server.png)
+![models](docs/img/app/models.png)
+![load dialog](docs/img/app/load-dialog.png)
+![chat](docs/img/app/chat.png)
+![server](docs/img/app/server.png)
 
 ## Layout
 
 - `crates/core`: the in-process native engine thread, the `Target` trait and the OpenAI-compatible target used by the dev bench commands, `RunResult`, matrix runner, logit diff, settings, library, result store.
 - `crates/cli`: the `inference-bench` command.
 - `crates/ui`: the `inference-bench-ui` window.
-- `crates/server`: the OpenAI-compatible server for the native engine. See `docs/server.md`.
-- `crates/specrt`: the native CUDA runtime and its `specrt::Engine` API. See its README.
+- `crates/server`: the OpenAI-compatible server for the native engine. See `docs/guides/server.md`.
+- `crates/specrt`: the native CUDA runtime and its `specrt::Engine` API. See `docs/design/engine.md`.
 
-Measured comparisons with llama.cpp and vLLM on a DGX Spark are in `docs/spark-matrix.md`.
+Speed against llama.cpp and vLLM per architecture is in `docs/generated/perf/scoreboard.md`.

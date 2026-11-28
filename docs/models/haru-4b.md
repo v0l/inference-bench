@@ -201,7 +201,7 @@ Bytes read per frame for one session, everything else is small:
 
 | Part | bf16 | Quantised | Time bf16 | Time quantised |
 |---|---|---|---|---|
-| Backbone, 3.57 GB of layers plus the 1.27 GB tied head | 8.41 GB | 5.9 GB in the bench4b layout (NVFP4 MLPs, FP8 projections, bf16 head): **3.9 ms measured** (255 tok/s single stream, `docs/specrt-test-fixtures.md`); 3.3 GB with every linear in NVFP4 | 5.6 ms | 3.9 ms (2.2 ms) |
+| Backbone, 3.57 GB of layers plus the 1.27 GB tied head | 8.41 GB | 5.9 GB in the bench4b layout (NVFP4 MLPs, FP8 projections, bf16 head): **3.9 ms measured** (255 tok/s single stream, [../guides/test-fixtures.md](../guides/test-fixtures.md)); 3.3 GB with every linear in NVFP4 | 5.6 ms | 3.9 ms (2.2 ms) |
 | MeanFlow head, constant embeddings hoisted | 0.67 GB | 0.19 GB NVFP4 | 0.45 ms | 0.13 ms |
 | Codec encoder, nearly all weights in the 8 blocks at 2048 that run on one time step | 0.69 GB | | 0.46 ms | |
 | Codec decoder | 0.69 GB | | 0.46 ms | |

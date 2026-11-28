@@ -658,7 +658,7 @@ fn the_agent_chat_shows_the_reasoning_parser_output_as_thinking() {
 }
 
 #[test]
-#[ignore = "renders with wgpu; run with SHOTS=docs/gui"]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
 fn screenshot_of_the_chat_with_thinking_and_a_tool_row() {
     let out = shots_dir();
     std::fs::create_dir_all(&out).unwrap();
@@ -722,7 +722,7 @@ fn the_chat_draws_reasoning_an_attachment_and_a_tool_row_with_the_shared_widgets
 }
 
 #[test]
-#[ignore = "renders with wgpu; run with SHOTS=docs/gui"]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
 fn screenshot_of_the_chat_with_reasoning_attachment_and_tool_row() {
     let out = shots_dir();
     std::fs::create_dir_all(&out).unwrap();
@@ -1557,7 +1557,7 @@ fn screenshot_of_a_failed_spec_check_line() {
 }
 
 #[test]
-#[ignore = "renders with wgpu; run with SHOTS=docs/gui"]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
 fn screenshots_of_the_server_and_logs_tabs() {
     let out = shots_dir();
     std::fs::create_dir_all(&out).unwrap();
@@ -2879,7 +2879,7 @@ fn the_pipeline_section_names_each_stage_and_shows_a_lost_stage() {
 }
 
 #[test]
-#[ignore = "renders with wgpu; run with SHOTS=docs/gui"]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
 fn screenshot_of_the_hardware_tab() {
     let out = shots_dir();
     std::fs::create_dir_all(&out).unwrap();
@@ -3061,7 +3061,7 @@ fn a_finished_download_preselects_its_fitted_context_and_kv_in_the_load_dialog()
 }
 
 #[test]
-#[ignore = "renders with wgpu; run with SHOTS=docs/gui"]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
 fn screenshot_of_discover() {
     let out = shots_dir();
     std::fs::create_dir_all(&out).unwrap();
@@ -3230,7 +3230,7 @@ fn the_server_tab_per_request_table_fits_desktop_and_phone_with_the_wait_columns
 }
 
 #[test]
-#[ignore = "renders with wgpu; run with SHOTS=docs/gui"]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
 fn screenshot_of_the_per_request_table() {
     let out = shots_dir();
     std::fs::create_dir_all(&out).unwrap();
@@ -3815,7 +3815,7 @@ fn the_stats_strip_follows_the_model_picked_in_the_bar_and_names_it() {
 }
 
 #[test]
-#[ignore = "renders with wgpu; run with SHOTS=docs/gui"]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
 fn screenshot_of_the_server_tab_with_two_models_loaded() {
     let out = shots_dir();
     std::fs::create_dir_all(&out).unwrap();
