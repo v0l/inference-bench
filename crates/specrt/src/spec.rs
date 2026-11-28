@@ -3729,7 +3729,7 @@ impl Spec {
         }
         let safe = self.default_kv_f16_layers(context);
         if raw < safe {
-            return Some((false, format!("fp8 KV: {split}. Past {FP8_KV_VERIFIED_CONTEXT} tokens fewer than {safe} f16 layers drift from f16 and can derail long generations; leave f16 kv layers on auto or use f16 (docs/specrt-kv-quant.md).")));
+            return Some((false, format!("fp8 KV: {split}. Past {FP8_KV_VERIFIED_CONTEXT} tokens fewer than {safe} f16 layers drift from f16 and can derail long generations; leave f16 kv layers on auto or use f16 (docs/design/quantisation.md).")));
         }
         let note = if context > FP8_KV_LONG_VERIFIED_CONTEXT { format!(", verified to {FP8_KV_LONG_VERIFIED_CONTEXT} tokens") } else { String::new() };
         Some((true, format!("fp8 KV past {FP8_KV_VERIFIED_CONTEXT} tokens: {split}{note}.")))
